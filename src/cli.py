@@ -7,7 +7,12 @@ from pathlib import Path
 import numpy as np
 
 from config import AnalysisConfig
-from core import check_analysis_cancelled, compute_average_per_channel
+from core import (
+    AmplifierSpikeSource,
+    check_analysis_cancelled,
+    compute_average_per_channel,
+    resolve_work_dir,
+)
 from gui import launch_qt_gui
 from plotting import plot_channel_averages, plot_channel_comparison
 
@@ -37,102 +42,207 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Frequence de coupure (Hz) du passe-bas Butterworth sur les canaux amplificateur (defaut: pas de filtre)",
     )
+    parser.add_argument(
+        "--spike-threshold-uv",
+        type=float,
+        default=-40.0,
+        help=(
+            "Seuil (µV) spikes amplificateur : >=0 = passage montant au-dessus ; "
+            "<0 = passage descendant en dessous (pics negatifs, defaut: -40)"
+        ),
+    )
+    parser.add_argument(
+        "--firing-rate-window-s",
+        type=float,
+        default=0.025,
+        help="Largeur (s) du lissage gaussien du PSTH / taux de decharge (defaut: 0.025)",
+    )
+    parser.add_argument(
+        "--spike-bandpass-low-hz",
+        type=float,
+        default=None,
+        help=(
+            "Frequence basse (Hz) du passe-bande Butterworth sur l'amplificateur pour "
+            "raster / PSTH / ISI (avec --spike-bandpass-high-hz ; defaut: desactive = brut mmap)"
+        ),
+    )
+    parser.add_argument(
+        "--spike-bandpass-high-hz",
+        type=float,
+        default=None,
+        help=(
+            "Frequence haute (Hz) du passe-bande Butterworth spikes "
+            "(avec --spike-bandpass-low-hz ; defaut: desactive = brut mmap)"
+        ),
+    )
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        default=None,
+        help="Dossier fichiers intermediaires (amplificateur .npy mmap). Defaut: auto sous le PDF",
+    )
+    parser.add_argument(
+        "--keep-intermediate",
+        action="store_true",
+        help="Conserver le dossier de travail (amplifier_raw.npy) apres le PDF",
+    )
     return parser.parse_args()
 
 
 def run(config: AnalysisConfig) -> None:
-    mean_per_channel, t_rel, channel_names, n_valid, n_total, fs, end_rising_s = (
-        compute_average_per_channel(config)
-    )
-    check_analysis_cancelled()
-    out_dir = config.save_dir if config.save_dir is not None else config.rhs_file.parent
-    pdf_path = plot_channel_averages(
-        t_rel=t_rel,
-        mean_per_channel=mean_per_channel,
-        channel_names=channel_names,
-        output_dir=out_dir,
-        rhs_file=config.rhs_file,
-        lowpass_cutoff_hz=config.lowpass_cutoff_hz,
-        trigger_end_rising_rel_s=end_rising_s,
-    )
-    print(f"Frequence d'echantillonnage: {fs:.2f} Hz")
-    print("--- Triggers (ANALOG_IN 0) ---")
-    print(f"Nombre total de triggers detectes: {n_total}")
-    print(f"Nombre de triggers utilises pour la moyenne: {n_valid}")
-    if n_total > n_valid:
-        print(f"  ({n_total - n_valid} trigger(s) exclus: fenetre [-pre,+post] hors du signal)")
-    print(f"Nb canaux amplificateur: {mean_per_channel.shape[0]}")
-    print(f"Fenetre temporelle: [-{config.pre_s:.3f}s, +{config.post_s:.3f}s]")
-    print(f"Front ANALOG_IN 0: {config.edge}")
-    if end_rising_s is not None:
-        print(f"Delai moyen jusqu'au prochain front montant (fin de pulse typique): {end_rising_s*1e3:.3f} ms")
-    else:
-        print("Prochain front montant au seuil: non calcule (aucun front montant apres les triggers).")
-    if config.lowpass_cutoff_hz is not None:
-        print(f"Passe-bas Butterworth: fc = {config.lowpass_cutoff_hz} Hz (ordre 4, filtfilt)")
-    else:
-        print("Passe-bas Butterworth: desactive")
-    print(f"PDF genere: {pdf_path}")
+    spike_src: AmplifierSpikeSource | None = None
+    try:
+        (
+            mean_per_channel,
+            t_rel,
+            channel_names,
+            n_valid,
+            n_total,
+            fs,
+            end_rising_s,
+            spike_src,
+            mean_per_channel_raw,
+        ) = compute_average_per_channel(config)
+        check_analysis_cancelled()
+        out_dir = config.save_dir if config.save_dir is not None else config.rhs_file.parent
+        pdf_path = plot_channel_averages(
+            t_rel=t_rel,
+            mean_per_channel=mean_per_channel,
+            channel_names=channel_names,
+            output_dir=out_dir,
+            rhs_file=config.rhs_file,
+            lowpass_cutoff_hz=config.lowpass_cutoff_hz,
+            trigger_end_rising_rel_s=end_rising_s,
+            spike_source=spike_src,
+            windows=None,
+            fs=fs,
+            spike_threshold_uv=config.spike_threshold_uv,
+            firing_rate_window_s=config.firing_rate_window_s,
+            mean_per_channel_raw=mean_per_channel_raw,
+            spike_bandpass_low_hz=config.spike_bandpass_low_hz,
+            spike_bandpass_high_hz=config.spike_bandpass_high_hz,
+        )
+        print(f"Frequence d'echantillonnage: {fs:.2f} Hz")
+        print("--- Triggers (ANALOG_IN 0) ---")
+        print(f"Nombre total de triggers detectes: {n_total}")
+        print(f"Nombre de triggers utilises pour la moyenne: {n_valid}")
+        if n_total > n_valid:
+            print(f"  ({n_total - n_valid} trigger(s) exclus: fenetre [-pre,+post] hors du signal)")
+        print(f"Nb canaux amplificateur: {mean_per_channel.shape[0]}")
+        print(f"Fenetre temporelle: [-{config.pre_s:.3f}s, +{config.post_s:.3f}s]")
+        print(f"Front ANALOG_IN 0: {config.edge}")
+        if end_rising_s is not None:
+            print(f"Delai moyen jusqu'au prochain front montant (fin de pulse typique): {end_rising_s*1e3:.3f} ms")
+        else:
+            print("Prochain front montant au seuil: non calcule (aucun front montant apres les triggers).")
+        if config.lowpass_cutoff_hz is not None:
+            print(f"Passe-bas Butterworth: fc = {config.lowpass_cutoff_hz} Hz (ordre 4, filtfilt)")
+        else:
+            print("Passe-bas Butterworth: desactive")
+        spike_rule = (
+            "front descendant (pic négatif)"
+            if config.spike_threshold_uv < 0
+            else "front montant"
+        )
+        bp_txt = (
+            f" | passe-bande spikes {config.spike_bandpass_low_hz:g}–{config.spike_bandpass_high_hz:g} Hz"
+            if config.spike_bandpass_low_hz is not None
+            else " | passe-bande spikes: desactive (brut)"
+        )
+        print(
+            f"Spikes (PDF amplificateur): seuil {config.spike_threshold_uv} µV ({spike_rule}) | "
+            f"lissage taux σ = {config.firing_rate_window_s} s{bp_txt}"
+        )
+        print(f"PDF genere: {pdf_path}")
+        print(
+            f"Dossier travail (mmap amplificateur): {resolve_work_dir(config)} — "
+            + (
+                "conserve (--keep-intermediate)."
+                if config.keep_intermediate_files
+                else "supprime apres succes (economie disque)."
+            )
+        )
+    finally:
+        if spike_src is not None:
+            spike_src.close()
 
 
 def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> None:
     """Deux enregistrements, memes parametres (sauf fichiers), PDF superpose."""
-    ma, ta, names_a, va, tta, fsa, end_a = compute_average_per_channel(config_a)
-    check_analysis_cancelled()
-    mb, tb, names_b, vb, ttb, fsb, end_b = compute_average_per_channel(config_b)
-    check_analysis_cancelled()
+    spike_a: AmplifierSpikeSource | None = None
+    spike_b: AmplifierSpikeSource | None = None
+    try:
+        ma, ta, names_a, va, tta, fsa, end_a, spike_a, ma_raw = compute_average_per_channel(config_a)
+        check_analysis_cancelled()
+        mb, tb, names_b, vb, ttb, fsb, end_b, spike_b, mb_raw = compute_average_per_channel(config_b)
+        check_analysis_cancelled()
 
-    if abs(fsa - fsb) > 1e-3:
-        print(f"Attention: frequences d'echantillonnage differentes ({fsa} vs {fsb} Hz).")
+        if abs(fsa - fsb) > 1e-3:
+            print(f"Attention: frequences d'echantillonnage differentes ({fsa} vs {fsb} Hz).")
 
-    t_min = min(len(ta), len(tb))
-    n_ch = min(ma.shape[0], mb.shape[0])
-    ta = np.asarray(ta[:t_min])
-    ma = np.asarray(ma[:n_ch, :t_min])
-    mb = np.asarray(mb[:n_ch, :t_min])
-    names = [f"{names_a[i]} / {names_b[i]}" if names_a[i] != names_b[i] else names_a[i] for i in range(n_ch)]
+        t_min = min(len(ta), len(tb))
+        n_ch = min(ma.shape[0], mb.shape[0])
+        ta = np.asarray(ta[:t_min])
+        ma = np.asarray(ma[:n_ch, :t_min])
+        mb = np.asarray(mb[:n_ch, :t_min])
+        ma_raw = np.asarray(ma_raw[:n_ch, :t_min])
+        mb_raw = np.asarray(mb_raw[:n_ch, :t_min])
+        names = [f"{names_a[i]} / {names_b[i]}" if names_a[i] != names_b[i] else names_a[i] for i in range(n_ch)]
 
-    if ma.shape[1] != mb.shape[1]:
-        raise RuntimeError("Longueurs de fenetres incompatibles apres alignement.")
+        if ma.shape[1] != mb.shape[1]:
+            raise RuntimeError("Longueurs de fenetres incompatibles apres alignement.")
 
-    check_analysis_cancelled()
+        check_analysis_cancelled()
 
-    out_dir = config_a.save_dir if config_a.save_dir is not None else config_a.rhs_file.parent
-    if config_b.save_dir is not None and config_a.save_dir != config_b.save_dir:
-        print("Note: dossier PDF = celui de l'enregistrement 1 (ou --save-dir commun).")
+        out_dir = config_a.save_dir if config_a.save_dir is not None else config_a.rhs_file.parent
+        if config_b.save_dir is not None and config_a.save_dir != config_b.save_dir:
+            print("Note: dossier PDF = celui de l'enregistrement 1 (ou --save-dir commun).")
 
-    la = config_a.rhs_file.stem
-    lb = config_b.rhs_file.stem
-    pdf_path = plot_channel_comparison(
-        t_rel=ta,
-        mean_a=ma,
-        mean_b=mb,
-        channel_names=names,
-        output_dir=out_dir,
-        label_a=la,
-        label_b=lb,
-        lowpass_cutoff_hz=config_a.lowpass_cutoff_hz,
-        trigger_end_rising_rel_s_a=end_a,
-        trigger_end_rising_rel_s_b=end_b,
-    )
-
-    print(f"Frequence echantillonnage A: {fsa:.2f} Hz | B: {fsb:.2f} Hz")
-    print("--- Enregistrement A ---")
-    print(f"  Triggers detectes: {tta} | utilises: {va}")
-    print("--- Enregistrement B ---")
-    print(f"  Triggers detectes: {ttb} | utilises: {vb}")
-    print(f"Canaux compares (superposition): {n_ch}")
-    print(f"Fenetre temporelle: [-{config_a.pre_s:.3f}s, +{config_a.post_s:.3f}s]")
-    print(f"Front ANALOG_IN 0: {config_a.edge}")
-    if end_a is not None:
-        print(f"Delai moyen fin trigger (↗) — A: {end_a*1e3:.3f} ms")
-    if end_b is not None:
-        print(f"Delai moyen fin trigger (↗) — B: {end_b*1e3:.3f} ms")
-    if config_a.lowpass_cutoff_hz is not None:
-        print(f"Passe-bas Butterworth: fc = {config_a.lowpass_cutoff_hz} Hz")
-    else:
-        print("Passe-bas Butterworth: desactive")
-    print(f"PDF comparaison genere: {pdf_path}")
+        la = config_a.rhs_file.stem
+        lb = config_b.rhs_file.stem
+        pdf_path = plot_channel_comparison(
+            t_rel=ta,
+            mean_a=ma,
+            mean_b=mb,
+            channel_names=names,
+            output_dir=out_dir,
+            label_a=la,
+            label_b=lb,
+            lowpass_cutoff_hz=config_a.lowpass_cutoff_hz,
+            trigger_end_rising_rel_s_a=end_a,
+            trigger_end_rising_rel_s_b=end_b,
+            mean_a_raw=ma_raw,
+            mean_b_raw=mb_raw,
+            spike_source_a=spike_a,
+            spike_source_b=spike_b,
+            fs=float(fsa),
+            spike_threshold_uv=config_a.spike_threshold_uv,
+            firing_rate_window_s=config_a.firing_rate_window_s,
+            spike_bandpass_low_hz=config_a.spike_bandpass_low_hz,
+            spike_bandpass_high_hz=config_a.spike_bandpass_high_hz,
+        )
+        print(f"Frequence echantillonnage A: {fsa:.2f} Hz | B: {fsb:.2f} Hz")
+        print("--- Enregistrement A ---")
+        print(f"  Triggers detectes: {tta} | utilises: {va}")
+        print("--- Enregistrement B ---")
+        print(f"  Triggers detectes: {ttb} | utilises: {vb}")
+        print(f"Canaux compares (superposition): {n_ch}")
+        print(f"Fenetre temporelle: [-{config_a.pre_s:.3f}s, +{config_a.post_s:.3f}s]")
+        print(f"Front ANALOG_IN 0: {config_a.edge}")
+        if end_a is not None:
+            print(f"Delai moyen fin trigger (↗) — A: {end_a*1e3:.3f} ms")
+        if end_b is not None:
+            print(f"Delai moyen fin trigger (↗) — B: {end_b*1e3:.3f} ms")
+        if config_a.lowpass_cutoff_hz is not None:
+            print(f"Passe-bas Butterworth: fc = {config_a.lowpass_cutoff_hz} Hz")
+        else:
+            print("Passe-bas Butterworth: desactive")
+        print(f"PDF comparaison genere: {pdf_path}")
+    finally:
+        if spike_a is not None:
+            spike_a.close()
+        if spike_b is not None:
+            spike_b.close()
 
 
 def main() -> None:
@@ -145,6 +255,10 @@ def main() -> None:
             default_threshold=args.threshold,
             default_edge=args.edge,
             default_lowpass_hz=args.lowpass_hz,
+            default_spike_threshold_uv=args.spike_threshold_uv,
+            default_firing_rate_window_s=args.firing_rate_window_s,
+            default_spike_bandpass_low_hz=args.spike_bandpass_low_hz,
+            default_spike_bandpass_high_hz=args.spike_bandpass_high_hz,
         )
         if exit_code != 0:
             sys.exit(exit_code)
@@ -158,6 +272,12 @@ def main() -> None:
         post_s=args.post,
         lowpass_cutoff_hz=args.lowpass_hz,
         save_dir=args.save_dir,
+        spike_threshold_uv=args.spike_threshold_uv,
+        firing_rate_window_s=args.firing_rate_window_s,
+        spike_bandpass_low_hz=args.spike_bandpass_low_hz,
+        spike_bandpass_high_hz=args.spike_bandpass_high_hz,
+        work_dir=args.work_dir,
+        keep_intermediate_files=args.keep_intermediate,
     )
     try:
         run(config)

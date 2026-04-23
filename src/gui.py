@@ -18,6 +18,10 @@ def launch_qt_gui(
     default_threshold: float = 1.0,
     default_edge: str = "falling",
     default_lowpass_hz: float | None = None,
+    default_spike_threshold_uv: float = -40.0,
+    default_firing_rate_window_s: float = 0.025,
+    default_spike_bandpass_low_hz: float | None = None,
+    default_spike_bandpass_high_hz: float | None = None,
 ) -> int:
     try:
         from PySide6.QtCore import QThread, Signal
@@ -37,6 +41,7 @@ def launch_qt_gui(
             QTextEdit,
             QVBoxLayout,
             QWidget,
+            QCheckBox,
         )
     except ImportError as exc:
         raise RuntimeError("PySide6 n'est pas installe. Execute: pip install PySide6") from exc
@@ -73,7 +78,7 @@ def launch_qt_gui(
 
     window = QWidget()
     window.setWindowTitle("Intan RHS Trigger Plotter")
-    window.resize(820, 560)
+    window.resize(860, 720)
 
     # --- Onglets (fichiers seulement) ---
     tabs = QTabWidget()
@@ -127,21 +132,81 @@ def launch_qt_gui(
     if default_lowpass_hz is not None:
         lowpass_edit.setText(str(default_lowpass_hz))
     lowpass_edit.setPlaceholderText("ex: 300 — vide = pas de filtre")
+    spike_threshold_edit = QLineEdit(str(default_spike_threshold_uv))
+    spike_threshold_edit.setToolTip(
+        "Seuil en µV (signal amplificateur, éventuellement filtré passe-bande si renseigné). "
+        "Valeur ≥ 0 : spike = front montant (signal dépasse le seuil vers le haut). "
+        "Valeur < 0 : spike = front descendant (signal passe sous le seuil, ex. pic négatif). "
+        "Les instants détectés servent pour le raster, le PSTH / taux de décharge et l’ISI. "
+        "Indépendant du seuil ANALOG_IN pour le trigger."
+    )
+    firing_rate_window_edit = QLineEdit(str(default_firing_rate_window_s))
+    firing_rate_window_edit.setToolTip(
+        "Largeur σ (secondes) du noyau gaussien appliqué au PSTH pour la courbe de taux (Hz)."
+    )
+    bandpass_spikes_low_edit = QLineEdit()
+    bandpass_spikes_high_edit = QLineEdit()
+    if default_spike_bandpass_low_hz is not None:
+        bandpass_spikes_low_edit.setText(str(default_spike_bandpass_low_hz))
+    if default_spike_bandpass_high_hz is not None:
+        bandpass_spikes_high_edit.setText(str(default_spike_bandpass_high_hz))
+    bandpass_spikes_low_edit.setPlaceholderText("vide = brut — ex: 300")
+    bandpass_spikes_high_edit.setPlaceholderText("vide = brut — ex: 3000")
+    _bp_tip = (
+        "Passe-bande Butterworth (ordre 4) sur chaque canal avant raster, PSTH et ISI. "
+        "Les deux champs vides = signal brut (mmap). Les deux renseignés = fc basse et fc haute (Hz) ; "
+        "fc haute doit rester sous la fréquence de Nyquist."
+    )
+    bandpass_spikes_low_edit.setToolTip("Fréquence basse (Hz). " + _bp_tip)
+    bandpass_spikes_high_edit.setToolTip("Fréquence haute (Hz). " + _bp_tip)
+    work_dir_edit = QLineEdit()
+    work_dir_edit.setPlaceholderText("vide = auto sous le dossier PDF (.plot_erg/…)")
+    browse_work_btn = QPushButton("Parcourir…")
+    work_dir_row = QHBoxLayout()
+    work_dir_row.addWidget(work_dir_edit)
+    work_dir_row.addWidget(browse_work_btn)
+    keep_work_cb = QCheckBox("Conserver le dossier travail (amplifier_raw.npy)")
+    keep_work_cb.setToolTip(
+        "Sinon le dossier intermédiaire est supprimé après génération du PDF (économie disque)."
+    )
 
-    params_form = QFormLayout()
-    params_form.addRow("Front sur ANALOG_IN 0:", edge_combo)
-    params_form.addRow("Seuil:", threshold_edit)
-    params_form.addRow("Pre-trigger (s):", pre_edit)
-    params_form.addRow("Post-trigger (s):", post_edit)
-    params_form.addRow("Passe-bas Butterworth fc (Hz):", lowpass_edit)
     save_row = QHBoxLayout()
     save_row.addWidget(save_dir_edit)
     browse_save_btn = QPushButton("Parcourir...")
     save_row.addWidget(browse_save_btn)
-    params_form.addRow("Dossier PDF (vide = dossier du .rhs):", save_row)
 
-    params_group = QGroupBox("Parametres (communs aux deux modes)")
-    params_group.setLayout(params_form)
+    general_form = QFormLayout()
+    general_form.addRow("Front sur ANALOG_IN 0:", edge_combo)
+    general_form.addRow("Seuil trigger ANALOG_IN 0:", threshold_edit)
+    general_form.addRow("Pre-trigger (s):", pre_edit)
+    general_form.addRow("Post-trigger (s):", post_edit)
+    general_form.addRow("Passe-bas Butterworth fc (Hz):", lowpass_edit)
+    general_form.addRow("Dossier travail (mmap):", work_dir_row)
+    general_form.addRow("", keep_work_cb)
+    general_form.addRow("Dossier PDF (vide = dossier du .rhs):", save_row)
+
+    general_group = QGroupBox("Paramètres généraux — trigger ANALOG_IN, moyennes amplificateur, fichiers")
+    general_group.setLayout(general_form)
+
+    spike_form = QFormLayout()
+    spike_form.addRow("Seuil spikes amplificateur (µV) — raster, PSTH et ISI:", spike_threshold_edit)
+    spike_form.addRow("Lissage gaussien PSTH / taux de décharge (σ, s):", firing_rate_window_edit)
+    spike_form.addRow("Passe-bande signal (raster, PSTH, ISI) f_bas (Hz):", bandpass_spikes_low_edit)
+    spike_form.addRow("Passe-bande signal (raster, PSTH, ISI) f_haut (Hz):", bandpass_spikes_high_edit)
+
+    spike_group = QGroupBox("Raster, taux de décharge (PSTH) et ISI — panneaux PDF amplificateur")
+    spike_group.setLayout(spike_form)
+    spike_group.setToolTip(
+        "Ces réglages concernent uniquement les graphiques spikes du PDF. "
+        "Le raster, le PSTH (taux) et l’ISI utilisent les mêmes instants de spike (même seuil et même filtre passe-bande). "
+        "Les fenêtres temporelles affichées (vue complète / zoom) sont définies dans le code (plotting.py)."
+    )
+
+    params_stack = QWidget()
+    params_stack_layout = QVBoxLayout(params_stack)
+    params_stack_layout.setContentsMargins(0, 0, 0, 0)
+    params_stack_layout.addWidget(general_group)
+    params_stack_layout.addWidget(spike_group)
 
     status_label = QLabel("Choisis un onglet, un ou deux fichiers .rhs, puis lance.")
     log_view = QTextEdit()
@@ -166,7 +231,7 @@ def launch_qt_gui(
 
     main_layout = QVBoxLayout()
     main_layout.addWidget(tabs)
-    main_layout.addWidget(params_group)
+    main_layout.addWidget(params_stack)
     main_layout.addLayout(progress_row)
     main_layout.addWidget(status_label)
     main_layout.addWidget(log_view)
@@ -177,7 +242,20 @@ def launch_qt_gui(
         log_view.append(f"[{ts}] {message}")
         log_view.ensureCursorVisible()
 
-    def build_shared_params() -> tuple[float, str, float, float, float | None, Path | None]:
+    def build_shared_params() -> tuple[
+        float,
+        str,
+        float,
+        float,
+        float | None,
+        Path | None,
+        float,
+        float,
+        float | None,
+        float | None,
+        Path | None,
+        bool,
+    ]:
         lp_text = lowpass_edit.text().strip()
         lowpass_hz: float | None = None
         if lp_text:
@@ -186,6 +264,22 @@ def launch_qt_gui(
         edge = edge_combo.currentData()
         if edge not in ("falling", "rising"):
             edge = "falling"
+        bp_lo_text = bandpass_spikes_low_edit.text().strip()
+        bp_hi_text = bandpass_spikes_high_edit.text().strip()
+        bp_lo: float | None = None
+        bp_hi: float | None = None
+        if bp_lo_text or bp_hi_text:
+            if not bp_lo_text or not bp_hi_text:
+                raise ValueError(
+                    "Passe-bande spikes : renseigner les deux fréquences (Hz) ou laisser les deux champs vides."
+                )
+            bp_lo = float(bp_lo_text)
+            bp_hi = float(bp_hi_text)
+            if bp_lo <= 0 or bp_hi <= 0:
+                raise ValueError("Passe-bande spikes : chaque fréquence doit être > 0 Hz.")
+            if bp_lo >= bp_hi:
+                raise ValueError("Passe-bande spikes : la fréquence basse doit être < la fréquence haute.")
+        work_text = work_dir_edit.text().strip()
         return (
             float(threshold_edit.text().strip()),
             edge,
@@ -193,6 +287,12 @@ def launch_qt_gui(
             float(post_edit.text().strip()),
             lowpass_hz,
             Path(save_text) if save_text else None,
+            float(spike_threshold_edit.text().strip()),
+            float(firing_rate_window_edit.text().strip()),
+            bp_lo,
+            bp_hi,
+            Path(work_text) if work_text else None,
+            keep_work_cb.isChecked(),
         )
 
     def browse_rhs() -> None:
@@ -230,6 +330,11 @@ def launch_qt_gui(
         if selected:
             save_dir_edit.setText(selected)
 
+    def browse_work_dir() -> None:
+        selected = QFileDialog.getExistingDirectory(window, "Dossier travail (fichiers intermédiaires mmap)")
+        if selected:
+            work_dir_edit.setText(selected)
+
     analysis_thread: QThread | None = None
 
     def set_busy(running: bool) -> None:
@@ -244,9 +349,16 @@ def launch_qt_gui(
         edge_combo.setEnabled(not running)
         lowpass_edit.setEnabled(not running)
         threshold_edit.setEnabled(not running)
+        spike_threshold_edit.setEnabled(not running)
+        firing_rate_window_edit.setEnabled(not running)
+        bandpass_spikes_low_edit.setEnabled(not running)
+        bandpass_spikes_high_edit.setEnabled(not running)
         pre_edit.setEnabled(not running)
         post_edit.setEnabled(not running)
         save_dir_edit.setEnabled(not running)
+        work_dir_edit.setEnabled(not running)
+        browse_work_btn.setEnabled(not running)
+        keep_work_cb.setEnabled(not running)
         tabs.setEnabled(not running)
 
     def on_analysis_ok(output: str) -> None:
@@ -316,7 +428,11 @@ def launch_qt_gui(
             rhs_text = rhs_path_edit.text().strip()
             if not rhs_text:
                 raise ValueError("Choisis un fichier RHS.")
-            thr, edge, pre, post, lp_hz, save_p = build_shared_params()
+            thr, edge, pre, post, lp_hz, save_p, sp_thr, fr_w, bp_lo, bp_hi, work_p, keep_w = (
+                build_shared_params()
+            )
+            if fr_w <= 0:
+                raise ValueError("La fenêtre de lissage du taux (s) doit être > 0.")
             config = AnalysisConfig(
                 rhs_file=Path(rhs_text),
                 threshold=thr,
@@ -325,6 +441,12 @@ def launch_qt_gui(
                 post_s=post,
                 lowpass_cutoff_hz=lp_hz,
                 save_dir=save_p,
+                spike_threshold_uv=sp_thr,
+                firing_rate_window_s=fr_w,
+                spike_bandpass_low_hz=bp_lo,
+                spike_bandpass_high_hz=bp_hi,
+                work_dir=work_p,
+                keep_intermediate_files=keep_w,
             )
         except ValueError as exc:
             append_log(f"Erreur: {exc}")
@@ -363,7 +485,11 @@ def launch_qt_gui(
                 raise ValueError("Choisis deux fichiers RHS.")
             if Path(p1).resolve() == Path(p2).resolve():
                 raise ValueError("Les deux fichiers doivent etre differents.")
-            thr, edge, pre, post, lp_hz, save_p = build_shared_params()
+            thr, edge, pre, post, lp_hz, save_p, sp_thr, fr_w, bp_lo, bp_hi, work_p, keep_w = (
+                build_shared_params()
+            )
+            if fr_w <= 0:
+                raise ValueError("La fenêtre de lissage du taux (s) doit être > 0.")
             cfg_a = AnalysisConfig(
                 rhs_file=Path(p1),
                 threshold=thr,
@@ -372,6 +498,12 @@ def launch_qt_gui(
                 post_s=post,
                 lowpass_cutoff_hz=lp_hz,
                 save_dir=save_p,
+                spike_threshold_uv=sp_thr,
+                firing_rate_window_s=fr_w,
+                spike_bandpass_low_hz=bp_lo,
+                spike_bandpass_high_hz=bp_hi,
+                work_dir=work_p,
+                keep_intermediate_files=keep_w,
             )
             cfg_b = AnalysisConfig(
                 rhs_file=Path(p2),
@@ -381,6 +513,12 @@ def launch_qt_gui(
                 post_s=post,
                 lowpass_cutoff_hz=lp_hz,
                 save_dir=save_p,
+                spike_threshold_uv=sp_thr,
+                firing_rate_window_s=fr_w,
+                spike_bandpass_low_hz=bp_lo,
+                spike_bandpass_high_hz=bp_hi,
+                work_dir=work_p,
+                keep_intermediate_files=keep_w,
             )
         except ValueError as exc:
             append_log(f"Erreur: {exc}")
@@ -412,6 +550,7 @@ def launch_qt_gui(
     browse1_btn.clicked.connect(browse_rhs1)
     browse2_btn.clicked.connect(browse_rhs2)
     browse_save_btn.clicked.connect(browse_save_dir)
+    browse_work_btn.clicked.connect(browse_work_dir)
     run_btn.clicked.connect(run_analysis)
     run_compare_btn.clicked.connect(run_compare)
     stop_btn.clicked.connect(on_stop_clicked)
