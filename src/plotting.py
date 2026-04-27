@@ -28,6 +28,13 @@ ISI_ABSCISSA_T1_S = 2.0
 TIME_REL_XLABEL = "Temps relatif au trigger (s)"
 
 
+def _shift_axes_down(axes: Sequence[Any], delta: float) -> None:
+    """Décale un groupe d'axes vers le bas (coordonnées figure)."""
+    for ax in axes:
+        pos = ax.get_position()
+        ax.set_position([pos.x0, pos.y0 - delta, pos.width, pos.height])
+
+
 def _spike_times_per_trial(
     windows_ch: np.ndarray,
     t_rel: np.ndarray,
@@ -207,7 +214,7 @@ def _draw_spike_panels_single_channel(
         f"{sec}Taux de décharge moyen — {short} (PSTH gaussien, σ={firing_rate_window_s:g} s)"
     )
     ax_fr.grid(True, alpha=0.3)
-    ax_fr.legend(loc="best", fontsize=8)
+    ax_fr.legend(loc="best", fontsize=6)
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.set_xlabel(TIME_REL_XLABEL)
     ax_fr.set_xlabel(TIME_REL_XLABEL)
@@ -325,7 +332,7 @@ def _draw_spike_panels_dual_channel(
     ax_raster.set_ylim(-0.5, max(offset + n_b - 0.5, 0.5))
     ax_raster.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.axhline(offset - 0.5, color="0.5", linestyle="--", linewidth=0.8, alpha=0.7)
-    ax_raster.legend(loc="upper right", fontsize=7)
+    ax_raster.legend(loc="upper right", fontsize=6)
 
     bin_w = max(1.0 / fs, min(0.002, max(firing_rate_window_s / 12.0, 5e-5)))
     tc_a, rate_a = _psth_mean_hz(
@@ -343,7 +350,7 @@ def _draw_spike_panels_dual_channel(
         f"{sec}Taux de décharge (PSTH gaussien σ={firing_rate_window_s:g} s) — {short}"
     )
     ax_fr.grid(True, alpha=0.3)
-    ax_fr.legend(loc="best", fontsize=8)
+    ax_fr.legend(loc="best", fontsize=6)
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.set_xlabel(TIME_REL_XLABEL)
     ax_fr.set_xlabel(TIME_REL_XLABEL)
@@ -378,7 +385,7 @@ def _draw_spike_panels_dual_channel(
             f"{sec}ISI — {short} ({isi_caption} ; abscisse = temps du 2e spike de la paire)"
         )
         ax_isi.grid(True, alpha=0.25)
-        ax_isi.legend(loc="best", fontsize=7)
+        ax_isi.legend(loc="best", fontsize=6)
         ax_isi.set_xlim(ISI_ABSCISSA_T0_S, ISI_ABSCISSA_T1_S)
         ax_isi.set_xlabel(TIME_REL_XLABEL)
     else:
@@ -454,9 +461,9 @@ def plot_channel_averages(
         for ch in range(n_channels):
             check_analysis_cancelled()
             y = mean_per_channel[ch]
-            fig = plt.figure(figsize=(10, 22))
+            fig = plt.figure(figsize=(12, 26))
             hr = [0.06, 1.05, 1.15, 0.95, 0.95, 0.06, 1.05, 1.15, 0.95, 0.95]
-            gs = fig.add_gridspec(10, 1, height_ratios=hr, hspace=0.4)
+            gs = fig.add_gridspec(10, 1, height_ratios=hr, hspace=0.65)
             ax_hdr1 = fig.add_subplot(gs[0, 0])
             ax_hdr1.axis("off")
             ax_hdr1.text(
@@ -537,7 +544,12 @@ def plot_channel_averages(
             ax_full.set_ylabel("Amplitude (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
-            ax_full.legend(loc="best", fontsize=8)
+            ax_full.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.2),
+                ncol=3,
+                fontsize=6,
+            )
 
             zmask = (t_rel >= zoom_t0) & (t_rel <= zoom_t1)
             if show_both and y_raw is not None:
@@ -572,7 +584,7 @@ def plot_channel_averages(
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
             if show_both:
-                ax_zoom.legend(loc="best", fontsize=7)
+                ax_zoom.legend(loc="best", fontsize=6)
 
             if _has_spike_data and (
                 spike_source is not None
@@ -648,6 +660,10 @@ def plot_channel_averages(
                 ax.tick_params(axis="x", labelbottom=True)
 
             fig.tight_layout()
+            _shift_axes_down(
+                [ax_raster_f, ax_fr_f, ax_isi_f, ax_hdr2, ax_zoom, ax_raster_z, ax_fr_z, ax_isi_z],
+                delta=0.015,
+            )
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=120)
             plt.close(fig)
 
@@ -718,9 +734,9 @@ def plot_channel_comparison(
                     or not np.allclose(yb, yb_raw, rtol=0.0, atol=1e-9)
                 )
             )
-            fig = plt.figure(figsize=(10, 22))
+            fig = plt.figure(figsize=(12, 26))
             hr = [0.06, 1.05, 1.15, 0.95, 0.95, 0.06, 1.05, 1.15, 0.95, 0.95]
-            gs = fig.add_gridspec(10, 1, height_ratios=hr, hspace=0.4)
+            gs = fig.add_gridspec(10, 1, height_ratios=hr, hspace=0.65)
             ax_hdr1 = fig.add_subplot(gs[0, 0])
             ax_hdr1.axis("off")
             ax_hdr1.text(
@@ -816,7 +832,12 @@ def plot_channel_comparison(
             ax_full.set_ylabel("Amplitude (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
-            ax_full.legend(loc="best", fontsize=7)
+            ax_full.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.2),
+                ncol=3,
+                fontsize=6,
+            )
 
             if show_both and ya_raw is not None and yb_raw is not None:
                 ax_zoom.plot(
@@ -872,7 +893,7 @@ def plot_channel_comparison(
             ax_zoom.set_ylabel("Amplitude (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
-            ax_zoom.legend(loc="best", fontsize=7)
+            ax_zoom.legend(loc="best", fontsize=6)
 
             if _has_spike_cmp:
                 w_a = spike_source_a.windows_2d_for_channel(ch)
@@ -951,6 +972,10 @@ def plot_channel_comparison(
                 ax.tick_params(axis="x", labelbottom=True)
 
             fig.tight_layout()
+            _shift_axes_down(
+                [ax_raster_f, ax_fr_f, ax_isi_f, ax_hdr2, ax_zoom, ax_raster_z, ax_fr_z, ax_isi_z],
+                delta=0.015,
+            )
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=120)
             plt.close(fig)
 
