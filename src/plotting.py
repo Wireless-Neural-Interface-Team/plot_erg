@@ -112,6 +112,22 @@ def _psth_mean_hz(
     return centers, rate_s
 
 
+def _mean_firing_rate_in_window_hz(
+    spike_times_per_trial: list[np.ndarray],
+    t_window: tuple[float, float],
+) -> float:
+    """Average firing rate (Hz) in a given time window."""
+    t0, t1 = float(t_window[0]), float(t_window[1])
+    if t1 <= t0:
+        return 0.0
+    n_trials = max(1, len(spike_times_per_trial))
+    n_spikes = 0
+    for st in spike_times_per_trial:
+        st_arr = np.asarray(st, dtype=np.float64)
+        n_spikes += int(np.sum((st_arr >= t0) & (st_arr <= t1)))
+    return float(n_spikes) / (float(n_trials) * (t1 - t0))
+
+
 def _spike_pipeline_captions(
     spike_bandpass_low_hz: Optional[float],
     spike_bandpass_high_hz: Optional[float],
@@ -249,6 +265,16 @@ def _draw_spike_panels_single_channel(
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.set_xlabel(TIME_REL_XLABEL)
     ax_fr.set_xlabel(TIME_REL_XLABEL)
+    mean_fr = _mean_firing_rate_in_window_hz(st_per_tr, (t_xlim_lo, t_xlim_hi))
+    ax_fr.text(
+        0.01,
+        -0.28,
+        f"Mean firing rate in shown window: {mean_fr:.2f} Hz",
+        transform=ax_fr.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+    )
 
     t_isi, isi_vals_s = _isi_time_and_values_s(st_per_tr, isi_window_s=isi_window)
     if t_isi.size:
@@ -390,6 +416,17 @@ def _draw_spike_panels_dual_channel(
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.set_xlabel(TIME_REL_XLABEL)
     ax_fr.set_xlabel(TIME_REL_XLABEL)
+    mean_fr_a = _mean_firing_rate_in_window_hz(sta, (t_xlim_lo, t_xlim_hi))
+    mean_fr_b = _mean_firing_rate_in_window_hz(stb, (t_xlim_lo, t_xlim_hi))
+    ax_fr.text(
+        0.01,
+        -0.28,
+        f"Mean firing rate in shown window — {label_a}: {mean_fr_a:.2f} Hz | {label_b}: {mean_fr_b:.2f} Hz",
+        transform=ax_fr.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+    )
 
     t_a, isi_a_s = _isi_time_and_values_s(sta, isi_window_s=isi_window)
     t_b, isi_b_s = _isi_time_and_values_s(stb, isi_window_s=isi_window)
@@ -531,6 +568,19 @@ def _draw_spike_panels_multi_channel(
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.set_xlabel(TIME_REL_XLABEL)
     ax_fr.set_xlabel(TIME_REL_XLABEL)
+    fr_parts: list[str] = []
+    for rec_idx, st_per_trial in enumerate(spikes_per_recording):
+        mean_fr = _mean_firing_rate_in_window_hz(st_per_trial, (t_xlim_lo, t_xlim_hi))
+        fr_parts.append(f"{labels[rec_idx]}: {mean_fr:.2f} Hz")
+    ax_fr.text(
+        0.01,
+        -0.28,
+        "Mean firing rate in shown window — " + " | ".join(fr_parts),
+        transform=ax_fr.transAxes,
+        ha="left",
+        va="top",
+        fontsize=8,
+    )
 
     has_isi = False
     for rec_idx, st_per_trial in enumerate(spikes_per_recording):
