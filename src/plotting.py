@@ -31,7 +31,7 @@ ISI_ABSCISSA_T0_S = 0.0
 ISI_ABSCISSA_T1_S = 2.0
 
 # Libellé d'abscisse pour tous les graphiques en temps rel. au trigger
-TIME_REL_XLABEL = "Temps relatif au trigger (s)"
+TIME_REL_XLABEL = "Time relative to trigger (s)"
 
 
 def _shift_axes_down(axes: Sequence[Any], delta: float) -> None:
@@ -128,6 +128,23 @@ def _mean_firing_rate_in_window_hz(
     return float(n_spikes) / (float(n_trials) * (t1 - t0))
 
 
+def _add_psth_mean_table(ax_fr: Any, rows: list[tuple[str, float]]) -> None:
+    """Render a compact PSTH mean-rate table below FR axis."""
+    if not rows:
+        return
+    cell_text = [[name, f"{rate:.2f}"] for name, rate in rows]
+    tbl = ax_fr.table(
+        cellText=cell_text,
+        colLabels=["Signal", "Mean FR (Hz)"],
+        cellLoc="left",
+        colLoc="left",
+        bbox=[0.0, -0.68, 1.0, 0.34],
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(7)
+    tbl.scale(1.0, 1.25)
+
+
 def _spike_pipeline_captions(
     spike_bandpass_low_hz: Optional[float],
     spike_bandpass_high_hz: Optional[float],
@@ -136,10 +153,10 @@ def _spike_pipeline_captions(
     if spike_bandpass_low_hz is not None and spike_bandpass_high_hz is not None:
         flo = float(spike_bandpass_low_hz)
         fhi = float(spike_bandpass_high_hz)
-        short = f"passe-bande {flo:g}–{fhi:g} Hz"
-        detail = f"Butterworth passe-bande {flo:g}–{fhi:g} Hz (ordre 4, filtfilt)"
+        short = f"band-pass {flo:g}–{fhi:g} Hz"
+        detail = f"Butterworth band-pass {flo:g}–{fhi:g} Hz (order 4, filtfilt)"
         return short, detail
-    return "brut", "signal brut mmap (sans passe-bande spikes)"
+    return "raw", "raw mmap signal (no spike band-pass)"
 
 
 def _isi_time_and_values_s(
@@ -205,18 +222,18 @@ def _draw_spike_panels_single_channel(
         t_xlim_lo, t_xlim_hi = float(t_rel[0]), float(t_rel[-1])
         psth_t_range: Optional[Tuple[float, float]] = None
         isi_window: Optional[Tuple[float, float]] = None
-        isi_caption = f"spikes dans ±{ISI_HALF_WINDOW_S:g} s du trigger, intra-essai"
+        isi_caption = f"spikes within ±{ISI_HALF_WINDOW_S:g} s of trigger, within-trial"
         isi_empty_hint = (
-            "moins de 2 spikes dans ±"
-            f"{ISI_HALF_WINDOW_S:g} s du trigger, par essai"
+            "fewer than 2 spikes within ±"
+            f"{ISI_HALF_WINDOW_S:g} s of trigger, per trial"
         )
     else:
         t_xlim_lo, t_xlim_hi = float(t_range_s[0]), float(t_range_s[1])
         psth_t_range = (t_xlim_lo, t_xlim_hi)
         isi_window = (t_xlim_lo, t_xlim_hi)
-        isi_caption = f"spikes dans [{t_xlim_lo:g}, {t_xlim_hi:g}] s rel. trigger, intra-essai"
+        isi_caption = f"spikes in [{t_xlim_lo:g}, {t_xlim_hi:g}] s relative to trigger, within-trial"
         isi_empty_hint = (
-            f"moins de 2 spikes dans [{t_xlim_lo:g}, {t_xlim_hi:g}] s, par essai"
+            f"fewer than 2 spikes in [{t_xlim_lo:g}, {t_xlim_hi:g}] s, per trial"
         )
 
     sec = f"{section_title} — " if section_title else ""
@@ -237,9 +254,9 @@ def _draw_spike_panels_single_channel(
             )
     ax_raster.set_ylabel("Essai n°")
     cap = (
-        f"passage sous {spike_threshold_uv:g} µV (front descendant)"
+        f"crossing below {spike_threshold_uv:g} µV (falling edge)"
         if spike_threshold_uv < 0
-        else f"passage au-dessus de {spike_threshold_uv:g} µV (front montant)"
+        else f"crossing above {spike_threshold_uv:g} µV (rising edge)"
     )
     ax_raster.set_title(f"{sec}Raster — {short} ({cap}, réfractaire 1 ms)")
     ax_raster.grid(True, alpha=0.25, axis="x")
@@ -259,22 +276,14 @@ def _draw_spike_panels_single_channel(
         ax_fr.plot(tc, rate_hz, linewidth=1.3, color="darkred", label="PSTH lissé (Hz)")
     ax_fr.set_ylabel("Taux (Hz)")
     ax_fr.set_title(
-        f"{sec}Taux de décharge moyen — {short} (PSTH gaussien, σ={firing_rate_window_s:g} s)"
+        f"{sec}Mean firing rate — {short} (Gaussian PSTH, σ={firing_rate_window_s:g} s)"
     )
     ax_fr.grid(True, alpha=0.3)
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.set_xlabel(TIME_REL_XLABEL)
     ax_fr.set_xlabel(TIME_REL_XLABEL)
     mean_fr = _mean_firing_rate_in_window_hz(st_per_tr, (t_xlim_lo, t_xlim_hi))
-    ax_fr.text(
-        0.01,
-        -0.28,
-        f"Mean firing rate in shown window: {mean_fr:.2f} Hz",
-        transform=ax_fr.transAxes,
-        ha="left",
-        va="top",
-        fontsize=8,
-    )
+    _add_psth_mean_table(ax_fr, [("Channel", mean_fr)])
 
     t_isi, isi_vals_s = _isi_time_and_values_s(st_per_tr, isi_window_s=isi_window)
     if t_isi.size:
@@ -299,7 +308,7 @@ def _draw_spike_panels_single_channel(
         ax_isi.text(
             0.5,
             0.5,
-            "Pas assez de spikes pour l'ISI\n(" + isi_empty_hint + ")",
+            "Not enough spikes for ISI\n(" + isi_empty_hint + ")",
             ha="center",
             va="center",
             transform=ax_isi.transAxes,
@@ -387,9 +396,9 @@ def _draw_spike_panels_dual_channel(
             )
     ax_raster.set_ylabel("Essai n° (A puis B empilés)")
     cap = (
-        f"seuil {spike_threshold_uv:g} µV (desc.)"
+        f"threshold {spike_threshold_uv:g} µV (falling)"
         if spike_threshold_uv < 0
-        else f"seuil {spike_threshold_uv:g} µV (montant)"
+        else f"threshold {spike_threshold_uv:g} µV (rising)"
     )
     ax_raster.set_title(f"{sec}Raster — {short} ({cap})")
     ax_raster.grid(True, alpha=0.25, axis="x")
@@ -410,7 +419,7 @@ def _draw_spike_panels_dual_channel(
         ax_fr.plot(tc_b, rate_b, linewidth=1.3, color="C1", label=label_b)
     ax_fr.set_ylabel("Taux (Hz)")
     ax_fr.set_title(
-        f"{sec}Taux de décharge (PSTH gaussien σ={firing_rate_window_s:g} s) — {short}"
+        f"{sec}Firing rate (Gaussian PSTH σ={firing_rate_window_s:g} s) — {short}"
     )
     ax_fr.grid(True, alpha=0.3)
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
@@ -418,14 +427,12 @@ def _draw_spike_panels_dual_channel(
     ax_fr.set_xlabel(TIME_REL_XLABEL)
     mean_fr_a = _mean_firing_rate_in_window_hz(sta, (t_xlim_lo, t_xlim_hi))
     mean_fr_b = _mean_firing_rate_in_window_hz(stb, (t_xlim_lo, t_xlim_hi))
-    ax_fr.text(
-        0.01,
-        -0.28,
-        f"Mean firing rate in shown window — {label_a}: {mean_fr_a:.2f} Hz | {label_b}: {mean_fr_b:.2f} Hz",
-        transform=ax_fr.transAxes,
-        ha="left",
-        va="top",
-        fontsize=8,
+    _add_psth_mean_table(
+        ax_fr,
+        [
+            (label_a, mean_fr_a),
+            (label_b, mean_fr_b),
+        ],
     )
 
     t_a, isi_a_s = _isi_time_and_values_s(sta, isi_window_s=isi_window)
@@ -468,7 +475,7 @@ def _draw_spike_panels_dual_channel(
         ax_isi.text(
             0.5,
             0.5,
-            f"Pas assez de spikes pour l'ISI\n({isi_empty_hint})",
+            f"Not enough spikes for ISI\n({isi_empty_hint})",
             ha="center",
             va="center",
             transform=ax_isi.transAxes,
@@ -540,9 +547,9 @@ def _draw_spike_panels_multi_channel(
         if rec_idx < len(spikes_per_recording) - 1:
             ax_raster.axhline(y_offset - 0.5, color="0.55", linestyle="--", linewidth=0.8, alpha=0.7)
     cap = (
-        f"seuil {spike_threshold_uv:g} µV (desc.)"
+        f"threshold {spike_threshold_uv:g} µV (falling)"
         if spike_threshold_uv < 0
-        else f"seuil {spike_threshold_uv:g} µV (montant)"
+        else f"threshold {spike_threshold_uv:g} µV (rising)"
     )
     ax_raster.set_ylabel("Essai n° (groupés par fichier)")
     ax_raster.set_title(f"{sec}Raster — {short} ({cap})")
@@ -563,24 +570,16 @@ def _draw_spike_panels_multi_channel(
         if tc.size:
             ax_fr.plot(tc, rate, linewidth=1.3, color=colors[rec_idx % len(colors)], label=labels[rec_idx])
     ax_fr.set_ylabel("Taux (Hz)")
-    ax_fr.set_title(f"{sec}Taux de décharge (PSTH gaussien σ={firing_rate_window_s:g} s) — {short}")
+    ax_fr.set_title(f"{sec}Firing rate (Gaussian PSTH σ={firing_rate_window_s:g} s) — {short}")
     ax_fr.grid(True, alpha=0.3)
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.set_xlabel(TIME_REL_XLABEL)
     ax_fr.set_xlabel(TIME_REL_XLABEL)
-    fr_parts: list[str] = []
+    fr_rows: list[tuple[str, float]] = []
     for rec_idx, st_per_trial in enumerate(spikes_per_recording):
         mean_fr = _mean_firing_rate_in_window_hz(st_per_trial, (t_xlim_lo, t_xlim_hi))
-        fr_parts.append(f"{labels[rec_idx]}: {mean_fr:.2f} Hz")
-    ax_fr.text(
-        0.01,
-        -0.28,
-        "Mean firing rate in shown window — " + " | ".join(fr_parts),
-        transform=ax_fr.transAxes,
-        ha="left",
-        va="top",
-        fontsize=8,
-    )
+        fr_rows.append((labels[rec_idx], mean_fr))
+    _add_psth_mean_table(ax_fr, fr_rows)
 
     has_isi = False
     for rec_idx, st_per_trial in enumerate(spikes_per_recording):
@@ -608,7 +607,7 @@ def _draw_spike_panels_multi_channel(
         ax_isi.text(
             0.5,
             0.5,
-            f"Pas assez de spikes pour l'ISI\n({isi_empty_hint})",
+            f"Not enough spikes for ISI\n({isi_empty_hint})",
             ha="center",
             va="center",
             transform=ax_isi.transAxes,
@@ -657,8 +656,8 @@ def plot_channel_multi_comparison(
 
     zoom_t0, zoom_t1 = ZOOM_T0, ZOOM_T1
     filt_note = f" — Butterworth passe-bas {lowpass_cutoff_hz:g} Hz" if lowpass_cutoff_hz is not None else ""
-    both_note = " — signal brut en surimpression (courbe filtrée mise en avant)" if lowpass_cutoff_hz is not None else ""
-    zoom_title = f"Zoom : {zoom_t0:.1f} à {zoom_t1:.1f} s (relatif au trigger){filt_note}{both_note}"
+    both_note = " — raw signal overlaid (filtered curve emphasized)" if lowpass_cutoff_hz is not None else ""
+    zoom_title = f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){filt_note}{both_note}"
     n_channels = (
         min(src.amplifier.shape[0] for src in spike_sources if src is not None)
         if streaming_mode and spike_sources is not None
@@ -720,19 +719,19 @@ def plot_channel_multi_comparison(
             hr = [0.06, 1.05, 1.15, 0.95, 0.95, 0.06, 1.05, 1.15, 0.95, 0.95, 0.06, 1.05, 1.15, 0.95, 0.95]
             gs = fig.add_gridspec(15, 1, height_ratios=hr, hspace=0.9)
             ax_hdr1 = fig.add_subplot(gs[0, 0]); ax_hdr1.axis("off")
-            ax_hdr1.text(0.02, 0.5, "Partie 1 — Vue complète (toute la fenêtre pré/post-trigger)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr1.transAxes)
+            ax_hdr1.text(0.02, 0.5, "Part 1 — Full view (entire pre/post-trigger window)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr1.transAxes)
             ax_full = fig.add_subplot(gs[1, 0])
             ax_raster_f = fig.add_subplot(gs[2, 0], sharex=ax_full)
             ax_fr_f = fig.add_subplot(gs[3, 0], sharex=ax_full)
             ax_isi_f = fig.add_subplot(gs[4, 0])
             ax_hdr2 = fig.add_subplot(gs[5, 0]); ax_hdr2.axis("off")
-            ax_hdr2.text(0.02, 0.5, f"Partie 2 — Vue zoomée [{zoom_t0:.2f}, {zoom_t1:.2f}] s (relatif au trigger)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr2.transAxes)
+            ax_hdr2.text(0.02, 0.5, f"Part 2 — Zoomed view [{zoom_t0:.2f}, {zoom_t1:.2f}] s (relative to trigger)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr2.transAxes)
             ax_zoom = fig.add_subplot(gs[6, 0])
             ax_raster_z = fig.add_subplot(gs[7, 0], sharex=ax_zoom)
             ax_fr_z = fig.add_subplot(gs[8, 0], sharex=ax_zoom)
             ax_isi_z = fig.add_subplot(gs[9, 0])
             ax_hdr3 = fig.add_subplot(gs[10, 0]); ax_hdr3.axis("off")
-            ax_hdr3.text(0.02, 0.5, "Partie 3 — Zoom fin de trigger (front montant)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr3.transAxes)
+            ax_hdr3.text(0.02, 0.5, "Part 3 — Trigger-end zoom (rising edge)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr3.transAxes)
             ax_zoom_end = fig.add_subplot(gs[11, 0])
             ax_raster_ze = fig.add_subplot(gs[12, 0], sharex=ax_zoom_end)
             ax_fr_ze = fig.add_subplot(gs[13, 0], sharex=ax_zoom_end)
@@ -752,7 +751,7 @@ def plot_channel_multi_comparison(
                 if show_both and means_raw_ch is not None:
                     y_raw = np.asarray(means_raw_ch[i])
                     ax_full.plot(t_rel, y_raw, linewidth=1.0, color=c, alpha=0.35, label="_nolegend_")
-                    ax_full.plot(t_rel, y, linewidth=1.35, color=c, label=f"{labels[i]} (filtré)")
+                    ax_full.plot(t_rel, y, linewidth=1.35, color=c, label=f"{labels[i]} (filtered)")
                     ax_zoom.plot(t_rel[zmask], y_raw[zmask], linewidth=1.05, color=c, alpha=0.35)
                     ax_zoom.plot(t_rel[zmask], y[zmask], linewidth=1.35, color=c, label=labels[i])
                 else:
@@ -766,9 +765,9 @@ def plot_channel_multi_comparison(
             if end_markers:
                 end_zoom_t0 = float(min(end_markers) + zoom_t0)
                 end_zoom_t1 = float(max(end_markers) + zoom_t1)
-                ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Zone zoom fin trigger")
-            spike_note = f" — + raster / taux / ISI ({spike_cmp_pipe})" if _has_spike_cmp else ""
-            ax_full.set_title(f"Comparaison multi — {channel_names[ch]} (vue complète){filt_note}{both_note}{spike_note}")
+                ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom area")
+            spike_note = f" — + raster / rate / ISI ({spike_cmp_pipe})" if _has_spike_cmp else ""
+            ax_full.set_title(f"Multi-comparison — {channel_names[ch]} (full view){filt_note}{both_note}{spike_note}")
             ax_full.set_ylabel("Amplitude (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
@@ -799,12 +798,12 @@ def plot_channel_multi_comparison(
                 for v in end_markers:
                     ax_zoom_end.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
-                ax_zoom_end.set_title(f"Zoom fin trigger : {end_zoom_t0:.2f} à {end_zoom_t1:.2f} s (relatif au trigger){filt_note}{both_note}")
+                ax_zoom_end.set_title(f"Trigger-end zoom: {end_zoom_t0:.2f} to {end_zoom_t1:.2f} s (relative to trigger){filt_note}{both_note}")
                 ax_zoom_end.set_ylabel("Amplitude (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
             else:
-                ax_zoom_end.text(0.5, 0.5, "Zoom fin trigger indisponible\n(aucun front montant après trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
+                ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
                 ax_zoom_end.set_axis_off()
 
             if _has_spike_cmp and spike_sources is not None:
@@ -830,20 +829,20 @@ def plot_channel_multi_comparison(
                     _draw_spike_panels_multi_channel(
                         ax_raster_ze, ax_fr_ze, ax_isi_ze, w_list, t_rel, float(fs), spike_threshold_uv,
                         firing_rate_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
-                        t_range_s=end_zoom_range, section_title="Zoom fin trigger", spikes_per_recording=st_list, lightweight_mode=lightweight_mode, sampling_percent=sampling_percent,
+                        t_range_s=end_zoom_range, section_title="Trigger-end zoom", spikes_per_recording=st_list, lightweight_mode=lightweight_mode, sampling_percent=sampling_percent,
                     )
                 else:
                     for ax in (ax_raster_ze, ax_fr_ze):
-                        ax.text(0.5, 0.5, "Zoom fin trigger indisponible\n(aucun front montant après trigger)", ha="center", va="center", transform=ax.transAxes)
+                        ax.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax.transAxes)
                         ax.set_axis_off()
-                    ax_isi_ze.text(0.5, 0.5, "ISI indisponible", ha="center", va="center", transform=ax_isi_ze.transAxes)
+                    ax_isi_ze.text(0.5, 0.5, "ISI unavailable", ha="center", va="center", transform=ax_isi_ze.transAxes)
                     ax_isi_ze.set_axis_off()
             else:
                 for ax in (ax_raster_f, ax_fr_f, ax_raster_z, ax_fr_z, ax_raster_ze, ax_fr_ze):
-                    ax.text(0.5, 0.5, "Raster / PSTH / ISI indisponibles\n(sources mmap manquantes)", ha="center", va="center", transform=ax.transAxes, fontsize=9)
+                    ax.text(0.5, 0.5, "Raster / PSTH / ISI unavailable\n(missing mmap sources)", ha="center", va="center", transform=ax.transAxes, fontsize=9)
                     ax.set_axis_off()
                 for ax in (ax_isi_f, ax_isi_z, ax_isi_ze):
-                    ax.text(0.5, 0.5, "ISI indisponible", ha="center", va="center", transform=ax.transAxes)
+                    ax.text(0.5, 0.5, "ISI unavailable", ha="center", va="center", transform=ax.transAxes)
                     ax.set_axis_off()
 
             for ax in (ax_full, ax_zoom, ax_raster_f, ax_fr_f, ax_isi_f, ax_raster_z, ax_fr_z, ax_isi_z, ax_raster_ze, ax_fr_ze, ax_isi_ze, ax_zoom_end):
@@ -902,18 +901,18 @@ def plot_channel_averages(
         else ""
     )
     both_note = (
-        " — signal brut en surimpression (courbe filtrée mise en avant)"
+        " — raw signal overlaid (filtered curve emphasized)"
         if lowpass_cutoff_hz is not None
         else ""
     )
     zoom_title = (
-        f"Zoom : {zoom_t0:.1f} à {zoom_t1:.1f} s (relatif au trigger){filt_note}{both_note}"
+        f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){filt_note}{both_note}"
     )
 
     def _spike_threshold_caption(thr: float) -> str:
         if thr >= 0:
-            return f"seuil {thr:g} µV (front montant)"
-        return f"seuil {thr:g} µV (front descendant, pic négatif)"
+            return f"threshold {thr:g} µV (rising edge)"
+        return f"threshold {thr:g} µV (falling edge, negative spike)"
 
     _has_spike_data = fs is not None and (
         spike_source is not None or (windows is not None and getattr(windows, "ndim", 0) == 3)
@@ -954,7 +953,7 @@ def plot_channel_averages(
             ax_hdr1.text(
                 0.02,
                 0.5,
-                "Partie 1 — Vue complète (toute la fenêtre pré/post-trigger)",
+                "Part 1 — Full view (entire pre/post-trigger window)",
                 ha="left",
                 va="center",
                 fontsize=11,
@@ -970,7 +969,7 @@ def plot_channel_averages(
             ax_hdr2.text(
                 0.02,
                 0.5,
-                f"Partie 2 — Vue zoomée [{zoom_t0:.2f}, {zoom_t1:.2f}] s (relatif au trigger)",
+                f"Part 2 — Zoomed view [{zoom_t0:.2f}, {zoom_t1:.2f}] s (relative to trigger)",
                 ha="left",
                 va="center",
                 fontsize=11,
@@ -986,7 +985,7 @@ def plot_channel_averages(
             ax_hdr3.text(
                 0.02,
                 0.5,
-                "Partie 3 — Zoom fin de trigger (front montant)",
+                "Part 3 — Trigger-end zoom (rising edge)",
                 ha="left",
                 va="center",
                 fontsize=11,
@@ -1016,7 +1015,7 @@ def plot_channel_averages(
                     linewidth=1.05,
                     color="0.35",
                     alpha=0.85,
-                    label="Moyenne (non filtrée)",
+                    label="Mean (raw)",
                     zorder=1,
                 )
                 ax_full.plot(
@@ -1024,11 +1023,11 @@ def plot_channel_averages(
                     y,
                     linewidth=1.35,
                     color="C0",
-                    label=f"Moyenne filtrée ({lowpass_cutoff_hz:g} Hz)",
+                    label=f"Mean (filtered, {lowpass_cutoff_hz:g} Hz)",
                     zorder=2,
                 )
             else:
-                ax_full.plot(t_rel, y, linewidth=1.2, color="C0", label="Moyenne")
+                ax_full.plot(t_rel, y, linewidth=1.2, color="C0", label="Mean")
             ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (début)")
             if trigger_end_rising_rel_s is not None:
                 ax_full.axvline(
@@ -1044,7 +1043,7 @@ def plot_channel_averages(
                 end_zoom_t1 = float(trigger_end_rising_rel_s + zoom_t1)
                 ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Zone zoom fin trigger")
             ax_full.set_title(
-                f"Moyenne trigger — {channel_names[ch]} (vue complète){filt_note}{both_note}{spike_note}"
+                f"Trigger mean — {channel_names[ch]} (full view){filt_note}{both_note}{spike_note}"
             )
             ax_full.set_ylabel("Amplitude (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
@@ -1064,14 +1063,14 @@ def plot_channel_averages(
                     linewidth=1.15,
                     color="0.35",
                     alpha=0.85,
-                    label="Non filtrée",
+                    label="Raw",
                 )
                 ax_zoom.plot(
                     t_rel[zmask],
                     y[zmask],
                     linewidth=1.45,
                     color="C0",
-                    label=f"Filtrée ({lowpass_cutoff_hz:g} Hz)",
+                    label=f"Filtered ({lowpass_cutoff_hz:g} Hz)",
                 )
             else:
                 ax_zoom.plot(t_rel[zmask], y[zmask], linewidth=1.4, color="C0")
@@ -1101,14 +1100,14 @@ def plot_channel_averages(
                         linewidth=1.15,
                         color="0.35",
                         alpha=0.85,
-                        label="Non filtrée",
+                        label="Raw",
                     )
                     ax_zoom_end.plot(
                         t_rel[end_mask],
                         y[end_mask],
                         linewidth=1.45,
                         color="C0",
-                        label=f"Filtrée ({lowpass_cutoff_hz:g} Hz)",
+                        label=f"Filtered ({lowpass_cutoff_hz:g} Hz)",
                     )
                 else:
                     ax_zoom_end.plot(t_rel[end_mask], y[end_mask], linewidth=1.4, color="C0")
@@ -1121,7 +1120,7 @@ def plot_channel_averages(
                 )
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
                 ax_zoom_end.set_title(
-                    f"Zoom fin trigger : {end_zoom_t0:.2f} à {end_zoom_t1:.2f} s (relatif au trigger){filt_note}{both_note}"
+                    f"Trigger-end zoom: {end_zoom_t0:.2f} to {end_zoom_t1:.2f} s (relative to trigger){filt_note}{both_note}"
                 )
                 ax_zoom_end.set_ylabel("Amplitude (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
@@ -1130,7 +1129,7 @@ def plot_channel_averages(
                 ax_zoom_end.text(
                     0.5,
                     0.5,
-                    "Zoom fin trigger indisponible\n(aucun front montant après trigger)",
+                    "Trigger-end zoom unavailable\n(no rising edge after trigger)",
                     ha="center",
                     va="center",
                     transform=ax_zoom_end.transAxes,
@@ -1199,7 +1198,7 @@ def plot_channel_averages(
                         spike_bandpass_high_hz,
                         t_range_s=end_zoom_range,
                         st_per_tr=st_per_tr,
-                        section_title="Zoom fin trigger",
+                        section_title="Trigger-end zoom",
                         lightweight_mode=lightweight_mode,
                         sampling_percent=sampling_percent,
                     )
@@ -1208,7 +1207,7 @@ def plot_channel_averages(
                         ax.text(
                             0.5,
                             0.5,
-                            "Zoom fin trigger indisponible\n(aucun front montant après trigger)",
+                            "Trigger-end zoom unavailable\n(no rising edge after trigger)",
                             ha="center",
                             va="center",
                             transform=ax.transAxes,
@@ -1217,7 +1216,7 @@ def plot_channel_averages(
                     ax_isi_ze.text(
                         0.5,
                         0.5,
-                        "ISI indisponible",
+                        "ISI unavailable",
                         ha="center",
                         va="center",
                         transform=ax_isi_ze.transAxes,
@@ -1228,7 +1227,7 @@ def plot_channel_averages(
                     ax.text(
                         0.5,
                         0.5,
-                        "Données brutes par essai indisponibles",
+                        "Raw trial data unavailable",
                         ha="center",
                         va="center",
                         transform=ax.transAxes,
@@ -1238,7 +1237,7 @@ def plot_channel_averages(
                     ax.text(
                         0.5,
                         0.5,
-                        "ISI indisponible",
+                        "ISI unavailable",
                         ha="center",
                         va="center",
                         transform=ax.transAxes,
@@ -1329,11 +1328,11 @@ def plot_channel_comparison(
         else ""
     )
     both_note = (
-        " — signal brut en surimpression (courbe filtrée mise en avant)"
+        " — raw signal overlaid (filtered curve emphasized)"
         if lowpass_cutoff_hz is not None
         else ""
     )
-    zoom_title = f"Zoom : {zoom_t0:.1f} à {zoom_t1:.1f} s (relatif au trigger){filt_note}{both_note}"
+    zoom_title = f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){filt_note}{both_note}"
     n_channels = mean_a.shape[0]
     zmask = (t_rel >= zoom_t0) & (t_rel <= zoom_t1)
     _has_spike_cmp = (
@@ -1383,7 +1382,7 @@ def plot_channel_comparison(
             ax_hdr1.text(
                 0.02,
                 0.5,
-                "Partie 1 — Vue complète (toute la fenêtre pré/post-trigger)",
+                "Part 1 — Full view (entire pre/post-trigger window)",
                 ha="left",
                 va="center",
                 fontsize=11,
@@ -1399,7 +1398,7 @@ def plot_channel_comparison(
             ax_hdr2.text(
                 0.02,
                 0.5,
-                f"Partie 2 — Vue zoomée [{zoom_t0:.2f}, {zoom_t1:.2f}] s (relatif au trigger)",
+                f"Part 2 — Zoomed view [{zoom_t0:.2f}, {zoom_t1:.2f}] s (relative to trigger)",
                 ha="left",
                 va="center",
                 fontsize=11,
@@ -1415,7 +1414,7 @@ def plot_channel_comparison(
             ax_hdr3.text(
                 0.02,
                 0.5,
-                "Partie 3 — Zoom fin de trigger (front montant)",
+                "Part 3 — Trigger-end zoom (rising edge)",
                 ha="left",
                 va="center",
                 fontsize=11,
@@ -1448,14 +1447,14 @@ def plot_channel_comparison(
                     ya,
                     linewidth=1.35,
                     color="C0",
-                    label=f"{label_a} (filtré {lowpass_cutoff_hz:g} Hz)",
+                    label=f"{label_a} (filtered {lowpass_cutoff_hz:g} Hz)",
                 )
                 ax_full.plot(
                     t_rel,
                     yb,
                     linewidth=1.35,
                     color="C1",
-                    label=f"{label_b} (filtré {lowpass_cutoff_hz:g} Hz)",
+                    label=f"{label_b} (filtered {lowpass_cutoff_hz:g} Hz)",
                 )
             else:
                 ax_full.plot(t_rel, ya, linewidth=1.2, color="C0", label=label_a)
@@ -1489,7 +1488,7 @@ def plot_channel_comparison(
                 else ""
             )
             ax_full.set_title(
-                f"Comparaison — {channel_names[ch]} (vue complète){filt_note}{both_note}{spike_cmp_note}"
+                f"Comparison — {channel_names[ch]} (full view){filt_note}{both_note}{spike_cmp_note}"
             )
             ax_full.set_ylabel("Amplitude (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
@@ -1508,7 +1507,7 @@ def plot_channel_comparison(
                     linewidth=1.1,
                     color="C0",
                     alpha=0.45,
-                    label=f"{label_a} brut",
+                    label=f"{label_a} raw",
                 )
                 ax_zoom.plot(
                     t_rel[zmask],
@@ -1516,21 +1515,21 @@ def plot_channel_comparison(
                     linewidth=1.1,
                     color="C1",
                     alpha=0.45,
-                    label=f"{label_b} brut",
+                    label=f"{label_b} raw",
                 )
                 ax_zoom.plot(
                     t_rel[zmask],
                     ya[zmask],
                     linewidth=1.45,
                     color="C0",
-                    label=f"{label_a} filtré",
+                    label=f"{label_a} filtered",
                 )
                 ax_zoom.plot(
                     t_rel[zmask],
                     yb[zmask],
                     linewidth=1.45,
                     color="C1",
-                    label=f"{label_b} filtré",
+                    label=f"{label_b} filtered",
                 )
             else:
                 ax_zoom.plot(t_rel[zmask], ya[zmask], linewidth=1.4, color="C0", label=label_a)
@@ -1569,7 +1568,7 @@ def plot_channel_comparison(
                         linewidth=1.1,
                         color="C0",
                         alpha=0.45,
-                        label=f"{label_a} brut",
+                        label=f"{label_a} raw",
                     )
                     ax_zoom_end.plot(
                         t_rel[end_mask],
@@ -1577,21 +1576,21 @@ def plot_channel_comparison(
                         linewidth=1.1,
                         color="C1",
                         alpha=0.45,
-                        label=f"{label_b} brut",
+                        label=f"{label_b} raw",
                     )
                     ax_zoom_end.plot(
                         t_rel[end_mask],
                         ya[end_mask],
                         linewidth=1.45,
                         color="C0",
-                        label=f"{label_a} filtré",
+                        label=f"{label_a} filtered",
                     )
                     ax_zoom_end.plot(
                         t_rel[end_mask],
                         yb[end_mask],
                         linewidth=1.45,
                         color="C1",
-                        label=f"{label_b} filtré",
+                        label=f"{label_b} filtered",
                     )
                 else:
                     ax_zoom_end.plot(t_rel[end_mask], ya[end_mask], linewidth=1.4, color="C0", label=label_a)
@@ -1613,7 +1612,7 @@ def plot_channel_comparison(
                     )
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
                 ax_zoom_end.set_title(
-                    f"Zoom fin trigger : {end_zoom_t0:.2f} à {end_zoom_t1:.2f} s (relatif au trigger){filt_note}{both_note}"
+                    f"Trigger-end zoom: {end_zoom_t0:.2f} to {end_zoom_t1:.2f} s (relative to trigger){filt_note}{both_note}"
                 )
                 ax_zoom_end.set_ylabel("Amplitude (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
@@ -1622,7 +1621,7 @@ def plot_channel_comparison(
                 ax_zoom_end.text(
                     0.5,
                     0.5,
-                    "Zoom fin trigger indisponible\n(aucun front montant après trigger)",
+                    "Trigger-end zoom unavailable\n(no rising edge after trigger)",
                     ha="center",
                     va="center",
                     transform=ax_zoom_end.transAxes,
@@ -1694,7 +1693,7 @@ def plot_channel_comparison(
                         t_range_s=end_zoom_range,
                         sta=sta,
                         stb=stb,
-                        section_title="Zoom fin trigger",
+                        section_title="Trigger-end zoom",
                         lightweight_mode=lightweight_mode,
                         sampling_percent=sampling_percent,
                     )
@@ -1703,7 +1702,7 @@ def plot_channel_comparison(
                         ax.text(
                             0.5,
                             0.5,
-                            "Zoom fin trigger indisponible\n(aucun front montant après trigger)",
+                            "Trigger-end zoom unavailable\n(no rising edge after trigger)",
                             ha="center",
                             va="center",
                             transform=ax.transAxes,
@@ -1713,7 +1712,7 @@ def plot_channel_comparison(
                     ax_isi_ze.text(
                         0.5,
                         0.5,
-                        "ISI indisponible",
+                        "ISI unavailable",
                         ha="center",
                         va="center",
                         transform=ax_isi_ze.transAxes,
@@ -1724,7 +1723,7 @@ def plot_channel_comparison(
                     ax.text(
                         0.5,
                         0.5,
-                        "Raster / PSTH / ISI indisponibles\n(sources mmap manquantes)",
+                        "Raster / PSTH / ISI unavailable\n(missing mmap sources)",
                         ha="center",
                         va="center",
                         transform=ax.transAxes,
@@ -1735,7 +1734,7 @@ def plot_channel_comparison(
                     ax.text(
                         0.5,
                         0.5,
-                        "ISI indisponible",
+                        "ISI unavailable",
                         ha="center",
                         va="center",
                         transform=ax.transAxes,
