@@ -17,6 +17,8 @@ class AnalysisConfig:
     # Passe-bas Butterworth sur amplifier_data (None = desactive)
     lowpass_cutoff_hz: Optional[float] = 250.0
     save_dir: Path | None = None
+    # Titre/nom du PDF de sortie (sans extension .pdf = ajouté automatiquement).
+    pdf_title: str | None = None
     # Spikes (amplificateur, µV) : seuil >= 0 = passage vers le haut ; seuil < 0 = passage vers le bas
     spike_threshold_uv: float = -15.0
     # Largeur de lissage du taux de decharge (s), noyau gaussien sur le PSTH
@@ -28,3 +30,11 @@ class AnalysisConfig:
     work_dir: Path | None = None
     # Ne pas supprimer work_dir à la fin (amplificateur .npy, etc.)
     keep_intermediate_files: bool = False
+    # Nb de workers process pour comparaison A/B (>=1).
+    comparison_workers: int = 32
+    # Nb max de workers canaux (None = auto, cap 16).
+    channel_workers: int | None = None
+    # Mode affichage léger PDF (downsample raster/ISI + DPI réduit).
+    lightweight_plot: bool = False
+    # Pourcentage de points conservés dans les graphes spikes (1..100).
+    sampling_percent: int = 100
