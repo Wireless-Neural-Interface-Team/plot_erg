@@ -11,7 +11,12 @@ import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
 from scipy.ndimage import gaussian_filter1d
 
-from core import AmplifierSpikeSource, check_analysis_cancelled, detect_spikes_at_threshold
+from core import (
+    AmplifierSpikeSource,
+    apply_butterworth_lowpass,
+    check_analysis_cancelled,
+    detect_spikes_at_threshold,
+)
 
 # Fenetre du panneau zoom (s), temps relatif au trigger (t=0)
 ZOOM_T0 = -0.1
@@ -26,6 +31,28 @@ ISI_ABSCISSA_T1_S = 2.0
 
 # Libellé d'abscisse pour tous les graphiques en temps rel. au trigger
 TIME_REL_XLABEL = "Temps relatif au trigger (s)"
+
+
+def _downsample_points(x: np.ndarray, y: np.ndarray, sampling_percent: int) -> tuple[np.ndarray, np.ndarray]:
+    """Sous-échantillonne des points (x, y) de manière déterministe."""
+    pct = int(np.clip(int(sampling_percent), 1, 100))
+    if pct >= 100 or x.size <= 1:
+        return x, y
+    keep = max(1, int(np.ceil(x.size * (pct / 100.0))))
+    idx = np.linspace(0, x.size - 1, keep, dtype=np.int64)
+    return x[idx], y[idx]
+
+
+def _shorten_filename_for_windows(output_dir: Path, filename: str, max_full_len: int = 240) -> str:
+    """Raccourcit un nom de fichier pour limiter la longueur de chemin Windows."""
+    full = str(output_dir / filename)
+    if len(full) <= max_full_len:
+        return filename
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix or ".pdf"
+    overhead = len(str(output_dir / ("_" + suffix)))
+    max_stem = max(8, max_full_len - overhead)
+    return f"{stem[:max_stem]}{suffix}"
 
 
 def _shift_axes_down(axes: Sequence[Any], delta: float) -> None:
@@ -84,8 +111,6 @@ def _psth_mean_hz(
     return centers, rate_s
 
 
-<<<<<<< Updated upstream
-=======
 def _mean_firing_rate_in_window_hz(
     spike_times_per_trial: list[np.ndarray],
     t_window: tuple[float, float],
@@ -134,7 +159,6 @@ def _trial_mean_firing_rate_hz(
     return out
 
 
->>>>>>> Stashed changes
 def _spike_pipeline_captions(
     spike_bandpass_low_hz: Optional[float],
     spike_bandpass_high_hz: Optional[float],
@@ -270,8 +294,6 @@ def _draw_spike_panels_single_channel(
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.set_xlabel(TIME_REL_XLABEL)
     ax_fr.set_xlabel(TIME_REL_XLABEL)
-<<<<<<< Updated upstream
-=======
     fr_trials = _trial_mean_firing_rate_hz(st_per_tr, (t_xlim_lo, t_xlim_hi))
     x_trials = np.arange(1, len(fr_trials) + 1)
     if fr_trials.size:
@@ -280,7 +302,6 @@ def _draw_spike_panels_single_channel(
     ax_trial_fr.set_xlabel("Trial index")
     ax_trial_fr.set_ylabel("FR (Hz)")
     ax_trial_fr.grid(True, alpha=0.25)
->>>>>>> Stashed changes
 
     t_isi, isi_vals_s = _isi_time_and_values_s(st_per_tr, isi_window_s=isi_window)
     if t_isi.size:
@@ -418,8 +439,6 @@ def _draw_spike_panels_dual_channel(
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.set_xlabel(TIME_REL_XLABEL)
     ax_fr.set_xlabel(TIME_REL_XLABEL)
-<<<<<<< Updated upstream
-=======
     fr_a = _trial_mean_firing_rate_hz(sta, (t_xlim_lo, t_xlim_hi))
     fr_b = _trial_mean_firing_rate_hz(stb, (t_xlim_lo, t_xlim_hi))
     xa = np.arange(1, len(fr_a) + 1)
@@ -432,7 +451,6 @@ def _draw_spike_panels_dual_channel(
     ax_trial_fr.set_xlabel("Trial index")
     ax_trial_fr.set_ylabel("FR (Hz)")
     ax_trial_fr.grid(True, alpha=0.25)
->>>>>>> Stashed changes
 
     t_a, isi_a_s = _isi_time_and_values_s(sta, isi_window_s=isi_window)
     t_b, isi_b_s = _isi_time_and_values_s(stb, isi_window_s=isi_window)
@@ -479,8 +497,6 @@ def _draw_spike_panels_dual_channel(
         ax_isi.set_axis_off()
 
 
-<<<<<<< Updated upstream
-=======
 def _draw_spike_panels_multi_channel(
     ax_raster: Any,
     ax_fr: Any,
@@ -910,7 +926,6 @@ def plot_channel_multi_comparison(
     return pdf_path
 
 
->>>>>>> Stashed changes
 def plot_channel_averages(
     t_rel: np.ndarray,
     mean_per_channel: np.ndarray,
@@ -972,11 +987,6 @@ def plot_channel_averages(
         for ch in range(n_channels):
             check_analysis_cancelled()
             y = mean_per_channel[ch]
-<<<<<<< Updated upstream
-            fig = plt.figure(figsize=(12, 26))
-            hr = [0.06, 1.05, 1.15, 0.95, 0.95, 0.06, 1.05, 1.15, 0.95, 0.95]
-            gs = fig.add_gridspec(10, 1, height_ratios=hr, hspace=0.65)
-=======
             fig = plt.figure(figsize=(12, 38))
             hr = [
                 0.06,
@@ -996,7 +1006,6 @@ def plot_channel_averages(
                 0.95,
             ]
             gs = fig.add_gridspec(18, 1, height_ratios=[0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95], hspace=0.9)
->>>>>>> Stashed changes
             ax_hdr1 = fig.add_subplot(gs[0, 0])
             ax_hdr1.axis("off")
             ax_hdr1.text(
@@ -1026,12 +1035,6 @@ def plot_channel_averages(
                 fontweight="bold",
                 transform=ax_hdr2.transAxes,
             )
-<<<<<<< Updated upstream
-            ax_zoom = fig.add_subplot(gs[6, 0])
-            ax_raster_z = fig.add_subplot(gs[7, 0], sharex=ax_zoom)
-            ax_fr_z = fig.add_subplot(gs[8, 0], sharex=ax_zoom)
-            ax_isi_z = fig.add_subplot(gs[9, 0])
-=======
             ax_zoom = fig.add_subplot(gs[7, 0])
             ax_raster_z = fig.add_subplot(gs[8, 0], sharex=ax_zoom)
             ax_fr_z = fig.add_subplot(gs[9, 0], sharex=ax_zoom)
@@ -1054,7 +1057,6 @@ def plot_channel_averages(
             ax_fr_ze = fig.add_subplot(gs[15, 0], sharex=ax_zoom_end)
             ax_trial_fr_ze = fig.add_subplot(gs[16, 0])
             ax_isi_ze = fig.add_subplot(gs[17, 0])
->>>>>>> Stashed changes
 
             y_raw = (
                 mean_per_channel_raw[ch]
@@ -1105,11 +1107,7 @@ def plot_channel_averages(
             ax_full.grid(True, alpha=0.3)
             ax_full.legend(
                 loc="upper center",
-<<<<<<< Updated upstream
-                bbox_to_anchor=(0.5, -0.2),
-=======
                 bbox_to_anchor=(0.5, -0.36),
->>>>>>> Stashed changes
                 ncol=3,
                 fontsize=6,
             )
@@ -1148,6 +1146,26 @@ def plot_channel_averages(
             ax_zoom.grid(True, alpha=0.3)
             if show_both:
                 ax_zoom.legend(loc="best", fontsize=6)
+            end_zoom_range: tuple[float, float] | None = None
+            if trigger_end_rising_rel_s is not None:
+                end_zoom_t0 = float(trigger_end_rising_rel_s + zoom_t0)
+                end_zoom_t1 = float(trigger_end_rising_rel_s + zoom_t1)
+                end_zoom_range = (end_zoom_t0, end_zoom_t1)
+                end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
+                if show_both and y_raw is not None:
+                    ax_zoom_end.plot(t_rel[end_mask], y_raw[end_mask], linewidth=1.15, color="0.35", alpha=0.85, label="Non filtrée")
+                    ax_zoom_end.plot(t_rel[end_mask], y[end_mask], linewidth=1.45, color="C0", label=f"Filtrée ({lowpass_cutoff_hz:g} Hz)")
+                else:
+                    ax_zoom_end.plot(t_rel[end_mask], y[end_mask], linewidth=1.4, color="C0")
+                ax_zoom_end.axvline(trigger_end_rising_rel_s, linestyle="--", linewidth=1.0, color="darkorange")
+                ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
+                ax_zoom_end.set_title(f"Partie 3 — Zoom fin trigger [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
+                ax_zoom_end.set_ylabel("Amplitude (µV)")
+                ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
+                ax_zoom_end.grid(True, alpha=0.3)
+            else:
+                ax_zoom_end.text(0.5, 0.5, "Zoom fin trigger indisponible\n(pas de front montant après trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
+                ax_zoom_end.set_axis_off()
 
             if _has_spike_data and (
                 spike_source is not None
@@ -1190,10 +1208,6 @@ def plot_channel_averages(
                     t_range_s=(zoom_t0, zoom_t1),
                     st_per_tr=st_per_tr,
                 )
-<<<<<<< Updated upstream
-            elif not _has_spike_data:
-                for ax in (ax_raster_f, ax_fr_f, ax_raster_z, ax_fr_z):
-=======
                 if end_zoom_range is not None:
                     _draw_spike_panels_single_channel(
                         ax_raster_ze,
@@ -1210,8 +1224,6 @@ def plot_channel_averages(
                         t_range_s=end_zoom_range,
                         st_per_tr=st_per_tr,
                         section_title="Trigger-end zoom",
-                        lightweight_mode=lightweight_mode,
-                        sampling_percent=sampling_percent,
                     )
                 else:
                     for ax in (ax_raster_ze, ax_fr_ze, ax_trial_fr_ze):
@@ -1235,7 +1247,6 @@ def plot_channel_averages(
                     ax_isi_ze.set_axis_off()
             elif not _has_spike_data:
                 for ax in (ax_raster_f, ax_fr_f, ax_trial_fr_f, ax_raster_z, ax_fr_z, ax_trial_fr_z, ax_raster_ze, ax_fr_ze, ax_trial_fr_ze):
->>>>>>> Stashed changes
                     ax.text(
                         0.5,
                         0.5,
@@ -1267,22 +1278,16 @@ def plot_channel_averages(
                 ax_fr_z,
                 ax_trial_fr_z,
                 ax_isi_z,
-<<<<<<< Updated upstream
-=======
                 ax_raster_ze,
                 ax_fr_ze,
                 ax_trial_fr_ze,
                 ax_isi_ze,
                 ax_zoom_end,
->>>>>>> Stashed changes
             ):
                 ax.tick_params(axis="x", labelbottom=True)
 
             fig.tight_layout()
             _shift_axes_down(
-<<<<<<< Updated upstream
-                [ax_raster_f, ax_fr_f, ax_isi_f, ax_hdr2, ax_zoom, ax_raster_z, ax_fr_z, ax_isi_z],
-=======
                 [
                     ax_raster_f,
                     ax_fr_f,
@@ -1301,7 +1306,6 @@ def plot_channel_averages(
                     ax_trial_fr_ze,
                     ax_isi_ze,
                 ],
->>>>>>> Stashed changes
                 delta=0.015,
             )
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=120)
@@ -1374,11 +1378,6 @@ def plot_channel_comparison(
                     or not np.allclose(yb, yb_raw, rtol=0.0, atol=1e-9)
                 )
             )
-<<<<<<< Updated upstream
-            fig = plt.figure(figsize=(12, 26))
-            hr = [0.06, 1.05, 1.15, 0.95, 0.95, 0.06, 1.05, 1.15, 0.95, 0.95]
-            gs = fig.add_gridspec(10, 1, height_ratios=hr, hspace=0.65)
-=======
             fig = plt.figure(figsize=(12, 38))
             hr = [
                 0.06,
@@ -1398,7 +1397,6 @@ def plot_channel_comparison(
                 0.95,
             ]
             gs = fig.add_gridspec(18, 1, height_ratios=[0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95], hspace=0.9)
->>>>>>> Stashed changes
             ax_hdr1 = fig.add_subplot(gs[0, 0])
             ax_hdr1.axis("off")
             ax_hdr1.text(
@@ -1428,12 +1426,6 @@ def plot_channel_comparison(
                 fontweight="bold",
                 transform=ax_hdr2.transAxes,
             )
-<<<<<<< Updated upstream
-            ax_zoom = fig.add_subplot(gs[6, 0])
-            ax_raster_z = fig.add_subplot(gs[7, 0], sharex=ax_zoom)
-            ax_fr_z = fig.add_subplot(gs[8, 0], sharex=ax_zoom)
-            ax_isi_z = fig.add_subplot(gs[9, 0])
-=======
             ax_zoom = fig.add_subplot(gs[7, 0])
             ax_raster_z = fig.add_subplot(gs[8, 0], sharex=ax_zoom)
             ax_fr_z = fig.add_subplot(gs[9, 0], sharex=ax_zoom)
@@ -1456,7 +1448,6 @@ def plot_channel_comparison(
             ax_fr_ze = fig.add_subplot(gs[15, 0], sharex=ax_zoom_end)
             ax_trial_fr_ze = fig.add_subplot(gs[16, 0])
             ax_isi_ze = fig.add_subplot(gs[17, 0])
->>>>>>> Stashed changes
             if show_both:
                 ax_full.plot(
                     t_rel,
@@ -1522,11 +1513,7 @@ def plot_channel_comparison(
             ax_full.grid(True, alpha=0.3)
             ax_full.legend(
                 loc="upper center",
-<<<<<<< Updated upstream
-                bbox_to_anchor=(0.5, -0.2),
-=======
                 bbox_to_anchor=(0.5, -0.36),
->>>>>>> Stashed changes
                 ncol=3,
                 fontsize=6,
             )
@@ -1586,6 +1573,28 @@ def plot_channel_comparison(
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
             ax_zoom.legend(loc="best", fontsize=6)
+            end_zoom_range: tuple[float, float] | None = None
+            end_markers = [v for v in (trigger_end_rising_rel_s_a, trigger_end_rising_rel_s_b) if v is not None]
+            if end_markers:
+                end_zoom_t0 = float(min(end_markers) + zoom_t0)
+                end_zoom_t1 = float(max(end_markers) + zoom_t1)
+                end_zoom_range = (end_zoom_t0, end_zoom_t1)
+                end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
+                ax_zoom_end.plot(t_rel[end_mask], ya[end_mask], linewidth=1.35, color="C0", label=label_a)
+                ax_zoom_end.plot(t_rel[end_mask], yb[end_mask], linewidth=1.35, color="C1", label=label_b)
+                if trigger_end_rising_rel_s_a is not None:
+                    ax_zoom_end.axvline(trigger_end_rising_rel_s_a, linestyle=":", linewidth=1.0, color="darkorange")
+                if trigger_end_rising_rel_s_b is not None:
+                    ax_zoom_end.axvline(trigger_end_rising_rel_s_b, linestyle=":", linewidth=1.0, color="purple")
+                ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
+                ax_zoom_end.set_title(f"Partie 3 — Zoom fin trigger [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
+                ax_zoom_end.set_ylabel("Amplitude (µV)")
+                ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
+                ax_zoom_end.grid(True, alpha=0.3)
+                ax_zoom_end.legend(loc="best", fontsize=6)
+            else:
+                ax_zoom_end.text(0.5, 0.5, "Zoom fin trigger indisponible\n(pas de front montant après trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
+                ax_zoom_end.set_axis_off()
 
             if _has_spike_cmp:
                 w_a = spike_source_a.windows_2d_for_channel(ch)
@@ -1630,10 +1639,6 @@ def plot_channel_comparison(
                     sta=sta,
                     stb=stb,
                 )
-<<<<<<< Updated upstream
-            else:
-                for ax in (ax_raster_f, ax_fr_f, ax_raster_z, ax_fr_z):
-=======
                 if end_zoom_range is not None:
                     _draw_spike_panels_dual_channel(
                         ax_raster_ze,
@@ -1654,8 +1659,6 @@ def plot_channel_comparison(
                         sta=sta,
                         stb=stb,
                         section_title="Trigger-end zoom",
-                        lightweight_mode=lightweight_mode,
-                        sampling_percent=sampling_percent,
                     )
                 else:
                     for ax in (ax_raster_ze, ax_fr_ze, ax_trial_fr_ze):
@@ -1680,7 +1683,6 @@ def plot_channel_comparison(
                     ax_isi_ze.set_axis_off()
             else:
                 for ax in (ax_raster_f, ax_fr_f, ax_trial_fr_f, ax_raster_z, ax_fr_z, ax_trial_fr_z, ax_raster_ze, ax_fr_ze, ax_trial_fr_ze):
->>>>>>> Stashed changes
                     ax.text(
                         0.5,
                         0.5,
@@ -1713,22 +1715,16 @@ def plot_channel_comparison(
                 ax_fr_z,
                 ax_trial_fr_z,
                 ax_isi_z,
-<<<<<<< Updated upstream
-=======
                 ax_raster_ze,
                 ax_fr_ze,
                 ax_trial_fr_ze,
                 ax_isi_ze,
                 ax_zoom_end,
->>>>>>> Stashed changes
             ):
                 ax.tick_params(axis="x", labelbottom=True)
 
             fig.tight_layout()
             _shift_axes_down(
-<<<<<<< Updated upstream
-                [ax_raster_f, ax_fr_f, ax_isi_f, ax_hdr2, ax_zoom, ax_raster_z, ax_fr_z, ax_isi_z],
-=======
                 [
                     ax_raster_f,
                     ax_fr_f,
@@ -1747,7 +1743,6 @@ def plot_channel_comparison(
                     ax_trial_fr_ze,
                     ax_isi_ze,
                 ],
->>>>>>> Stashed changes
                 delta=0.015,
             )
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=120)

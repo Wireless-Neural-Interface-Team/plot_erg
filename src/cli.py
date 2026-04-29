@@ -87,32 +87,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Conserver le dossier de travail (amplifier_raw.npy) apres le PDF",
     )
-<<<<<<< Updated upstream
-=======
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=defaults.comparison_workers,
-        help="Nombre de processus pour la comparaison A/B (defaut: 2)",
-    )
-    parser.add_argument(
-        "--channel-workers",
-        type=int,
-        default=defaults.channel_workers,
-        help="Nombre max de workers canal (defaut: auto, cap 16).",
-    )
-    parser.add_argument(
-        "--lightweight-plot",
-        action="store_true",
-        help="Mode affichage léger PDF (downsample raster/ISI + dpi reduit).",
-    )
-    parser.add_argument(
-        "--sampling-percent",
-        type=int,
-        default=defaults.sampling_percent,
-        help="Pourcentage de points conserves dans raster/ISI (1..100, defaut: 100).",
-    )
->>>>>>> Stashed changes
     return parser.parse_args()
 
 
