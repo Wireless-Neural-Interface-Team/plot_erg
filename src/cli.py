@@ -18,6 +18,7 @@ from plotting import plot_channel_averages, plot_channel_comparison
 
 
 def parse_args() -> argparse.Namespace:
+    defaults = AnalysisConfig(rhs_file=Path("."))
     parser = argparse.ArgumentParser(
         description=(
             "Lit un fichier Intan RHS, detecte un front sur ANALOG_IN 0 (montant ou descendant), "
@@ -29,23 +30,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--edge",
         choices=("falling", "rising"),
-        default="falling",
+        default=defaults.edge,
         help="Type de front sur ANALOG_IN 0: falling=descendant, rising=montant (defaut: falling)",
     )
-    parser.add_argument("--threshold", type=float, default=1.0, help="Seuil de detection (defaut: 1.0)")
-    parser.add_argument("--pre", type=float, default=2.0, help="Temps avant trigger en secondes")
-    parser.add_argument("--post", type=float, default=10.0, help="Temps apres trigger en secondes")
+    parser.add_argument("--threshold", type=float, default=defaults.threshold, help="Seuil de detection (defaut: 1.0)")
+    parser.add_argument("--pre", type=float, default=defaults.pre_s, help="Temps avant trigger en secondes")
+    parser.add_argument("--post", type=float, default=defaults.post_s, help="Temps apres trigger en secondes")
     parser.add_argument("--save-dir", type=Path, default=None, help="Dossier de sauvegarde du PDF")
     parser.add_argument(
         "--lowpass-hz",
         type=float,
-        default=None,
+        default=defaults.lowpass_cutoff_hz,
         help="Frequence de coupure (Hz) du passe-bas Butterworth sur les canaux amplificateur (defaut: pas de filtre)",
     )
     parser.add_argument(
         "--spike-threshold-uv",
         type=float,
-        default=-40.0,
+        default=defaults.spike_threshold_uv,
         help=(
             "Seuil (µV) spikes amplificateur : >=0 = passage montant au-dessus ; "
             "<0 = passage descendant en dessous (pics negatifs, defaut: -40)"
@@ -54,13 +55,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--firing-rate-window-s",
         type=float,
-        default=0.025,
+        default=defaults.firing_rate_window_s,
         help="Largeur (s) du lissage gaussien du PSTH / taux de decharge (defaut: 0.025)",
     )
     parser.add_argument(
         "--spike-bandpass-low-hz",
         type=float,
-        default=None,
+        default=defaults.spike_bandpass_low_hz,
         help=(
             "Frequence basse (Hz) du passe-bande Butterworth sur l'amplificateur pour "
             "raster / PSTH / ISI (avec --spike-bandpass-high-hz ; defaut: desactive = brut mmap)"
@@ -69,7 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--spike-bandpass-high-hz",
         type=float,
-        default=None,
+        default=defaults.spike_bandpass_high_hz,
         help=(
             "Frequence haute (Hz) du passe-bande Butterworth spikes "
             "(avec --spike-bandpass-low-hz ; defaut: desactive = brut mmap)"
@@ -86,6 +87,32 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Conserver le dossier de travail (amplifier_raw.npy) apres le PDF",
     )
+<<<<<<< Updated upstream
+=======
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=defaults.comparison_workers,
+        help="Nombre de processus pour la comparaison A/B (defaut: 2)",
+    )
+    parser.add_argument(
+        "--channel-workers",
+        type=int,
+        default=defaults.channel_workers,
+        help="Nombre max de workers canal (defaut: auto, cap 16).",
+    )
+    parser.add_argument(
+        "--lightweight-plot",
+        action="store_true",
+        help="Mode affichage léger PDF (downsample raster/ISI + dpi reduit).",
+    )
+    parser.add_argument(
+        "--sampling-percent",
+        type=int,
+        default=defaults.sampling_percent,
+        help="Pourcentage de points conserves dans raster/ISI (1..100, defaut: 100).",
+    )
+>>>>>>> Stashed changes
     return parser.parse_args()
 
 
@@ -254,6 +281,8 @@ def main() -> None:
             run_comparison_callback=run_comparison,
             default_threshold=args.threshold,
             default_edge=args.edge,
+            default_pre_s=args.pre,
+            default_post_s=args.post,
             default_lowpass_hz=args.lowpass_hz,
             default_spike_threshold_uv=args.spike_threshold_uv,
             default_firing_rate_window_s=args.firing_rate_window_s,

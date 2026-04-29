@@ -230,6 +230,23 @@ def resolve_work_dir(config: AnalysisConfig) -> Path:
     return root / ".plot_erg" / f"{config.rhs_file.stem}_work"
 
 
+def cleanup_plot_erg_root_if_empty(work_dir: Path | None) -> None:
+    """Supprime le dossier racine .plot_erg uniquement s'il est vide."""
+    if work_dir is None:
+        return
+    root = work_dir.parent
+    if root.name != ".plot_erg":
+        return
+    if not root.exists():
+        return
+    try:
+        if not any(root.iterdir()):
+            root.rmdir()
+    except OSError:
+        # Dossier non vide / verrouille / droits insuffisants: on ignore.
+        pass
+
+
 class AmplifierSpikeSource:
     """Fenêtres alignées sur triggers, une canal à la fois (pas de tensor 3D complet)."""
 
@@ -280,6 +297,7 @@ class AmplifierSpikeSource:
         self.amplifier = np.empty((0,))  # libère la référence
         if self.work_dir is not None and self.work_dir.exists() and not self.keep_intermediate_files:
             shutil.rmtree(self.work_dir, ignore_errors=True)
+            cleanup_plot_erg_root_if_empty(self.work_dir)
 
 
 def valid_triggers_and_timebase(

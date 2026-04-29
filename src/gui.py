@@ -17,6 +17,8 @@ def launch_qt_gui(
     run_comparison_callback: Callable[[AnalysisConfig, AnalysisConfig], None],
     default_threshold: float = 1.0,
     default_edge: str = "falling",
+    default_pre_s: float = 2.0,
+    default_post_s: float = 10.0,
     default_lowpass_hz: float | None = None,
     default_spike_threshold_uv: float = -40.0,
     default_firing_rate_window_s: float = 0.025,
@@ -125,8 +127,8 @@ def launch_qt_gui(
     if idx >= 0:
         edge_combo.setCurrentIndex(idx)
     threshold_edit = QLineEdit(str(default_threshold))
-    pre_edit = QLineEdit("2.0")
-    post_edit = QLineEdit("10.0")
+    pre_edit = QLineEdit(str(default_pre_s))
+    post_edit = QLineEdit(str(default_post_s))
     save_dir_edit = QLineEdit()
     lowpass_edit = QLineEdit()
     if default_lowpass_hz is not None:
