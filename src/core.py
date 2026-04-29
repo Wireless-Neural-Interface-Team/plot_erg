@@ -4,7 +4,9 @@ import contextlib
 import contextvars
 import gc
 import importlib.util
+import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
 import threading
@@ -20,6 +22,7 @@ _analysis_cancel_event: contextvars.ContextVar[threading.Event | None] = context
     "analysis_cancel_event",
     default=None,
 )
+MAX_PARALLEL_CHANNELS = 16
 
 
 @contextlib.contextmanager
@@ -264,8 +267,43 @@ class AmplifierSpikeSource:
             row = apply_butterworth_bandpass(
                 row_2d, self.fs, self.bandpass_low_hz, self.bandpass_high_hz
             )[0]
-        sample_idx = self.valid_triggers[:, None] + self._offsets[None, :]
-        return np.take(row, sample_idx, axis=0)
+        n_trials = int(self.valid_triggers.size)
+        win_len = int(self._offsets.size)
+        # Garde-fou: évite les allocations monstrueuses de fenêtres spikes.
+        if n_trials * win_len > 25_000_000:
+            raise RuntimeError(
+                "Fenêtre spikes trop grande pour une extraction 2D en RAM. "
+                "Réduis pre/post, sampling %, ou active le mode léger."
+            )
+        out = np.empty((n_trials, win_len), dtype=np.float64)
+        for i, trig in enumerate(self.valid_triggers):
+            start = int(trig - self.pre_n)
+            end = int(trig + self.post_n)
+            out[i] = row[start:end]
+        return out
+
+    def spike_times_per_trial_for_channel(
+        self,
+        ch: int,
+        t_rel: np.ndarray,
+        threshold: float,
+        refractory_s: float = 0.001,
+    ) -> list[np.ndarray]:
+        """Détecte les spikes essai par essai, sans matrice 2D géante en RAM."""
+        row = np.asarray(self.amplifier[ch], dtype=np.float64)
+        if self.bandpass_low_hz is not None and self.bandpass_high_hz is not None:
+            row_2d = row.reshape(1, -1)
+            row = apply_butterworth_bandpass(
+                row_2d, self.fs, self.bandpass_low_hz, self.bandpass_high_hz
+            )[0]
+        out: list[np.ndarray] = []
+        for trig in self.valid_triggers:
+            start = int(trig - self.pre_n)
+            end = int(trig + self.post_n)
+            seg = row[start:end]
+            idx = detect_spikes_at_threshold(seg, self.fs, threshold, refractory_s=refractory_s)
+            out.append(np.asarray(t_rel[idx], dtype=np.float64))
+        return out
 
     def close(self) -> None:
         if self._closed:
@@ -306,6 +344,16 @@ def valid_triggers_and_timebase(
     return valid_triggers, t_rel, pre_n, post_n
 
 
+def resolve_channel_workers(channel_workers: int | None, n_channels: int) -> int:
+    """Calcule le nb de workers canaux avec cap de sécurité."""
+    if n_channels <= 0:
+        return 1
+    if channel_workers is not None:
+        return max(1, min(int(channel_workers), int(MAX_PARALLEL_CHANNELS), int(n_channels)))
+    cpu_half = max(1, (os.cpu_count() or 2) // 2)
+    return max(1, min(cpu_half, int(MAX_PARALLEL_CHANNELS), int(n_channels)))
+
+
 def mean_filtered_channelwise(
     amplifier_2d: np.ndarray,
     valid_triggers: np.ndarray,
@@ -313,18 +361,28 @@ def mean_filtered_channelwise(
     pre_n: int,
     post_n: int,
     cutoff_hz: float,
+    channel_workers: int | None = None,
 ) -> np.ndarray:
-    """Passe-bas canal par canal : jamais de matrice filtrée multi-canaux entière."""
+    """Passe-bas canal par canal, parallélisé jusqu'à MAX_PARALLEL_CHANNELS."""
     n_ch, _ = amplifier_2d.shape
     win_len = pre_n + post_n
-    offsets = np.arange(-pre_n, post_n, dtype=np.int64)
-    sample_idx = valid_triggers[:, None] + offsets[None, :]
     out = np.zeros((n_ch, win_len), dtype=np.float64)
-    for c in range(n_ch):
+
+    def _compute_one_channel(c: int) -> tuple[int, np.ndarray]:
         check_analysis_cancelled()
         row_f = apply_butterworth_lowpass(amplifier_2d[c : c + 1], fs, cutoff_hz)
-        w = np.take(row_f, sample_idx, axis=1)[0]
-        out[c] = np.mean(w, axis=0)
+        row = row_f[0]
+        acc = np.zeros(win_len, dtype=np.float64)
+        for trig in valid_triggers:
+            start = int(trig - pre_n)
+            end = int(trig + post_n)
+            acc += row[start:end]
+        return c, acc / float(valid_triggers.size)
+
+    n_workers = resolve_channel_workers(channel_workers, n_ch)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for c, m in pool.map(_compute_one_channel, range(n_ch)):
+            out[c] = m
     return out
 
 
@@ -340,6 +398,11 @@ def extract_triggered_windows(
     pre_s: float,
     post_s: float,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """Extraction legacy des fenêtres 3D.
+
+    Implémentation sans matrice d'index 2D géante (sample_idx) pour éviter
+    les allocations int64 massives.
+    """
     amplifier_data = np.asarray(amplifier_data)
     if amplifier_data.ndim != 2:
         raise RuntimeError("Format inattendu pour amplifier_data (attendu [n_channels, n_samples]).")
@@ -360,11 +423,63 @@ def extract_triggered_windows(
     if valid_triggers.size == 0:
         raise RuntimeError("Aucune fenetre valide autour des triggers.")
 
-    offsets = np.arange(-pre_n, post_n, dtype=np.int64)
-    sample_idx = valid_triggers[:, None] + offsets[None, :]
-    windows = np.take(amplifier_data, sample_idx, axis=1).transpose(1, 0, 2)
+    n_trials = int(valid_triggers.size)
+    n_channels = int(amplifier_data.shape[0])
+    # Garde-fou mémoire pour éviter une allocation 3D excessive.
+    est_values = n_trials * n_channels * win_len
+    if est_values > 200_000_000:
+        raise RuntimeError(
+            "Fenêtres 3D trop volumineuses pour extraction en RAM. "
+            "Utilise le pipeline streaming par canal."
+        )
+
+    windows = np.empty((n_trials, n_channels, win_len), dtype=np.asarray(amplifier_data).dtype)
+    for i, trig in enumerate(valid_triggers):
+        start = int(trig - pre_n)
+        end = int(trig + post_n)
+        windows[i] = amplifier_data[:, start:end]
     t_rel = np.arange(-pre_n, post_n, dtype=np.float64) / fs
     return windows, t_rel
+
+
+def mean_triggered_windows_channelwise(
+    amplifier_data: np.ndarray,
+    valid_triggers: np.ndarray,
+    pre_n: int,
+    post_n: int,
+    channel_workers: int | None = None,
+) -> np.ndarray:
+    """Moyenne brute canal par canal, parallélisée jusqu'à MAX_PARALLEL_CHANNELS."""
+    amplifier_data = np.asarray(amplifier_data)
+    if amplifier_data.ndim != 2:
+        raise RuntimeError("Format inattendu pour amplifier_data (attendu [n_channels, n_samples]).")
+
+    n_ch, _ = amplifier_data.shape
+    win_len = pre_n + post_n
+    if win_len <= 1:
+        raise RuntimeError("Fenetre temporelle invalide.")
+    valid_triggers = np.asarray(valid_triggers, dtype=np.int64)
+    if valid_triggers.size == 0:
+        raise RuntimeError("Aucune fenetre valide autour des triggers.")
+
+    # float32 suffit pour l'affichage PDF et limite fortement l'empreinte RAM.
+    out = np.zeros((n_ch, win_len), dtype=np.float32)
+
+    def _compute_one_channel(c: int) -> tuple[int, np.ndarray]:
+        check_analysis_cancelled()
+        row = np.asarray(amplifier_data[c], dtype=np.float32)
+        acc = np.zeros(win_len, dtype=np.float32)
+        for trig in valid_triggers:
+            start = int(trig - pre_n)
+            end = int(trig + post_n)
+            acc += row[start:end]
+        return c, acc / float(valid_triggers.size)
+
+    n_workers = resolve_channel_workers(channel_workers, n_ch)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        for c, m in pool.map(_compute_one_channel, range(n_ch)):
+            out[c] = m
+    return out
 
 
 def get_channel_names(data: dict[str, Any], n_channels: int) -> list[str]:
@@ -425,19 +540,14 @@ def compute_average_per_channel(
     n_valid = int(valid_triggers.shape[0])
     n_total = int(trigger_indices.size)
 
-    # Moyenne brute : extraction de toutes les fenêtres puis moyenne (tensor 3D temporaire).
-    windows_raw, t_rel_mean = extract_triggered_windows(
+    # Moyenne brute en mode streaming (évite les allocations massives en RAM).
+    mean_per_channel_raw = mean_triggered_windows_channelwise(
         amplifier_data=amplifier_raw,
-        trigger_indices=trigger_indices,
-        fs=fs,
-        pre_s=config.pre_s,
-        post_s=config.post_s,
+        valid_triggers=valid_triggers,
+        pre_n=pre_n,
+        post_n=post_n,
+        channel_workers=config.channel_workers,
     )
-    check_analysis_cancelled()
-    if t_rel_mean.shape != t_rel.shape or not np.allclose(t_rel_mean, t_rel):
-        raise RuntimeError("Incohérence grille temporelle (moyenne brute).")
-    mean_per_channel_raw = windows_raw.mean(axis=0)
-    del windows_raw
 
     if config.lowpass_cutoff_hz is not None:
         mean_per_channel = mean_filtered_channelwise(
@@ -447,6 +557,7 @@ def compute_average_per_channel(
             pre_n,
             post_n,
             config.lowpass_cutoff_hz,
+            config.channel_workers,
         )
     else:
         mean_per_channel = mean_per_channel_raw

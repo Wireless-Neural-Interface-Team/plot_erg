@@ -12,6 +12,8 @@ import numpy as np
 
 from intanutil.report import print_record_time_summary, print_progress
 
+LOAD_STIM_DATA = False
+
 
 def calculate_data_size(header, filename, fid):
     """Calculates how much data is present in this file. Returns:
@@ -78,7 +80,8 @@ def parse_data(header, data):
     """
     print('Parsing data...')
     extract_digital_data(header, data)
-    extract_stim_data(data)
+    if LOAD_STIM_DATA and 'stim_data_raw' in data:
+        extract_stim_data(data)
     scale_analog_data(header, data)
     scale_timestamps(header, data)
 
@@ -89,15 +92,19 @@ def data_to_result(header, data, result):
     no channels of this type exist), does not copy those entries into 'result'.
     """
     result['t'] = data['t']
-    result['stim_data'] = data['stim_data']
+    if 'stim_data' in data:
+        result['stim_data'] = data['stim_data']
 
     if header['dc_amplifier_data_saved']:
         result['dc_amplifier_data'] = data['dc_amplifier_data']
 
     if header['num_amplifier_channels'] > 0:
-        result['compliance_limit_data'] = data['compliance_limit_data']
-        result['charge_recovery_data'] = data['charge_recovery_data']
-        result['amp_settle_data'] = data['amp_settle_data']
+        if 'compliance_limit_data' in data:
+            result['compliance_limit_data'] = data['compliance_limit_data']
+        if 'charge_recovery_data' in data:
+            result['charge_recovery_data'] = data['charge_recovery_data']
+        if 'amp_settle_data' in data:
+            result['amp_settle_data'] = data['amp_settle_data']
         result['amplifier_data'] = data['amplifier_data']
 
     if header['num_board_adc_channels'] > 0:
@@ -243,11 +250,15 @@ def read_analog_signals(fid, data, index, samples_per_block, header):
                                 samples_per_block,
                                 header['num_amplifier_channels'])
 
-    read_analog_signal_type(fid,
-                            data['stim_data_raw'],
-                            index,
-                            samples_per_block,
-                            header['num_amplifier_channels'])
+    if LOAD_STIM_DATA and 'stim_data_raw' in data:
+        read_analog_signal_type(fid,
+                                data['stim_data_raw'],
+                                index,
+                                samples_per_block,
+                                header['num_amplifier_channels'])
+    else:
+        # Skip stimulation payload when not used by downstream pipeline.
+        fid.seek(2 * samples_per_block * header['num_amplifier_channels'], 1)
 
     read_analog_signal_type(fid,
                             data['board_adc_data'],
@@ -322,30 +333,31 @@ def initialize_memory(header, num_samples):
     data = {}
 
     # Create zero array for timestamps.
-    data['t'] = np.zeros(num_samples, np.int_)
+    data['t'] = np.zeros(num_samples, dtype=np.int32)
 
     # Create zero array for amplifier data.
     data['amplifier_data'] = np.zeros(
-        [header['num_amplifier_channels'], num_samples], dtype=np.uint)
+        [header['num_amplifier_channels'], num_samples], dtype=np.uint16)
 
     # Create zero array for DC amplifier data.
     if header['dc_amplifier_data_saved']:
         data['dc_amplifier_data'] = np.zeros(
-            [header['num_amplifier_channels'], num_samples], dtype=np.uint)
+            [header['num_amplifier_channels'], num_samples], dtype=np.uint16)
 
-    # Create zero array for stim data.
-    data['stim_data_raw'] = np.zeros(
-        [header['num_amplifier_channels'], num_samples], dtype=np.int_)
-    data['stim_data'] = np.zeros(
-        [header['num_amplifier_channels'], num_samples], dtype=np.int_)
+    # Create zero array for stim data (optional, can be disabled to reduce RAM).
+    if LOAD_STIM_DATA:
+        data['stim_data_raw'] = np.zeros(
+            [header['num_amplifier_channels'], num_samples], dtype=np.uint16)
+        data['stim_data'] = np.zeros(
+            [header['num_amplifier_channels'], num_samples], dtype=np.int16)
 
     # Create zero array for board ADC data.
     data['board_adc_data'] = np.zeros(
-        [header['num_board_adc_channels'], num_samples], dtype=np.uint)
+        [header['num_board_adc_channels'], num_samples], dtype=np.uint16)
 
     # Create zero array for board DAC data.
     data['board_dac_data'] = np.zeros(
-        [header['num_board_dac_channels'], num_samples], dtype=np.uint)
+        [header['num_board_dac_channels'], num_samples], dtype=np.uint16)
 
     # By default, this script interprets digital events (digital inputs
     # and outputs) as booleans. if unsigned int values are preferred
@@ -365,7 +377,7 @@ def initialize_memory(header, num_samples):
         dtype=np.bool_)
     data['board_dig_in_raw'] = np.zeros(
         num_samples,
-        dtype=np.uint)
+        dtype=np.uint16)
 
     # Create 16-row zero array for digital out data, and 1-row zero array for
     # raw digital out data (each bit of 16-bit entry represents a different
@@ -375,7 +387,7 @@ def initialize_memory(header, num_samples):
         dtype=np.bool_)
     data['board_dig_out_raw'] = np.zeros(
         num_samples,
-        dtype=np.uint)
+        dtype=np.uint16)
 
     # Set index representing position of data (shared across all signal types
     # for RHS file) to 0
@@ -407,25 +419,34 @@ def scale_analog_data(header, data):
     units (microVolts, Volts, microAmps).
     """
     # Scale amplifier data (units = microVolts).
-    data['amplifier_data'] = np.multiply(
-        0.195, (data['amplifier_data'].astype(np.int32) - 32768))
-    data['stim_data'] = np.multiply(
-        header['stim_step_size'],
-        data['stim_data'] / 1.0e-6)
+    # Conversion mémoire-robuste: évite l'allocation intermédiaire int32 géante.
+    amp = data['amplifier_data'].astype(np.float32, copy=True)
+    amp -= np.float32(32768.0)
+    amp *= np.float32(0.195)
+    data['amplifier_data'] = amp
+    if 'stim_data' in data:
+        data['stim_data'] = np.multiply(
+            header['stim_step_size'],
+            data['stim_data'] / 1.0e-6)
 
     # Scale DC amplifier data (units = Volts).
     if header['dc_amplifier_data_saved']:
-        data['dc_amplifier_data'] = (
-            np.multiply(-0.01923,
-                        data['dc_amplifier_data'].astype(np.int32) - 512))
+        dc = data['dc_amplifier_data'].astype(np.float32, copy=True)
+        dc -= np.float32(512.0)
+        dc *= np.float32(-0.01923)
+        data['dc_amplifier_data'] = dc
 
     # Scale board ADC data (units = Volts).
-    data['board_adc_data'] = np.multiply(
-        312.5e-6, (data['board_adc_data'].astype(np.int32) - 32768))
+    adc = data['board_adc_data'].astype(np.float32, copy=True)
+    adc -= np.float32(32768.0)
+    adc *= np.float32(312.5e-6)
+    data['board_adc_data'] = adc
 
     # Scale board DAC data (units = Volts).
-    data['board_dac_data'] = np.multiply(
-        312.5e-6, (data['board_dac_data'].astype(np.int32) - 32768))
+    dac = data['board_dac_data'].astype(np.float32, copy=True)
+    dac -= np.float32(32768.0)
+    dac *= np.float32(312.5e-6)
+    data['board_dac_data'] = dac
 
 
 def extract_digital_data(header, data):
