@@ -15,17 +15,17 @@ class AnalysisConfig:
     pre_s: float = 2.0
     post_s: float = 10.0
     # Passe-bas Butterworth sur amplifier_data (None = desactive)
-    lowpass_cutoff_hz: Optional[float] = None
+    lowpass_cutoff_hz: Optional[float] = 250.0
     save_dir: Path | None = None
     # Titre/nom du PDF de sortie (sans extension .pdf = ajouté automatiquement).
     pdf_title: str | None = None
     # Spikes (amplificateur, µV) : seuil >= 0 = passage vers le haut ; seuil < 0 = passage vers le bas
-    spike_threshold_uv: float = -40.0
+    spike_threshold_uv: float = -15.0
     # Largeur de lissage du taux de decharge (s), noyau gaussien sur le PSTH
-    firing_rate_window_s: float = 0.025
+    firing_rate_window_s: float = 0.010
     # Passe-bande Butterworth sur l'amplificateur pour raster / PSTH / ISI (les deux None = brut)
-    spike_bandpass_low_hz: Optional[float] = None
-    spike_bandpass_high_hz: Optional[float] = None
+    spike_bandpass_low_hz: Optional[float] = 250.0
+    spike_bandpass_high_hz: Optional[float] = 7500.0
     # None = auto : (save_dir ou dossier du .rhs) / ".plot_erg" / <stem>
     work_dir: Path | None = None
     # Ne pas supprimer work_dir à la fin (amplificateur .npy, etc.)
