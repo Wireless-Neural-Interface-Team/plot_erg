@@ -190,6 +190,18 @@ def parse_args() -> argparse.Namespace:
         help="Largeur (s) du lissage gaussien du PSTH / taux de decharge (defaut: 0.025)",
     )
     parser.add_argument(
+        "--zoom-t0-s",
+        type=float,
+        default=defaults.zoom_t0_s,
+        help="Debut de la fenetre de zoom (s, relatif au trigger).",
+    )
+    parser.add_argument(
+        "--zoom-t1-s",
+        type=float,
+        default=defaults.zoom_t1_s,
+        help="Fin de la fenetre de zoom (s, relatif au trigger).",
+    )
+    parser.add_argument(
         "--spike-bandpass-low-hz",
         type=float,
         default=defaults.spike_bandpass_low_hz,
@@ -285,6 +297,8 @@ def run(config: AnalysisConfig) -> None:
                 fs=fs,
                 spike_threshold_uv=config.spike_threshold_uv,
                 firing_rate_window_s=config.firing_rate_window_s,
+                zoom_t0_s=config.zoom_t0_s,
+                zoom_t1_s=config.zoom_t1_s,
                 mean_per_channel_raw=mean_raw_mm,
                 spike_bandpass_low_hz=config.spike_bandpass_low_hz,
                 spike_bandpass_high_hz=config.spike_bandpass_high_hz,
@@ -322,6 +336,7 @@ def run(config: AnalysisConfig) -> None:
             f"Spikes (PDF amplificateur): seuil {config.spike_threshold_uv} µV ({spike_rule}) | "
             f"lissage taux σ = {config.firing_rate_window_s} s{bp_txt}"
         )
+        print(f"Fenetre zoom PDF: [{config.zoom_t0_s:.3f}s, {config.zoom_t1_s:.3f}s]")
         print(f"PDF genere: {pdf_path}")
         elapsed_s = time.perf_counter() - t0
         print(f"Temps total analyse + PDF: {elapsed_s:.2f} s")
@@ -499,6 +514,8 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             fs=float(fs_ref),
             spike_threshold_uv=tuned[0].spike_threshold_uv,
             firing_rate_window_s=tuned[0].firing_rate_window_s,
+            zoom_t0_s=tuned[0].zoom_t0_s,
+            zoom_t1_s=tuned[0].zoom_t1_s,
             spike_bandpass_low_hz=tuned[0].spike_bandpass_low_hz,
             spike_bandpass_high_hz=tuned[0].spike_bandpass_high_hz,
             lightweight_mode=tuned[0].lightweight_plot,
@@ -540,6 +557,8 @@ def main() -> None:
             default_lowpass_hz=args.lowpass_hz,
             default_spike_threshold_uv=args.spike_threshold_uv,
             default_firing_rate_window_s=args.firing_rate_window_s,
+            default_zoom_t0_s=args.zoom_t0_s,
+            default_zoom_t1_s=args.zoom_t1_s,
             default_spike_bandpass_low_hz=args.spike_bandpass_low_hz,
             default_spike_bandpass_high_hz=args.spike_bandpass_high_hz,
             default_channel_workers=args.channel_workers,
@@ -561,6 +580,8 @@ def main() -> None:
         pdf_title=args.pdf_title,
         spike_threshold_uv=args.spike_threshold_uv,
         firing_rate_window_s=args.firing_rate_window_s,
+        zoom_t0_s=args.zoom_t0_s,
+        zoom_t1_s=args.zoom_t1_s,
         spike_bandpass_low_hz=args.spike_bandpass_low_hz,
         spike_bandpass_high_hz=args.spike_bandpass_high_hz,
         work_dir=args.work_dir,
@@ -570,6 +591,9 @@ def main() -> None:
         lightweight_plot=args.lightweight_plot,
         sampling_percent=args.sampling_percent,
     )
+    if config.zoom_t1_s <= config.zoom_t0_s:
+        print("Erreur: --zoom-t1-s doit être strictement supérieur à --zoom-t0-s.", file=sys.stderr)
+        sys.exit(2)
     try:
         run(config)
     except Exception as exc:

@@ -826,6 +826,8 @@ def plot_channel_multi_comparison(
     fs: Optional[float] = None,
     spike_threshold_uv: float = -40.0,
     firing_rate_window_s: float = 0.025,
+    zoom_t0_s: float = ZOOM_T0,
+    zoom_t1_s: float = ZOOM_T1,
     spike_bandpass_low_hz: Optional[float] = None,
     spike_bandpass_high_hz: Optional[float] = None,
     lightweight_mode: bool = False,
@@ -851,7 +853,7 @@ def plot_channel_multi_comparison(
     pdf_name = _shorten_filename_for_windows(output_dir, f"{pdf_stem}.pdf")
     pdf_path = output_dir / pdf_name
 
-    zoom_t0, zoom_t1 = ZOOM_T0, ZOOM_T1
+    zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
     filt_note = f" — Butterworth passe-bas {lowpass_cutoff_hz:g} Hz" if lowpass_cutoff_hz is not None else ""
     both_note = " — raw signal overlaid (filtered curve emphasized)" if lowpass_cutoff_hz is not None else ""
     zoom_title = f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){filt_note}{both_note}"
@@ -1106,6 +1108,8 @@ def plot_channel_averages(
     fs: Optional[float] = None,
     spike_threshold_uv: float = -40.0,
     firing_rate_window_s: float = 0.025,
+    zoom_t0_s: float = ZOOM_T0,
+    zoom_t1_s: float = ZOOM_T1,
     mean_per_channel_raw: Optional[np.ndarray] = None,
     spike_bandpass_low_hz: Optional[float] = None,
     spike_bandpass_high_hz: Optional[float] = None,
@@ -1127,7 +1131,7 @@ def plot_channel_averages(
     pdf_name = _shorten_filename_for_windows(output_dir, f"{pdf_stem}.pdf")
     pdf_path = output_dir / pdf_name
 
-    zoom_t0, zoom_t1 = ZOOM_T0, ZOOM_T1
+    zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
     filt_note = (
         f" — Butterworth passe-bas {lowpass_cutoff_hz:g} Hz"
         if lowpass_cutoff_hz is not None
@@ -1521,6 +1525,8 @@ def plot_channel_comparison(
     fs: Optional[float] = None,
     spike_threshold_uv: float = -40.0,
     firing_rate_window_s: float = 0.025,
+    zoom_t0_s: float = ZOOM_T0,
+    zoom_t1_s: float = ZOOM_T1,
     spike_bandpass_low_hz: Optional[float] = None,
     spike_bandpass_high_hz: Optional[float] = None,
     lightweight_mode: bool = False,
@@ -1538,7 +1544,7 @@ def plot_channel_comparison(
     pdf_name = _shorten_filename_for_windows(output_dir, f"{pdf_stem}.pdf")
     pdf_path = output_dir / pdf_name
 
-    zoom_t0, zoom_t1 = ZOOM_T0, ZOOM_T1
+    zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
     filt_note = (
         f" — Butterworth passe-bas {lowpass_cutoff_hz:g} Hz"
         if lowpass_cutoff_hz is not None

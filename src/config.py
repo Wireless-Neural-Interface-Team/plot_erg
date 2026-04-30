@@ -23,6 +23,9 @@ class AnalysisConfig:
     spike_threshold_uv: float = -15.0
     # Largeur de lissage du taux de decharge (s), noyau gaussien sur le PSTH
     firing_rate_window_s: float = 0.010
+    # Fenetre de zoom des panneaux PDF (s, temps relatif au trigger).
+    zoom_t0_s: float = -0.1
+    zoom_t1_s: float = 0.5
     # Passe-bande Butterworth sur l'amplificateur pour raster / PSTH / ISI (les deux None = brut)
     spike_bandpass_low_hz: Optional[float] = 250.0
     spike_bandpass_high_hz: Optional[float] = 7500.0

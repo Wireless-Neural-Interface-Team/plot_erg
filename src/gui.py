@@ -23,6 +23,8 @@ def launch_qt_gui(
     default_lowpass_hz: float | None = None,
     default_spike_threshold_uv: float = -40.0,
     default_firing_rate_window_s: float = 0.025,
+    default_zoom_t0_s: float = -0.1,
+    default_zoom_t1_s: float = 0.2,
     default_spike_bandpass_low_hz: float | None = None,
     default_spike_bandpass_high_hz: float | None = None,
     default_channel_workers: int | None = None,
@@ -157,6 +159,10 @@ def launch_qt_gui(
     firing_rate_window_edit.setToolTip(
         "Largeur σ (secondes) du noyau gaussien appliqué au PSTH pour la courbe de taux (Hz)."
     )
+    zoom_t0_edit = QLineEdit(str(default_zoom_t0_s))
+    zoom_t1_edit = QLineEdit(str(default_zoom_t1_s))
+    zoom_t0_edit.setToolTip("Début de la fenêtre de zoom (secondes relatives au trigger).")
+    zoom_t1_edit.setToolTip("Fin de la fenêtre de zoom (secondes relatives au trigger).")
     bandpass_spikes_low_edit = QLineEdit()
     bandpass_spikes_high_edit = QLineEdit()
     if default_spike_bandpass_low_hz is not None:
@@ -211,6 +217,8 @@ def launch_qt_gui(
     spike_form = QFormLayout()
     spike_form.addRow("Amplifier spike threshold (µV) — raster, PSTH and ISI:", spike_threshold_edit)
     spike_form.addRow("PSTH / firing-rate Gaussian smoothing (σ, s):", firing_rate_window_edit)
+    spike_form.addRow("Zoom window start (s, relative to trigger):", zoom_t0_edit)
+    spike_form.addRow("Zoom window end (s, relative to trigger):", zoom_t1_edit)
     spike_form.addRow("Band-pass signal (raster, PSTH, ISI) low f (Hz):", bandpass_spikes_low_edit)
     spike_form.addRow("Band-pass signal (raster, PSTH, ISI) high f (Hz):", bandpass_spikes_high_edit)
 
@@ -219,7 +227,7 @@ def launch_qt_gui(
     spike_group.setToolTip(
         "Ces réglages concernent uniquement les graphiques spikes du PDF. "
         "Le raster, le PSTH (taux) et l’ISI utilisent les mêmes instants de spike (même seuil et même filtre passe-bande). "
-        "Les fenêtres temporelles affichées (vue complète / zoom) sont définies dans le code (plotting.py)."
+        "La fenêtre de zoom est configurable dans ce panneau."
     )
 
     params_stack = QWidget()
@@ -265,6 +273,8 @@ def launch_qt_gui(
     def build_shared_params() -> tuple[
         float,
         str,
+        float,
+        float,
         float,
         float,
         float | None,
@@ -315,6 +325,10 @@ def launch_qt_gui(
         sampling_percent = int(sampling_percent_edit.text().strip())
         if sampling_percent < 1 or sampling_percent > 100:
             raise ValueError("Sampling (%) : renseigner une valeur entre 1 et 100.")
+        zoom_t0_s = float(zoom_t0_edit.text().strip())
+        zoom_t1_s = float(zoom_t1_edit.text().strip())
+        if zoom_t1_s <= zoom_t0_s:
+            raise ValueError("Fenêtre de zoom : la fin doit être strictement > au début.")
         return (
             float(threshold_edit.text().strip()),
             edge,
@@ -325,6 +339,8 @@ def launch_qt_gui(
             pdf_title_text if pdf_title_text else None,
             float(spike_threshold_edit.text().strip()),
             float(firing_rate_window_edit.text().strip()),
+            zoom_t0_s,
+            zoom_t1_s,
             bp_lo,
             bp_hi,
             None,
@@ -486,6 +502,8 @@ def launch_qt_gui(
         threshold_edit.setEnabled(not running)
         spike_threshold_edit.setEnabled(not running)
         firing_rate_window_edit.setEnabled(not running)
+        zoom_t0_edit.setEnabled(not running)
+        zoom_t1_edit.setEnabled(not running)
         bandpass_spikes_low_edit.setEnabled(not running)
         bandpass_spikes_high_edit.setEnabled(not running)
         pre_edit.setEnabled(not running)
@@ -572,7 +590,7 @@ def launch_qt_gui(
             rhs_text = rhs_path_edit.text().strip()
             if not rhs_text:
                 raise ValueError("Choisis un fichier RHS.")
-            thr, edge, pre, post, lp_hz, save_p, pdf_title, sp_thr, fr_w, bp_lo, bp_hi, work_p, keep_w, ch_w, light_plot, samp_pct = (
+            thr, edge, pre, post, lp_hz, save_p, pdf_title, sp_thr, fr_w, zoom_t0_s, zoom_t1_s, bp_lo, bp_hi, work_p, keep_w, ch_w, light_plot, samp_pct = (
                 build_shared_params()
             )
             if fr_w <= 0:
@@ -588,6 +606,8 @@ def launch_qt_gui(
                 pdf_title=pdf_title,
                 spike_threshold_uv=sp_thr,
                 firing_rate_window_s=fr_w,
+                zoom_t0_s=zoom_t0_s,
+                zoom_t1_s=zoom_t1_s,
                 spike_bandpass_low_hz=bp_lo,
                 spike_bandpass_high_hz=bp_hi,
                 work_dir=work_p,
@@ -647,7 +667,7 @@ def launch_qt_gui(
                     uniq_paths.append(p)
             if len(uniq_paths) < 2:
                 raise ValueError("Ajoute au moins deux fichiers RHS pour la comparaison.")
-            thr, edge, pre, post, lp_hz, save_p, pdf_title, sp_thr, fr_w, bp_lo, bp_hi, work_p, keep_w, ch_w, light_plot, samp_pct = (
+            thr, edge, pre, post, lp_hz, save_p, pdf_title, sp_thr, fr_w, zoom_t0_s, zoom_t1_s, bp_lo, bp_hi, work_p, keep_w, ch_w, light_plot, samp_pct = (
                 build_shared_params()
             )
             if fr_w <= 0:
@@ -666,6 +686,8 @@ def launch_qt_gui(
                         pdf_title=pdf_title,
                         spike_threshold_uv=sp_thr,
                         firing_rate_window_s=fr_w,
+                        zoom_t0_s=zoom_t0_s,
+                        zoom_t1_s=zoom_t1_s,
                         spike_bandpass_low_hz=bp_lo,
                         spike_bandpass_high_hz=bp_hi,
                         work_dir=work_p,
