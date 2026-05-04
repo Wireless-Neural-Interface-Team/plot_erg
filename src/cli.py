@@ -504,9 +504,9 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
         if imp_sessions:
             n_skip = len(tuned) - len(imp_sessions)
             print(
-                f"Impédance |Z| @ 1 kHz : {len(imp_sessions)} session(s) avec CSV companion "
-                f"(suffixe _YYMMDD_HHMMSS, tri chronologique) — pages ajoutées au PDF."
-                + (f" ({n_skip} RHS sans CSV ignoré(s).)" if n_skip else "")
+                f"Impedance |Z| @ 1 kHz: {len(imp_sessions)} session(s) with companion CSV "
+                f"(_YYMMDD_HHMMSS suffix, chronological order) — panel at bottom of each multi-comparison channel page."
+                + (f" ({n_skip} RHS file(s) skipped: no CSV.)" if n_skip else "")
             )
         t_render0 = time.perf_counter()
         pdf_path = plot_channel_multi_comparison(

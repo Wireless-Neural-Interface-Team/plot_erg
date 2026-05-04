@@ -292,13 +292,13 @@ def _draw_spike_panels_single_channel(
                 alpha=0.75,
                 linewidths=0,
             )
-    ax_raster.set_ylabel("Essai n°")
+    ax_raster.set_ylabel("Trial #")
     cap = (
         f"crossing below {spike_threshold_uv:g} µV (falling edge)"
         if spike_threshold_uv < 0
         else f"crossing above {spike_threshold_uv:g} µV (rising edge)"
     )
-    ax_raster.set_title(f"{sec}Raster — {short} ({cap}, réfractaire 1 ms)")
+    ax_raster.set_title(f"{sec}Raster — {short} ({cap}, 1 ms refractory)")
     ax_raster.grid(True, alpha=0.25, axis="x")
     ax_raster.set_ylim(-0.5, max(n_tr - 0.5, 0.5))
     ax_raster.set_xlim(t_xlim_lo, t_xlim_hi)
@@ -313,8 +313,8 @@ def _draw_spike_panels_single_channel(
         t_range_s=psth_t_range,
     )
     if tc.size:
-        ax_fr.plot(tc, rate_hz, linewidth=1.3, color="darkred", label="PSTH lissé (Hz)")
-    ax_fr.set_ylabel("Taux (Hz)")
+        ax_fr.plot(tc, rate_hz, linewidth=1.3, color="darkred", label="Smoothed PSTH (Hz)")
+    ax_fr.set_ylabel("Rate (Hz)")
     ax_fr.set_title(
         f"{sec}Mean firing rate — {short} (Gaussian PSTH, σ={firing_rate_window_s:g} s)"
     )
@@ -328,7 +328,7 @@ def _draw_spike_panels_single_channel(
         ax_trial_fr.plot(x_trials, fr_trials, color="teal", linewidth=1.1, marker="o", markersize=2.6)
     ax_trial_fr.set_title(f"{sec}Mean firing rate per trial — shown window")
     ax_trial_fr.set_xlabel("Trial index")
-    ax_trial_fr.set_ylabel("FR (Hz)")
+    ax_trial_fr.set_ylabel("Firing rate (Hz)")
     ax_trial_fr.grid(True, alpha=0.25)
 
     t_isi, isi_vals_s = _isi_time_and_values_s(st_per_tr, isi_window_s=isi_window)
@@ -345,7 +345,7 @@ def _draw_spike_panels_single_channel(
         )
         ax_isi.set_ylabel("ISI (ms)")
         ax_isi.set_title(
-            f"{sec}ISI — {short} ({isi_caption} ; abscisse = temps du 2e spike de la paire)"
+            f"{sec}ISI — {short} ({isi_caption} ; x-axis = time of 2nd spike in pair)"
         )
         ax_isi.grid(True, alpha=0.25)
         ax_isi.set_xlim(ISI_ABSCISSA_T0_S, ISI_ABSCISSA_T1_S)
@@ -398,14 +398,14 @@ def _draw_spike_panels_dual_channel(
         t_xlim_lo, t_xlim_hi = float(t_rel[0]), float(t_rel[-1])
         psth_t_range = None
         isi_window = None
-        isi_caption = f"±{ISI_HALF_WINDOW_S:g} s du trigger, intra-essai"
-        isi_empty_hint = f"±{ISI_HALF_WINDOW_S:g} s du trigger"
+        isi_caption = f"±{ISI_HALF_WINDOW_S:g} s of trigger, within-trial"
+        isi_empty_hint = f"±{ISI_HALF_WINDOW_S:g} s of trigger"
     else:
         t_xlim_lo, t_xlim_hi = float(t_range_s[0]), float(t_range_s[1])
         psth_t_range = (t_xlim_lo, t_xlim_hi)
         isi_window = (t_xlim_lo, t_xlim_hi)
-        isi_caption = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s rel. trigger, intra-essai"
-        isi_empty_hint = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s du trigger"
+        isi_caption = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s rel. trigger, within-trial"
+        isi_empty_hint = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s of trigger"
 
     sec = f"{section_title} — " if section_title else ""
     for tri, st in enumerate(sta):
@@ -441,7 +441,7 @@ def _draw_spike_panels_dual_channel(
                 linewidths=0,
                 label=label_b if tri == 0 else "",
             )
-    ax_raster.set_ylabel("Essai n° (A puis B empilés)")
+    ax_raster.set_ylabel("Trial # (A then B stacked)")
     cap = (
         f"threshold {spike_threshold_uv:g} µV (falling)"
         if spike_threshold_uv < 0
@@ -464,7 +464,7 @@ def _draw_spike_panels_dual_channel(
         ax_fr.plot(tc_a, rate_a, linewidth=1.3, color="C0", label=label_a)
     if tc_b.size:
         ax_fr.plot(tc_b, rate_b, linewidth=1.3, color="C1", label=label_b)
-    ax_fr.set_ylabel("Taux (Hz)")
+    ax_fr.set_ylabel("Rate (Hz)")
     ax_fr.set_title(
         f"{sec}Firing rate (Gaussian PSTH σ={firing_rate_window_s:g} s) — {short}"
     )
@@ -482,7 +482,7 @@ def _draw_spike_panels_dual_channel(
         ax_trial_fr.plot(xb, fr_b, color="C1", linewidth=1.1, marker="o", markersize=2.4, label=label_b)
     ax_trial_fr.set_title(f"{sec}Mean firing rate per trial — shown window")
     ax_trial_fr.set_xlabel("Trial index")
-    ax_trial_fr.set_ylabel("FR (Hz)")
+    ax_trial_fr.set_ylabel("Firing rate (Hz)")
     ax_trial_fr.grid(True, alpha=0.25)
 
     t_a, isi_a_s = _isi_time_and_values_s(sta, isi_window_s=isi_window)
@@ -516,7 +516,7 @@ def _draw_spike_panels_dual_channel(
             )
         ax_isi.set_ylabel("ISI (ms)")
         ax_isi.set_title(
-            f"{sec}ISI — {short} ({isi_caption} ; abscisse = temps du 2e spike de la paire)"
+            f"{sec}ISI — {short} ({isi_caption} ; x-axis = time of 2nd spike in pair)"
         )
         ax_isi.grid(True, alpha=0.25)
         ax_isi.set_xlim(ISI_ABSCISSA_T0_S, ISI_ABSCISSA_T1_S)
@@ -563,14 +563,14 @@ def _draw_spike_panels_multi_channel(
         t_xlim_lo, t_xlim_hi = float(t_rel[0]), float(t_rel[-1])
         psth_t_range = None
         isi_window = None
-        isi_caption = f"±{ISI_HALF_WINDOW_S:g} s du trigger, intra-essai"
-        isi_empty_hint = f"±{ISI_HALF_WINDOW_S:g} s du trigger"
+        isi_caption = f"±{ISI_HALF_WINDOW_S:g} s of trigger, within-trial"
+        isi_empty_hint = f"±{ISI_HALF_WINDOW_S:g} s of trigger"
     else:
         t_xlim_lo, t_xlim_hi = float(t_range_s[0]), float(t_range_s[1])
         psth_t_range = (t_xlim_lo, t_xlim_hi)
         isi_window = (t_xlim_lo, t_xlim_hi)
-        isi_caption = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s rel. trigger, intra-essai"
-        isi_empty_hint = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s du trigger"
+        isi_caption = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s rel. trigger, within-trial"
+        isi_empty_hint = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s of trigger"
 
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
     sec = f"{section_title} — " if section_title else ""
@@ -601,7 +601,7 @@ def _draw_spike_panels_multi_channel(
         if spike_threshold_uv < 0
         else f"threshold {spike_threshold_uv:g} µV (rising)"
     )
-    ax_raster.set_ylabel("Essai n° (groupés par fichier)")
+    ax_raster.set_ylabel("Trial # (grouped by file)")
     ax_raster.set_title(f"{sec}Raster — {short} ({cap})")
     ax_raster.grid(True, alpha=0.25, axis="x")
     ax_raster.set_ylim(-0.5, max(y_offset - 0.5, 0.5))
@@ -619,7 +619,7 @@ def _draw_spike_panels_multi_channel(
         )
         if tc.size:
             ax_fr.plot(tc, rate, linewidth=1.3, color=colors[rec_idx % len(colors)], label=labels[rec_idx])
-    ax_fr.set_ylabel("Taux (Hz)")
+    ax_fr.set_ylabel("Rate (Hz)")
     ax_fr.set_title(f"{sec}Firing rate (Gaussian PSTH σ={firing_rate_window_s:g} s) — {short}")
     ax_fr.grid(True, alpha=0.3)
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
@@ -649,7 +649,7 @@ def _draw_spike_panels_multi_channel(
             )
     if has_isi:
         ax_isi.set_ylabel("ISI (ms)")
-        ax_isi.set_title(f"{sec}ISI — {short} ({isi_caption} ; abscisse = temps du 2e spike)")
+        ax_isi.set_title(f"{sec}ISI — {short} ({isi_caption} ; x-axis = time of 2nd spike)")
         ax_isi.grid(True, alpha=0.25)
         ax_isi.set_xlim(ISI_ABSCISSA_T0_S, ISI_ABSCISSA_T1_S)
         ax_isi.set_xlabel(TIME_REL_XLABEL)
@@ -696,14 +696,14 @@ def _draw_spike_panels_multi_channel(
         t_xlim_lo, t_xlim_hi = float(t_rel[0]), float(t_rel[-1])
         psth_t_range = None
         isi_window = None
-        isi_caption = f"±{ISI_HALF_WINDOW_S:g} s du trigger, intra-essai"
-        isi_empty_hint = f"±{ISI_HALF_WINDOW_S:g} s du trigger"
+        isi_caption = f"±{ISI_HALF_WINDOW_S:g} s of trigger, within-trial"
+        isi_empty_hint = f"±{ISI_HALF_WINDOW_S:g} s of trigger"
     else:
         t_xlim_lo, t_xlim_hi = float(t_range_s[0]), float(t_range_s[1])
         psth_t_range = (t_xlim_lo, t_xlim_hi)
         isi_window = (t_xlim_lo, t_xlim_hi)
-        isi_caption = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s rel. trigger, intra-essai"
-        isi_empty_hint = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s du trigger"
+        isi_caption = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s rel. trigger, within-trial"
+        isi_empty_hint = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s of trigger"
 
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
     sec = f"{section_title} — " if section_title else ""
@@ -734,7 +734,7 @@ def _draw_spike_panels_multi_channel(
         if spike_threshold_uv < 0
         else f"threshold {spike_threshold_uv:g} µV (rising)"
     )
-    ax_raster.set_ylabel("Essai n° (groupés par fichier)")
+    ax_raster.set_ylabel("Trial # (grouped by file)")
     ax_raster.set_title(f"{sec}Raster — {short} ({cap})")
     ax_raster.grid(True, alpha=0.25, axis="x")
     ax_raster.set_ylim(-0.5, max(y_offset - 0.5, 0.5))
@@ -752,7 +752,7 @@ def _draw_spike_panels_multi_channel(
         )
         if tc.size:
             ax_fr.plot(tc, rate, linewidth=1.3, color=colors[rec_idx % len(colors)], label=labels[rec_idx])
-    ax_fr.set_ylabel("Taux (Hz)")
+    ax_fr.set_ylabel("Rate (Hz)")
     ax_fr.set_title(f"{sec}Firing rate (Gaussian PSTH σ={firing_rate_window_s:g} s) — {short}")
     ax_fr.grid(True, alpha=0.3)
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
@@ -775,7 +775,7 @@ def _draw_spike_panels_multi_channel(
             )
     ax_trial_fr.set_title(f"{sec}Mean firing rate per trial — shown window")
     ax_trial_fr.set_xlabel("Trial index")
-    ax_trial_fr.set_ylabel("FR (Hz)")
+    ax_trial_fr.set_ylabel("Firing rate (Hz)")
     ax_trial_fr.grid(True, alpha=0.25)
     if max_trials > 0:
         ax_trial_fr.set_xlim(1, max_trials)
@@ -798,7 +798,7 @@ def _draw_spike_panels_multi_channel(
             )
     if has_isi:
         ax_isi.set_ylabel("ISI (ms)")
-        ax_isi.set_title(f"{sec}ISI — {short} ({isi_caption} ; abscisse = temps du 2e spike)")
+        ax_isi.set_title(f"{sec}ISI — {short} ({isi_caption} ; x-axis = time of 2nd spike)")
         ax_isi.grid(True, alpha=0.25)
         ax_isi.set_xlim(ISI_ABSCISSA_T0_S, ISI_ABSCISSA_T1_S)
         ax_isi.set_xlabel(TIME_REL_XLABEL)
@@ -814,38 +814,37 @@ def _draw_spike_panels_multi_channel(
         ax_isi.set_axis_off()
 
 
-def _append_impedance_evolution_pages(
-    pdf: PdfPages,
-    channel_names: Sequence[str],
+def _draw_impedance_evolution_panel(
+    ax_imp: Any,
+    channel_name: str,
     sessions: Sequence[ImpedanceSession],
-    lightweight_mode: bool,
 ) -> None:
-    """Ajoute une page par canal : évolution de |Z|@1 kHz (CSV Intan) vs le temps des sessions."""
-    if not sessions:
-        return
-    dpi = 100 if lightweight_mode else 120
+    """Semi-log evolution of |Z| @ 1 kHz for one channel vs session timestamps."""
     times_num = np.array([mdates.date2num(s.when) for s in sessions], dtype=np.float64)
-    for ch_name in channel_names:
-        check_analysis_cancelled()
-        ys = np.array([s.magnitudes_ohm.get(ch_name, float("nan")) for s in sessions], dtype=np.float64)
-        valid = np.isfinite(ys) & (ys > 0)
-        if not np.any(valid):
-            continue
-        fig, ax = plt.subplots(figsize=(11, 5.5))
-        ax.semilogy(times_num[valid], ys[valid], "o-", color="C0", linewidth=1.4, markersize=6)
-        ax.set_title(
-            f"Impédance |Z| @ 1 kHz — {ch_name}\n"
-            "(CSV « nom_dossier/nom_dossier.csv » ; ordre chronologique _YYMMDD_HHMMSS)"
+    ys = np.array([s.magnitudes_ohm.get(channel_name, float("nan")) for s in sessions], dtype=np.float64)
+    valid = np.isfinite(ys) & (ys > 0)
+    if not np.any(valid):
+        ax_imp.text(
+            0.5,
+            0.5,
+            "No impedance data for this channel",
+            ha="center",
+            va="center",
+            transform=ax_imp.transAxes,
+            fontsize=10,
         )
-        ax.set_ylabel("|Z| à 1 kHz (Ω), échelle log")
-        ax.set_xlabel("Date / heure (suffixe fin de nom : année, mois, jour, puis h, min, s)")
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M:%S"))
-        ax.tick_params(axis="x", labelsize=8)
-        ax.grid(True, which="major", alpha=0.35)
-        ax.grid(True, which="minor", alpha=0.15)
-        fig.autofmt_xdate()
-        pdf.savefig(fig, bbox_inches="tight", pad_inches=0.25, dpi=dpi)
-        plt.close(fig)
+        ax_imp.set_axis_off()
+        return
+    ax_imp.semilogy(times_num[valid], ys[valid], "o-", color="C0", linewidth=1.2, markersize=4)
+    ax_imp.set_ylabel("|Z| @ 1 kHz (Ω)", fontsize=8)
+    ax_imp.set_xlabel("Session time (_YYMMDD_HHMMSS)", fontsize=8)
+    ax_imp.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    ax_imp.tick_params(axis="both", labelsize=7)
+    ax_imp.grid(True, which="major", alpha=0.35)
+    ax_imp.grid(True, which="minor", alpha=0.12)
+    for label in ax_imp.get_xticklabels():
+        label.set_rotation(18)
+        label.set_ha("right")
 
 
 def plot_channel_multi_comparison(
@@ -876,11 +875,11 @@ def plot_channel_multi_comparison(
     """PDF multi-pages : superposition de N enregistrements (mêmes canaux alignés)."""
     n_records = len(labels)
     if n_records < 2:
-        raise ValueError("plot_channel_multi_comparison attend au moins 2 enregistrements alignés.")
+        raise ValueError("plot_channel_multi_comparison requires at least 2 aligned recordings.")
     if not streaming_mode and (len(means) < 2 or len(means) != n_records):
-        raise ValueError("Mode non streaming: `means` doit contenir N enregistrements.")
+        raise ValueError("Non-streaming mode: `means` must contain N recordings.")
     if streaming_mode and (spike_sources is None or len(spike_sources) != n_records):
-        raise ValueError("Mode streaming: `spike_sources` doit contenir N enregistrements.")
+        raise ValueError("Streaming mode: `spike_sources` must contain N recordings.")
     output_dir.mkdir(parents=True, exist_ok=True)
     if pdf_title is not None and pdf_title.strip():
         safe_title = "".join(c if c.isalnum() or c in "._- " else "_" for c in pdf_title.strip())
@@ -891,7 +890,7 @@ def plot_channel_multi_comparison(
     pdf_path = output_dir / pdf_name
 
     zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
-    filt_note = f" — Butterworth passe-bas {lowpass_cutoff_hz:g} Hz" if lowpass_cutoff_hz is not None else ""
+    filt_note = f" — Butterworth low-pass {lowpass_cutoff_hz:g} Hz" if lowpass_cutoff_hz is not None else ""
     both_note = " — raw signal overlaid (filtered curve emphasized)" if lowpass_cutoff_hz is not None else ""
     zoom_title = f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){filt_note}{both_note}"
     n_channels = (
@@ -951,9 +950,14 @@ def plot_channel_multi_comparison(
                 if means_raw is not None and lowpass_cutoff_hz is not None:
                     means_raw_ch = [np.asarray(means_raw[i][ch]) for i in range(n_records)]
 
-            fig = plt.figure(figsize=(12, 38))
-            hr = [0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95]
-            gs = fig.add_gridspec(18, 1, height_ratios=hr, hspace=0.9)
+            hr_multi = [0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95]
+            if impedance_sessions:
+                hr_layout = [*hr_multi, 0.05, 0.56]
+                fig = plt.figure(figsize=(12, 42))
+                gs = fig.add_gridspec(len(hr_layout), 1, height_ratios=hr_layout, hspace=0.88)
+            else:
+                fig = plt.figure(figsize=(12, 38))
+                gs = fig.add_gridspec(18, 1, height_ratios=hr_multi, hspace=0.9)
             ax_hdr1 = fig.add_subplot(gs[0, 0]); ax_hdr1.axis("off")
             ax_hdr1.text(0.02, 0.5, "Part 1 — Full view (entire pre/post-trigger window)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr1.transAxes)
             ax_full = fig.add_subplot(gs[1, 0])
@@ -976,6 +980,22 @@ def plot_channel_multi_comparison(
             ax_trial_fr_ze = fig.add_subplot(gs[16, 0])
             ax_isi_ze = fig.add_subplot(gs[17, 0])
 
+            if impedance_sessions:
+                ax_imp_hdr = fig.add_subplot(gs[18, 0])
+                ax_imp_hdr.axis("off")
+                ax_imp_hdr.text(
+                    0.02,
+                    0.5,
+                    "Part 4 — Impedance |Z| @ 1 kHz vs session (CSV folder/folder.csv; chronological _YYMMDD_HHMMSS)",
+                    ha="left",
+                    va="center",
+                    fontsize=11,
+                    fontweight="bold",
+                    transform=ax_imp_hdr.transAxes,
+                )
+                ax_imp = fig.add_subplot(gs[19, 0])
+                _draw_impedance_evolution_panel(ax_imp, channel_names[ch], impedance_sessions)
+
             show_both = (
                 lowpass_cutoff_hz is not None
                 and means_raw_ch is not None
@@ -996,15 +1016,15 @@ def plot_channel_multi_comparison(
                 else:
                     ax_full.plot(t_rel, y, linewidth=1.2, color=c, label=labels[i])
                     ax_zoom.plot(t_rel[zmask], y[zmask], linewidth=1.3, color=c, label=labels[i])
-            ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (début)")
+            ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             for v in end_markers:
                 ax_full.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
                 ax_zoom.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
-            ax_full.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zone zoom")
+            ax_full.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
             if end_markers:
                 end_zoom_t0 = float(min(end_markers) + zoom_t0)
                 end_zoom_t1 = float(max(end_markers) + zoom_t1)
-                ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom area")
+                ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom region")
             spike_note = f" — + raster / rate / ISI ({spike_cmp_pipe})" if _has_spike_cmp else ""
             ax_full.set_title(f"Multi-comparison — {channel_names[ch]} (full view){filt_note}{both_note}{spike_note}")
             ax_full.set_ylabel("Potential (µV)")
@@ -1084,7 +1104,7 @@ def plot_channel_multi_comparison(
                     ax.text(0.5, 0.5, "ISI unavailable", ha="center", va="center", transform=ax.transAxes)
                     ax.set_axis_off()
 
-            for ax in (
+            _axes_tick_bottom = [
                 ax_full,
                 ax_zoom,
                 ax_raster_f,
@@ -1100,7 +1120,10 @@ def plot_channel_multi_comparison(
                 ax_trial_fr_ze,
                 ax_isi_ze,
                 ax_zoom_end,
-            ):
+            ]
+            if impedance_sessions:
+                _axes_tick_bottom.append(ax_imp)
+            for ax in _axes_tick_bottom:
                 ax.tick_params(axis="x", labelbottom=True)
 
             fig.tight_layout()
@@ -1127,9 +1150,6 @@ def plot_channel_multi_comparison(
             )
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=100 if lightweight_mode else 120)
             plt.close(fig)
-
-        if impedance_sessions:
-            _append_impedance_evolution_pages(pdf, channel_names, impedance_sessions, lightweight_mode)
 
     return pdf_path
 
@@ -1173,7 +1193,7 @@ def plot_channel_averages(
 
     zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
     filt_note = (
-        f" — Butterworth passe-bas {lowpass_cutoff_hz:g} Hz"
+        f" — Butterworth low-pass {lowpass_cutoff_hz:g} Hz"
         if lowpass_cutoff_hz is not None
         else ""
     )
@@ -1197,7 +1217,7 @@ def plot_channel_averages(
     _, spike_pipe_detail = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
     spike_note = (
         f" — spikes ({spike_pipe_detail}): {_spike_threshold_caption(spike_threshold_uv)}, "
-        f"lissage FR σ={firing_rate_window_s:g} s"
+        f"FR smoothing σ={firing_rate_window_s:g} s"
         if _has_spike_data
         else ""
     )
@@ -1308,20 +1328,20 @@ def plot_channel_averages(
                 )
             else:
                 ax_full.plot(t_rel, y, linewidth=1.2, color="C0", label="Mean")
-            ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (début)")
+            ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             if trigger_end_rising_rel_s is not None:
                 ax_full.axvline(
                     trigger_end_rising_rel_s,
                     linestyle=":",
                     linewidth=1.0,
                     color="darkorange",
-                    label="Fin trigger (↗)",
+                    label="Trigger end (rising)",
                 )
-            ax_full.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zone zoom")
+            ax_full.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
             if trigger_end_rising_rel_s is not None:
                 end_zoom_t0 = float(trigger_end_rising_rel_s + zoom_t0)
                 end_zoom_t1 = float(trigger_end_rising_rel_s + zoom_t1)
-                ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Zone zoom fin trigger")
+                ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom region")
             ax_full.set_title(
                 f"Trigger mean — {channel_names[ch]} (full view){filt_note}{both_note}{spike_note}"
             )
@@ -1376,18 +1396,18 @@ def plot_channel_averages(
                 end_zoom_range = (end_zoom_t0, end_zoom_t1)
                 end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
                 if show_both and y_raw is not None:
-                    ax_zoom_end.plot(t_rel[end_mask], y_raw[end_mask], linewidth=1.15, color="0.35", alpha=0.85, label="Non filtrée")
-                    ax_zoom_end.plot(t_rel[end_mask], y[end_mask], linewidth=1.45, color="C0", label=f"Filtrée ({lowpass_cutoff_hz:g} Hz)")
+                    ax_zoom_end.plot(t_rel[end_mask], y_raw[end_mask], linewidth=1.15, color="0.35", alpha=0.85, label="Unfiltered")
+                    ax_zoom_end.plot(t_rel[end_mask], y[end_mask], linewidth=1.45, color="C0", label=f"Filtered ({lowpass_cutoff_hz:g} Hz)")
                 else:
                     ax_zoom_end.plot(t_rel[end_mask], y[end_mask], linewidth=1.4, color="C0")
                 ax_zoom_end.axvline(trigger_end_rising_rel_s, linestyle="--", linewidth=1.0, color="darkorange")
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
-                ax_zoom_end.set_title(f"Partie 3 — Zoom fin trigger [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
+                ax_zoom_end.set_title(f"Part 3 — Trigger-end zoom [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
             else:
-                ax_zoom_end.text(0.5, 0.5, "Zoom fin trigger indisponible\n(pas de front montant après trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
+                ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
                 ax_zoom_end.set_axis_off()
 
             if _has_spike_data and (
@@ -1586,7 +1606,7 @@ def plot_channel_comparison(
 
     zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
     filt_note = (
-        f" — Butterworth passe-bas {lowpass_cutoff_hz:g} Hz"
+        f" — Butterworth low-pass {lowpass_cutoff_hz:g} Hz"
         if lowpass_cutoff_hz is not None
         else ""
     )
@@ -1725,14 +1745,14 @@ def plot_channel_comparison(
             else:
                 ax_full.plot(t_rel, ya, linewidth=1.2, color="C0", label=label_a)
                 ax_full.plot(t_rel, yb, linewidth=1.2, color="C1", label=label_b)
-            ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (début)")
+            ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             if trigger_end_rising_rel_s_a is not None:
                 ax_full.axvline(
                     trigger_end_rising_rel_s_a,
                     linestyle=":",
                     linewidth=1.0,
                     color="darkorange",
-                    label=f"Fin (↗) {label_a}",
+                    label=f"End (rising) {label_a}",
                 )
             if trigger_end_rising_rel_s_b is not None:
                 ax_full.axvline(
@@ -1740,16 +1760,16 @@ def plot_channel_comparison(
                     linestyle=":",
                     linewidth=1.0,
                     color="purple",
-                    label=f"Fin (↗) {label_b}",
+                    label=f"End (rising) {label_b}",
                 )
-            ax_full.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zone zoom")
+            ax_full.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
             end_markers = [v for v in (trigger_end_rising_rel_s_a, trigger_end_rising_rel_s_b) if v is not None]
             if end_markers:
                 end_zoom_t0 = float(min(end_markers) + zoom_t0)
                 end_zoom_t1 = float(max(end_markers) + zoom_t1)
-                ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Zone zoom fin trigger")
+                ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom region")
             spike_cmp_note = (
-                f" — + raster / taux / ISI ({spike_cmp_pipe})"
+                f" — + raster / rate / ISI ({spike_cmp_pipe})"
                 if _has_spike_cmp
                 else ""
             )
@@ -1835,13 +1855,13 @@ def plot_channel_comparison(
                 if trigger_end_rising_rel_s_b is not None:
                     ax_zoom_end.axvline(trigger_end_rising_rel_s_b, linestyle=":", linewidth=1.0, color="purple")
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
-                ax_zoom_end.set_title(f"Partie 3 — Zoom fin trigger [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
+                ax_zoom_end.set_title(f"Part 3 — Trigger-end zoom [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
                 ax_zoom_end.legend(loc="best", fontsize=6)
             else:
-                ax_zoom_end.text(0.5, 0.5, "Zoom fin trigger indisponible\n(pas de front montant après trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
+                ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
                 ax_zoom_end.set_axis_off()
 
             if _has_spike_cmp:

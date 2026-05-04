@@ -1,4 +1,4 @@
-"""Mesures d’impédance (export Intan CSV) associées aux enregistrements RHS."""
+"""Intan CSV impedance exports paired with RHS recordings."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
-# Export typique RHX / Intan (colonne littérale)
+# Typical RHX / Intan export (literal column header)
 _IMP_MAG_COL = "Impedance Magnitude at 1000 Hz (ohms)"
 _CH_COL = "Channel Number"
 
@@ -17,10 +17,10 @@ _TS_SUFFIX = re.compile(r"_(\d{2})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})$")
 
 
 def find_companion_impedance_csv(rhs_file: Path) -> Path | None:
-    """Cherche CSV d’impédance dans le même dossier que le .rhs.
+    """Look for an impedance CSV in the same directory as the .rhs file.
 
-    Convention attendue : ``<dossier_parent>/<nom_du_dossier>.csv``
-    (ex. dossier ``..._260430_144115`` + fichier ``..._260430_144115.csv``).
+    Expected layout: ``<parent_dir>/<parent_dir.name>.csv``
+    (e.g. folder ``..._260430_144115`` and file ``..._260430_144115.csv``).
     """
     parent = rhs_file.parent
     for ext in (".csv", ".CSV"):
@@ -31,7 +31,7 @@ def find_companion_impedance_csv(rhs_file: Path) -> Path | None:
 
 
 def parse_recording_timestamp(rhs_file: Path) -> datetime:
-    """Découpe la fin du nom (stem du .rhs puis du dossier) : suffixe ``_YYMMDD_HHMMSS``."""
+    """Parse trailing ``_YYMMDD_HHMMSS`` from the .rhs stem, then from the parent folder name."""
     for fragment in (rhs_file.stem, rhs_file.parent.name):
         dt = _parse_yymmdd_hhmmss_suffix(fragment)
         if dt is not None:
@@ -51,7 +51,7 @@ def _parse_yymmdd_hhmmss_suffix(text: str) -> datetime | None:
 
 
 def load_impedance_magnitude_1k_ohm(csv_path: Path) -> dict[str, float]:
-    """Lit le CSV ; clé = nom de canal (ex. A-000), valeur = |Z| à 1 kHz (Ω)."""
+    """Read CSV rows; keys are channel names (e.g. A-000), values are |Z| at 1 kHz (ohms)."""
     out: dict[str, float] = {}
     with csv_path.open(newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
@@ -88,7 +88,7 @@ class ImpedanceSession:
 
 
 def collect_impedance_sessions(rhs_files: Sequence[Path]) -> list[ImpedanceSession]:
-    """Pour chaque RHS : si un CSV companion existe, charge |Z|@1kHz et l’horodatage du nom."""
+    """For each RHS path: if a companion CSV exists, load |Z| at 1 kHz and timestamp from the filename."""
     sessions: list[ImpedanceSession] = []
     for rhs in rhs_files:
         csv_p = find_companion_impedance_csv(rhs)
