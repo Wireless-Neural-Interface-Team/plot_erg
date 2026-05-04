@@ -847,6 +847,75 @@ def _draw_impedance_evolution_panel(
         label.set_ha("right")
 
 
+def _append_mean_impedance_summary_page(
+    pdf: PdfPages,
+    sessions: Sequence[ImpedanceSession],
+    lightweight_mode: bool,
+) -> None:
+    """Final PDF page: mean |Z|@1 kHz averaged over CSV channels vs session time."""
+    if not sessions:
+        return
+    check_analysis_cancelled()
+    dpi = 100 if lightweight_mode else 120
+    fig, ax = plt.subplots(figsize=(11, 6))
+    times_num = np.array([mdates.date2num(s.when) for s in sessions], dtype=np.float64)
+    means_z: list[float] = []
+    stem_labels: list[str] = []
+    for s in sessions:
+        vals = np.asarray(list(s.magnitudes_ohm.values()), dtype=np.float64)
+        vals = vals[np.isfinite(vals) & (vals > 0)]
+        means_z.append(float(np.mean(vals)) if vals.size > 0 else float("nan"))
+        stem_labels.append(s.rhs_label[:50] + ("..." if len(s.rhs_label) > 50 else ""))
+
+    means_arr = np.asarray(means_z, dtype=np.float64)
+    valid = np.isfinite(means_arr) & (means_arr > 0)
+    if not np.any(valid):
+        ax.text(
+            0.5,
+            0.5,
+            "No valid mean impedance across sessions",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=11,
+        )
+        ax.set_axis_off()
+    else:
+        ax.semilogy(
+            times_num[valid],
+            means_arr[valid],
+            "o-",
+            color="darkgreen",
+            linewidth=1.5,
+            markersize=7,
+        )
+        ax.set_title(
+            "Recording-mean impedance |Z| @ 1 kHz\n(mean over channels in each companion CSV; chronological _YYMMDD_HHMMSS)"
+        )
+        ax.set_ylabel("Mean |Z| (Ω), log scale")
+        ax.set_xlabel("Session time")
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M"))
+        ax.tick_params(axis="x", labelsize=8)
+        ax.grid(True, which="major", alpha=0.35)
+        ax.grid(True, which="minor", alpha=0.12)
+        for label in ax.get_xticklabels():
+            label.set_rotation(15)
+            label.set_ha("right")
+        if int(np.count_nonzero(valid)) <= 12:
+            for i in np.flatnonzero(valid):
+                ax.annotate(
+                    stem_labels[int(i)],
+                    (times_num[int(i)], means_arr[int(i)]),
+                    textcoords="offset points",
+                    xytext=(4, 4),
+                    fontsize=6,
+                    alpha=0.85,
+                )
+
+    pdf.savefig(fig, bbox_inches="tight", pad_inches=0.25, dpi=dpi)
+    plt.close(fig)
+
+
 def plot_channel_multi_comparison(
     t_rel: np.ndarray,
     means: Sequence[np.ndarray],
@@ -1150,6 +1219,9 @@ def plot_channel_multi_comparison(
             )
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=100 if lightweight_mode else 120)
             plt.close(fig)
+
+        if impedance_sessions:
+            _append_mean_impedance_summary_page(pdf, impedance_sessions, lightweight_mode)
 
     return pdf_path
 
