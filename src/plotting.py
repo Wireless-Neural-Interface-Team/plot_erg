@@ -7,6 +7,7 @@ from typing import Any, Optional, Sequence, Tuple
 import matplotlib
 
 matplotlib.use("Agg")
+import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
@@ -18,6 +19,7 @@ from core import (
     check_analysis_cancelled,
     detect_spikes_at_threshold,
 )
+from impedance_tracking import ImpedanceSession
 
 # Fenetre du panneau zoom (s), temps relatif au trigger (t=0)
 ZOOM_T0 = -0.1
@@ -812,6 +814,40 @@ def _draw_spike_panels_multi_channel(
         ax_isi.set_axis_off()
 
 
+def _append_impedance_evolution_pages(
+    pdf: PdfPages,
+    channel_names: Sequence[str],
+    sessions: Sequence[ImpedanceSession],
+    lightweight_mode: bool,
+) -> None:
+    """Ajoute une page par canal : évolution de |Z|@1 kHz (CSV Intan) vs le temps des sessions."""
+    if not sessions:
+        return
+    dpi = 100 if lightweight_mode else 120
+    times_num = np.array([mdates.date2num(s.when) for s in sessions], dtype=np.float64)
+    for ch_name in channel_names:
+        check_analysis_cancelled()
+        ys = np.array([s.magnitudes_ohm.get(ch_name, float("nan")) for s in sessions], dtype=np.float64)
+        valid = np.isfinite(ys) & (ys > 0)
+        if not np.any(valid):
+            continue
+        fig, ax = plt.subplots(figsize=(11, 5.5))
+        ax.semilogy(times_num[valid], ys[valid], "o-", color="C0", linewidth=1.4, markersize=6)
+        ax.set_title(
+            f"Impédance |Z| @ 1 kHz — {ch_name}\n"
+            "(CSV « nom_dossier/nom_dossier.csv » ; ordre chronologique _YYMMDD_HHMMSS)"
+        )
+        ax.set_ylabel("|Z| à 1 kHz (Ω), échelle log")
+        ax.set_xlabel("Date / heure (suffixe fin de nom : année, mois, jour, puis h, min, s)")
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M:%S"))
+        ax.tick_params(axis="x", labelsize=8)
+        ax.grid(True, which="major", alpha=0.35)
+        ax.grid(True, which="minor", alpha=0.15)
+        fig.autofmt_xdate()
+        pdf.savefig(fig, bbox_inches="tight", pad_inches=0.25, dpi=dpi)
+        plt.close(fig)
+
+
 def plot_channel_multi_comparison(
     t_rel: np.ndarray,
     means: Sequence[np.ndarray],
@@ -835,6 +871,7 @@ def plot_channel_multi_comparison(
     streaming_mode: bool = False,
     pre_n_common: Optional[int] = None,
     post_n_common: Optional[int] = None,
+    impedance_sessions: Optional[Sequence[ImpedanceSession]] = None,
 ) -> Path:
     """PDF multi-pages : superposition de N enregistrements (mêmes canaux alignés)."""
     n_records = len(labels)
@@ -970,7 +1007,7 @@ def plot_channel_multi_comparison(
                 ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom area")
             spike_note = f" — + raster / rate / ISI ({spike_cmp_pipe})" if _has_spike_cmp else ""
             ax_full.set_title(f"Multi-comparison — {channel_names[ch]} (full view){filt_note}{both_note}{spike_note}")
-            ax_full.set_ylabel("Amplitude (µV)")
+            ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
             ax_full.legend(loc="upper center", bbox_to_anchor=(0.5, -0.36), ncol=4, fontsize=6)
@@ -978,7 +1015,7 @@ def plot_channel_multi_comparison(
             ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
             ax_zoom.set_xlim(zoom_t0, zoom_t1)
             ax_zoom.set_title(zoom_title)
-            ax_zoom.set_ylabel("Amplitude (µV)")
+            ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
 
@@ -1001,7 +1038,7 @@ def plot_channel_multi_comparison(
                     ax_zoom_end.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
                 ax_zoom_end.set_title(f"Trigger-end zoom: {end_zoom_t0:.2f} to {end_zoom_t1:.2f} s (relative to trigger){filt_note}{both_note}")
-                ax_zoom_end.set_ylabel("Amplitude (µV)")
+                ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
             else:
@@ -1090,6 +1127,9 @@ def plot_channel_multi_comparison(
             )
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=100 if lightweight_mode else 120)
             plt.close(fig)
+
+        if impedance_sessions:
+            _append_impedance_evolution_pages(pdf, channel_names, impedance_sessions, lightweight_mode)
 
     return pdf_path
 
@@ -1285,7 +1325,7 @@ def plot_channel_averages(
             ax_full.set_title(
                 f"Trigger mean — {channel_names[ch]} (full view){filt_note}{both_note}{spike_note}"
             )
-            ax_full.set_ylabel("Amplitude (µV)")
+            ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
             ax_full.legend(
@@ -1324,7 +1364,7 @@ def plot_channel_averages(
                 )
             ax_zoom.set_xlim(zoom_t0, zoom_t1)
             ax_zoom.set_title(zoom_title)
-            ax_zoom.set_ylabel("Amplitude (µV)")
+            ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
             if show_both:
@@ -1343,7 +1383,7 @@ def plot_channel_averages(
                 ax_zoom_end.axvline(trigger_end_rising_rel_s, linestyle="--", linewidth=1.0, color="darkorange")
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
                 ax_zoom_end.set_title(f"Partie 3 — Zoom fin trigger [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
-                ax_zoom_end.set_ylabel("Amplitude (µV)")
+                ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
             else:
@@ -1716,7 +1756,7 @@ def plot_channel_comparison(
             ax_full.set_title(
                 f"Comparison — {channel_names[ch]} (full view){filt_note}{both_note}{spike_cmp_note}"
             )
-            ax_full.set_ylabel("Amplitude (µV)")
+            ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
             ax_full.legend(
@@ -1777,7 +1817,7 @@ def plot_channel_comparison(
                 )
             ax_zoom.set_xlim(zoom_t0, zoom_t1)
             ax_zoom.set_title(zoom_title)
-            ax_zoom.set_ylabel("Amplitude (µV)")
+            ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
             ax_zoom.legend(loc="best", fontsize=6)
@@ -1796,7 +1836,7 @@ def plot_channel_comparison(
                     ax_zoom_end.axvline(trigger_end_rising_rel_s_b, linestyle=":", linewidth=1.0, color="purple")
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
                 ax_zoom_end.set_title(f"Partie 3 — Zoom fin trigger [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
-                ax_zoom_end.set_ylabel("Amplitude (µV)")
+                ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
                 ax_zoom_end.legend(loc="best", fontsize=6)

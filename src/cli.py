@@ -26,6 +26,7 @@ from core import (
     valid_triggers_and_timebase,
 )
 from gui import launch_qt_gui
+from impedance_tracking import collect_impedance_sessions
 from plotting import plot_channel_averages, plot_channel_comparison, plot_channel_multi_comparison
 
 
@@ -499,6 +500,14 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
         pre_n_common = min(pre_vals)
         post_n_common = min(post_vals)
         out_dir = tuned[0].save_dir if tuned[0].save_dir is not None else tuned[0].rhs_file.parent
+        imp_sessions = collect_impedance_sessions([cfg.rhs_file for cfg in tuned])
+        if imp_sessions:
+            n_skip = len(tuned) - len(imp_sessions)
+            print(
+                f"Impédance |Z| @ 1 kHz : {len(imp_sessions)} session(s) avec CSV companion "
+                f"(suffixe _YYMMDD_HHMMSS, tri chronologique) — pages ajoutées au PDF."
+                + (f" ({n_skip} RHS sans CSV ignoré(s).)" if n_skip else "")
+            )
         t_render0 = time.perf_counter()
         pdf_path = plot_channel_multi_comparison(
             t_rel=t_ref,
@@ -523,6 +532,7 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             streaming_mode=True,
             pre_n_common=pre_n_common,
             post_n_common=post_n_common,
+            impedance_sessions=imp_sessions if imp_sessions else None,
         )
         t_render_s = time.perf_counter() - t_render0
         stats: dict[str, object] = {
