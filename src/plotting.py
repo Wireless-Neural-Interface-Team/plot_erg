@@ -21,23 +21,23 @@ from core import (
 )
 from impedance_tracking import ImpedanceSession
 
-# Fenetre du panneau zoom (s), temps relatif au trigger (t=0)
+# Zoom panel window (s), time relative to trigger (t=0)
 ZOOM_T0 = -0.1
 ZOOM_T1 = 0.2
 
-# ISI : uniquement les spikes dans [-ISI_HALF_WINDOW_S, +ISI_HALF_WINDOW_S] (s rel. trigger)
+# ISI: only spikes within [-ISI_HALF_WINDOW_S, +ISI_HALF_WINDOW_S] (s relative to trigger)
 ISI_HALF_WINDOW_S = 1.0
 
-# Abscisse (temps rel. trigger, s) des panneaux ISI (nuage temps × ISI)
+# X-axis (time relative to trigger, s) for ISI panels (time x ISI scatter)
 ISI_ABSCISSA_T0_S = 0.0
 ISI_ABSCISSA_T1_S = 2.0
 
-# Libellé d'abscisse pour tous les graphiques en temps rel. au trigger
+# X-axis label for all time-relative-to-trigger plots
 TIME_REL_XLABEL = "Time relative to trigger (s)"
 
 
 def _downsample_points(x: np.ndarray, y: np.ndarray, sampling_percent: int) -> tuple[np.ndarray, np.ndarray]:
-    """Sous-échantillonne des points (x, y) de manière déterministe."""
+    """Deterministically subsample (x, y) points."""
     pct = int(np.clip(int(sampling_percent), 1, 100))
     if pct >= 100 or x.size <= 1:
         return x, y
@@ -47,7 +47,7 @@ def _downsample_points(x: np.ndarray, y: np.ndarray, sampling_percent: int) -> t
 
 
 def _shorten_filename_for_windows(output_dir: Path, filename: str, max_full_len: int = 240) -> str:
-    """Raccourcit un nom de fichier pour limiter la longueur de chemin Windows."""
+    """Shorten a filename to keep Windows path length under control."""
     full = str(output_dir / filename)
     if len(full) <= max_full_len:
         return filename
@@ -59,14 +59,14 @@ def _shorten_filename_for_windows(output_dir: Path, filename: str, max_full_len:
 
 
 def _shift_axes_down(axes: Sequence[Any], delta: float) -> None:
-    """Décale un groupe d'axes vers le bas (coordonnées figure)."""
+    """Shift a group of axes downward (figure coordinates)."""
     for ax in axes:
         pos = ax.get_position()
         ax.set_position([pos.x0, pos.y0 - delta, pos.width, pos.height])
 
 
 def _shorten_filename_for_windows(output_dir: Path, filename: str, max_total_len: int = 240) -> str:
-    """Raccourcit le nom de fichier si le chemin total risque de dépasser la limite Windows."""
+    """Shorten filename if total path length may exceed Windows limits."""
     full_len = len(str(output_dir / filename))
     if full_len <= max_total_len:
         return filename
@@ -93,7 +93,7 @@ def _spike_times_per_trial(
     fs: float,
     threshold: float,
 ) -> list[np.ndarray]:
-    """Pour un canal : liste de tableaux de temps (s) relatifs au trigger, un par essai."""
+    """For one channel: list of spike-time arrays (s rel. trigger), one per trial."""
     n_trials = int(windows_ch.shape[0])
     out: list[np.ndarray] = []
     for i in range(n_trials):
@@ -110,9 +110,9 @@ def _psth_mean_hz(
     smooth_sigma_s: float,
     t_range_s: Optional[Tuple[float, float]] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """PSTH moyen (Hz) : nombre de spikes par bin / (n_trials * bin_width).
+    """Mean PSTH (Hz): spike count per bin / (n_trials * bin_width).
 
-    t_range_s : si (t0, t1), histogramme sur cet intervalle uniquement (spikes hors plage exclus).
+    t_range_s: if (t0, t1), histogram only on this interval (out-of-range spikes excluded).
     """
     if t_range_s is not None:
         t0, t1 = float(t_range_s[0]), float(t_range_s[1])
@@ -188,7 +188,7 @@ def _spike_pipeline_captions(
     spike_bandpass_low_hz: Optional[float],
     spike_bandpass_high_hz: Optional[float],
 ) -> Tuple[str, str]:
-    """(court pour sous-titres, détail pour note de page)"""
+    """(short for subtitles, detailed for footer note)"""
     if spike_bandpass_low_hz is not None and spike_bandpass_high_hz is not None:
         flo = float(spike_bandpass_low_hz)
         fhi = float(spike_bandpass_high_hz)
@@ -203,7 +203,7 @@ def _isi_time_and_values_s(
     *,
     isi_window_s: Optional[Tuple[float, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Temps de fin d'intervalle (s rel. trigger) et ISI (s) pour chaque paire consécutive."""
+    """Interval end time (s rel. trigger) and ISI (s) for each consecutive pair."""
     if isi_window_s is None:
         lo, hi = -float(ISI_HALF_WINDOW_S), float(ISI_HALF_WINDOW_S)
     else:
@@ -229,7 +229,7 @@ def _concat_isi_s(
     *,
     isi_window_s: Optional[Tuple[float, float]] = None,
 ) -> np.ndarray:
-    """ISI intra-essai (s), concaténation des écarts."""
+    """Within-trial ISI (s), concatenated intervals."""
     _, isi = _isi_time_and_values_s(spike_times_per_trial, isi_window_s=isi_window_s)
     return isi
 
@@ -253,7 +253,7 @@ def _draw_spike_panels_single_channel(
     lightweight_mode: bool = False,
     sampling_percent: int = 100,
 ) -> None:
-    """Raster, PSTH / firing rate, ISI (temps rel. trigger × durée) pour un canal."""
+    """Raster, PSTH / firing rate, ISI (time rel. trigger x duration) for one channel."""
     short, _ = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
     n_tr = int(w_ch.shape[0])
     if st_per_tr is None:
@@ -385,7 +385,7 @@ def _draw_spike_panels_dual_channel(
     lightweight_mode: bool = False,
     sampling_percent: int = 100,
 ) -> None:
-    """Raster / PSTH / ISI superposés pour deux enregistrements (même canal, même axe temps)."""
+    """Overlaid raster / PSTH / ISI for two recordings (same channel, same time axis)."""
     short, _ = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
     n_a = int(w_a.shape[0])
     n_b = int(w_b.shape[0])
@@ -552,7 +552,7 @@ def _draw_spike_panels_multi_channel(
     lightweight_mode: bool = False,
     sampling_percent: int = 100,
 ) -> None:
-    """Raster / PSTH / ISI superposés pour N enregistrements."""
+    """Overlaid raster / PSTH / ISI for N recordings."""
     short, _ = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
     if spikes_per_recording is None:
         spikes_per_recording = [
@@ -685,7 +685,7 @@ def _draw_spike_panels_multi_channel(
     lightweight_mode: bool = False,
     sampling_percent: int = 100,
 ) -> None:
-    """Raster / PSTH / ISI superposés pour N enregistrements."""
+    """Overlaid raster / PSTH / ISI for N recordings."""
     short, _ = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
     if spikes_per_recording is None:
         spikes_per_recording = [
@@ -835,10 +835,50 @@ def _draw_impedance_evolution_panel(
         )
         ax_imp.set_axis_off()
         return
-    ax_imp.semilogy(times_num[valid], ys[valid], "o-", color="C0", linewidth=1.2, markersize=4)
+    default_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0"])
+    valid_idx = np.flatnonzero(valid)
+    point_colors = [default_colors[int(i) % len(default_colors)] for i in valid_idx]
+    ax_imp.semilogy(
+        times_num[valid],
+        ys[valid],
+        linestyle="None",
+        marker="o",
+        markersize=5,
+        markeredgewidth=0.0,
+        color="none",
+    )
+    ax_imp.scatter(
+        times_num[valid],
+        ys[valid],
+        s=26,
+        c=point_colors,
+        alpha=0.95,
+        edgecolors="none",
+        zorder=3,
+    )
+    for x_val, y_val in zip(times_num[valid], ys[valid]):
+        ax_imp.annotate(
+            f"{y_val:.3e} Ω",
+            (x_val, y_val),
+            textcoords="offset points",
+            xytext=(0, 6),
+            ha="center",
+            va="bottom",
+            fontsize=7,
+            alpha=0.9,
+            zorder=4,
+        )
     ax_imp.set_ylabel("|Z| @ 1 kHz (Ω)", fontsize=8)
     ax_imp.set_xlabel("Session time (_YYMMDD_HHMMSS)", fontsize=8)
-    ax_imp.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    valid_times = times_num[valid]
+    day_start = np.floor(np.min(valid_times))
+    day_end = np.ceil(np.max(valid_times))
+    if day_end <= day_start:
+        day_end = day_start + 1.0
+    ax_imp.set_xlim(day_start, day_end)
+    ax_imp.xaxis.set_major_locator(mdates.DayLocator(interval=1))
+    ax_imp.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    ax_imp.set_xticks(valid_times.tolist(), minor=True)
     ax_imp.tick_params(axis="both", labelsize=7)
     ax_imp.grid(True, which="major", alpha=0.35)
     ax_imp.grid(True, which="minor", alpha=0.12)
@@ -881,16 +921,29 @@ def _append_mean_impedance_summary_page(
         )
         ax.set_axis_off()
     else:
+        default_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0"])
+        valid_idx = np.flatnonzero(valid)
+        point_colors = [default_colors[int(i) % len(default_colors)] for i in valid_idx]
         ax.semilogy(
             times_num[valid],
             means_arr[valid],
-            "o-",
-            color="darkgreen",
-            linewidth=1.5,
-            markersize=7,
+            linestyle="None",
+            marker="o",
+            markersize=6,
+            markeredgewidth=0.0,
+            color="none",
+        )
+        ax.scatter(
+            times_num[valid],
+            means_arr[valid],
+            s=42,
+            c=point_colors,
+            alpha=0.95,
+            edgecolors="none",
+            zorder=3,
         )
         ax.set_title(
-            "Recording-mean impedance |Z| @ 1 kHz\n(mean over channels in each companion CSV; chronological _YYMMDD_HHMMSS)"
+            "Recording-mean impedance |Z| @ 1 kHz\n(mean over channels in each recording)"
         )
         ax.set_ylabel("Mean |Z| (Ω), log scale")
         ax.set_xlabel("Session time")
@@ -941,7 +994,7 @@ def plot_channel_multi_comparison(
     post_n_common: Optional[int] = None,
     impedance_sessions: Optional[Sequence[ImpedanceSession]] = None,
 ) -> Path:
-    """PDF multi-pages : superposition de N enregistrements (mêmes canaux alignés)."""
+    """Multi-page PDF: overlay of N recordings (same aligned channels)."""
     n_records = len(labels)
     if n_records < 2:
         raise ValueError("plot_channel_multi_comparison requires at least 2 aligned recordings.")
@@ -985,7 +1038,7 @@ def plot_channel_multi_comparison(
             means_raw_ch: list[np.ndarray] | None = [] if lowpass_cutoff_hz is not None else None
             if streaming_mode:
                 if pre_n_common is None or post_n_common is None:
-                    raise ValueError("Mode streaming: pre_n_common/post_n_common requis.")
+                    raise ValueError("Streaming mode: pre_n_common/post_n_common are required.")
                 win_len = int(pre_n_common) + int(post_n_common)
                 for src in (spike_sources or []):
                     if src is None:
@@ -1021,7 +1074,7 @@ def plot_channel_multi_comparison(
 
             hr_multi = [0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95]
             if impedance_sessions:
-                hr_layout = [*hr_multi, 0.05, 0.56]
+                hr_layout = [*hr_multi, 0.05, 0.95]
                 fig = plt.figure(figsize=(12, 42))
                 gs = fig.add_gridspec(len(hr_layout), 1, height_ratios=hr_layout, hspace=0.88)
             else:
@@ -1054,8 +1107,8 @@ def plot_channel_multi_comparison(
                 ax_imp_hdr.axis("off")
                 ax_imp_hdr.text(
                     0.02,
-                    0.5,
-                    "Part 4 — Impedance |Z| @ 1 kHz vs session (CSV folder/folder.csv; chronological _YYMMDD_HHMMSS)",
+                    0.25,
+                    "Part 4 — Impedance |Z| @ 1 kHz vs session",
                     ha="left",
                     va="center",
                     fontsize=11,
@@ -1094,8 +1147,7 @@ def plot_channel_multi_comparison(
                 end_zoom_t0 = float(min(end_markers) + zoom_t0)
                 end_zoom_t1 = float(max(end_markers) + zoom_t1)
                 ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom region")
-            spike_note = f" — + raster / rate / ISI ({spike_cmp_pipe})" if _has_spike_cmp else ""
-            ax_full.set_title(f"Multi-comparison — {channel_names[ch]} (full view){filt_note}{both_note}{spike_note}")
+            ax_full.set_title(f"Multi-comparison — {channel_names[ch]} (full view){filt_note}{both_note}")
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
@@ -1136,8 +1188,8 @@ def plot_channel_multi_comparison(
 
             if _has_spike_cmp and spike_sources is not None:
                 sources_ok = [src for src in spike_sources if src is not None]
-                # Détection des spikes calculée une seule fois par canal/fichier,
-                # puis réutilisée pour full / zoom / zoom fin.
+                # Spike detection is computed once per channel/file,
+                # then reused for full / zoom / trigger-end zoom.
                 st_list = [
                     src.spike_times_per_trial_for_channel(ch, t_rel, spike_threshold_uv)
                     for src in sources_ok
@@ -1248,10 +1300,10 @@ def plot_channel_averages(
     lightweight_mode: bool = False,
     sampling_percent: int = 100,
 ) -> Path:
-    """Un seul PDF multi-pages (une page par canal), sans fenêtre graphique.
+    """Single multi-page PDF (one page per channel), without GUI window.
 
-    Les valeurs amplificateur Intan sont affichées en microvolts (µV), comme
-    fournies par load_intan_rhs_format (amplifier_data).
+    Intan amplifier values are displayed in microvolts (uV), as
+    provided by load_intan_rhs_format (amplifier_data).
     """
     n_channels = mean_per_channel.shape[0]
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1493,8 +1545,8 @@ def plot_channel_averages(
                     w_ch = np.empty((len(st_per_tr), 1), dtype=np.float32)
                 else:
                     w_ch = np.asarray(windows[:, ch, :])
-                    # Détection spikes calculée une seule fois par canal,
-                    # puis réutilisée pour full / zoom / zoom fin.
+                    # Spike detection is computed once per channel,
+                    # then reused for full / zoom / trigger-end zoom.
                     st_per_tr = _spike_times_per_trial(
                         w_ch, t_rel, float(fs), spike_threshold_uv
                     )
@@ -1664,7 +1716,7 @@ def plot_channel_comparison(
     lightweight_mode: bool = False,
     sampling_percent: int = 100,
 ) -> Path:
-    """PDF multi-pages : par canal, moyennes + zoom + raster / PSTH / ISI (deux enregistrements superposés)."""
+    """Multi-page PDF: per channel, means + zoom + raster / PSTH / ISI (two overlaid recordings)."""
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_a = "".join(c if c.isalnum() or c in "._-" else "_" for c in label_a)[:80]
     safe_b = "".join(c if c.isalnum() or c in "._-" else "_" for c in label_b)[:80]
@@ -1937,8 +1989,8 @@ def plot_channel_comparison(
                 ax_zoom_end.set_axis_off()
 
             if _has_spike_cmp:
-                # Détection spikes calculée une seule fois par canal (A/B),
-                # puis réutilisée pour full / zoom / zoom fin.
+                # Spike detection is computed once per channel (A/B),
+                # then reused for full / zoom / trigger-end zoom.
                 sta = spike_source_a.spike_times_per_trial_for_channel(ch, t_rel, spike_threshold_uv)
                 stb = spike_source_b.spike_times_per_trial_for_channel(ch, t_rel, spike_threshold_uv)
                 w_a = np.empty((len(sta), 1), dtype=np.float32)
