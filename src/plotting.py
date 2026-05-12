@@ -20,7 +20,7 @@ from core import (
     detect_spikes_at_threshold,
 )
 from impedance_tracking import ImpedanceSession
-from probe_layout import draw_probe_inset_on_axes, load_probe_layout_json
+from probe_layout import draw_probe_inset_on_axes, load_probe_layout_json, match_contact_index
 
 # Zoom panel window (s), time relative to trigger (t=0)
 ZOOM_T0 = -0.1
@@ -1078,13 +1078,20 @@ def plot_channel_multi_comparison(
                 if means_raw is not None and lowpass_cutoff_hz is not None:
                     means_raw_ch = [np.asarray(means_raw[i][ch]) for i in range(n_records)]
 
-            hr_multi = [0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95]
+            show_mea_panel = probe_layout_loaded is not None and (
+                match_contact_index(probe_layout_loaded, str(channel_names[ch])) is not None
+            )
+            fig_w = 18.0 if show_mea_panel else 12.0
+            hdr0 = 0.72 if show_mea_panel else 0.06
+            hr_multi = [hdr0, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95]
             if impedance_sessions:
                 hr_layout = [*hr_multi, 0.05, 0.95]
-                fig = plt.figure(figsize=(12, 42))
+                fig_h = 64.0 if show_mea_panel else 42.0
+                fig = plt.figure(figsize=(fig_w, fig_h))
                 gs = fig.add_gridspec(len(hr_layout), 1, height_ratios=hr_layout, hspace=0.88)
             else:
-                fig = plt.figure(figsize=(12, 38))
+                fig_h = 58.0 if show_mea_panel else 38.0
+                fig = plt.figure(figsize=(fig_w, fig_h))
                 gs = fig.add_gridspec(18, 1, height_ratios=hr_multi, hspace=0.9)
             ax_hdr1 = fig.add_subplot(gs[0, 0]); ax_hdr1.axis("off")
             ax_hdr1.text(0.02, 0.5, "Part 1 — Full view (entire pre/post-trigger window)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr1.transAxes)
@@ -1275,8 +1282,8 @@ def plot_channel_multi_comparison(
                 ],
                 delta=0.015,
             )
-            if probe_layout_loaded is not None:
-                draw_probe_inset_on_axes(ax_full, probe_layout_loaded, ch, str(channel_names[ch]))
+            if show_mea_panel:
+                draw_probe_inset_on_axes(ax_hdr1, probe_layout_loaded, str(channel_names[ch]))
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=100 if lightweight_mode else 120)
             plt.close(fig)
 
@@ -1363,25 +1370,38 @@ def plot_channel_averages(
         for ch in range(n_channels):
             check_analysis_cancelled()
             y = mean_per_channel[ch]
-            fig = plt.figure(figsize=(12, 38))
-            hr = [
-                0.06,
-                1.05,
-                1.15,
-                0.95,
-                0.95,
-                0.06,
-                1.05,
-                1.15,
-                0.95,
-                0.95,
-                0.06,
-                1.05,
-                1.15,
-                0.95,
-                0.95,
-            ]
-            gs = fig.add_gridspec(18, 1, height_ratios=[0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95], hspace=0.9)
+            show_mea_panel = probe_layout_loaded is not None and (
+                match_contact_index(probe_layout_loaded, str(channel_names[ch])) is not None
+            )
+            fig_w = 18.0 if show_mea_panel else 12.0
+            hdr_ratio = 0.72 if show_mea_panel else 0.06
+            fig_h = 58.0 if show_mea_panel else 38.0
+            fig = plt.figure(figsize=(fig_w, fig_h))
+            gs = fig.add_gridspec(
+                18,
+                1,
+                height_ratios=[
+                    hdr_ratio,
+                    1.05,
+                    1.10,
+                    0.90,
+                    0.85,
+                    0.95,
+                    0.06,
+                    1.05,
+                    1.10,
+                    0.90,
+                    0.85,
+                    0.95,
+                    0.06,
+                    1.05,
+                    1.10,
+                    0.90,
+                    0.85,
+                    0.95,
+                ],
+                hspace=0.9,
+            )
             ax_hdr1 = fig.add_subplot(gs[0, 0])
             ax_hdr1.axis("off")
             ax_hdr1.text(
@@ -1697,8 +1717,8 @@ def plot_channel_averages(
                 ],
                 delta=0.015,
             )
-            if probe_layout_loaded is not None:
-                draw_probe_inset_on_axes(ax_full, probe_layout_loaded, ch, str(channel_names[ch]))
+            if show_mea_panel:
+                draw_probe_inset_on_axes(ax_hdr1, probe_layout_loaded, str(channel_names[ch]))
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=100 if lightweight_mode else 120)
             plt.close(fig)
 
