@@ -28,6 +28,7 @@ from core import (
 from gui import launch_qt_gui
 from impedance_tracking import collect_impedance_sessions
 from plotting import plot_channel_averages, plot_channel_comparison, plot_channel_multi_comparison
+from probe_layout import load_probe_layout_json
 
 
 def _to_temp_mmap(arr: np.ndarray, folder: Path, name: str) -> np.ndarray:
@@ -254,6 +255,12 @@ def parse_args() -> argparse.Namespace:
         default=100,
         help="Pourcentage de points conserves dans raster/ISI (1..100, defaut: 100).",
     )
+    parser.add_argument(
+        "--probe-layout-json",
+        type=Path,
+        default=None,
+        help="JSON probeinterface (MEA) : encart carte electrodes en haut a droite si le canal est mappe.",
+    )
     return parser.parse_args()
 
 
@@ -261,6 +268,11 @@ def run(config: AnalysisConfig) -> None:
     spike_src: AmplifierSpikeSource | None = None
     t0 = time.perf_counter()
     try:
+        if config.probe_layout_json is not None:
+            pj = config.probe_layout_json
+            if not pj.exists():
+                raise FileNotFoundError(f"Probe JSON introuvable : {pj}")
+            load_probe_layout_json(pj)
         (
             mean_per_channel,
             t_rel,
@@ -305,6 +317,7 @@ def run(config: AnalysisConfig) -> None:
                 spike_bandpass_high_hz=config.spike_bandpass_high_hz,
                 lightweight_mode=config.lightweight_plot,
                 sampling_percent=config.sampling_percent,
+                probe_layout_json=config.probe_layout_json,
             )
         print(f"Frequence d'echantillonnage: {fs:.2f} Hz")
         print("--- Triggers (ANALOG_IN 0) ---")
@@ -533,6 +546,7 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             pre_n_common=pre_n_common,
             post_n_common=post_n_common,
             impedance_sessions=imp_sessions if imp_sessions else None,
+            probe_layout_json=tuned[0].probe_layout_json,
         )
         t_render_s = time.perf_counter() - t_render0
         stats: dict[str, object] = {
@@ -574,6 +588,7 @@ def main() -> None:
             default_channel_workers=args.channel_workers,
             default_lightweight_plot=args.lightweight_plot,
             default_sampling_percent=args.sampling_percent,
+            default_probe_layout_json=args.probe_layout_json,
         )
         if exit_code != 0:
             sys.exit(exit_code)
@@ -600,6 +615,7 @@ def main() -> None:
         channel_workers=args.channel_workers,
         lightweight_plot=args.lightweight_plot,
         sampling_percent=args.sampling_percent,
+        probe_layout_json=args.probe_layout_json,
     )
     if config.zoom_t1_s <= config.zoom_t0_s:
         print("Erreur: --zoom-t1-s doit être strictement supérieur à --zoom-t0-s.", file=sys.stderr)

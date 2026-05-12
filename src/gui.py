@@ -10,6 +10,7 @@ from typing import Callable
 
 from config import AnalysisConfig
 from core import analysis_cancel_scope
+from probe_layout import load_probe_layout_json
 
 
 def launch_qt_gui(
@@ -30,6 +31,7 @@ def launch_qt_gui(
     default_channel_workers: int | None = None,
     default_lightweight_plot: bool = False,
     default_sampling_percent: int = 100,
+    default_probe_layout_json: Path | None = None,
 ) -> int:
     try:
         from PySide6.QtCore import QThread, Signal
@@ -189,6 +191,14 @@ def launch_qt_gui(
     save_row.addWidget(browse_save_btn)
     pdf_title_edit = QLineEdit()
     pdf_title_edit.setPlaceholderText("empty = auto name from .rhs file")
+    probe_layout_json_edit = QLineEdit()
+    if default_probe_layout_json is not None:
+        probe_layout_json_edit.setText(str(default_probe_layout_json))
+    probe_layout_json_edit.setPlaceholderText("optionnel — JSON probeinterface (carte MEA)")
+    browse_probe_json_btn = QPushButton("Parcourir…")
+    probe_json_row = QHBoxLayout()
+    probe_json_row.addWidget(probe_layout_json_edit)
+    probe_json_row.addWidget(browse_probe_json_btn)
     channel_workers_edit = QLineEdit()
     if default_channel_workers is not None:
         channel_workers_edit.setText(str(default_channel_workers))
@@ -207,6 +217,7 @@ def launch_qt_gui(
     general_form.addRow("", keep_work_cb)
     general_form.addRow("PDF output folder (empty = .rhs folder):", save_row)
     general_form.addRow("PDF title/name:", pdf_title_edit)
+    general_form.addRow("Probe MEA (JSON probeinterface):", probe_json_row)
     general_form.addRow("Channel workers (max 16, empty = auto):", channel_workers_edit)
     general_form.addRow("", lightweight_plot_cb)
     general_form.addRow("Spike display sampling (%):", sampling_percent_edit)
@@ -467,6 +478,29 @@ def launch_qt_gui(
         if selected:
             save_dir_edit.setText(selected)
 
+    def browse_probe_layout_json() -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            window,
+            "JSON probeinterface (MEA)",
+            "",
+            "JSON (*.json);;Tous les fichiers (*)",
+        )
+        if selected:
+            probe_layout_json_edit.setText(selected)
+
+    def resolve_probe_layout_json_param() -> Path | None:
+        pj = probe_layout_json_edit.text().strip()
+        if not pj:
+            return None
+        pp = Path(pj)
+        if not pp.exists():
+            raise ValueError(f"Fichier probe JSON introuvable : {pp}")
+        try:
+            load_probe_layout_json(pp)
+        except Exception as exc:
+            raise ValueError(f"JSON probe invalide : {exc}") from exc
+        return pp
+
     analysis_thread: QThread | None = None
 
     def stop_analysis_thread_on_exit() -> None:
@@ -513,6 +547,8 @@ def launch_qt_gui(
         channel_workers_edit.setEnabled(not running)
         lightweight_plot_cb.setEnabled(not running)
         sampling_percent_edit.setEnabled(not running)
+        probe_layout_json_edit.setEnabled(not running)
+        browse_probe_json_btn.setEnabled(not running)
         tabs.setEnabled(not running)
 
     def on_analysis_ok(output: str) -> None:
@@ -595,6 +631,7 @@ def launch_qt_gui(
             )
             if fr_w <= 0:
                 raise ValueError("La fenêtre de lissage du taux (s) doit être > 0.")
+            probe_p = resolve_probe_layout_json_param()
             config = AnalysisConfig(
                 rhs_file=Path(rhs_text),
                 threshold=thr,
@@ -615,6 +652,7 @@ def launch_qt_gui(
                 channel_workers=ch_w,
                 lightweight_plot=light_plot,
                 sampling_percent=samp_pct,
+                probe_layout_json=probe_p,
             )
         except ValueError as exc:
             append_log(f"Erreur: {exc}")
@@ -672,6 +710,7 @@ def launch_qt_gui(
             )
             if fr_w <= 0:
                 raise ValueError("La fenêtre de lissage du taux (s) doit être > 0.")
+            probe_p = resolve_probe_layout_json_param()
             cfgs: list[AnalysisConfig] = []
             for p in uniq_paths:
                 cfgs.append(
@@ -695,6 +734,7 @@ def launch_qt_gui(
                         channel_workers=ch_w,
                         lightweight_plot=light_plot,
                         sampling_percent=samp_pct,
+                        probe_layout_json=probe_p,
                     )
                 )
         except ValueError as exc:
@@ -741,6 +781,7 @@ def launch_qt_gui(
     browse2_btn.clicked.connect(browse_rhs2)
     add_rhs_field_btn.clicked.connect(lambda: add_rhs_field(""))
     browse_save_btn.clicked.connect(browse_save_dir)
+    browse_probe_json_btn.clicked.connect(browse_probe_layout_json)
     rhs_path_edit.textChanged.connect(refresh_pdf_title)
     rhs1_edit.textChanged.connect(refresh_pdf_title)
     rhs2_edit.textChanged.connect(refresh_pdf_title)

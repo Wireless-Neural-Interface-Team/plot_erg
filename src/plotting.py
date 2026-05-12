@@ -20,6 +20,7 @@ from core import (
     detect_spikes_at_threshold,
 )
 from impedance_tracking import ImpedanceSession
+from probe_layout import draw_probe_inset_on_axes, load_probe_layout_json
 
 # Zoom panel window (s), time relative to trigger (t=0)
 ZOOM_T0 = -0.1
@@ -989,6 +990,7 @@ def plot_channel_multi_comparison(
     spike_bandpass_high_hz: Optional[float] = None,
     lightweight_mode: bool = False,
     sampling_percent: int = 100,
+    probe_layout_json: Optional[Path] = None,
     streaming_mode: bool = False,
     pre_n_common: Optional[int] = None,
     post_n_common: Optional[int] = None,
@@ -1030,6 +1032,10 @@ def plot_channel_multi_comparison(
     )
     _, spike_cmp_pipe = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
+
+    probe_layout_loaded = None
+    if probe_layout_json is not None:
+        probe_layout_loaded = load_probe_layout_json(Path(probe_layout_json))
 
     with PdfPages(pdf_path) as pdf:
         for ch in range(n_channels):
@@ -1269,6 +1275,8 @@ def plot_channel_multi_comparison(
                 ],
                 delta=0.015,
             )
+            if probe_layout_loaded is not None:
+                draw_probe_inset_on_axes(ax_full, probe_layout_loaded, ch, str(channel_names[ch]))
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=100 if lightweight_mode else 120)
             plt.close(fig)
 
@@ -1299,6 +1307,7 @@ def plot_channel_averages(
     spike_bandpass_high_hz: Optional[float] = None,
     lightweight_mode: bool = False,
     sampling_percent: int = 100,
+    probe_layout_json: Optional[Path] = None,
 ) -> Path:
     """Single multi-page PDF (one page per channel), without GUI window.
 
@@ -1345,6 +1354,10 @@ def plot_channel_averages(
         if _has_spike_data
         else ""
     )
+
+    probe_layout_loaded = None
+    if probe_layout_json is not None:
+        probe_layout_loaded = load_probe_layout_json(Path(probe_layout_json))
 
     with PdfPages(pdf_path) as pdf:
         for ch in range(n_channels):
@@ -1684,6 +1697,8 @@ def plot_channel_averages(
                 ],
                 delta=0.015,
             )
+            if probe_layout_loaded is not None:
+                draw_probe_inset_on_axes(ax_full, probe_layout_loaded, ch, str(channel_names[ch]))
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=100 if lightweight_mode else 120)
             plt.close(fig)
 

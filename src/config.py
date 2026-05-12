@@ -41,3 +41,5 @@ class AnalysisConfig:
     lightweight_plot: bool = False
     # Pourcentage de points conservés dans les graphes spikes (1..100).
     sampling_percent: int = 100
+    # JSON probeinterface (carte MEA en encart PDF si le canal y est mappé).
+    probe_layout_json: Path | None = None
