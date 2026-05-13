@@ -28,7 +28,7 @@ class ProbeLayout:
 
 
 # Header band: [left, bottom, width, height] in parent transAxes (MEA inset; Part 1 title on the left).
-PROBE_INSET_HEADER_RECT: tuple[float, float, float, float] = (0.06, 0.01, 0.98, 0.98)
+PROBE_INSET_HEADER_RECT: tuple[float, float, float, float] = (0.20, 0.00, 1, 1)
 
 
 def _as_int_or_none(v: Any) -> int | None:
@@ -129,44 +129,57 @@ def draw_probe_inset_on_axes(
     inset_rect: tuple[float, float, float, float] = PROBE_INSET_HEADER_RECT,
 ) -> None:
     """Inset on the header: one marker per electrode, ``contact_id`` labels, highlight for the active channel."""
-    idx = match_contact_index(layout, channel_name)
-    if idx is None:
-        return
-    n = len(layout.contact_ids)
-    xy = layout.positions_um
-    span_x = float(np.ptp(xy[:, 0])) + 1e-6
-    span_y = float(np.ptp(xy[:, 1])) + 1e-6
-    pad = 0.06 * max(span_x, span_y)
-    x0, x1 = float(np.min(xy[:, 0]) - pad), float(np.max(xy[:, 0]) + pad)
-    y0, y1 = float(np.min(xy[:, 1]) - pad), float(np.max(xy[:, 1]) + pad)
-
-    left, bottom, width, height = inset_rect
-    ax_in = parent_ax.inset_axes(
-        [left, bottom, width, height],
+    inset_left, inset_bottom, inset_width, inset_height = inset_rect
+    inset_axes = parent_ax.inset_axes(
+        [inset_left, inset_bottom, inset_width, inset_height],
         transform=parent_ax.transAxes,
     )
-    ax_in.set_facecolor((1.0, 1.0, 1.0, 0.88))
-    for spine in ax_in.spines.values():
+    draw_probe_layout_on_axes(inset_axes, layout, channel_name)
+
+
+def draw_probe_layout_on_axes(
+    target_ax: Any,  # matplotlib.axes.Axes
+    layout: ProbeLayout,
+    channel_name: str,
+) -> None:
+    """Draw the MEA layout directly on an axes (no inset), highlight active channel."""
+    active_contact_index = match_contact_index(layout, channel_name)
+    if active_contact_index is None:
+        return
+    contact_count = len(layout.contact_ids)
+    contact_positions_um = layout.positions_um
+    span_x_um = float(np.ptp(contact_positions_um[:, 0])) + 1e-6
+    span_y_um = float(np.ptp(contact_positions_um[:, 1])) + 1e-6
+    outer_padding_um = 0.06 * max(span_x_um, span_y_um)
+    x_min_um = float(np.min(contact_positions_um[:, 0]) - outer_padding_um)
+    x_max_um = float(np.max(contact_positions_um[:, 0]) + outer_padding_um)
+    y_min_um = float(np.min(contact_positions_um[:, 1]) - outer_padding_um)
+    y_max_um = float(np.max(contact_positions_um[:, 1]) + outer_padding_um)
+
+    layout_ax = target_ax
+    layout_ax.set_facecolor((1.0, 1.0, 1.0, 0.88))
+    for spine in layout_ax.spines.values():
         spine.set_linewidth(0.6)
         spine.set_edgecolor("0.45")
 
-    pt_size = max(5, min(18, int(780 // max(n, 1))))
-    ax_in.scatter(
-        xy[:, 0],
-        xy[:, 1],
-        s=pt_size,
+    point_size = max(5, min(18, int(780 // max(contact_count, 1))))
+    layout_ax.scatter(
+        contact_positions_um[:, 0],
+        contact_positions_um[:, 1],
+        s=point_size,
         c="0.55",
         edgecolors="0.35",
         linewidths=0.2,
         zorder=1,
     )
 
-    hx, hy = float(xy[idx, 0]), float(xy[idx, 1])
-    r = 0.035 * max(span_x, span_y)
-    ax_in.add_patch(
+    active_x_um = float(contact_positions_um[active_contact_index, 0])
+    active_y_um = float(contact_positions_um[active_contact_index, 1])
+    highlight_radius_um = 0.035 * max(span_x_um, span_y_um)
+    layout_ax.add_patch(
         Circle(
-            (hx, hy),
-            radius=r,
+            (active_x_um, active_y_um),
+            radius=highlight_radius_um,
             facecolor="none",
             edgecolor="crimson",
             linewidth=2.0,
@@ -174,28 +187,28 @@ def draw_probe_inset_on_axes(
         )
     )
 
-    label_fs = max(2.6, min(4.6, 420.0 / max(float(n) ** 0.48, 1.0)))
-    stroke_w = max(1.8, min(2.8, label_fs * 0.55))
-    for i in range(n):
-        cid_s = str(layout.contact_ids[i]).strip()
-        if _is_nc_contact(cid_s):
+    label_font_size = max(2.6, min(4.6, 420.0 / max(float(contact_count) ** 0.48, 1.0)))
+    text_stroke_width = max(1.8, min(2.8, label_font_size * 0.55))
+    for contact_index in range(contact_count):
+        contact_id = str(layout.contact_ids[contact_index]).strip()
+        if _is_nc_contact(contact_id):
             continue
-        t = ax_in.annotate(
-            cid_s,
-            (float(xy[i, 0]), float(xy[i, 1])),
+        text_artist = layout_ax.annotate(
+            contact_id,
+            (float(contact_positions_um[contact_index, 0]), float(contact_positions_um[contact_index, 1])),
             ha="center",
             va="center",
-            fontsize=label_fs,
+            fontsize=label_font_size,
             color="0.12",
             fontweight="normal",
             zorder=5,
         )
-        t.set_path_effects([pe.withStroke(linewidth=stroke_w, foreground="white")])
+        text_artist.set_path_effects([pe.withStroke(linewidth=text_stroke_width, foreground="white")])
 
-    ax_in.set_xlim(x0, x1)
-    ax_in.set_ylim(y0, y1)
-    ax_in.set_aspect("equal", adjustable="box")
-    ax_in.set_xticks([])
-    ax_in.set_yticks([])
-    ax_in.set_title("MEA layout", fontsize=7, pad=2)
-    ax_in.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+    layout_ax.set_xlim(x_min_um, x_max_um)
+    layout_ax.set_ylim(y_min_um, y_max_um)
+    layout_ax.set_aspect("equal", adjustable="box")
+    layout_ax.set_xticks([])
+    layout_ax.set_yticks([])
+    layout_ax.set_title("MEA layout", fontsize=7, pad=2)
+    layout_ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
