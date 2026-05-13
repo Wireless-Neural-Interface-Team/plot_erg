@@ -31,17 +31,14 @@ ZOOM_T1 = 0.2
 # ISI: only spikes within [-ISI_HALF_WINDOW_S, +ISI_HALF_WINDOW_S] (s relative to trigger)
 ISI_HALF_WINDOW_S = 1.0
 
-# X-axis (time relative to trigger, s) for ISI panels (time x ISI scatter)
-ISI_ABSCISSA_T0_S = 0.0
-ISI_ABSCISSA_T1_S = 2.0
-
 # X-axis label for all time-relative-to-trigger plots
 TIME_REL_XLABEL = "Time relative to trigger (s)"
+LEGEND_FONT_SIZE = 10
 
 
 def _lightweight_pdf_dpi(lightweight_mode: bool) -> int:
     """Lower DPI aggressively in lightweight mode to speed up rendering."""
-    return 72 if lightweight_mode else 120
+    return 60 if lightweight_mode else 120
 
 
 def _scale_page_size_for_lightweight(
@@ -52,7 +49,14 @@ def _scale_page_size_for_lightweight(
     """Scale page size down when lightweight mode is enabled."""
     if not lightweight_mode:
         return width_in, height_in
-    return max(10.0, width_in * 0.72), max(20.0, height_in * 0.72)
+    # Clamp to a strict lightweight envelope to keep rendering fast even
+    # when upstream page sizes are very large.
+    scaled_width_in = width_in * 0.55
+    scaled_height_in = height_in * 0.45
+    return (
+        max(10.0, min(14.0, scaled_width_in)),
+        max(20.0, min(42.0, scaled_height_in)),
+    )
 
 
 def _spike_times_per_trial(
@@ -202,6 +206,28 @@ def _concat_isi_s(
     return isi
 
 
+def _set_adaptive_x_limits(
+    ax: Any,
+    x_values: np.ndarray,
+    *,
+    fallback_limits: tuple[float, float],
+    pad_ratio: float = 0.06,
+) -> None:
+    """Set x-limits from displayed data with a small visual padding."""
+    vals = np.asarray(x_values, dtype=np.float64)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        ax.set_xlim(float(fallback_limits[0]), float(fallback_limits[1]))
+        return
+    x_min = float(np.min(vals))
+    x_max = float(np.max(vals))
+    if np.isclose(x_min, x_max):
+        pad = max(abs(x_min) * 0.05, 1e-3)
+    else:
+        pad = (x_max - x_min) * max(float(pad_ratio), 0.0)
+    ax.set_xlim(x_min - pad, x_max + pad)
+
+
 def _draw_spike_panels_single_channel(
     ax_raster: Any,
     ax_fr: Any,
@@ -317,7 +343,7 @@ def _draw_spike_panels_single_channel(
             f"{sec}ISI — {short} ({isi_caption} ; x-axis = time of 2nd spike in pair)"
         )
         ax_isi.grid(True, alpha=0.25)
-        ax_isi.set_xlim(ISI_ABSCISSA_T0_S, ISI_ABSCISSA_T1_S)
+        _set_adaptive_x_limits(ax_isi, t_isi, fallback_limits=(t_xlim_lo, t_xlim_hi))
         ax_isi.set_xlabel(TIME_REL_XLABEL)
     else:
         ax_isi.text(
@@ -491,7 +517,8 @@ def _draw_spike_panels_dual_channel(
             f"{sec}ISI — {short} ({isi_caption} ; x-axis = time of 2nd spike in pair)"
         )
         ax_isi.grid(True, alpha=0.25)
-        ax_isi.set_xlim(ISI_ABSCISSA_T0_S, ISI_ABSCISSA_T1_S)
+        isi_time_union = np.concatenate([t_a, t_b]) if (t_a.size and t_b.size) else (t_a if t_a.size else t_b)
+        _set_adaptive_x_limits(ax_isi, isi_time_union, fallback_limits=(t_xlim_lo, t_xlim_hi))
         ax_isi.set_xlabel(TIME_REL_XLABEL)
     else:
         ax_isi.text(
@@ -622,11 +649,13 @@ def _draw_spike_panels_multi_channel(
         ax_trial_fr.set_xlim(1, max_trials)
 
     has_isi = False
+    isi_time_chunks: list[np.ndarray] = []
     for rec_idx, st_per_trial in enumerate(spikes_per_recording):
         tx, isi_vals_s = _isi_time_and_values_s(st_per_trial, isi_window_s=isi_window)
         if tx.size:
             has_isi = True
             tx, isi_vals_s = downsample_points(tx, isi_vals_s, sampling_percent)
+            isi_time_chunks.append(np.asarray(tx, dtype=np.float64))
             ax_isi.scatter(
                 tx,
                 isi_vals_s * 1e3,
@@ -641,7 +670,8 @@ def _draw_spike_panels_multi_channel(
         ax_isi.set_ylabel("ISI (ms)")
         ax_isi.set_title(f"{sec}ISI — {short} ({isi_caption} ; x-axis = time of 2nd spike)")
         ax_isi.grid(True, alpha=0.25)
-        ax_isi.set_xlim(ISI_ABSCISSA_T0_S, ISI_ABSCISSA_T1_S)
+        isi_time_union = np.concatenate(isi_time_chunks) if isi_time_chunks else np.empty(0, dtype=np.float64)
+        _set_adaptive_x_limits(ax_isi, isi_time_union, fallback_limits=(t_xlim_lo, t_xlim_hi))
         ax_isi.set_xlabel(TIME_REL_XLABEL)
     else:
         ax_isi.text(
@@ -923,21 +953,23 @@ def plot_channel_multi_comparison(
                 match_contact_index(probe_layout_loaded, channel_name) is not None
             )
             page_width_in = 26.0 if channel_has_mea_layout else 12.0
-            mea_row_height_ratio = 1.35 if channel_has_mea_layout else 0.06
+            mea_row_height_ratio = 2.20 if channel_has_mea_layout else 0.06
             panel_height_ratios = [mea_row_height_ratio, 1.25, 1.30, 1.15, 1.05, 1.15, 0.06, 1.25, 1.30, 1.15, 1.05, 1.15, 0.06, 1.25, 1.30, 1.15, 1.05, 1.15]
             if impedance_sessions:
                 full_height_ratios = [*panel_height_ratios, 0.05, 0.95]
                 page_height_in = 104.0 if channel_has_mea_layout else 50.0
-                page_width_in, page_height_in = _scale_page_size_for_lightweight(
-                    page_width_in, page_height_in, lightweight_mode
-                )
+                if not channel_has_mea_layout:
+                    page_width_in, page_height_in = _scale_page_size_for_lightweight(
+                        page_width_in, page_height_in, lightweight_mode
+                    )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
                 gs = fig.add_gridspec(len(full_height_ratios), 1, height_ratios=full_height_ratios, hspace=0.58)
             else:
                 page_height_in = 96.0 if channel_has_mea_layout else 46.0
-                page_width_in, page_height_in = _scale_page_size_for_lightweight(
-                    page_width_in, page_height_in, lightweight_mode
-                )
+                if not channel_has_mea_layout:
+                    page_width_in, page_height_in = _scale_page_size_for_lightweight(
+                        page_width_in, page_height_in, lightweight_mode
+                    )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
                 gs = fig.add_gridspec(18, 1, height_ratios=panel_height_ratios, hspace=0.58)
             ax_hdr1 = fig.add_subplot(gs[0, 0])
@@ -1015,7 +1047,7 @@ def plot_channel_multi_comparison(
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
-            ax_full.legend(loc="upper center", bbox_to_anchor=(0.5, -0.36), ncol=4, fontsize=6)
+            ax_full.legend(loc="upper center", bbox_to_anchor=(0.5, -0.36), ncol=4, fontsize=LEGEND_FONT_SIZE)
 
             ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
             ax_zoom.set_xlim(zoom_t0, zoom_t1)
@@ -1132,8 +1164,6 @@ def plot_channel_multi_comparison(
                 ],
                 delta=0.015,
             )
-            if channel_has_mea_layout:
-                shift_axes_down([ax_hdr1], delta=0.03)
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
             plt.close(fig)
 
@@ -1225,11 +1255,12 @@ def plot_channel_averages(
                 match_contact_index(probe_layout_loaded, channel_name) is not None
             )
             page_width_in = 26.0 if channel_has_mea_layout else 12.0
-            mea_row_height_ratio = 1.35 if channel_has_mea_layout else 0.06
+            mea_row_height_ratio = 2.20 if channel_has_mea_layout else 0.06
             page_height_in = 96.0 if channel_has_mea_layout else 46.0
-            page_width_in, page_height_in = _scale_page_size_for_lightweight(
-                page_width_in, page_height_in, lightweight_mode
-            )
+            if not channel_has_mea_layout:
+                page_width_in, page_height_in = _scale_page_size_for_lightweight(
+                    page_width_in, page_height_in, lightweight_mode
+                )
             fig = plt.figure(figsize=(page_width_in, page_height_in))
             gs = fig.add_gridspec(
                 18,
@@ -1366,7 +1397,7 @@ def plot_channel_averages(
                 loc="upper center",
                 bbox_to_anchor=(0.5, -0.36),
                 ncol=3,
-                fontsize=6,
+                fontsize=LEGEND_FONT_SIZE,
             )
 
             zmask = (t_rel >= zoom_t0) & (t_rel <= zoom_t1)
@@ -1402,7 +1433,7 @@ def plot_channel_averages(
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
             if show_filtered_and_raw:
-                ax_zoom.legend(loc="best", fontsize=6)
+                ax_zoom.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
             end_zoom_range: tuple[float, float] | None = None
             if trigger_end_rising_rel_s is not None:
                 end_zoom_t0 = float(trigger_end_rising_rel_s + zoom_t0)
@@ -1571,8 +1602,6 @@ def plot_channel_averages(
                 ],
                 delta=0.015,
             )
-            if channel_has_mea_layout:
-                shift_axes_down([ax_hdr1], delta=0.03)
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
             plt.close(fig)
 
@@ -1788,7 +1817,7 @@ def plot_channel_comparison(
                 loc="upper center",
                 bbox_to_anchor=(0.5, -0.36),
                 ncol=3,
-                fontsize=6,
+                fontsize=LEGEND_FONT_SIZE,
             )
 
             if show_filtered_and_raw and channel_mean_a_raw is not None and channel_mean_b_raw is not None:
@@ -1845,7 +1874,7 @@ def plot_channel_comparison(
             ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
-            ax_zoom.legend(loc="best", fontsize=6)
+            ax_zoom.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
             end_zoom_range: tuple[float, float] | None = None
             end_markers = [v for v in (trigger_end_rising_rel_s_a, trigger_end_rising_rel_s_b) if v is not None]
             if end_markers:
@@ -1864,7 +1893,7 @@ def plot_channel_comparison(
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
-                ax_zoom_end.legend(loc="best", fontsize=6)
+                ax_zoom_end.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
             else:
                 ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
                 ax_zoom_end.set_axis_off()

@@ -153,8 +153,12 @@ def draw_probe_layout_on_axes(
     outer_padding_um = 0.06 * max(span_x_um, span_y_um)
     x_min_um = float(np.min(contact_positions_um[:, 0]) - outer_padding_um)
     x_max_um = float(np.max(contact_positions_um[:, 0]) + outer_padding_um)
-    y_min_um = float(np.min(contact_positions_um[:, 1]) - outer_padding_um)
-    y_max_um = float(np.max(contact_positions_um[:, 1]) + outer_padding_um)
+    # Asymmetric vertical padding: more space above pushes the MEA cloud lower
+    # in its own subplot without moving any other graph.
+    y_padding_bottom_um = outer_padding_um * 0.55
+    y_padding_top_um = outer_padding_um * 2.20
+    y_min_um = float(np.min(contact_positions_um[:, 1]) - y_padding_bottom_um)
+    y_max_um = float(np.max(contact_positions_um[:, 1]) + y_padding_top_um)
 
     layout_ax = target_ax
     layout_ax.set_facecolor((1.0, 1.0, 1.0, 0.88))
