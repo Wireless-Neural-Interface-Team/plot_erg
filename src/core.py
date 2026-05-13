@@ -280,26 +280,26 @@ class AmplifierSpikeSource:
         self._closed = False
 
     def windows_2d_for_channel(self, ch: int) -> np.ndarray:
-        row = np.asarray(self.amplifier[ch], dtype=np.float64)
+        channel_trace = np.asarray(self.amplifier[ch], dtype=np.float64)
         if self.bandpass_low_hz is not None and self.bandpass_high_hz is not None:
-            row_2d = row.reshape(1, -1)
-            row = apply_butterworth_bandpass(
-                row_2d, self.fs, self.bandpass_low_hz, self.bandpass_high_hz
+            channel_trace_2d = channel_trace.reshape(1, -1)
+            channel_trace = apply_butterworth_bandpass(
+                channel_trace_2d, self.fs, self.bandpass_low_hz, self.bandpass_high_hz
             )[0]
-        n_trials = int(self.valid_triggers.size)
-        win_len = int(self._offsets.size)
+        trial_count = int(self.valid_triggers.size)
+        window_length = int(self._offsets.size)
         # Guard: avoid huge spike-window allocations.
-        if n_trials * win_len > 25_000_000:
+        if trial_count * window_length > 25_000_000:
             raise RuntimeError(
                 "Spike window too large for 2D RAM extraction. "
                 "Reduce pre/post, sampling %, or enable lightweight mode."
             )
-        out = np.empty((n_trials, win_len), dtype=np.float64)
-        for i, trig in enumerate(self.valid_triggers):
-            start = int(trig - self.pre_n)
-            end = int(trig + self.post_n)
-            out[i] = row[start:end]
-        return out
+        trial_windows = np.empty((trial_count, window_length), dtype=np.float64)
+        for trial_index, trigger_index in enumerate(self.valid_triggers):
+            sample_start = int(trigger_index - self.pre_n)
+            sample_end = int(trigger_index + self.post_n)
+            trial_windows[trial_index] = channel_trace[sample_start:sample_end]
+        return trial_windows
 
     def spike_times_per_trial_for_channel(
         self,
@@ -309,29 +309,31 @@ class AmplifierSpikeSource:
         refractory_s: float = 0.001,
     ) -> list[np.ndarray]:
         """Detect spikes trial by trial without building a giant 2D matrix in RAM."""
-        row = np.asarray(self.amplifier[ch], dtype=np.float64)
+        channel_trace = np.asarray(self.amplifier[ch], dtype=np.float64)
         if self.bandpass_low_hz is not None and self.bandpass_high_hz is not None:
-            row_2d = row.reshape(1, -1)
-            row = apply_butterworth_bandpass(
-                row_2d, self.fs, self.bandpass_low_hz, self.bandpass_high_hz
+            channel_trace_2d = channel_trace.reshape(1, -1)
+            channel_trace = apply_butterworth_bandpass(
+                channel_trace_2d, self.fs, self.bandpass_low_hz, self.bandpass_high_hz
             )[0]
-        out: list[np.ndarray] = []
-        for trig in self.valid_triggers:
-            start = int(trig - self.pre_n)
-            end = int(trig + self.post_n)
-            seg = row[start:end]
-            idx = detect_spikes_at_threshold(seg, self.fs, threshold, refractory_s=refractory_s)
-            out.append(np.asarray(t_rel[idx], dtype=np.float64))
-        return out
+        spike_times_by_trial: list[np.ndarray] = []
+        for trigger_index in self.valid_triggers:
+            sample_start = int(trigger_index - self.pre_n)
+            sample_end = int(trigger_index + self.post_n)
+            trial_trace = channel_trace[sample_start:sample_end]
+            spike_sample_indices = detect_spikes_at_threshold(
+                trial_trace, self.fs, threshold, refractory_s=refractory_s
+            )
+            spike_times_by_trial.append(np.asarray(t_rel[spike_sample_indices], dtype=np.float64))
+        return spike_times_by_trial
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        a = self.amplifier
+        amplifier_array = self.amplifier
         try:
-            if isinstance(a, np.memmap):
-                a._mmap.close()
+            if isinstance(amplifier_array, np.memmap):
+                amplifier_array._mmap.close()
         except Exception:
             pass
         self.amplifier = np.empty((0,))  # drop reference
@@ -384,26 +386,25 @@ def mean_filtered_channelwise(
     channel_workers: int | None = None,
 ) -> np.ndarray:
     """Low-pass per channel, parallelized up to MAX_PARALLEL_CHANNELS."""
-    n_ch, _ = amplifier_2d.shape
-    win_len = pre_n + post_n
-    out = np.zeros((n_ch, win_len), dtype=np.float64)
+    channel_count, _ = amplifier_2d.shape
+    window_length = pre_n + post_n
+    mean_windows = np.zeros((channel_count, window_length), dtype=np.float64)
 
     def _compute_one_channel(c: int) -> tuple[int, np.ndarray]:
         check_analysis_cancelled()
-        row_f = apply_butterworth_lowpass(amplifier_2d[c : c + 1], fs, cutoff_hz)
-        row = row_f[0]
-        acc = np.zeros(win_len, dtype=np.float64)
-        for trig in valid_triggers:
-            start = int(trig - pre_n)
-            end = int(trig + post_n)
-            acc += row[start:end]
-        return c, acc / float(valid_triggers.size)
+        filtered_channel = apply_butterworth_lowpass(amplifier_2d[c : c + 1], fs, cutoff_hz)[0]
+        summed_windows = np.zeros(window_length, dtype=np.float64)
+        for trigger_index in valid_triggers:
+            sample_start = int(trigger_index - pre_n)
+            sample_end = int(trigger_index + post_n)
+            summed_windows += filtered_channel[sample_start:sample_end]
+        return c, summed_windows / float(valid_triggers.size)
 
-    n_workers = resolve_channel_workers(channel_workers, n_ch)
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        for c, m in pool.map(_compute_one_channel, range(n_ch)):
-            out[c] = m
-    return out
+    worker_count = resolve_channel_workers(channel_workers, channel_count)
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        for channel_index, channel_mean in pool.map(_compute_one_channel, range(channel_count)):
+            mean_windows[channel_index] = channel_mean
+    return mean_windows
 
 
 def persist_amplifier_float32(amplifier_2d: np.ndarray, path: Path) -> None:

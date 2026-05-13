@@ -625,36 +625,36 @@ def launch_qt_gui(
         if analysis_thread is not None and analysis_thread.isRunning():
             return
         try:
-            rhs_text = rhs_path_edit.text().strip()
-            if not rhs_text:
+            rhs_file_path_text = rhs_path_edit.text().strip()
+            if not rhs_file_path_text:
                 raise ValueError("Choose an RHS file.")
-            thr, edge, pre, post, lp_hz, save_p, pdf_title, sp_thr, fr_w, zoom_t0_s, zoom_t1_s, bp_lo, bp_hi, work_p, keep_w, ch_w, light_plot, samp_pct = (
+            trigger_threshold, edge_mode, pre_window_s, post_window_s, lowpass_hz, save_dir_path, pdf_title, spike_threshold_uv, firing_rate_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
                 build_shared_params()
             )
-            if fr_w <= 0:
+            if firing_rate_window_s <= 0:
                 raise ValueError("Firing-rate smoothing window (s) must be > 0.")
-            probe_p = resolve_probe_layout_json_param()
+            probe_layout_path = resolve_probe_layout_json_param()
             config = AnalysisConfig(
-                rhs_file=Path(rhs_text),
-                threshold=thr,
-                edge=edge,
-                pre_s=pre,
-                post_s=post,
-                lowpass_cutoff_hz=lp_hz,
-                save_dir=save_p,
+                rhs_file=Path(rhs_file_path_text),
+                threshold=trigger_threshold,
+                edge=edge_mode,
+                pre_s=pre_window_s,
+                post_s=post_window_s,
+                lowpass_cutoff_hz=lowpass_hz,
+                save_dir=save_dir_path,
                 pdf_title=pdf_title,
-                spike_threshold_uv=sp_thr,
-                firing_rate_window_s=fr_w,
-                zoom_t0_s=zoom_t0_s,
-                zoom_t1_s=zoom_t1_s,
-                spike_bandpass_low_hz=bp_lo,
-                spike_bandpass_high_hz=bp_hi,
-                work_dir=work_p,
-                keep_intermediate_files=keep_w,
-                channel_workers=ch_w,
-                lightweight_plot=light_plot,
-                sampling_percent=samp_pct,
-                probe_layout_json=probe_p,
+                spike_threshold_uv=spike_threshold_uv,
+                firing_rate_window_s=firing_rate_window_s,
+                zoom_t0_s=zoom_start_s,
+                zoom_t1_s=zoom_end_s,
+                spike_bandpass_low_hz=bandpass_low_hz,
+                spike_bandpass_high_hz=bandpass_high_hz,
+                work_dir=work_dir_path,
+                keep_intermediate_files=keep_work_files,
+                channel_workers=channel_worker_count,
+                lightweight_plot=lightweight_mode_enabled,
+                sampling_percent=sampling_percent,
+                probe_layout_json=probe_layout_path,
             )
         except ValueError as exc:
             append_log(f"Error: {exc}")
@@ -675,8 +675,8 @@ def launch_qt_gui(
 
         status_label.setText("Analysis running...")
         append_log(f"Starting analysis: {config.rhs_file}")
-        out_dir = config.save_dir if config.save_dir is not None else config.rhs_file.parent
-        append_log(f"PDF will be saved to: {out_dir}")
+        output_dir = config.save_dir if config.save_dir is not None else config.rhs_file.parent
+        append_log(f"PDF will be saved to: {output_dir}")
 
         analysis_thread = thread
         set_busy(True)
@@ -688,55 +688,55 @@ def launch_qt_gui(
             return
         try:
             selected_paths: list[str] = []
-            p1 = rhs1_edit.text().strip()
-            p2 = rhs2_edit.text().strip()
-            if p1:
-                selected_paths.append(p1)
-            if p2:
-                selected_paths.append(p2)
+            recording_path_1 = rhs1_edit.text().strip()
+            recording_path_2 = rhs2_edit.text().strip()
+            if recording_path_1:
+                selected_paths.append(recording_path_1)
+            if recording_path_2:
+                selected_paths.append(recording_path_2)
             for edit in extra_rhs_edits:
-                p = edit.text().strip()
-                if p:
-                    selected_paths.append(p)
-            uniq_paths: list[str] = []
-            seen: set[str] = set()
-            for p in selected_paths:
-                pr = str(Path(p).resolve())
-                if pr not in seen:
-                    seen.add(pr)
-                    uniq_paths.append(p)
-            if len(uniq_paths) < 2:
+                path_value = edit.text().strip()
+                if path_value:
+                    selected_paths.append(path_value)
+            unique_paths: list[str] = []
+            resolved_seen_paths: set[str] = set()
+            for candidate_path in selected_paths:
+                resolved_path = str(Path(candidate_path).resolve())
+                if resolved_path not in resolved_seen_paths:
+                    resolved_seen_paths.add(resolved_path)
+                    unique_paths.append(candidate_path)
+            if len(unique_paths) < 2:
                 raise ValueError("Add at least two RHS files for comparison.")
-            thr, edge, pre, post, lp_hz, save_p, pdf_title, sp_thr, fr_w, zoom_t0_s, zoom_t1_s, bp_lo, bp_hi, work_p, keep_w, ch_w, light_plot, samp_pct = (
+            trigger_threshold, edge_mode, pre_window_s, post_window_s, lowpass_hz, save_dir_path, pdf_title, spike_threshold_uv, firing_rate_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
                 build_shared_params()
             )
-            if fr_w <= 0:
+            if firing_rate_window_s <= 0:
                 raise ValueError("Firing-rate smoothing window (s) must be > 0.")
-            probe_p = resolve_probe_layout_json_param()
-            cfgs: list[AnalysisConfig] = []
-            for p in uniq_paths:
-                cfgs.append(
+            probe_layout_path = resolve_probe_layout_json_param()
+            configs_to_compare: list[AnalysisConfig] = []
+            for rhs_path in unique_paths:
+                configs_to_compare.append(
                     AnalysisConfig(
-                        rhs_file=Path(p),
-                        threshold=thr,
-                        edge=edge,
-                        pre_s=pre,
-                        post_s=post,
-                        lowpass_cutoff_hz=lp_hz,
-                        save_dir=save_p,
+                        rhs_file=Path(rhs_path),
+                        threshold=trigger_threshold,
+                        edge=edge_mode,
+                        pre_s=pre_window_s,
+                        post_s=post_window_s,
+                        lowpass_cutoff_hz=lowpass_hz,
+                        save_dir=save_dir_path,
                         pdf_title=pdf_title,
-                        spike_threshold_uv=sp_thr,
-                        firing_rate_window_s=fr_w,
-                        zoom_t0_s=zoom_t0_s,
-                        zoom_t1_s=zoom_t1_s,
-                        spike_bandpass_low_hz=bp_lo,
-                        spike_bandpass_high_hz=bp_hi,
-                        work_dir=work_p,
-                        keep_intermediate_files=keep_w,
-                        channel_workers=ch_w,
-                        lightweight_plot=light_plot,
-                        sampling_percent=samp_pct,
-                        probe_layout_json=probe_p,
+                        spike_threshold_uv=spike_threshold_uv,
+                        firing_rate_window_s=firing_rate_window_s,
+                        zoom_t0_s=zoom_start_s,
+                        zoom_t1_s=zoom_end_s,
+                        spike_bandpass_low_hz=bandpass_low_hz,
+                        spike_bandpass_high_hz=bandpass_high_hz,
+                        work_dir=work_dir_path,
+                        keep_intermediate_files=keep_work_files,
+                        channel_workers=channel_worker_count,
+                        lightweight_plot=lightweight_mode_enabled,
+                        sampling_percent=sampling_percent,
+                        probe_layout_json=probe_layout_path,
                     )
                 )
         except ValueError as exc:
@@ -749,14 +749,14 @@ def launch_qt_gui(
             return
 
         def task() -> None:
-            if len(cfgs) == 2:
-                run_comparison_callback(cfgs[0], cfgs[1])
+            if len(configs_to_compare) == 2:
+                run_comparison_callback(configs_to_compare[0], configs_to_compare[1])
                 return
             if run_multi_comparison_callback is None:
                 raise RuntimeError(
                     "Multi-file comparison unavailable in this build (missing backend)."
                 )
-            run_multi_comparison_callback(cfgs)
+            run_multi_comparison_callback(configs_to_compare)
 
         thread = AnalysisThread(task)
         thread.finished_ok.connect(on_compare_ok)
@@ -764,15 +764,19 @@ def launch_qt_gui(
         thread.finished_interrupted.connect(on_interrupted)
 
         status_label.setText("Comparison running...")
-        if len(cfgs) == 2:
-            append_log(f"Comparison: {cfgs[0].rhs_file.name} vs {cfgs[1].rhs_file.name}")
+        if len(configs_to_compare) == 2:
+            append_log(f"Comparison: {configs_to_compare[0].rhs_file.name} vs {configs_to_compare[1].rhs_file.name}")
         else:
             append_log(
                 "Multi comparison: "
-                + " | ".join(c.rhs_file.name for c in cfgs)
+                + " | ".join(cfg.rhs_file.name for cfg in configs_to_compare)
             )
-        out_dir = cfgs[0].save_dir if cfgs[0].save_dir is not None else cfgs[0].rhs_file.parent
-        append_log(f"Comparison PDF folder: {out_dir}")
+        output_dir = (
+            configs_to_compare[0].save_dir
+            if configs_to_compare[0].save_dir is not None
+            else configs_to_compare[0].rhs_file.parent
+        )
+        append_log(f"Comparison PDF folder: {output_dir}")
 
         analysis_thread = thread
         set_busy(True)

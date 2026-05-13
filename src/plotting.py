@@ -39,6 +39,22 @@ ISI_ABSCISSA_T1_S = 2.0
 TIME_REL_XLABEL = "Time relative to trigger (s)"
 
 
+def _lightweight_pdf_dpi(lightweight_mode: bool) -> int:
+    """Lower DPI aggressively in lightweight mode to speed up rendering."""
+    return 72 if lightweight_mode else 120
+
+
+def _scale_page_size_for_lightweight(
+    width_in: float,
+    height_in: float,
+    lightweight_mode: bool,
+) -> tuple[float, float]:
+    """Scale page size down when lightweight mode is enabled."""
+    if not lightweight_mode:
+        return width_in, height_in
+    return max(10.0, width_in * 0.72), max(20.0, height_in * 0.72)
+
+
 def _spike_times_per_trial(
     windows_ch: np.ndarray,
     t_rel: np.ndarray,
@@ -721,7 +737,7 @@ def _append_mean_impedance_summary_page(
     if not sessions:
         return
     check_analysis_cancelled()
-    dpi = 100 if lightweight_mode else 120
+    dpi = _lightweight_pdf_dpi(lightweight_mode)
     fig, ax = plt.subplots(figsize=(11, 6))
     times_num = np.array([mdates.date2num(s.when) for s in sessions], dtype=np.float64)
     means_z: list[float] = []
@@ -864,6 +880,7 @@ def plot_channel_multi_comparison(
     with PdfPages(pdf_path) as pdf:
         for ch in range(n_channels):
             check_analysis_cancelled()
+            channel_name = str(channel_names[ch])
             means_ch: list[np.ndarray] = []
             means_raw_ch: list[np.ndarray] | None = [] if lowpass_cutoff_hz is not None else None
             if streaming_mode:
@@ -903,23 +920,29 @@ def plot_channel_multi_comparison(
                     means_raw_ch = [np.asarray(means_raw[i][ch]) for i in range(n_records)]
 
             channel_has_mea_layout = probe_layout_loaded is not None and (
-                match_contact_index(probe_layout_loaded, str(channel_names[ch])) is not None
+                match_contact_index(probe_layout_loaded, channel_name) is not None
             )
-            page_width_in = 24.0 if channel_has_mea_layout else 12.0
-            mea_row_height_ratio = 1 if channel_has_mea_layout else 0.06
-            panel_height_ratios = [mea_row_height_ratio, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95]
+            page_width_in = 26.0 if channel_has_mea_layout else 12.0
+            mea_row_height_ratio = 1.35 if channel_has_mea_layout else 0.06
+            panel_height_ratios = [mea_row_height_ratio, 1.25, 1.30, 1.15, 1.05, 1.15, 0.06, 1.25, 1.30, 1.15, 1.05, 1.15, 0.06, 1.25, 1.30, 1.15, 1.05, 1.15]
             if impedance_sessions:
                 full_height_ratios = [*panel_height_ratios, 0.05, 0.95]
-                page_height_in = 88.0 if channel_has_mea_layout else 42.0
+                page_height_in = 104.0 if channel_has_mea_layout else 50.0
+                page_width_in, page_height_in = _scale_page_size_for_lightweight(
+                    page_width_in, page_height_in, lightweight_mode
+                )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
-                gs = fig.add_gridspec(len(full_height_ratios), 1, height_ratios=full_height_ratios, hspace=0.88)
+                gs = fig.add_gridspec(len(full_height_ratios), 1, height_ratios=full_height_ratios, hspace=0.58)
             else:
-                page_height_in = 80.0 if channel_has_mea_layout else 38.0
+                page_height_in = 96.0 if channel_has_mea_layout else 46.0
+                page_width_in, page_height_in = _scale_page_size_for_lightweight(
+                    page_width_in, page_height_in, lightweight_mode
+                )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
-                gs = fig.add_gridspec(18, 1, height_ratios=panel_height_ratios, hspace=0.9)
+                gs = fig.add_gridspec(18, 1, height_ratios=panel_height_ratios, hspace=0.58)
             ax_hdr1 = fig.add_subplot(gs[0, 0])
             if channel_has_mea_layout and probe_layout_loaded is not None:
-                draw_probe_layout_on_axes(ax_hdr1, probe_layout_loaded, str(channel_names[ch]))
+                draw_probe_layout_on_axes(ax_hdr1, probe_layout_loaded, channel_name)
             else:
                 ax_hdr1.axis("off")
                 ax_hdr1.text(0.02, 0.5, "Part 1 — Full view (entire pre/post-trigger window)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr1.transAxes)
@@ -957,9 +980,9 @@ def plot_channel_multi_comparison(
                     transform=ax_imp_hdr.transAxes,
                 )
                 ax_imp = fig.add_subplot(gs[19, 0])
-                _draw_impedance_evolution_panel(ax_imp, channel_names[ch], impedance_sessions)
+                _draw_impedance_evolution_panel(ax_imp, channel_name, impedance_sessions)
 
-            show_both = (
+            show_filtered_and_raw = (
                 lowpass_cutoff_hz is not None
                 and means_raw_ch is not None
                 and len(means_raw_ch) == len(means_ch)
@@ -968,17 +991,17 @@ def plot_channel_multi_comparison(
                     for i in range(len(means_ch))
                 )
             )
-            for i, y in enumerate(means_ch):
-                c = colors[i % len(colors)]
-                if show_both and means_raw_ch is not None:
-                    y_raw = np.asarray(means_raw_ch[i])
-                    ax_full.plot(t_rel, y_raw, linewidth=1.0, color=c, alpha=0.35, label="_nolegend_")
-                    ax_full.plot(t_rel, y, linewidth=1.35, color=c, label=f"{labels[i]} (filtered)")
-                    ax_zoom.plot(t_rel[zmask], y_raw[zmask], linewidth=1.05, color=c, alpha=0.35)
-                    ax_zoom.plot(t_rel[zmask], y[zmask], linewidth=1.35, color=c, label=labels[i])
+            for recording_index, recording_curve in enumerate(means_ch):
+                line_color = colors[recording_index % len(colors)]
+                if show_filtered_and_raw and means_raw_ch is not None:
+                    raw_curve = np.asarray(means_raw_ch[recording_index])
+                    ax_full.plot(t_rel, raw_curve, linewidth=1.0, color=line_color, alpha=0.35, label="_nolegend_")
+                    ax_full.plot(t_rel, recording_curve, linewidth=1.35, color=line_color, label=f"{labels[recording_index]} (filtered)")
+                    ax_zoom.plot(t_rel[zmask], raw_curve[zmask], linewidth=1.05, color=line_color, alpha=0.35)
+                    ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=1.35, color=line_color, label=labels[recording_index])
                 else:
-                    ax_full.plot(t_rel, y, linewidth=1.2, color=c, label=labels[i])
-                    ax_zoom.plot(t_rel[zmask], y[zmask], linewidth=1.3, color=c, label=labels[i])
+                    ax_full.plot(t_rel, recording_curve, linewidth=1.2, color=line_color, label=labels[recording_index])
+                    ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=1.3, color=line_color, label=labels[recording_index])
             ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             for v in end_markers:
                 ax_full.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
@@ -988,7 +1011,7 @@ def plot_channel_multi_comparison(
                 end_zoom_t0 = float(min(end_markers) + zoom_t0)
                 end_zoom_t1 = float(max(end_markers) + zoom_t1)
                 ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom region")
-            ax_full.set_title(f"Multi-comparison — {channel_names[ch]} (full view){filt_note}{both_note}")
+            ax_full.set_title(f"Multi-comparison — {channel_name} (full view){filt_note}{both_note}")
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
@@ -1007,14 +1030,14 @@ def plot_channel_multi_comparison(
                 end_zoom_t1 = float(max(end_markers) + zoom_t1)
                 end_zoom_range = (end_zoom_t0, end_zoom_t1)
                 end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
-                for i, y in enumerate(means_ch):
-                    c = colors[i % len(colors)]
-                    if show_both and means_raw_ch is not None:
-                        y_raw = np.asarray(means_raw_ch[i])
-                        ax_zoom_end.plot(t_rel[end_mask], y_raw[end_mask], linewidth=1.05, color=c, alpha=0.35)
-                        ax_zoom_end.plot(t_rel[end_mask], y[end_mask], linewidth=1.35, color=c, label=labels[i])
+                for recording_index, recording_curve in enumerate(means_ch):
+                    line_color = colors[recording_index % len(colors)]
+                    if show_filtered_and_raw and means_raw_ch is not None:
+                        raw_curve = np.asarray(means_raw_ch[recording_index])
+                        ax_zoom_end.plot(t_rel[end_mask], raw_curve[end_mask], linewidth=1.05, color=line_color, alpha=0.35)
+                        ax_zoom_end.plot(t_rel[end_mask], recording_curve[end_mask], linewidth=1.35, color=line_color, label=labels[recording_index])
                     else:
-                        ax_zoom_end.plot(t_rel[end_mask], y[end_mask], linewidth=1.35, color=c, label=labels[i])
+                        ax_zoom_end.plot(t_rel[end_mask], recording_curve[end_mask], linewidth=1.35, color=line_color, label=labels[recording_index])
                 ax_zoom_end.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
                 for v in end_markers:
                     ax_zoom_end.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
@@ -1109,7 +1132,9 @@ def plot_channel_multi_comparison(
                 ],
                 delta=0.015,
             )
-            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=100 if lightweight_mode else 120)
+            if channel_has_mea_layout:
+                shift_axes_down([ax_hdr1], delta=0.03)
+            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
             plt.close(fig)
 
         if impedance_sessions:
@@ -1194,42 +1219,46 @@ def plot_channel_averages(
     with PdfPages(pdf_path) as pdf:
         for ch in range(n_channels):
             check_analysis_cancelled()
-            y = mean_per_channel[ch]
-            show_mea_panel = probe_layout_loaded is not None and (
-                match_contact_index(probe_layout_loaded, str(channel_names[ch])) is not None
+            channel_name = str(channel_names[ch])
+            channel_mean = mean_per_channel[ch]
+            channel_has_mea_layout = probe_layout_loaded is not None and (
+                match_contact_index(probe_layout_loaded, channel_name) is not None
             )
-            fig_w = 24.0 if show_mea_panel else 12.0
-            hdr_ratio = 0.88 if show_mea_panel else 0.06
-            fig_h = 80.0 if show_mea_panel else 38.0
-            fig = plt.figure(figsize=(fig_w, fig_h))
+            page_width_in = 26.0 if channel_has_mea_layout else 12.0
+            mea_row_height_ratio = 1.35 if channel_has_mea_layout else 0.06
+            page_height_in = 96.0 if channel_has_mea_layout else 46.0
+            page_width_in, page_height_in = _scale_page_size_for_lightweight(
+                page_width_in, page_height_in, lightweight_mode
+            )
+            fig = plt.figure(figsize=(page_width_in, page_height_in))
             gs = fig.add_gridspec(
                 18,
                 1,
                 height_ratios=[
-                    hdr_ratio,
+                    mea_row_height_ratio,
+                    1.25,
+                    1.30,
+                    1.15,
                     1.05,
-                    1.10,
-                    0.90,
-                    0.85,
-                    0.95,
+                    1.15,
                     0.06,
+                    1.25,
+                    1.30,
+                    1.15,
                     1.05,
-                    1.10,
-                    0.90,
-                    0.85,
-                    0.95,
+                    1.15,
                     0.06,
+                    1.25,
+                    1.30,
+                    1.15,
                     1.05,
-                    1.10,
-                    0.90,
-                    0.85,
-                    0.95,
+                    1.15,
                 ],
-                hspace=0.9,
+                hspace=0.58,
             )
             ax_hdr1 = fig.add_subplot(gs[0, 0])
-            if show_mea_panel and probe_layout_loaded is not None:
-                draw_probe_layout_on_axes(ax_hdr1, probe_layout_loaded, str(channel_names[ch]))
+            if channel_has_mea_layout and probe_layout_loaded is not None:
+                draw_probe_layout_on_axes(ax_hdr1, probe_layout_loaded, channel_name)
             else:
                 ax_hdr1.axis("off")
                 ax_hdr1.text(
@@ -1282,21 +1311,21 @@ def plot_channel_averages(
             ax_trial_fr_ze = fig.add_subplot(gs[16, 0])
             ax_isi_ze = fig.add_subplot(gs[17, 0])
 
-            y_raw = (
+            channel_mean_raw = (
                 mean_per_channel_raw[ch]
                 if mean_per_channel_raw is not None
                 else None
             )
-            show_both = (
+            show_filtered_and_raw = (
                 lowpass_cutoff_hz is not None
                 and mean_per_channel_raw is not None
-                and y_raw is not None
-                and not np.allclose(y, y_raw, rtol=0.0, atol=1e-9)
+                and channel_mean_raw is not None
+                and not np.allclose(channel_mean, channel_mean_raw, rtol=0.0, atol=1e-9)
             )
-            if show_both:
+            if show_filtered_and_raw:
                 ax_full.plot(
                     t_rel,
-                    y_raw,
+                    channel_mean_raw,
                     linewidth=1.05,
                     color="0.35",
                     alpha=0.85,
@@ -1305,14 +1334,14 @@ def plot_channel_averages(
                 )
                 ax_full.plot(
                     t_rel,
-                    y,
+                    channel_mean,
                     linewidth=1.35,
                     color="C0",
                     label=f"Mean (filtered, {lowpass_cutoff_hz:g} Hz)",
                     zorder=2,
                 )
             else:
-                ax_full.plot(t_rel, y, linewidth=1.2, color="C0", label="Mean")
+                ax_full.plot(t_rel, channel_mean, linewidth=1.2, color="C0", label="Mean")
             ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             if trigger_end_rising_rel_s is not None:
                 ax_full.axvline(
@@ -1328,7 +1357,7 @@ def plot_channel_averages(
                 end_zoom_t1 = float(trigger_end_rising_rel_s + zoom_t1)
                 ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom region")
             ax_full.set_title(
-                f"Trigger mean — {channel_names[ch]} (full view){filt_note}{both_note}{spike_note}"
+                f"Trigger mean — {channel_name} (full view){filt_note}{both_note}{spike_note}"
             )
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
@@ -1341,10 +1370,10 @@ def plot_channel_averages(
             )
 
             zmask = (t_rel >= zoom_t0) & (t_rel <= zoom_t1)
-            if show_both and y_raw is not None:
+            if show_filtered_and_raw and channel_mean_raw is not None:
                 ax_zoom.plot(
                     t_rel[zmask],
-                    y_raw[zmask],
+                    channel_mean_raw[zmask],
                     linewidth=1.15,
                     color="0.35",
                     alpha=0.85,
@@ -1352,13 +1381,13 @@ def plot_channel_averages(
                 )
                 ax_zoom.plot(
                     t_rel[zmask],
-                    y[zmask],
+                    channel_mean[zmask],
                     linewidth=1.45,
                     color="C0",
                     label=f"Filtered ({lowpass_cutoff_hz:g} Hz)",
                 )
             else:
-                ax_zoom.plot(t_rel[zmask], y[zmask], linewidth=1.4, color="C0")
+                ax_zoom.plot(t_rel[zmask], channel_mean[zmask], linewidth=1.4, color="C0")
             ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
             if trigger_end_rising_rel_s is not None:
                 ax_zoom.axvline(
@@ -1372,7 +1401,7 @@ def plot_channel_averages(
             ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
-            if show_both:
+            if show_filtered_and_raw:
                 ax_zoom.legend(loc="best", fontsize=6)
             end_zoom_range: tuple[float, float] | None = None
             if trigger_end_rising_rel_s is not None:
@@ -1380,11 +1409,11 @@ def plot_channel_averages(
                 end_zoom_t1 = float(trigger_end_rising_rel_s + zoom_t1)
                 end_zoom_range = (end_zoom_t0, end_zoom_t1)
                 end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
-                if show_both and y_raw is not None:
-                    ax_zoom_end.plot(t_rel[end_mask], y_raw[end_mask], linewidth=1.15, color="0.35", alpha=0.85, label="Unfiltered")
-                    ax_zoom_end.plot(t_rel[end_mask], y[end_mask], linewidth=1.45, color="C0", label=f"Filtered ({lowpass_cutoff_hz:g} Hz)")
+                if show_filtered_and_raw and channel_mean_raw is not None:
+                    ax_zoom_end.plot(t_rel[end_mask], channel_mean_raw[end_mask], linewidth=1.15, color="0.35", alpha=0.85, label="Unfiltered")
+                    ax_zoom_end.plot(t_rel[end_mask], channel_mean[end_mask], linewidth=1.45, color="C0", label=f"Filtered ({lowpass_cutoff_hz:g} Hz)")
                 else:
-                    ax_zoom_end.plot(t_rel[end_mask], y[end_mask], linewidth=1.4, color="C0")
+                    ax_zoom_end.plot(t_rel[end_mask], channel_mean[end_mask], linewidth=1.4, color="C0")
                 ax_zoom_end.axvline(trigger_end_rising_rel_s, linestyle="--", linewidth=1.0, color="darkorange")
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
                 ax_zoom_end.set_title(f"Part 3 — Trigger-end zoom [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
@@ -1542,7 +1571,9 @@ def plot_channel_averages(
                 ],
                 delta=0.015,
             )
-            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=100 if lightweight_mode else 120)
+            if channel_has_mea_layout:
+                shift_axes_down([ax_hdr1], delta=0.03)
+            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
             plt.close(fig)
 
     return pdf_path
@@ -1610,38 +1641,30 @@ def plot_channel_comparison(
     with PdfPages(pdf_path) as pdf:
         for ch in range(n_channels):
             check_analysis_cancelled()
-            ya = mean_a[ch]
-            yb = mean_b[ch]
-            ya_raw = mean_a_raw[ch] if mean_a_raw is not None else None
-            yb_raw = mean_b_raw[ch] if mean_b_raw is not None else None
-            show_both = (
+            channel_name = str(channel_names[ch])
+            channel_mean_a = mean_a[ch]
+            channel_mean_b = mean_b[ch]
+            channel_mean_a_raw = mean_a_raw[ch] if mean_a_raw is not None else None
+            channel_mean_b_raw = mean_b_raw[ch] if mean_b_raw is not None else None
+            show_filtered_and_raw = (
                 lowpass_cutoff_hz is not None
-                and ya_raw is not None
-                and yb_raw is not None
+                and channel_mean_a_raw is not None
+                and channel_mean_b_raw is not None
                 and (
-                    not np.allclose(ya, ya_raw, rtol=0.0, atol=1e-9)
-                    or not np.allclose(yb, yb_raw, rtol=0.0, atol=1e-9)
+                    not np.allclose(channel_mean_a, channel_mean_a_raw, rtol=0.0, atol=1e-9)
+                    or not np.allclose(channel_mean_b, channel_mean_b_raw, rtol=0.0, atol=1e-9)
                 )
             )
-            fig = plt.figure(figsize=(12, 38))
-            hr = [
-                0.06,
-                1.05,
-                1.15,
-                0.95,
-                0.95,
-                0.06,
-                1.05,
-                1.15,
-                0.95,
-                0.95,
-                0.06,
-                1.05,
-                1.15,
-                0.95,
-                0.95,
-            ]
-            gs = fig.add_gridspec(18, 1, height_ratios=[0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95], hspace=0.9)
+            page_width_in, page_height_in = _scale_page_size_for_lightweight(
+                12.0, 46.0, lightweight_mode
+            )
+            fig = plt.figure(figsize=(page_width_in, page_height_in))
+            gs = fig.add_gridspec(
+                18,
+                1,
+                height_ratios=[0.06, 1.25, 1.30, 1.15, 1.05, 1.15, 0.06, 1.25, 1.30, 1.15, 1.05, 1.15, 0.06, 1.25, 1.30, 1.15, 1.05, 1.15],
+                hspace=0.62,
+            )
             ax_hdr1 = fig.add_subplot(gs[0, 0])
             ax_hdr1.axis("off")
             ax_hdr1.text(
@@ -1693,10 +1716,10 @@ def plot_channel_comparison(
             ax_fr_ze = fig.add_subplot(gs[15, 0], sharex=ax_zoom_end)
             ax_trial_fr_ze = fig.add_subplot(gs[16, 0])
             ax_isi_ze = fig.add_subplot(gs[17, 0])
-            if show_both:
+            if show_filtered_and_raw:
                 ax_full.plot(
                     t_rel,
-                    ya_raw,
+                    channel_mean_a_raw,
                     linewidth=1.0,
                     color="C0",
                     alpha=0.4,
@@ -1704,7 +1727,7 @@ def plot_channel_comparison(
                 )
                 ax_full.plot(
                     t_rel,
-                    yb_raw,
+                    channel_mean_b_raw,
                     linewidth=1.0,
                     color="C1",
                     alpha=0.4,
@@ -1712,21 +1735,21 @@ def plot_channel_comparison(
                 )
                 ax_full.plot(
                     t_rel,
-                    ya,
+                    channel_mean_a,
                     linewidth=1.35,
                     color="C0",
                     label=f"{label_a} (filtered {lowpass_cutoff_hz:g} Hz)",
                 )
                 ax_full.plot(
                     t_rel,
-                    yb,
+                    channel_mean_b,
                     linewidth=1.35,
                     color="C1",
                     label=f"{label_b} (filtered {lowpass_cutoff_hz:g} Hz)",
                 )
             else:
-                ax_full.plot(t_rel, ya, linewidth=1.2, color="C0", label=label_a)
-                ax_full.plot(t_rel, yb, linewidth=1.2, color="C1", label=label_b)
+                ax_full.plot(t_rel, channel_mean_a, linewidth=1.2, color="C0", label=label_a)
+                ax_full.plot(t_rel, channel_mean_b, linewidth=1.2, color="C1", label=label_b)
             ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             if trigger_end_rising_rel_s_a is not None:
                 ax_full.axvline(
@@ -1756,7 +1779,7 @@ def plot_channel_comparison(
                 else ""
             )
             ax_full.set_title(
-                f"Comparison — {channel_names[ch]} (full view){filt_note}{both_note}{spike_cmp_note}"
+                f"Comparison — {channel_name} (full view){filt_note}{both_note}{spike_cmp_note}"
             )
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
@@ -1768,10 +1791,10 @@ def plot_channel_comparison(
                 fontsize=6,
             )
 
-            if show_both and ya_raw is not None and yb_raw is not None:
+            if show_filtered_and_raw and channel_mean_a_raw is not None and channel_mean_b_raw is not None:
                 ax_zoom.plot(
                     t_rel[zmask],
-                    ya_raw[zmask],
+                    channel_mean_a_raw[zmask],
                     linewidth=1.1,
                     color="C0",
                     alpha=0.45,
@@ -1779,7 +1802,7 @@ def plot_channel_comparison(
                 )
                 ax_zoom.plot(
                     t_rel[zmask],
-                    yb_raw[zmask],
+                    channel_mean_b_raw[zmask],
                     linewidth=1.1,
                     color="C1",
                     alpha=0.45,
@@ -1787,21 +1810,21 @@ def plot_channel_comparison(
                 )
                 ax_zoom.plot(
                     t_rel[zmask],
-                    ya[zmask],
+                    channel_mean_a[zmask],
                     linewidth=1.45,
                     color="C0",
                     label=f"{label_a} filtered",
                 )
                 ax_zoom.plot(
                     t_rel[zmask],
-                    yb[zmask],
+                    channel_mean_b[zmask],
                     linewidth=1.45,
                     color="C1",
                     label=f"{label_b} filtered",
                 )
             else:
-                ax_zoom.plot(t_rel[zmask], ya[zmask], linewidth=1.4, color="C0", label=label_a)
-                ax_zoom.plot(t_rel[zmask], yb[zmask], linewidth=1.4, color="C1", label=label_b)
+                ax_zoom.plot(t_rel[zmask], channel_mean_a[zmask], linewidth=1.4, color="C0", label=label_a)
+                ax_zoom.plot(t_rel[zmask], channel_mean_b[zmask], linewidth=1.4, color="C1", label=label_b)
             ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
             if trigger_end_rising_rel_s_a is not None:
                 ax_zoom.axvline(
@@ -1830,8 +1853,8 @@ def plot_channel_comparison(
                 end_zoom_t1 = float(max(end_markers) + zoom_t1)
                 end_zoom_range = (end_zoom_t0, end_zoom_t1)
                 end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
-                ax_zoom_end.plot(t_rel[end_mask], ya[end_mask], linewidth=1.35, color="C0", label=label_a)
-                ax_zoom_end.plot(t_rel[end_mask], yb[end_mask], linewidth=1.35, color="C1", label=label_b)
+                ax_zoom_end.plot(t_rel[end_mask], channel_mean_a[end_mask], linewidth=1.35, color="C0", label=label_a)
+                ax_zoom_end.plot(t_rel[end_mask], channel_mean_b[end_mask], linewidth=1.35, color="C1", label=label_b)
                 if trigger_end_rising_rel_s_a is not None:
                     ax_zoom_end.axvline(trigger_end_rising_rel_s_a, linestyle=":", linewidth=1.0, color="darkorange")
                 if trigger_end_rising_rel_s_b is not None:
@@ -1997,7 +2020,7 @@ def plot_channel_comparison(
                 ],
                 delta=0.015,
             )
-            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=100 if lightweight_mode else 120)
+            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
             plt.close(fig)
 
     return pdf_path

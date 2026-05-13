@@ -267,14 +267,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def run(config: AnalysisConfig) -> None:
-    spike_src: AmplifierSpikeSource | None = None
-    t0 = time.perf_counter()
+    spike_source: AmplifierSpikeSource | None = None
+    run_start_time_s = time.perf_counter()
     try:
         if config.probe_layout_json is not None:
-            pj = config.probe_layout_json
-            if not pj.exists():
-                raise FileNotFoundError(f"Probe JSON not found: {pj}")
-            load_probe_layout_json(pj)
+            probe_json_path = config.probe_layout_json
+            if not probe_json_path.exists():
+                raise FileNotFoundError(f"Probe JSON not found: {probe_json_path}")
+            load_probe_layout_json(probe_json_path)
         (
             mean_per_channel,
             t_rel,
@@ -283,16 +283,16 @@ def run(config: AnalysisConfig) -> None:
             n_total,
             fs,
             end_rising_s,
-            spike_src,
+            spike_source,
             mean_per_channel_raw,
         ) = compute_average_per_channel(config)
         check_analysis_cancelled()
-        out_dir = config.save_dir if config.save_dir is not None else config.rhs_file.parent
-        with tempfile.TemporaryDirectory(prefix="plot_erg_means_") as td:
-            mm_dir = Path(td)
-            mean_mm = _to_temp_mmap(mean_per_channel, mm_dir, "mean_filtered_or_raw")
-            mean_raw_mm = (
-                _to_temp_mmap(mean_per_channel_raw, mm_dir, "mean_raw")
+        output_dir = config.save_dir if config.save_dir is not None else config.rhs_file.parent
+        with tempfile.TemporaryDirectory(prefix="plot_erg_means_") as temporary_dir:
+            mmap_dir = Path(temporary_dir)
+            mean_per_channel_mmap = _to_temp_mmap(mean_per_channel, mmap_dir, "mean_filtered_or_raw")
+            mean_per_channel_raw_mmap = (
+                _to_temp_mmap(mean_per_channel_raw, mmap_dir, "mean_raw")
                 if config.lowpass_cutoff_hz is not None
                 else None
             )
@@ -300,21 +300,21 @@ def run(config: AnalysisConfig) -> None:
             del mean_per_channel_raw
             pdf_path = plot_channel_averages(
                 t_rel=t_rel,
-                mean_per_channel=mean_mm,
+                mean_per_channel=mean_per_channel_mmap,
                 channel_names=channel_names,
-                output_dir=out_dir,
+                output_dir=output_dir,
                 rhs_file=config.rhs_file,
                 pdf_title=config.pdf_title,
                 lowpass_cutoff_hz=config.lowpass_cutoff_hz,
                 trigger_end_rising_rel_s=end_rising_s,
-                spike_source=spike_src,
+                spike_source=spike_source,
                 windows=None,
                 fs=fs,
                 spike_threshold_uv=config.spike_threshold_uv,
                 firing_rate_window_s=config.firing_rate_window_s,
                 zoom_t0_s=config.zoom_t0_s,
                 zoom_t1_s=config.zoom_t1_s,
-                mean_per_channel_raw=mean_raw_mm,
+                mean_per_channel_raw=mean_per_channel_raw_mmap,
                 spike_bandpass_low_hz=config.spike_bandpass_low_hz,
                 spike_bandpass_high_hz=config.spike_bandpass_high_hz,
                 lightweight_mode=config.lightweight_plot,
@@ -354,7 +354,7 @@ def run(config: AnalysisConfig) -> None:
         )
         print(f"PDF zoom window: [{config.zoom_t0_s:.3f}s, {config.zoom_t1_s:.3f}s]")
         print(f"PDF written: {pdf_path}")
-        elapsed_s = time.perf_counter() - t0
+        elapsed_s = time.perf_counter() - run_start_time_s
         print(f"Total time (analysis + PDF): {elapsed_s:.2f} s")
         print(
             f"Work dir (amplifier mmap): {resolve_work_dir(config)} — "
@@ -365,8 +365,8 @@ def run(config: AnalysisConfig) -> None:
             )
         )
     finally:
-        if spike_src is not None:
-            spike_src.close()
+        if spike_source is not None:
+            spike_source.close()
 
 
 def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
