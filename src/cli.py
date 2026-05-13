@@ -206,6 +206,12 @@ def parse_args() -> argparse.Namespace:
         help="Zoom window end (s, relative to trigger).",
     )
     parser.add_argument(
+        "--rms-window-s",
+        type=float,
+        default=defaults.rms_window_s,
+        help="RMS window duration (s) after trigger onset for RMS-evolution plot.",
+    )
+    parser.add_argument(
         "--spike-bandpass-low-hz",
         type=float,
         default=defaults.spike_bandpass_low_hz,
@@ -312,6 +318,7 @@ def run(config: AnalysisConfig) -> None:
                 fs=fs,
                 spike_threshold_uv=config.spike_threshold_uv,
                 firing_rate_window_s=config.firing_rate_window_s,
+                rms_window_s=config.rms_window_s,
                 zoom_t0_s=config.zoom_t0_s,
                 zoom_t1_s=config.zoom_t1_s,
                 mean_per_channel_raw=mean_per_channel_raw_mmap,
@@ -353,6 +360,7 @@ def run(config: AnalysisConfig) -> None:
             f"firing-rate smooth σ = {config.firing_rate_window_s} s{bp_txt}"
         )
         print(f"PDF zoom window: [{config.zoom_t0_s:.3f}s, {config.zoom_t1_s:.3f}s]")
+        print(f"RMS evolution window: [0.000s, {config.rms_window_s:.3f}s] after trigger onset")
         print(f"PDF written: {pdf_path}")
         elapsed_s = time.perf_counter() - run_start_time_s
         print(f"Total time (analysis + PDF): {elapsed_s:.2f} s")
@@ -538,6 +546,7 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             fs=float(fs_ref),
             spike_threshold_uv=tuned[0].spike_threshold_uv,
             firing_rate_window_s=tuned[0].firing_rate_window_s,
+            rms_window_s=tuned[0].rms_window_s,
             zoom_t0_s=tuned[0].zoom_t0_s,
             zoom_t1_s=tuned[0].zoom_t1_s,
             spike_bandpass_low_hz=tuned[0].spike_bandpass_low_hz,
@@ -583,6 +592,7 @@ def main() -> None:
             default_lowpass_hz=args.lowpass_hz,
             default_spike_threshold_uv=args.spike_threshold_uv,
             default_firing_rate_window_s=args.firing_rate_window_s,
+            default_rms_window_s=args.rms_window_s,
             default_zoom_t0_s=args.zoom_t0_s,
             default_zoom_t1_s=args.zoom_t1_s,
             default_spike_bandpass_low_hz=args.spike_bandpass_low_hz,
@@ -607,6 +617,7 @@ def main() -> None:
         pdf_title=args.pdf_title,
         spike_threshold_uv=args.spike_threshold_uv,
         firing_rate_window_s=args.firing_rate_window_s,
+        rms_window_s=args.rms_window_s,
         zoom_t0_s=args.zoom_t0_s,
         zoom_t1_s=args.zoom_t1_s,
         spike_bandpass_low_hz=args.spike_bandpass_low_hz,
@@ -621,6 +632,9 @@ def main() -> None:
     )
     if config.zoom_t1_s <= config.zoom_t0_s:
         print("Error: --zoom-t1-s must be strictly greater than --zoom-t0-s.", file=sys.stderr)
+        sys.exit(2)
+    if config.rms_window_s <= 0:
+        print("Error: --rms-window-s must be > 0.", file=sys.stderr)
         sys.exit(2)
     try:
         run(config)

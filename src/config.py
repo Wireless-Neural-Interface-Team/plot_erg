@@ -26,6 +26,8 @@ class AnalysisConfig:
     # PDF zoom-panel window (s, time relative to trigger)
     zoom_t0_s: float = -0.1
     zoom_t1_s: float = 0.5
+    # RMS window duration (s) after trigger onset for per-trigger RMS evolution plot
+    rms_window_s: float = 0.050
     # Butterworth band-pass on amplifier for raster / PSTH / ISI (both None = raw)
     spike_bandpass_low_hz: Optional[float] = 250.0
     spike_bandpass_high_hz: Optional[float] = 7500.0

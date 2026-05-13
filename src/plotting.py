@@ -840,6 +840,103 @@ def _append_mean_impedance_summary_page(
     plt.close(fig)
 
 
+def _mean_rms_per_trigger_from_source(
+    source: AmplifierSpikeSource,
+    rms_window_s: float,
+) -> np.ndarray:
+    """Mean RMS (across channels) computed for each trigger on [0, rms_window_s]."""
+    if source.valid_triggers.size == 0:
+        return np.array([], dtype=np.float64)
+    fs = float(source.fs)
+    rms_n = max(1, int(round(float(rms_window_s) * fs)))
+    n_samples = int(source.amplifier.shape[1])
+    rms_values = np.full(int(source.valid_triggers.size), np.nan, dtype=np.float64)
+    for i, trig in enumerate(source.valid_triggers):
+        start = int(trig)
+        end = min(start + rms_n, n_samples)
+        if end <= start:
+            continue
+        segment = np.asarray(source.amplifier[:, start:end], dtype=np.float64)
+        channel_rms = np.sqrt(np.mean(segment * segment, axis=1))
+        rms_values[i] = float(np.mean(channel_rms))
+    return rms_values[np.isfinite(rms_values)]
+
+
+def _mean_rms_per_trigger_from_windows(
+    windows: np.ndarray,
+    t_rel: np.ndarray,
+    rms_window_s: float,
+) -> np.ndarray:
+    """Mean RMS (across channels) for each trial using in-memory windows."""
+    if windows is None or windows.ndim != 3 or windows.shape[0] == 0:
+        return np.array([], dtype=np.float64)
+    if t_rel.size < 2:
+        return np.array([], dtype=np.float64)
+    dt = float(np.median(np.diff(t_rel)))
+    if dt <= 0:
+        return np.array([], dtype=np.float64)
+    fs = 1.0 / dt
+    start_idx = int(np.searchsorted(t_rel, 0.0, side="left"))
+    rms_n = max(1, int(round(float(rms_window_s) * fs)))
+    end_idx = min(start_idx + rms_n, int(windows.shape[2]))
+    if end_idx <= start_idx:
+        return np.array([], dtype=np.float64)
+    rms_values = np.full(int(windows.shape[0]), np.nan, dtype=np.float64)
+    for trial_index in range(int(windows.shape[0])):
+        segment = np.asarray(windows[trial_index, :, start_idx:end_idx], dtype=np.float64)
+        channel_rms = np.sqrt(np.mean(segment * segment, axis=1))
+        rms_values[trial_index] = float(np.mean(channel_rms))
+    return rms_values[np.isfinite(rms_values)]
+
+
+def _append_mean_rms_evolution_page(
+    pdf: PdfPages,
+    rms_series: Sequence[tuple[str, np.ndarray]],
+    rms_window_s: float,
+    lightweight_mode: bool,
+) -> None:
+    """Append one summary page: mean RMS evolution across triggers."""
+    check_analysis_cancelled()
+    fig_w, fig_h = _scale_page_size_for_lightweight(12.0, 6.0, lightweight_mode)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
+    has_data = False
+    for i, (label, values) in enumerate(rms_series):
+        if values.size == 0:
+            continue
+        has_data = True
+        x = np.arange(1, int(values.size) + 1, dtype=np.int64)
+        ax.plot(
+            x,
+            values,
+            linewidth=1.3,
+            color=colors[i % len(colors)],
+            marker="o",
+            markersize=2.4,
+            label=label,
+        )
+    if has_data:
+        ax.set_title(f"Mean RMS evolution across triggers (window: 0 to {rms_window_s:g} s)")
+        ax.set_xlabel("Trigger index")
+        ax.set_ylabel("Mean RMS across channels (µV)")
+        ax.grid(True, alpha=0.3)
+        if len(rms_series) > 1:
+            ax.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "RMS evolution unavailable\n(no valid trigger window)",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=11,
+        )
+        ax.set_axis_off()
+    pdf.savefig(fig, bbox_inches="tight", pad_inches=0.25, dpi=_lightweight_pdf_dpi(lightweight_mode))
+    plt.close(fig)
+
+
 def plot_channel_multi_comparison(
     t_rel: np.ndarray,
     means: Sequence[np.ndarray],
@@ -854,6 +951,7 @@ def plot_channel_multi_comparison(
     fs: Optional[float] = None,
     spike_threshold_uv: float = -40.0,
     firing_rate_window_s: float = 0.025,
+    rms_window_s: float = 0.050,
     zoom_t0_s: float = ZOOM_T0,
     zoom_t1_s: float = ZOOM_T1,
     spike_bandpass_low_hz: Optional[float] = None,
@@ -954,10 +1052,32 @@ def plot_channel_multi_comparison(
             )
             page_width_in = 26.0 if channel_has_mea_layout else 12.0
             mea_row_height_ratio = 2.20 if channel_has_mea_layout else 0.06
-            panel_height_ratios = [mea_row_height_ratio, 1.25, 1.30, 1.15, 1.05, 1.15, 0.06, 1.25, 1.30, 1.15, 1.05, 1.15, 0.06, 1.25, 1.30, 1.15, 1.05, 1.15]
+            panel_height_ratios = [
+                mea_row_height_ratio,
+                1.70,
+                1.60,
+                1.30,
+                1.15,
+                1.05,
+                1.15,
+                0.06,
+                1.70,
+                1.50,
+                1.30,
+                1.15,
+                1.05,
+                1.15,
+                0.06,
+                1.70,
+                1.50,
+                1.30,
+                1.15,
+                1.05,
+                1.15,
+            ]
             if impedance_sessions:
                 full_height_ratios = [*panel_height_ratios, 0.05, 0.95]
-                page_height_in = 104.0 if channel_has_mea_layout else 50.0
+                page_height_in = 116.0 if channel_has_mea_layout else 56.0
                 if not channel_has_mea_layout:
                     page_width_in, page_height_in = _scale_page_size_for_lightweight(
                         page_width_in, page_height_in, lightweight_mode
@@ -965,13 +1085,13 @@ def plot_channel_multi_comparison(
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
                 gs = fig.add_gridspec(len(full_height_ratios), 1, height_ratios=full_height_ratios, hspace=0.58)
             else:
-                page_height_in = 96.0 if channel_has_mea_layout else 46.0
+                page_height_in = 108.0 if channel_has_mea_layout else 52.0
                 if not channel_has_mea_layout:
                     page_width_in, page_height_in = _scale_page_size_for_lightweight(
                         page_width_in, page_height_in, lightweight_mode
                     )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
-                gs = fig.add_gridspec(18, 1, height_ratios=panel_height_ratios, hspace=0.58)
+                gs = fig.add_gridspec(21, 1, height_ratios=panel_height_ratios, hspace=0.58)
             ax_hdr1 = fig.add_subplot(gs[0, 0])
             if channel_has_mea_layout and probe_layout_loaded is not None:
                 draw_probe_layout_on_axes(ax_hdr1, probe_layout_loaded, channel_name)
@@ -979,27 +1099,30 @@ def plot_channel_multi_comparison(
                 ax_hdr1.axis("off")
                 ax_hdr1.text(0.02, 0.5, "Part 1 — Full view (entire pre/post-trigger window)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr1.transAxes)
             ax_full = fig.add_subplot(gs[1, 0])
-            ax_raster_f = fig.add_subplot(gs[2, 0], sharex=ax_full)
-            ax_fr_f = fig.add_subplot(gs[3, 0], sharex=ax_full)
-            ax_trial_fr_f = fig.add_subplot(gs[4, 0])
-            ax_isi_f = fig.add_subplot(gs[5, 0])
-            ax_hdr2 = fig.add_subplot(gs[6, 0]); ax_hdr2.axis("off")
+            ax_first_trigger = fig.add_subplot(gs[2, 0], sharex=ax_full)
+            ax_raster_f = fig.add_subplot(gs[3, 0], sharex=ax_full)
+            ax_fr_f = fig.add_subplot(gs[4, 0], sharex=ax_full)
+            ax_trial_fr_f = fig.add_subplot(gs[5, 0])
+            ax_isi_f = fig.add_subplot(gs[6, 0])
+            ax_hdr2 = fig.add_subplot(gs[7, 0]); ax_hdr2.axis("off")
             ax_hdr2.text(0.02, 0.5, f"Part 2 — Zoomed view [{zoom_t0:.2f}, {zoom_t1:.2f}] s (relative to trigger)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr2.transAxes)
-            ax_zoom = fig.add_subplot(gs[7, 0])
-            ax_raster_z = fig.add_subplot(gs[8, 0], sharex=ax_zoom)
-            ax_fr_z = fig.add_subplot(gs[9, 0], sharex=ax_zoom)
-            ax_trial_fr_z = fig.add_subplot(gs[10, 0])
-            ax_isi_z = fig.add_subplot(gs[11, 0])
-            ax_hdr3 = fig.add_subplot(gs[12, 0]); ax_hdr3.axis("off")
+            ax_zoom = fig.add_subplot(gs[8, 0])
+            ax_zoom_first = fig.add_subplot(gs[9, 0], sharex=ax_zoom)
+            ax_raster_z = fig.add_subplot(gs[10, 0], sharex=ax_zoom)
+            ax_fr_z = fig.add_subplot(gs[11, 0], sharex=ax_zoom)
+            ax_trial_fr_z = fig.add_subplot(gs[12, 0])
+            ax_isi_z = fig.add_subplot(gs[13, 0])
+            ax_hdr3 = fig.add_subplot(gs[14, 0]); ax_hdr3.axis("off")
             ax_hdr3.text(0.02, 0.5, "Part 3 — Trigger-end zoom (rising edge)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr3.transAxes)
-            ax_zoom_end = fig.add_subplot(gs[13, 0])
-            ax_raster_ze = fig.add_subplot(gs[14, 0], sharex=ax_zoom_end)
-            ax_fr_ze = fig.add_subplot(gs[15, 0], sharex=ax_zoom_end)
-            ax_trial_fr_ze = fig.add_subplot(gs[16, 0])
-            ax_isi_ze = fig.add_subplot(gs[17, 0])
+            ax_zoom_end = fig.add_subplot(gs[15, 0])
+            ax_zoom_end_first = fig.add_subplot(gs[16, 0], sharex=ax_zoom_end)
+            ax_raster_ze = fig.add_subplot(gs[17, 0], sharex=ax_zoom_end)
+            ax_fr_ze = fig.add_subplot(gs[18, 0], sharex=ax_zoom_end)
+            ax_trial_fr_ze = fig.add_subplot(gs[19, 0])
+            ax_isi_ze = fig.add_subplot(gs[20, 0])
 
             if impedance_sessions:
-                ax_imp_hdr = fig.add_subplot(gs[18, 0])
+                ax_imp_hdr = fig.add_subplot(gs[21, 0])
                 ax_imp_hdr.axis("off")
                 ax_imp_hdr.text(
                     0.02,
@@ -1011,7 +1134,7 @@ def plot_channel_multi_comparison(
                     fontweight="bold",
                     transform=ax_imp_hdr.transAxes,
                 )
-                ax_imp = fig.add_subplot(gs[19, 0])
+                ax_imp = fig.add_subplot(gs[22, 0])
                 _draw_impedance_evolution_panel(ax_imp, channel_name, impedance_sessions)
 
             show_filtered_and_raw = (
@@ -1023,6 +1146,20 @@ def plot_channel_multi_comparison(
                     for i in range(len(means_ch))
                 )
             )
+            first_trigger_curves: list[Optional[np.ndarray]] = []
+            if spike_sources is not None:
+                for src in spike_sources:
+                    if src is None or src.valid_triggers.size == 0:
+                        first_trigger_curves.append(None)
+                        continue
+                    first_trig = int(src.valid_triggers[0])
+                    start = int(first_trig - src.pre_n)
+                    end = int(first_trig + src.post_n)
+                    first_curve = np.asarray(src.amplifier[ch, start:end], dtype=np.float64)
+                    if first_curve.shape[0] != t_rel.shape[0]:
+                        first_trigger_curves.append(None)
+                        continue
+                    first_trigger_curves.append(first_curve)
             for recording_index, recording_curve in enumerate(means_ch):
                 line_color = colors[recording_index % len(colors)]
                 if show_filtered_and_raw and means_raw_ch is not None:
@@ -1047,7 +1184,48 @@ def plot_channel_multi_comparison(
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
-            ax_full.legend(loc="upper center", bbox_to_anchor=(0.5, -0.36), ncol=4, fontsize=LEGEND_FONT_SIZE)
+            ax_full.legend(loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=4, fontsize=LEGEND_FONT_SIZE)
+
+            if any(curve is not None for curve in first_trigger_curves):
+                for recording_index, first_curve in enumerate(first_trigger_curves):
+                    if first_curve is None:
+                        continue
+                    line_color = colors[recording_index % len(colors)]
+                    ax_first_trigger.plot(
+                        t_rel,
+                        first_curve,
+                        linewidth=1.1,
+                        color=line_color,
+                        label=f"{labels[recording_index]} first trigger raw",
+                    )
+                ax_first_trigger.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
+                for v in end_markers:
+                    ax_first_trigger.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
+                ax_first_trigger.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
+                if end_markers:
+                    end_zoom_t0 = float(min(end_markers) + zoom_t0)
+                    end_zoom_t1 = float(max(end_markers) + zoom_t1)
+                    ax_first_trigger.axvspan(
+                        end_zoom_t0,
+                        end_zoom_t1,
+                        alpha=0.10,
+                        color="gold",
+                        label="Trigger-end zoom region",
+                    )
+                ax_first_trigger.set_title("First trigger — raw signal (no averaging)")
+                ax_first_trigger.set_ylabel("Potential (µV)")
+                ax_first_trigger.set_xlabel(TIME_REL_XLABEL)
+                ax_first_trigger.grid(True, alpha=0.3)
+            else:
+                ax_first_trigger.text(
+                    0.5,
+                    0.5,
+                    "First trigger raw signal unavailable",
+                    ha="center",
+                    va="center",
+                    transform=ax_first_trigger.transAxes,
+                )
+                ax_first_trigger.set_axis_off()
 
             ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
             ax_zoom.set_xlim(zoom_t0, zoom_t1)
@@ -1055,6 +1233,29 @@ def plot_channel_multi_comparison(
             ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
+            if any(curve is not None for curve in first_trigger_curves):
+                for recording_index, first_curve in enumerate(first_trigger_curves):
+                    if first_curve is None:
+                        continue
+                    line_color = colors[recording_index % len(colors)]
+                    ax_zoom_first.plot(
+                        t_rel[zmask],
+                        first_curve[zmask],
+                        linewidth=1.2,
+                        color=line_color,
+                        label=f"{labels[recording_index]} first trigger raw",
+                    )
+                ax_zoom_first.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
+                for v in end_markers:
+                    ax_zoom_first.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
+                ax_zoom_first.set_xlim(zoom_t0, zoom_t1)
+                ax_zoom_first.set_title("Part 2 — First trigger raw (separate view)")
+                ax_zoom_first.set_ylabel("Potential (µV)")
+                ax_zoom_first.set_xlabel(TIME_REL_XLABEL)
+                ax_zoom_first.grid(True, alpha=0.3)
+            else:
+                ax_zoom_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_first.transAxes)
+                ax_zoom_first.set_axis_off()
 
             end_zoom_range: tuple[float, float] | None = None
             if end_markers:
@@ -1078,9 +1279,33 @@ def plot_channel_multi_comparison(
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
+                if any(curve is not None for curve in first_trigger_curves):
+                    for recording_index, first_curve in enumerate(first_trigger_curves):
+                        if first_curve is None:
+                            continue
+                        line_color = colors[recording_index % len(colors)]
+                        ax_zoom_end_first.plot(
+                            t_rel[end_mask],
+                            first_curve[end_mask],
+                            linewidth=1.2,
+                            color=line_color,
+                            label=f"{labels[recording_index]} first trigger raw",
+                        )
+                    for v in end_markers:
+                        ax_zoom_end_first.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
+                    ax_zoom_end_first.set_xlim(end_zoom_t0, end_zoom_t1)
+                    ax_zoom_end_first.set_title("Part 3 — First trigger raw (separate view)")
+                    ax_zoom_end_first.set_ylabel("Potential (µV)")
+                    ax_zoom_end_first.set_xlabel(TIME_REL_XLABEL)
+                    ax_zoom_end_first.grid(True, alpha=0.3)
+                else:
+                    ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
+                    ax_zoom_end_first.set_axis_off()
             else:
                 ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
                 ax_zoom_end.set_axis_off()
+                ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
+                ax_zoom_end_first.set_axis_off()
 
             if _has_spike_cmp and spike_sources is not None:
                 sources_ok = [src for src in spike_sources if src is not None]
@@ -1122,7 +1347,9 @@ def plot_channel_multi_comparison(
 
             _axes_tick_bottom = [
                 ax_full,
+                ax_first_trigger,
                 ax_zoom,
+                ax_zoom_first,
                 ax_raster_f,
                 ax_fr_f,
                 ax_trial_fr_f,
@@ -1136,6 +1363,7 @@ def plot_channel_multi_comparison(
                 ax_trial_fr_ze,
                 ax_isi_ze,
                 ax_zoom_end,
+                ax_zoom_end_first,
             ]
             if impedance_sessions:
                 _axes_tick_bottom.append(ax_imp)
@@ -1145,18 +1373,21 @@ def plot_channel_multi_comparison(
             fig.tight_layout()
             shift_axes_down(
                 [
+                    ax_first_trigger,
                     ax_raster_f,
                     ax_fr_f,
                     ax_trial_fr_f,
                     ax_isi_f,
                     ax_hdr2,
                     ax_zoom,
+                    ax_zoom_first,
                     ax_raster_z,
                     ax_fr_z,
                     ax_trial_fr_z,
                     ax_isi_z,
                     ax_hdr3,
                     ax_zoom_end,
+                    ax_zoom_end_first,
                     ax_raster_ze,
                     ax_fr_ze,
                     ax_trial_fr_ze,
@@ -1166,6 +1397,17 @@ def plot_channel_multi_comparison(
             )
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
             plt.close(fig)
+
+        if spike_sources is not None:
+            rms_series = []
+            for i, src in enumerate(spike_sources):
+                if src is None:
+                    continue
+                rms_vals = _mean_rms_per_trigger_from_source(src, rms_window_s)
+                label = labels[i] if i < len(labels) else f"Recording {i + 1}"
+                rms_series.append((label, rms_vals))
+            if rms_series:
+                _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s, lightweight_mode)
 
         if impedance_sessions:
             _append_mean_impedance_summary_page(pdf, impedance_sessions, lightweight_mode)
@@ -1187,6 +1429,7 @@ def plot_channel_averages(
     fs: Optional[float] = None,
     spike_threshold_uv: float = -40.0,
     firing_rate_window_s: float = 0.025,
+    rms_window_s: float = 0.050,
     zoom_t0_s: float = ZOOM_T0,
     zoom_t1_s: float = ZOOM_T1,
     mean_per_channel_raw: Optional[np.ndarray] = None,
@@ -1256,30 +1499,33 @@ def plot_channel_averages(
             )
             page_width_in = 26.0 if channel_has_mea_layout else 12.0
             mea_row_height_ratio = 2.20 if channel_has_mea_layout else 0.06
-            page_height_in = 96.0 if channel_has_mea_layout else 46.0
+            page_height_in = 108.0 if channel_has_mea_layout else 52.0
             if not channel_has_mea_layout:
                 page_width_in, page_height_in = _scale_page_size_for_lightweight(
                     page_width_in, page_height_in, lightweight_mode
                 )
             fig = plt.figure(figsize=(page_width_in, page_height_in))
             gs = fig.add_gridspec(
-                18,
+                21,
                 1,
                 height_ratios=[
                     mea_row_height_ratio,
-                    1.25,
+                    1.70,
+                    1.60,
                     1.30,
                     1.15,
                     1.05,
                     1.15,
                     0.06,
-                    1.25,
+                    1.70,
+                    1.50,
                     1.30,
                     1.15,
                     1.05,
                     1.15,
                     0.06,
-                    1.25,
+                    1.70,
+                    1.50,
                     1.30,
                     1.15,
                     1.05,
@@ -1303,11 +1549,12 @@ def plot_channel_averages(
                     transform=ax_hdr1.transAxes,
                 )
             ax_full = fig.add_subplot(gs[1, 0])
-            ax_raster_f = fig.add_subplot(gs[2, 0], sharex=ax_full)
-            ax_fr_f = fig.add_subplot(gs[3, 0], sharex=ax_full)
-            ax_trial_fr_f = fig.add_subplot(gs[4, 0])
-            ax_isi_f = fig.add_subplot(gs[5, 0])
-            ax_hdr2 = fig.add_subplot(gs[6, 0])
+            ax_first_trigger = fig.add_subplot(gs[2, 0], sharex=ax_full)
+            ax_raster_f = fig.add_subplot(gs[3, 0], sharex=ax_full)
+            ax_fr_f = fig.add_subplot(gs[4, 0], sharex=ax_full)
+            ax_trial_fr_f = fig.add_subplot(gs[5, 0])
+            ax_isi_f = fig.add_subplot(gs[6, 0])
+            ax_hdr2 = fig.add_subplot(gs[7, 0])
             ax_hdr2.axis("off")
             ax_hdr2.text(
                 0.02,
@@ -1319,12 +1566,13 @@ def plot_channel_averages(
                 fontweight="bold",
                 transform=ax_hdr2.transAxes,
             )
-            ax_zoom = fig.add_subplot(gs[7, 0])
-            ax_raster_z = fig.add_subplot(gs[8, 0], sharex=ax_zoom)
-            ax_fr_z = fig.add_subplot(gs[9, 0], sharex=ax_zoom)
-            ax_trial_fr_z = fig.add_subplot(gs[10, 0])
-            ax_isi_z = fig.add_subplot(gs[11, 0])
-            ax_hdr3 = fig.add_subplot(gs[12, 0])
+            ax_zoom = fig.add_subplot(gs[8, 0])
+            ax_zoom_first = fig.add_subplot(gs[9, 0], sharex=ax_zoom)
+            ax_raster_z = fig.add_subplot(gs[10, 0], sharex=ax_zoom)
+            ax_fr_z = fig.add_subplot(gs[11, 0], sharex=ax_zoom)
+            ax_trial_fr_z = fig.add_subplot(gs[12, 0])
+            ax_isi_z = fig.add_subplot(gs[13, 0])
+            ax_hdr3 = fig.add_subplot(gs[14, 0])
             ax_hdr3.axis("off")
             ax_hdr3.text(
                 0.02,
@@ -1336,17 +1584,33 @@ def plot_channel_averages(
                 fontweight="bold",
                 transform=ax_hdr3.transAxes,
             )
-            ax_zoom_end = fig.add_subplot(gs[13, 0])
-            ax_raster_ze = fig.add_subplot(gs[14, 0], sharex=ax_zoom_end)
-            ax_fr_ze = fig.add_subplot(gs[15, 0], sharex=ax_zoom_end)
-            ax_trial_fr_ze = fig.add_subplot(gs[16, 0])
-            ax_isi_ze = fig.add_subplot(gs[17, 0])
+            ax_zoom_end = fig.add_subplot(gs[15, 0])
+            ax_zoom_end_first = fig.add_subplot(gs[16, 0], sharex=ax_zoom_end)
+            ax_raster_ze = fig.add_subplot(gs[17, 0], sharex=ax_zoom_end)
+            ax_fr_ze = fig.add_subplot(gs[18, 0], sharex=ax_zoom_end)
+            ax_trial_fr_ze = fig.add_subplot(gs[19, 0])
+            ax_isi_ze = fig.add_subplot(gs[20, 0])
 
             channel_mean_raw = (
                 mean_per_channel_raw[ch]
                 if mean_per_channel_raw is not None
                 else None
             )
+            channel_first_trigger_raw: Optional[np.ndarray] = None
+            if spike_source is not None and spike_source.valid_triggers.size > 0:
+                first_trigger_index = int(spike_source.valid_triggers[0])
+                sample_start = int(first_trigger_index - spike_source.pre_n)
+                sample_end = int(first_trigger_index + spike_source.post_n)
+                channel_first_trigger_raw = np.asarray(
+                    spike_source.amplifier[ch, sample_start:sample_end],
+                    dtype=np.float64,
+                )
+                if channel_first_trigger_raw.shape[0] != t_rel.shape[0]:
+                    channel_first_trigger_raw = None
+            elif windows is not None and getattr(windows, "ndim", 0) == 3 and windows.shape[0] > 0:
+                first_trial_window = np.asarray(windows[0, ch, :], dtype=np.float64)
+                if first_trial_window.shape[0] == t_rel.shape[0]:
+                    channel_first_trigger_raw = first_trial_window
             show_filtered_and_raw = (
                 lowpass_cutoff_hz is not None
                 and mean_per_channel_raw is not None
@@ -1395,10 +1659,59 @@ def plot_channel_averages(
             ax_full.grid(True, alpha=0.3)
             ax_full.legend(
                 loc="upper center",
-                bbox_to_anchor=(0.5, -0.36),
+                bbox_to_anchor=(0.5, -0.28),
                 ncol=3,
                 fontsize=LEGEND_FONT_SIZE,
             )
+
+            if channel_first_trigger_raw is not None:
+                ax_first_trigger.plot(
+                    t_rel,
+                    channel_first_trigger_raw,
+                    linewidth=1.1,
+                    color="C3",
+                    label="First trigger (raw, no averaging)",
+                )
+                ax_first_trigger.axvline(
+                    0.0,
+                    linestyle="--",
+                    linewidth=1.0,
+                    color="red",
+                    label="Trigger (onset)",
+                )
+                if trigger_end_rising_rel_s is not None:
+                    ax_first_trigger.axvline(
+                        trigger_end_rising_rel_s,
+                        linestyle=":",
+                        linewidth=1.0,
+                        color="darkorange",
+                        label="Trigger end (rising)",
+                    )
+                ax_first_trigger.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
+                if trigger_end_rising_rel_s is not None:
+                    end_zoom_t0 = float(trigger_end_rising_rel_s + zoom_t0)
+                    end_zoom_t1 = float(trigger_end_rising_rel_s + zoom_t1)
+                    ax_first_trigger.axvspan(
+                        end_zoom_t0,
+                        end_zoom_t1,
+                        alpha=0.10,
+                        color="gold",
+                        label="Trigger-end zoom region",
+                    )
+                ax_first_trigger.set_title("First trigger — raw signal (no averaging)")
+                ax_first_trigger.set_ylabel("Potential (µV)")
+                ax_first_trigger.set_xlabel(TIME_REL_XLABEL)
+                ax_first_trigger.grid(True, alpha=0.3)
+            else:
+                ax_first_trigger.text(
+                    0.5,
+                    0.5,
+                    "First trigger raw signal unavailable",
+                    ha="center",
+                    va="center",
+                    transform=ax_first_trigger.transAxes,
+                )
+                ax_first_trigger.set_axis_off()
 
             zmask = (t_rel >= zoom_t0) & (t_rel <= zoom_t1)
             if show_filtered_and_raw and channel_mean_raw is not None:
@@ -1434,6 +1747,37 @@ def plot_channel_averages(
             ax_zoom.grid(True, alpha=0.3)
             if show_filtered_and_raw:
                 ax_zoom.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
+            if channel_first_trigger_raw is not None:
+                ax_zoom_first.plot(
+                    t_rel[zmask],
+                    channel_first_trigger_raw[zmask],
+                    linewidth=1.2,
+                    color="C3",
+                    label="First trigger raw (no averaging)",
+                )
+                ax_zoom_first.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
+                if trigger_end_rising_rel_s is not None:
+                    ax_zoom_first.axvline(
+                        trigger_end_rising_rel_s,
+                        linestyle=":",
+                        linewidth=1.0,
+                        color="darkorange",
+                    )
+                ax_zoom_first.set_xlim(zoom_t0, zoom_t1)
+                ax_zoom_first.set_title("Part 2 — First trigger raw (separate view)")
+                ax_zoom_first.set_ylabel("Potential (µV)")
+                ax_zoom_first.set_xlabel(TIME_REL_XLABEL)
+                ax_zoom_first.grid(True, alpha=0.3)
+            else:
+                ax_zoom_first.text(
+                    0.5,
+                    0.5,
+                    "First trigger raw signal unavailable",
+                    ha="center",
+                    va="center",
+                    transform=ax_zoom_first.transAxes,
+                )
+                ax_zoom_first.set_axis_off()
             end_zoom_range: tuple[float, float] | None = None
             if trigger_end_rising_rel_s is not None:
                 end_zoom_t0 = float(trigger_end_rising_rel_s + zoom_t0)
@@ -1451,9 +1795,37 @@ def plot_channel_averages(
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
+                if show_filtered_and_raw:
+                    ax_zoom_end.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
+                if channel_first_trigger_raw is not None:
+                    ax_zoom_end_first.plot(
+                        t_rel[end_mask],
+                        channel_first_trigger_raw[end_mask],
+                        linewidth=1.2,
+                        color="C3",
+                        label="First trigger raw (no averaging)",
+                    )
+                    ax_zoom_end_first.axvline(trigger_end_rising_rel_s, linestyle="--", linewidth=1.0, color="darkorange")
+                    ax_zoom_end_first.set_xlim(end_zoom_t0, end_zoom_t1)
+                    ax_zoom_end_first.set_title("Part 3 — First trigger raw (separate view)")
+                    ax_zoom_end_first.set_ylabel("Potential (µV)")
+                    ax_zoom_end_first.set_xlabel(TIME_REL_XLABEL)
+                    ax_zoom_end_first.grid(True, alpha=0.3)
+                else:
+                    ax_zoom_end_first.text(
+                        0.5,
+                        0.5,
+                        "First trigger raw signal unavailable",
+                        ha="center",
+                        va="center",
+                        transform=ax_zoom_end_first.transAxes,
+                    )
+                    ax_zoom_end_first.set_axis_off()
             else:
                 ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
                 ax_zoom_end.set_axis_off()
+                ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
+                ax_zoom_end_first.set_axis_off()
 
             if _has_spike_data and (
                 spike_source is not None
@@ -1563,7 +1935,9 @@ def plot_channel_averages(
 
             for ax in (
                 ax_full,
+                ax_first_trigger,
                 ax_zoom,
+                ax_zoom_first,
                 ax_raster_f,
                 ax_fr_f,
                 ax_trial_fr_f,
@@ -1577,24 +1951,28 @@ def plot_channel_averages(
                 ax_trial_fr_ze,
                 ax_isi_ze,
                 ax_zoom_end,
+                ax_zoom_end_first,
             ):
                 ax.tick_params(axis="x", labelbottom=True)
 
             fig.tight_layout()
             shift_axes_down(
                 [
+                    ax_first_trigger,
                     ax_raster_f,
                     ax_fr_f,
                     ax_trial_fr_f,
                     ax_isi_f,
                     ax_hdr2,
                     ax_zoom,
+                    ax_zoom_first,
                     ax_raster_z,
                     ax_fr_z,
                     ax_trial_fr_z,
                     ax_isi_z,
                     ax_hdr3,
                     ax_zoom_end,
+                    ax_zoom_end_first,
                     ax_raster_ze,
                     ax_fr_ze,
                     ax_trial_fr_ze,
@@ -1604,6 +1982,18 @@ def plot_channel_averages(
             )
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
             plt.close(fig)
+
+        rms_values = np.array([], dtype=np.float64)
+        if spike_source is not None:
+            rms_values = _mean_rms_per_trigger_from_source(spike_source, rms_window_s)
+        elif windows is not None and getattr(windows, "ndim", 0) == 3:
+            rms_values = _mean_rms_per_trigger_from_windows(np.asarray(windows), t_rel, rms_window_s)
+        _append_mean_rms_evolution_page(
+            pdf,
+            [("Mean RMS", rms_values)],
+            rms_window_s,
+            lightweight_mode,
+        )
 
     return pdf_path
 
@@ -1627,6 +2017,7 @@ def plot_channel_comparison(
     fs: Optional[float] = None,
     spike_threshold_uv: float = -40.0,
     firing_rate_window_s: float = 0.025,
+    rms_window_s: float = 0.050,
     zoom_t0_s: float = ZOOM_T0,
     zoom_t1_s: float = ZOOM_T1,
     spike_bandpass_low_hz: Optional[float] = None,
@@ -1684,14 +2075,30 @@ def plot_channel_comparison(
                     or not np.allclose(channel_mean_b, channel_mean_b_raw, rtol=0.0, atol=1e-9)
                 )
             )
+            first_trigger_a_raw: Optional[np.ndarray] = None
+            first_trigger_b_raw: Optional[np.ndarray] = None
+            if spike_source_a is not None and spike_source_a.valid_triggers.size > 0:
+                trig_a0 = int(spike_source_a.valid_triggers[0])
+                s0_a = int(trig_a0 - spike_source_a.pre_n)
+                s1_a = int(trig_a0 + spike_source_a.post_n)
+                first_trigger_a_raw = np.asarray(spike_source_a.amplifier[ch, s0_a:s1_a], dtype=np.float64)
+                if first_trigger_a_raw.shape[0] != t_rel.shape[0]:
+                    first_trigger_a_raw = None
+            if spike_source_b is not None and spike_source_b.valid_triggers.size > 0:
+                trig_b0 = int(spike_source_b.valid_triggers[0])
+                s0_b = int(trig_b0 - spike_source_b.pre_n)
+                s1_b = int(trig_b0 + spike_source_b.post_n)
+                first_trigger_b_raw = np.asarray(spike_source_b.amplifier[ch, s0_b:s1_b], dtype=np.float64)
+                if first_trigger_b_raw.shape[0] != t_rel.shape[0]:
+                    first_trigger_b_raw = None
             page_width_in, page_height_in = _scale_page_size_for_lightweight(
-                12.0, 46.0, lightweight_mode
+                12.0, 52.0, lightweight_mode
             )
             fig = plt.figure(figsize=(page_width_in, page_height_in))
             gs = fig.add_gridspec(
-                18,
+                21,
                 1,
-                height_ratios=[0.06, 1.25, 1.30, 1.15, 1.05, 1.15, 0.06, 1.25, 1.30, 1.15, 1.05, 1.15, 0.06, 1.25, 1.30, 1.15, 1.05, 1.15],
+                height_ratios=[0.06, 1.70, 1.60, 1.30, 1.15, 1.05, 1.15, 0.06, 1.70, 1.50, 1.30, 1.15, 1.05, 1.15, 0.06, 1.70, 1.50, 1.30, 1.15, 1.05, 1.15],
                 hspace=0.62,
             )
             ax_hdr1 = fig.add_subplot(gs[0, 0])
@@ -1707,11 +2114,12 @@ def plot_channel_comparison(
                 transform=ax_hdr1.transAxes,
             )
             ax_full = fig.add_subplot(gs[1, 0])
-            ax_raster_f = fig.add_subplot(gs[2, 0], sharex=ax_full)
-            ax_fr_f = fig.add_subplot(gs[3, 0], sharex=ax_full)
-            ax_trial_fr_f = fig.add_subplot(gs[4, 0])
-            ax_isi_f = fig.add_subplot(gs[5, 0])
-            ax_hdr2 = fig.add_subplot(gs[6, 0])
+            ax_first_trigger = fig.add_subplot(gs[2, 0], sharex=ax_full)
+            ax_raster_f = fig.add_subplot(gs[3, 0], sharex=ax_full)
+            ax_fr_f = fig.add_subplot(gs[4, 0], sharex=ax_full)
+            ax_trial_fr_f = fig.add_subplot(gs[5, 0])
+            ax_isi_f = fig.add_subplot(gs[6, 0])
+            ax_hdr2 = fig.add_subplot(gs[7, 0])
             ax_hdr2.axis("off")
             ax_hdr2.text(
                 0.02,
@@ -1723,12 +2131,13 @@ def plot_channel_comparison(
                 fontweight="bold",
                 transform=ax_hdr2.transAxes,
             )
-            ax_zoom = fig.add_subplot(gs[7, 0])
-            ax_raster_z = fig.add_subplot(gs[8, 0], sharex=ax_zoom)
-            ax_fr_z = fig.add_subplot(gs[9, 0], sharex=ax_zoom)
-            ax_trial_fr_z = fig.add_subplot(gs[10, 0])
-            ax_isi_z = fig.add_subplot(gs[11, 0])
-            ax_hdr3 = fig.add_subplot(gs[12, 0])
+            ax_zoom = fig.add_subplot(gs[8, 0])
+            ax_zoom_first = fig.add_subplot(gs[9, 0], sharex=ax_zoom)
+            ax_raster_z = fig.add_subplot(gs[10, 0], sharex=ax_zoom)
+            ax_fr_z = fig.add_subplot(gs[11, 0], sharex=ax_zoom)
+            ax_trial_fr_z = fig.add_subplot(gs[12, 0])
+            ax_isi_z = fig.add_subplot(gs[13, 0])
+            ax_hdr3 = fig.add_subplot(gs[14, 0])
             ax_hdr3.axis("off")
             ax_hdr3.text(
                 0.02,
@@ -1740,11 +2149,12 @@ def plot_channel_comparison(
                 fontweight="bold",
                 transform=ax_hdr3.transAxes,
             )
-            ax_zoom_end = fig.add_subplot(gs[13, 0])
-            ax_raster_ze = fig.add_subplot(gs[14, 0], sharex=ax_zoom_end)
-            ax_fr_ze = fig.add_subplot(gs[15, 0], sharex=ax_zoom_end)
-            ax_trial_fr_ze = fig.add_subplot(gs[16, 0])
-            ax_isi_ze = fig.add_subplot(gs[17, 0])
+            ax_zoom_end = fig.add_subplot(gs[15, 0])
+            ax_zoom_end_first = fig.add_subplot(gs[16, 0], sharex=ax_zoom_end)
+            ax_raster_ze = fig.add_subplot(gs[17, 0], sharex=ax_zoom_end)
+            ax_fr_ze = fig.add_subplot(gs[18, 0], sharex=ax_zoom_end)
+            ax_trial_fr_ze = fig.add_subplot(gs[19, 0])
+            ax_isi_ze = fig.add_subplot(gs[20, 0])
             if show_filtered_and_raw:
                 ax_full.plot(
                     t_rel,
@@ -1815,10 +2225,72 @@ def plot_channel_comparison(
             ax_full.grid(True, alpha=0.3)
             ax_full.legend(
                 loc="upper center",
-                bbox_to_anchor=(0.5, -0.36),
+                bbox_to_anchor=(0.5, -0.28),
                 ncol=3,
                 fontsize=LEGEND_FONT_SIZE,
             )
+            if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
+                if first_trigger_a_raw is not None:
+                    ax_first_trigger.plot(
+                        t_rel,
+                        first_trigger_a_raw,
+                        linewidth=1.1,
+                        color="C0",
+                        label=f"{label_a} first trigger raw",
+                    )
+                if first_trigger_b_raw is not None:
+                    ax_first_trigger.plot(
+                        t_rel,
+                        first_trigger_b_raw,
+                        linewidth=1.1,
+                        color="C1",
+                        label=f"{label_b} first trigger raw",
+                    )
+                ax_first_trigger.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
+                if trigger_end_rising_rel_s_a is not None:
+                    ax_first_trigger.axvline(
+                        trigger_end_rising_rel_s_a,
+                        linestyle=":",
+                        linewidth=1.0,
+                        color="darkorange",
+                        label=f"End (rising) {label_a}",
+                    )
+                if trigger_end_rising_rel_s_b is not None:
+                    ax_first_trigger.axvline(
+                        trigger_end_rising_rel_s_b,
+                        linestyle=":",
+                        linewidth=1.0,
+                        color="purple",
+                        label=f"End (rising) {label_b}",
+                    )
+                ax_first_trigger.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
+                end_markers_first = [
+                    v for v in (trigger_end_rising_rel_s_a, trigger_end_rising_rel_s_b) if v is not None
+                ]
+                if end_markers_first:
+                    end_zoom_t0 = float(min(end_markers_first) + zoom_t0)
+                    end_zoom_t1 = float(max(end_markers_first) + zoom_t1)
+                    ax_first_trigger.axvspan(
+                        end_zoom_t0,
+                        end_zoom_t1,
+                        alpha=0.10,
+                        color="gold",
+                        label="Trigger-end zoom region",
+                    )
+                ax_first_trigger.set_title("First trigger — raw signal (no averaging)")
+                ax_first_trigger.set_ylabel("Potential (µV)")
+                ax_first_trigger.set_xlabel(TIME_REL_XLABEL)
+                ax_first_trigger.grid(True, alpha=0.3)
+            else:
+                ax_first_trigger.text(
+                    0.5,
+                    0.5,
+                    "First trigger raw signal unavailable",
+                    ha="center",
+                    va="center",
+                    transform=ax_first_trigger.transAxes,
+                )
+                ax_first_trigger.set_axis_off()
 
             if show_filtered_and_raw and channel_mean_a_raw is not None and channel_mean_b_raw is not None:
                 ax_zoom.plot(
@@ -1875,6 +2347,36 @@ def plot_channel_comparison(
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
             ax_zoom.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
+            if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
+                if first_trigger_a_raw is not None:
+                    ax_zoom_first.plot(
+                        t_rel[zmask],
+                        first_trigger_a_raw[zmask],
+                        linewidth=1.2,
+                        color="C0",
+                        label=f"{label_a} first trigger raw",
+                    )
+                if first_trigger_b_raw is not None:
+                    ax_zoom_first.plot(
+                        t_rel[zmask],
+                        first_trigger_b_raw[zmask],
+                        linewidth=1.2,
+                        color="C1",
+                        label=f"{label_b} first trigger raw",
+                    )
+                ax_zoom_first.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
+                if trigger_end_rising_rel_s_a is not None:
+                    ax_zoom_first.axvline(trigger_end_rising_rel_s_a, linestyle=":", linewidth=1.0, color="darkorange")
+                if trigger_end_rising_rel_s_b is not None:
+                    ax_zoom_first.axvline(trigger_end_rising_rel_s_b, linestyle=":", linewidth=1.0, color="purple")
+                ax_zoom_first.set_xlim(zoom_t0, zoom_t1)
+                ax_zoom_first.set_title("Part 2 — First trigger raw (separate view)")
+                ax_zoom_first.set_ylabel("Potential (µV)")
+                ax_zoom_first.set_xlabel(TIME_REL_XLABEL)
+                ax_zoom_first.grid(True, alpha=0.3)
+            else:
+                ax_zoom_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_first.transAxes)
+                ax_zoom_first.set_axis_off()
             end_zoom_range: tuple[float, float] | None = None
             end_markers = [v for v in (trigger_end_rising_rel_s_a, trigger_end_rising_rel_s_b) if v is not None]
             if end_markers:
@@ -1894,9 +2396,40 @@ def plot_channel_comparison(
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
                 ax_zoom_end.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
+                if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
+                    if first_trigger_a_raw is not None:
+                        ax_zoom_end_first.plot(
+                            t_rel[end_mask],
+                            first_trigger_a_raw[end_mask],
+                            linewidth=1.2,
+                            color="C0",
+                            label=f"{label_a} first trigger raw",
+                        )
+                    if first_trigger_b_raw is not None:
+                        ax_zoom_end_first.plot(
+                            t_rel[end_mask],
+                            first_trigger_b_raw[end_mask],
+                            linewidth=1.2,
+                            color="C1",
+                            label=f"{label_b} first trigger raw",
+                        )
+                    if trigger_end_rising_rel_s_a is not None:
+                        ax_zoom_end_first.axvline(trigger_end_rising_rel_s_a, linestyle=":", linewidth=1.0, color="darkorange")
+                    if trigger_end_rising_rel_s_b is not None:
+                        ax_zoom_end_first.axvline(trigger_end_rising_rel_s_b, linestyle=":", linewidth=1.0, color="purple")
+                    ax_zoom_end_first.set_xlim(end_zoom_t0, end_zoom_t1)
+                    ax_zoom_end_first.set_title("Part 3 — First trigger raw (separate view)")
+                    ax_zoom_end_first.set_ylabel("Potential (µV)")
+                    ax_zoom_end_first.set_xlabel(TIME_REL_XLABEL)
+                    ax_zoom_end_first.grid(True, alpha=0.3)
+                else:
+                    ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
+                    ax_zoom_end_first.set_axis_off()
             else:
                 ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
                 ax_zoom_end.set_axis_off()
+                ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
+                ax_zoom_end_first.set_axis_off()
 
             if _has_spike_cmp:
                 # Spike detection is computed once per channel (A/B),
@@ -2010,7 +2543,9 @@ def plot_channel_comparison(
 
             for ax in (
                 ax_full,
+                ax_first_trigger,
                 ax_zoom,
+                ax_zoom_first,
                 ax_raster_f,
                 ax_fr_f,
                 ax_trial_fr_f,
@@ -2024,24 +2559,28 @@ def plot_channel_comparison(
                 ax_trial_fr_ze,
                 ax_isi_ze,
                 ax_zoom_end,
+                ax_zoom_end_first,
             ):
                 ax.tick_params(axis="x", labelbottom=True)
 
             fig.tight_layout()
             shift_axes_down(
                 [
+                    ax_first_trigger,
                     ax_raster_f,
                     ax_fr_f,
                     ax_trial_fr_f,
                     ax_isi_f,
                     ax_hdr2,
                     ax_zoom,
+                    ax_zoom_first,
                     ax_raster_z,
                     ax_fr_z,
                     ax_trial_fr_z,
                     ax_isi_z,
                     ax_hdr3,
                     ax_zoom_end,
+                    ax_zoom_end_first,
                     ax_raster_ze,
                     ax_fr_ze,
                     ax_trial_fr_ze,
@@ -2051,5 +2590,13 @@ def plot_channel_comparison(
             )
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
             plt.close(fig)
+
+        rms_series: list[tuple[str, np.ndarray]] = []
+        if spike_source_a is not None:
+            rms_series.append((label_a, _mean_rms_per_trigger_from_source(spike_source_a, rms_window_s)))
+        if spike_source_b is not None:
+            rms_series.append((label_b, _mean_rms_per_trigger_from_source(spike_source_b, rms_window_s)))
+        if rms_series:
+            _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s, lightweight_mode)
 
     return pdf_path

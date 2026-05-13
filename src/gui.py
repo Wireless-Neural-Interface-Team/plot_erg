@@ -26,6 +26,7 @@ def launch_qt_gui(
     default_lowpass_hz: float | None = None,
     default_spike_threshold_uv: float = -40.0,
     default_firing_rate_window_s: float = 0.025,
+    default_rms_window_s: float = 0.050,
     default_zoom_t0_s: float = -0.1,
     default_zoom_t1_s: float = 0.2,
     default_spike_bandpass_low_hz: float | None = None,
@@ -163,6 +164,10 @@ def launch_qt_gui(
     firing_rate_window_edit.setToolTip(
         "Gaussian smoothing σ (seconds) for PSTH firing-rate curve (Hz)."
     )
+    rms_window_edit = QLineEdit(str(default_rms_window_s))
+    rms_window_edit.setToolTip(
+        "RMS window duration (seconds) after trigger onset for the RMS-evolution plot."
+    )
     zoom_t0_edit = QLineEdit(str(default_zoom_t0_s))
     zoom_t1_edit = QLineEdit(str(default_zoom_t1_s))
     zoom_t0_edit.setToolTip("Zoom window start (seconds relative to trigger).")
@@ -230,6 +235,7 @@ def launch_qt_gui(
     spike_form = QFormLayout()
     spike_form.addRow("Amplifier spike threshold (µV) — raster, PSTH and ISI:", spike_threshold_edit)
     spike_form.addRow("PSTH / firing-rate Gaussian smoothing (σ, s):", firing_rate_window_edit)
+    spike_form.addRow("RMS window duration (s, after trigger onset):", rms_window_edit)
     spike_form.addRow("Zoom window start (s, relative to trigger):", zoom_t0_edit)
     spike_form.addRow("Zoom window end (s, relative to trigger):", zoom_t1_edit)
     spike_form.addRow("Band-pass signal (raster, PSTH, ISI) low f (Hz):", bandpass_spikes_low_edit)
@@ -295,6 +301,7 @@ def launch_qt_gui(
         str | None,
         float,
         float,
+        float,
         float | None,
         float | None,
         Path | None,
@@ -342,6 +349,9 @@ def launch_qt_gui(
         zoom_t1_s = float(zoom_t1_edit.text().strip())
         if zoom_t1_s <= zoom_t0_s:
             raise ValueError("Zoom window: end must be strictly greater than start.")
+        rms_window_s = float(rms_window_edit.text().strip())
+        if rms_window_s <= 0:
+            raise ValueError("RMS window duration (s): value must be > 0.")
         return (
             float(threshold_edit.text().strip()),
             edge,
@@ -352,6 +362,7 @@ def launch_qt_gui(
             pdf_title_text if pdf_title_text else None,
             float(spike_threshold_edit.text().strip()),
             float(firing_rate_window_edit.text().strip()),
+            rms_window_s,
             zoom_t0_s,
             zoom_t1_s,
             bp_lo,
@@ -538,6 +549,7 @@ def launch_qt_gui(
         threshold_edit.setEnabled(not running)
         spike_threshold_edit.setEnabled(not running)
         firing_rate_window_edit.setEnabled(not running)
+        rms_window_edit.setEnabled(not running)
         zoom_t0_edit.setEnabled(not running)
         zoom_t1_edit.setEnabled(not running)
         bandpass_spikes_low_edit.setEnabled(not running)
@@ -628,7 +640,7 @@ def launch_qt_gui(
             rhs_file_path_text = rhs_path_edit.text().strip()
             if not rhs_file_path_text:
                 raise ValueError("Choose an RHS file.")
-            trigger_threshold, edge_mode, pre_window_s, post_window_s, lowpass_hz, save_dir_path, pdf_title, spike_threshold_uv, firing_rate_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
+            trigger_threshold, edge_mode, pre_window_s, post_window_s, lowpass_hz, save_dir_path, pdf_title, spike_threshold_uv, firing_rate_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
                 build_shared_params()
             )
             if firing_rate_window_s <= 0:
@@ -645,6 +657,7 @@ def launch_qt_gui(
                 pdf_title=pdf_title,
                 spike_threshold_uv=spike_threshold_uv,
                 firing_rate_window_s=firing_rate_window_s,
+                rms_window_s=rms_window_s,
                 zoom_t0_s=zoom_start_s,
                 zoom_t1_s=zoom_end_s,
                 spike_bandpass_low_hz=bandpass_low_hz,
@@ -707,7 +720,7 @@ def launch_qt_gui(
                     unique_paths.append(candidate_path)
             if len(unique_paths) < 2:
                 raise ValueError("Add at least two RHS files for comparison.")
-            trigger_threshold, edge_mode, pre_window_s, post_window_s, lowpass_hz, save_dir_path, pdf_title, spike_threshold_uv, firing_rate_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
+            trigger_threshold, edge_mode, pre_window_s, post_window_s, lowpass_hz, save_dir_path, pdf_title, spike_threshold_uv, firing_rate_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
                 build_shared_params()
             )
             if firing_rate_window_s <= 0:
@@ -727,6 +740,7 @@ def launch_qt_gui(
                         pdf_title=pdf_title,
                         spike_threshold_uv=spike_threshold_uv,
                         firing_rate_window_s=firing_rate_window_s,
+                        rms_window_s=rms_window_s,
                         zoom_t0_s=zoom_start_s,
                         zoom_t1_s=zoom_end_s,
                         spike_bandpass_low_hz=bandpass_low_hz,
