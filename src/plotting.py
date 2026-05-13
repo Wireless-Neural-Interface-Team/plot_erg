@@ -873,7 +873,11 @@ def _mean_rms_profile_from_source_window(
     )
     nyq = 0.5 * fs
     use_bandpass = bp_low > 0 and bp_high > bp_low and bp_high < nyq
+    n_channels = int(source.amplifier.shape[0])
     n_samples = int(source.amplifier.shape[1])
+    ch_idx = int(channel_index) if channel_index is not None else None
+    if ch_idx is not None and (ch_idx < 0 or ch_idx >= n_channels):
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     n_win = int(end_off - start_off)
     rms_n = max(1, int(round(float(rms_window_s) * fs)))
     kernel = np.ones(rms_n, dtype=np.float64) / float(rms_n)
@@ -884,23 +888,28 @@ def _mean_rms_profile_from_source_window(
         end = int(trig + end_off)
         if start < 0 or end > n_samples:
             continue
-        seg = np.asarray(source.amplifier[:, start:end], dtype=np.float64)
-        if seg.size == 0:
-            continue
-        seg = seg - np.mean(seg, axis=1, keepdims=True)
-        if use_bandpass and seg.shape[1] >= 32:
-            try:
-                seg = apply_butterworth_bandpass(seg, fs, bp_low, bp_high)
-            except Exception:
-                pass
-        if seg.shape[1] != n_win:
-            continue
-        if channel_index is not None:
-            if channel_index < 0 or channel_index >= seg.shape[0]:
+        if ch_idx is not None:
+            seg_ch = np.asarray(source.amplifier[ch_idx, start:end], dtype=np.float64)
+            if seg_ch.size == 0 or seg_ch.shape[0] != n_win:
                 continue
-            ch_sq = seg[int(channel_index)] * seg[int(channel_index)]
+            seg_ch = seg_ch - float(np.mean(seg_ch))
+            if use_bandpass and seg_ch.shape[0] >= 32:
+                try:
+                    seg_ch = apply_butterworth_bandpass(seg_ch[np.newaxis, :], fs, bp_low, bp_high)[0]
+                except Exception:
+                    pass
+            ch_sq = seg_ch * seg_ch
             rms_t = np.sqrt(np.convolve(ch_sq, kernel, mode="same"))
         else:
+            seg = np.asarray(source.amplifier[:, start:end], dtype=np.float64)
+            if seg.size == 0 or seg.shape[1] != n_win:
+                continue
+            seg = seg - np.mean(seg, axis=1, keepdims=True)
+            if use_bandpass and seg.shape[1] >= 32:
+                try:
+                    seg = apply_butterworth_bandpass(seg, fs, bp_low, bp_high)
+                except Exception:
+                    pass
             ch_rms = np.zeros_like(seg, dtype=np.float64)
             for c in range(seg.shape[0]):
                 ch_sq = seg[c] * seg[c]
@@ -937,6 +946,12 @@ def _mean_rms_profile_from_windows_window(
     seg = np.asarray(windows[:, :, start_idx:end_idx], dtype=np.float64)
     if seg.size == 0:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    ch_idx = int(channel_index) if channel_index is not None else None
+    if ch_idx is not None:
+        if ch_idx < 0 or ch_idx >= seg.shape[1]:
+            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+        # Performance: in per-channel mode, process only one channel.
+        seg = seg[:, ch_idx : ch_idx + 1, :]
     seg = seg - np.mean(seg, axis=2, keepdims=True)
     dt = float(np.median(np.diff(t_rel)))
     fs = 1.0 / dt if dt > 0 else 0.0
@@ -958,12 +973,10 @@ def _mean_rms_profile_from_windows_window(
                 )
             except Exception:
                 pass
-    if channel_index is not None:
-        if channel_index < 0 or channel_index >= seg.shape[1]:
-            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    if ch_idx is not None:
         rms_trials = np.zeros((seg.shape[0], seg.shape[2]), dtype=np.float64)
         for trial_idx in range(seg.shape[0]):
-            ch_sq = seg[trial_idx, int(channel_index), :] * seg[trial_idx, int(channel_index), :]
+            ch_sq = seg[trial_idx, 0, :] * seg[trial_idx, 0, :]
             rms_trials[trial_idx] = np.sqrt(np.convolve(ch_sq, kernel, mode="same"))
     else:
         rms_trials = np.zeros((seg.shape[0], seg.shape[2]), dtype=np.float64)
@@ -975,6 +988,21 @@ def _mean_rms_profile_from_windows_window(
             rms_trials[trial_idx] = np.mean(ch_rms, axis=0)
     profile = np.mean(rms_trials, axis=0)
     return np.asarray(t_rel[start_idx:end_idx], dtype=np.float64), np.asarray(profile, dtype=np.float64)
+
+
+def _slice_rms_profile_window(
+    tx: np.ndarray,
+    values: np.ndarray,
+    t0_s: float,
+    t1_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Slice a precomputed RMS profile to [t0_s, t1_s]."""
+    if tx.size == 0 or values.size == 0 or t1_s <= t0_s:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    mask = (tx >= float(t0_s)) & (tx <= float(t1_s))
+    if not np.any(mask):
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    return np.asarray(tx[mask], dtype=np.float64), np.asarray(values[mask], dtype=np.float64)
 
 
 def _plot_rms_series(
@@ -1298,12 +1326,11 @@ def plot_channel_multi_comparison(
                         channel_index=ch,
                     )
                     rms_series_full_multi.append((label, tx_full, rms_full_vals))
-                    tx_zoom, rms_zoom_vals = _mean_rms_profile_from_source_window(
-                        src,
+                    tx_zoom, rms_zoom_vals = _slice_rms_profile_window(
+                        tx_full,
+                        rms_full_vals,
                         zoom_t0,
                         zoom_t1,
-                        rms_window_s,
-                        channel_index=ch,
                     )
                     rms_series_zoom_multi.append((label, tx_zoom, rms_zoom_vals))
                     marker_i = None
@@ -1314,12 +1341,11 @@ def plot_channel_multi_comparison(
                             (label, np.array([], dtype=np.float64), np.array([], dtype=np.float64))
                         )
                     else:
-                        tx_end, rms_zoom_end_vals = _mean_rms_profile_from_source_window(
-                            src,
+                        tx_end, rms_zoom_end_vals = _slice_rms_profile_window(
+                            tx_full,
+                            rms_full_vals,
                             float(marker_i + zoom_t0),
                             float(marker_i + zoom_t1),
-                            rms_window_s,
-                            channel_index=ch,
                         )
                         rms_series_zoom_end_multi.append((label, tx_end, rms_zoom_end_vals))
             first_trigger_curves: list[Optional[np.ndarray]] = []
@@ -1698,45 +1724,49 @@ def plot_channel_averages(
             check_analysis_cancelled()
             channel_name = str(channel_names[ch])
             channel_mean = mean_per_channel[ch]
+            rms_series_full: list[tuple[str, np.ndarray, np.ndarray]] = []
             rms_series_zoom: list[tuple[str, np.ndarray, np.ndarray]] = []
             rms_series_zoom_end: list[tuple[str, np.ndarray, np.ndarray]] = []
+            t0_rms = float(t_rel[0]) if t_rel.size else 0.0
+            t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
             if spike_source is not None:
-                tx_zoom, rms_zoom_vals = _mean_rms_profile_from_source_window(
+                tx_full, rms_full_vals = _mean_rms_profile_from_source_window(
                     spike_source,
-                    zoom_t0,
-                    zoom_t1,
+                    t0_rms,
+                    t1_rms,
                     rms_window_s,
                     channel_index=ch,
                 )
+                rms_series_full = [("RMS", tx_full, rms_full_vals)]
+                tx_zoom, rms_zoom_vals = _slice_rms_profile_window(tx_full, rms_full_vals, zoom_t0, zoom_t1)
                 rms_series_zoom = [("RMS", tx_zoom, rms_zoom_vals)]
                 if trigger_end_rising_rel_s is not None:
-                    tx_end, rms_zoom_end_vals = _mean_rms_profile_from_source_window(
-                        spike_source,
+                    tx_end, rms_zoom_end_vals = _slice_rms_profile_window(
+                        tx_full,
+                        rms_full_vals,
                         float(trigger_end_rising_rel_s + zoom_t0),
                         float(trigger_end_rising_rel_s + zoom_t1),
-                        rms_window_s,
-                        channel_index=ch,
                     )
                     rms_series_zoom_end = [("RMS", tx_end, rms_zoom_end_vals)]
             elif windows is not None and getattr(windows, "ndim", 0) == 3:
                 windows_arr = np.asarray(windows)
-                tx_zoom, rms_zoom_vals = _mean_rms_profile_from_windows_window(
+                tx_full, rms_full_vals = _mean_rms_profile_from_windows_window(
                     windows_arr,
                     t_rel,
-                    zoom_t0,
-                    zoom_t1,
+                    t0_rms,
+                    t1_rms,
                     rms_window_s,
                     channel_index=ch,
                 )
+                rms_series_full = [("RMS", tx_full, rms_full_vals)]
+                tx_zoom, rms_zoom_vals = _slice_rms_profile_window(tx_full, rms_full_vals, zoom_t0, zoom_t1)
                 rms_series_zoom = [("RMS", tx_zoom, rms_zoom_vals)]
                 if trigger_end_rising_rel_s is not None:
-                    tx_end, rms_zoom_end_vals = _mean_rms_profile_from_windows_window(
-                        windows_arr,
-                        t_rel,
+                    tx_end, rms_zoom_end_vals = _slice_rms_profile_window(
+                        tx_full,
+                        rms_full_vals,
                         float(trigger_end_rising_rel_s + zoom_t0),
                         float(trigger_end_rising_rel_s + zoom_t1),
-                        rms_window_s,
-                        channel_index=ch,
                     )
                     rms_series_zoom_end = [("RMS", tx_end, rms_zoom_end_vals)]
             channel_has_mea_layout = probe_layout_loaded is not None and (
@@ -1964,29 +1994,6 @@ def plot_channel_averages(
                 )
                 ax_first_trigger.set_axis_off()
 
-            rms_series_full: list[tuple[str, np.ndarray, np.ndarray]] = []
-            t0_rms = float(t_rel[0]) if t_rel.size else 0.0
-            t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
-            if spike_source is not None:
-                tx_full, rms_full_vals = _mean_rms_profile_from_source_window(
-                    spike_source,
-                    t0_rms,
-                    t1_rms,
-                    rms_window_s,
-                    channel_index=ch,
-                )
-                rms_series_full = [("RMS", tx_full, rms_full_vals)]
-            elif windows is not None and getattr(windows, "ndim", 0) == 3:
-                windows_arr = np.asarray(windows)
-                tx_full, rms_full_vals = _mean_rms_profile_from_windows_window(
-                    windows_arr,
-                    t_rel,
-                    t0_rms,
-                    t1_rms,
-                    rms_window_s,
-                    channel_index=ch,
-                )
-                rms_series_full = [("RMS", tx_full, rms_full_vals)]
             _plot_rms_series(
                 ax_full_rms,
                 rms_series_full,
@@ -2376,48 +2383,50 @@ def plot_channel_comparison(
             channel_name = str(channel_names[ch])
             channel_mean_a = mean_a[ch]
             channel_mean_b = mean_b[ch]
-            rms_zoom_a = (
+            t0_rms = float(t_rel[0]) if t_rel.size else 0.0
+            t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
+            rms_full_a = (
                 _mean_rms_profile_from_source_window(
                     spike_source_a,
-                    zoom_t0,
-                    zoom_t1,
+                    t0_rms,
+                    t1_rms,
                     rms_window_s,
                     channel_index=ch,
                 )
                 if spike_source_a is not None
                 else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
             )
-            rms_zoom_b = (
+            rms_full_b = (
                 _mean_rms_profile_from_source_window(
                     spike_source_b,
-                    zoom_t0,
-                    zoom_t1,
+                    t0_rms,
+                    t1_rms,
                     rms_window_s,
                     channel_index=ch,
                 )
                 if spike_source_b is not None
                 else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
             )
+            rms_zoom_a = _slice_rms_profile_window(rms_full_a[0], rms_full_a[1], zoom_t0, zoom_t1)
+            rms_zoom_b = _slice_rms_profile_window(rms_full_b[0], rms_full_b[1], zoom_t0, zoom_t1)
             rms_end_a = (
-                _mean_rms_profile_from_source_window(
-                    spike_source_a,
+                _slice_rms_profile_window(
+                    rms_full_a[0],
+                    rms_full_a[1],
                     float(trigger_end_rising_rel_s_a + zoom_t0),
                     float(trigger_end_rising_rel_s_a + zoom_t1),
-                    rms_window_s,
-                    channel_index=ch,
                 )
-                if spike_source_a is not None and trigger_end_rising_rel_s_a is not None
+                if trigger_end_rising_rel_s_a is not None
                 else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
             )
             rms_end_b = (
-                _mean_rms_profile_from_source_window(
-                    spike_source_b,
+                _slice_rms_profile_window(
+                    rms_full_b[0],
+                    rms_full_b[1],
                     float(trigger_end_rising_rel_s_b + zoom_t0),
                     float(trigger_end_rising_rel_s_b + zoom_t1),
-                    rms_window_s,
-                    channel_index=ch,
                 )
-                if spike_source_b is not None and trigger_end_rising_rel_s_b is not None
+                if trigger_end_rising_rel_s_b is not None
                 else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
             )
             channel_mean_a_raw = mean_a_raw[ch] if mean_a_raw is not None else None
@@ -2650,30 +2659,6 @@ def plot_channel_comparison(
                     transform=ax_first_trigger.transAxes,
                 )
                 ax_first_trigger.set_axis_off()
-            t0_rms = float(t_rel[0]) if t_rel.size else 0.0
-            t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
-            rms_full_a = (
-                _mean_rms_profile_from_source_window(
-                    spike_source_a,
-                    t0_rms,
-                    t1_rms,
-                    rms_window_s,
-                    channel_index=ch,
-                )
-                if spike_source_a is not None
-                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
-            )
-            rms_full_b = (
-                _mean_rms_profile_from_source_window(
-                    spike_source_b,
-                    t0_rms,
-                    t1_rms,
-                    rms_window_s,
-                    channel_index=ch,
-                )
-                if spike_source_b is not None
-                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
-            )
             _plot_rms_series(
                 ax_full_rms,
                 [(label_a, rms_full_a[0], rms_full_a[1]), (label_b, rms_full_b[0], rms_full_b[1])],
