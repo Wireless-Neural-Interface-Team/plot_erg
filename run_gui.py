@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lanceur GUI 100% Python pour Intan Trigger Plotter."""
+"""Pure-Python launcher for the Intan Trigger Plotter Qt GUI."""
 
 from pathlib import Path
 import sys
@@ -13,6 +13,6 @@ from cli import main
 
 
 if __name__ == "__main__":
-    # Force le mode GUI Qt.
+    # Force Qt GUI mode.
     sys.argv = [sys.argv[0], "--gui"]
     main()

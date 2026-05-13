@@ -1,3 +1,5 @@
+"""Command-line entry: single-file analysis, A/B and multi comparison, optional Qt GUI."""
+
 from __future__ import annotations
 
 import argparse
@@ -53,7 +55,7 @@ def _compute_payload_for_comparison(config: AnalysisConfig) -> tuple[
     int,
     str,
 ]:
-    """Calcule une analyse sérialisable pour exécution en process séparé."""
+    """Compute a serializable analysis payload for a separate worker process."""
     worker_cfg = replace(config, keep_intermediate_files=True)
     (
         mean_per_channel,
@@ -85,7 +87,7 @@ def _compute_payload_for_comparison(config: AnalysisConfig) -> tuple[
             str(amp_path),
         )
     finally:
-        # Le worker libère son mmap ; le parent rechargera son propre mmap.
+        # Worker releases its mmap; the parent reloads its own mmap.
         spike_src.close()
 
 
@@ -101,16 +103,16 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple[
     int,
     str,
 ]:
-    """Payload léger pour pipeline streaming multi (sans moyennes globales)."""
+    """Lightweight payload for multi-recording streaming (no global means)."""
     worker_cfg = replace(config, keep_intermediate_files=True)
     if not worker_cfg.rhs_file.exists():
-        raise FileNotFoundError(f"Fichier introuvable: {worker_cfg.rhs_file}")
+        raise FileNotFoundError(f"File not found: {worker_cfg.rhs_file}")
     data = load_rhs_file(worker_cfg.rhs_file)
     fs = get_sampling_rate(data)
     analog_in0 = get_analog_in0_signal(data)
     trigger_indices = detect_edges(analog_in0, threshold=worker_cfg.threshold, edge=worker_cfg.edge)
     if trigger_indices.size == 0:
-        edge_fr = "descendant" if worker_cfg.edge == "falling" else "montant"
+        edge_fr = "falling" if worker_cfg.edge == "falling" else "rising"
         raise RuntimeError(f"No {edge_fr} edge detected on ANALOG_IN 0.")
     amplifier_raw = np.asarray(data.get("amplifier_data"))
     if amplifier_raw.size == 0:
@@ -148,68 +150,68 @@ def parse_args() -> argparse.Namespace:
     defaults = AnalysisConfig(rhs_file=Path("."))
     parser = argparse.ArgumentParser(
         description=(
-            "Lit un fichier Intan RHS, detecte un front sur ANALOG_IN 0 (montant ou descendant), "
-            "et calcule les moyennes par canal sur [-2s, +10s]."
+            "Read an Intan RHS file, detect an edge on ANALOG_IN 0 (rising or falling), "
+            "and compute per-channel averages on [-pre, +post] seconds."
         )
     )
-    parser.add_argument("rhs_file", nargs="?", type=Path, help="Chemin vers le fichier .rhs")
-    parser.add_argument("--gui", action="store_true", help="Lancer l'interface graphique Qt")
+    parser.add_argument("rhs_file", nargs="?", type=Path, help="Path to the .rhs file")
+    parser.add_argument("--gui", action="store_true", help="Launch the Qt GUI")
     parser.add_argument(
         "--edge",
         choices=("falling", "rising"),
         default=defaults.edge,
-        help="Type de front sur ANALOG_IN 0: falling=descendant, rising=montant (defaut: falling)",
+        help="ANALOG_IN 0 edge type: falling vs rising (default: falling)",
     )
-    parser.add_argument("--threshold", type=float, default=defaults.threshold, help="Seuil de detection (defaut: 1.0)")
-    parser.add_argument("--pre", type=float, default=defaults.pre_s, help="Temps avant trigger en secondes")
-    parser.add_argument("--post", type=float, default=defaults.post_s, help="Temps apres trigger en secondes")
-    parser.add_argument("--save-dir", type=Path, default=None, help="Dossier de sauvegarde du PDF")
+    parser.add_argument("--threshold", type=float, default=defaults.threshold, help="Detection threshold (default: 1.0)")
+    parser.add_argument("--pre", type=float, default=defaults.pre_s, help="Time before trigger (seconds)")
+    parser.add_argument("--post", type=float, default=defaults.post_s, help="Time after trigger (seconds)")
+    parser.add_argument("--save-dir", type=Path, default=None, help="Folder for the output PDF")
     parser.add_argument(
         "--pdf-title",
         type=str,
         default=None,
-        help="Nom/titre du PDF de sortie (sans extension ou avec .pdf)",
+        help="PDF output name/title (with or without .pdf)",
     )
     parser.add_argument(
         "--lowpass-hz",
         type=float,
         default=defaults.lowpass_cutoff_hz,
-        help="Frequence de coupure (Hz) du passe-bas Butterworth sur les canaux amplificateur (defaut: pas de filtre)",
+        help="Butterworth low-pass corner (Hz) on amplifier channels (default: no filter)",
     )
     parser.add_argument(
         "--spike-threshold-uv",
         type=float,
         default=defaults.spike_threshold_uv,
         help=(
-            "Seuil (µV) spikes amplificateur : >=0 = passage montant au-dessus ; "
-            "<0 = passage descendant en dessous (pics negatifs, defaut: -40)"
+            "Spike threshold (µV) on amplifier: >=0 = upward crossing; "
+            "<0 = downward crossing (negative peaks, default -40)"
         ),
     )
     parser.add_argument(
         "--firing-rate-window-s",
         type=float,
         default=defaults.firing_rate_window_s,
-        help="Largeur (s) du lissage gaussien du PSTH / taux de decharge (defaut: 0.025)",
+        help="Gaussian smoothing width (s) for PSTH / firing rate (default 0.025)",
     )
     parser.add_argument(
         "--zoom-t0-s",
         type=float,
         default=defaults.zoom_t0_s,
-        help="Debut de la fenetre de zoom (s, relatif au trigger).",
+        help="Zoom window start (s, relative to trigger).",
     )
     parser.add_argument(
         "--zoom-t1-s",
         type=float,
         default=defaults.zoom_t1_s,
-        help="Fin de la fenetre de zoom (s, relatif au trigger).",
+        help="Zoom window end (s, relative to trigger).",
     )
     parser.add_argument(
         "--spike-bandpass-low-hz",
         type=float,
         default=defaults.spike_bandpass_low_hz,
         help=(
-            "Frequence basse (Hz) du passe-bande Butterworth sur l'amplificateur pour "
-            "raster / PSTH / ISI (avec --spike-bandpass-high-hz ; defaut: desactive = brut mmap)"
+            "Spike band-pass low corner (Hz) on amplifier for raster / PSTH / ISI "
+            "(use with --spike-bandpass-high-hz; default: disabled = raw mmap)"
         ),
     )
     parser.add_argument(
@@ -217,49 +219,49 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=defaults.spike_bandpass_high_hz,
         help=(
-            "Frequence haute (Hz) du passe-bande Butterworth spikes "
-            "(avec --spike-bandpass-low-hz ; defaut: desactive = brut mmap)"
+            "Spike band-pass high corner (Hz) "
+            "(use with --spike-bandpass-low-hz; default: disabled = raw mmap)"
         ),
     )
     parser.add_argument(
         "--work-dir",
         type=Path,
         default=None,
-        help="Dossier fichiers intermediaires (amplificateur .npy mmap). Defaut: auto sous le PDF",
+        help="Intermediate files folder (amplifier .npy mmap). Default: auto next to PDF",
     )
     parser.add_argument(
         "--keep-intermediate",
         action="store_true",
-        help="Conserver le dossier de travail (amplifier_raw.npy) apres le PDF",
+        help="Keep work folder (amplifier_raw.npy) after the PDF",
     )
     parser.add_argument(
         "--workers",
         type=int,
         default=2,
-        help="Nombre de processus pour la comparaison A/B (defaut: 2)",
+        help="Number of processes for A/B comparison (default: 2)",
     )
     parser.add_argument(
         "--channel-workers",
         type=int,
         default=None,
-        help="Nombre max de workers canal (defaut: auto, cap 16).",
+        help="Max channel worker threads (default: auto, cap 16).",
     )
     parser.add_argument(
         "--lightweight-plot",
         action="store_true",
-        help="Mode affichage léger PDF (downsample raster/ISI + dpi reduit).",
+        help="Lightweight PDF mode (raster/ISI downsample + reduced dpi).",
     )
     parser.add_argument(
         "--sampling-percent",
         type=int,
         default=100,
-        help="Pourcentage de points conserves dans raster/ISI (1..100, defaut: 100).",
+        help="Fraction of points kept in raster/ISI plots (1..100, default: 100).",
     )
     parser.add_argument(
         "--probe-layout-json",
         type=Path,
         default=None,
-        help="JSON probeinterface (MEA) : encart carte electrodes en haut a droite si le canal est mappe.",
+        help="probeinterface JSON (MEA): electrode map inset when channel maps.",
     )
     return parser.parse_args()
 
@@ -271,7 +273,7 @@ def run(config: AnalysisConfig) -> None:
         if config.probe_layout_json is not None:
             pj = config.probe_layout_json
             if not pj.exists():
-                raise FileNotFoundError(f"Probe JSON introuvable : {pj}")
+                raise FileNotFoundError(f"Probe JSON not found: {pj}")
             load_probe_layout_json(pj)
         (
             mean_per_channel,
@@ -319,47 +321,47 @@ def run(config: AnalysisConfig) -> None:
                 sampling_percent=config.sampling_percent,
                 probe_layout_json=config.probe_layout_json,
             )
-        print(f"Frequence d'echantillonnage: {fs:.2f} Hz")
+        print(f"Sample rate: {fs:.2f} Hz")
         print("--- Triggers (ANALOG_IN 0) ---")
-        print(f"Nombre total de triggers detectes: {n_total}")
-        print(f"Nombre de triggers utilises pour la moyenne: {n_valid}")
+        print(f"Total triggers detected: {n_total}")
+        print(f"Triggers used for average: {n_valid}")
         if n_total > n_valid:
-            print(f"  ({n_total - n_valid} trigger(s) exclus: fenetre [-pre,+post] hors du signal)")
-        print(f"Nb canaux amplificateur: {len(channel_names)}")
-        print(f"Fenetre temporelle: [-{config.pre_s:.3f}s, +{config.post_s:.3f}s]")
-        print(f"Front ANALOG_IN 0: {config.edge}")
+            print(f"  ({n_total - n_valid} trigger(s) excluded: [-pre,+post] window outside signal)")
+        print(f"Amplifier channels: {len(channel_names)}")
+        print(f"Time window: [-{config.pre_s:.3f}s, +{config.post_s:.3f}s]")
+        print(f"ANALOG_IN 0 edge: {config.edge}")
         if end_rising_s is not None:
-            print(f"Delai moyen jusqu'au prochain front montant (fin de pulse typique): {end_rising_s*1e3:.3f} ms")
+            print(f"Mean delay to next rising edge (typical pulse end): {end_rising_s*1e3:.3f} ms")
         else:
             print("Next rising edge at threshold: not computed (no rising edge after triggers).")
         if config.lowpass_cutoff_hz is not None:
-            print(f"Passe-bas Butterworth: fc = {config.lowpass_cutoff_hz} Hz (ordre 4, filtfilt)")
+            print(f"Butterworth low-pass: fc = {config.lowpass_cutoff_hz} Hz (order 4, filtfilt)")
         else:
             print("Butterworth low-pass: disabled")
         spike_rule = (
-            "front descendant (pic négatif)"
+            "falling edge (negative peak)"
             if config.spike_threshold_uv < 0
-            else "front montant"
+            else "rising edge"
         )
         bp_txt = (
-            f" | passe-bande spikes {config.spike_bandpass_low_hz:g}–{config.spike_bandpass_high_hz:g} Hz"
+            f" | spike band-pass {config.spike_bandpass_low_hz:g}–{config.spike_bandpass_high_hz:g} Hz"
             if config.spike_bandpass_low_hz is not None
-            else " | passe-bande spikes: desactive (brut)"
+            else " | spike band-pass: disabled (raw)"
         )
         print(
-            f"Spikes (PDF amplificateur): seuil {config.spike_threshold_uv} µV ({spike_rule}) | "
-            f"lissage taux σ = {config.firing_rate_window_s} s{bp_txt}"
+            f"Spikes (PDF amplifier): threshold {config.spike_threshold_uv} µV ({spike_rule}) | "
+            f"firing-rate smooth σ = {config.firing_rate_window_s} s{bp_txt}"
         )
-        print(f"Fenetre zoom PDF: [{config.zoom_t0_s:.3f}s, {config.zoom_t1_s:.3f}s]")
-        print(f"PDF genere: {pdf_path}")
+        print(f"PDF zoom window: [{config.zoom_t0_s:.3f}s, {config.zoom_t1_s:.3f}s]")
+        print(f"PDF written: {pdf_path}")
         elapsed_s = time.perf_counter() - t0
-        print(f"Temps total analyse + PDF: {elapsed_s:.2f} s")
+        print(f"Total time (analysis + PDF): {elapsed_s:.2f} s")
         print(
-            f"Dossier travail (mmap amplificateur): {resolve_work_dir(config)} — "
+            f"Work dir (amplifier mmap): {resolve_work_dir(config)} — "
             + (
-                "conserve (--keep-intermediate)."
+                "kept (--keep-intermediate)."
                 if config.keep_intermediate_files
-                else "supprime apres succes (economie disque)."
+                else "removed after success (save disk)."
             )
         )
     finally:
@@ -368,49 +370,49 @@ def run(config: AnalysisConfig) -> None:
 
 
 def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
-    """Deux enregistrements via moteur streaming unifié."""
-    pdf_path, stats = _run_streaming_comparison([config_a, config_b], "comparaison A/B")
-    print(f"Frequence echantillonnage A: {stats['fs_values'][0]:.2f} Hz | B: {stats['fs_values'][1]:.2f} Hz")
+    """Two recordings via the unified streaming engine."""
+    pdf_path, stats = _run_streaming_comparison([config_a, config_b], "A/B comparison")
+    print(f"Sample rate A: {stats['fs_values'][0]:.2f} Hz | B: {stats['fs_values'][1]:.2f} Hz")
     print("--- Recording A ---")
-    print(f"  Triggers detectes: {stats['n_totals'][0]} | utilises: {stats['n_valids'][0]}")
+    print(f"  Triggers detected: {stats['n_totals'][0]} | used: {stats['n_valids'][0]}")
     print("--- Recording B ---")
-    print(f"  Triggers detectes: {stats['n_totals'][1]} | utilises: {stats['n_valids'][1]}")
-    print(f"Canaux compares (superposition): {stats['n_ch']}")
-    print(f"Workers multiprocessing (comparaison A/B): {stats['workers']}")
-    print(f"Temps calcul A/B (multiprocessing): {stats['t_compute_s']:.2f} s")
-    print(f"Temps rendu PDF A/B: {stats['t_render_s']:.2f} s")
-    print(f"Fenetre temporelle: [-{config_a.pre_s:.3f}s, +{config_a.post_s:.3f}s]")
-    print(f"Front ANALOG_IN 0: {config_a.edge}")
+    print(f"  Triggers detected: {stats['n_totals'][1]} | used: {stats['n_valids'][1]}")
+    print(f"Channels compared (overlay): {stats['n_ch']}")
+    print(f"Multiprocessing workers (A/B comparison): {stats['workers']}")
+    print(f"A/B compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
+    print(f"A/B PDF render time: {stats['t_render_s']:.2f} s")
+    print(f"Time window: [-{config_a.pre_s:.3f}s, +{config_a.post_s:.3f}s]")
+    print(f"ANALOG_IN 0 edge: {config_a.edge}")
     if stats["end_markers"][0] is not None:
-        print(f"Delai moyen fin trigger (↗) — A: {stats['end_markers'][0]*1e3:.3f} ms")
+        print(f"Mean delay to trigger end (rising) — A: {stats['end_markers'][0]*1e3:.3f} ms")
     if stats["end_markers"][1] is not None:
-        print(f"Delai moyen fin trigger (↗) — B: {stats['end_markers'][1]*1e3:.3f} ms")
+        print(f"Mean delay to trigger end (rising) — B: {stats['end_markers'][1]*1e3:.3f} ms")
     if config_a.lowpass_cutoff_hz is not None:
-        print(f"Passe-bas Butterworth: fc = {config_a.lowpass_cutoff_hz} Hz")
+        print(f"Butterworth low-pass: fc = {config_a.lowpass_cutoff_hz} Hz")
     else:
         print("Butterworth low-pass: disabled")
-    print(f"PDF comparaison genere: {pdf_path}")
-    print(f"Temps total comparaison + PDF: {stats['t_total_s']:.2f} s")
+    print(f"Comparison PDF written: {pdf_path}")
+    print(f"Total time (comparison + PDF): {stats['t_total_s']:.2f} s")
     return pdf_path
 
 
 def run_multi_comparison(configs: list[AnalysisConfig]) -> None:
-    """Compare N enregistrements sur les mêmes graphes (superposition multi-courbes)."""
-    pdf_path, stats = _run_streaming_comparison(configs, "comparaison multi")
+    """Compare N recordings on the same plots (multi-trace overlay)."""
+    pdf_path, stats = _run_streaming_comparison(configs, "multi comparison")
     print("--- Triggers per recording ---")
     for i, cfg in enumerate(configs):
-        print(f"{cfg.rhs_file.name}: detectes={stats['n_totals'][i]} | utilises={stats['n_valids'][i]}")
-    print(f"Canaux compares (superposition): {stats['n_ch']}")
-    print(f"Workers multiprocessing (comparaison multi): {stats['workers']}")
-    print(f"Temps calcul multi (multiprocessing): {stats['t_compute_s']:.2f} s")
-    print(f"Temps rendu PDF multi: {stats['t_render_s']:.2f} s")
-    print(f"Front ANALOG_IN 0: {configs[0].edge}")
-    print(f"PDF comparaison genere: {pdf_path}")
-    print(f"Temps total comparaison + PDF: {stats['t_total_s']:.2f} s")
+        print(f"{cfg.rhs_file.name}: detected={stats['n_totals'][i]} | used={stats['n_valids'][i]}")
+    print(f"Channels compared (overlay): {stats['n_ch']}")
+    print(f"Multiprocessing workers (multi comparison): {stats['workers']}")
+    print(f"Multi compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
+    print(f"Multi PDF render time: {stats['t_render_s']:.2f} s")
+    print(f"ANALOG_IN 0 edge: {configs[0].edge}")
+    print(f"Comparison PDF written: {pdf_path}")
+    print(f"Total time (comparison + PDF): {stats['t_total_s']:.2f} s")
 
 
 def _autotune_config(cfg: AnalysisConfig, n_files: int) -> AnalysisConfig:
-    """Politique auto orientée vitesse stable."""
+    """Auto-tuning policy biased toward stable throughput."""
     workers = max(1, min(int(cfg.comparison_workers), max(1, min(6, n_files))))
     channel_workers = cfg.channel_workers
     if channel_workers is None:
@@ -442,7 +444,7 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
     tuned = [_autotune_config(cfg, len(configs)) for cfg in configs]
     workers = max(1, int(tuned[0].comparison_workers))
     labels = [cfg.rhs_file.stem for cfg in tuned]
-    print(f"{label.capitalize()}: {len(tuned)} fichiers.")
+    print(f"{label.capitalize()}: {len(tuned)} file(s).")
     print("Files: " + " | ".join(cfg.rhs_file.name for cfg in tuned))
     if tuned[0].pre_s + tuned[0].post_s > 20:
         print("Guardrail mode: large window detected, parallelism limited for memory stability.")
@@ -618,12 +620,12 @@ def main() -> None:
         probe_layout_json=args.probe_layout_json,
     )
     if config.zoom_t1_s <= config.zoom_t0_s:
-        print("Erreur: --zoom-t1-s doit être strictement supérieur à --zoom-t0-s.", file=sys.stderr)
+        print("Error: --zoom-t1-s must be strictly greater than --zoom-t0-s.", file=sys.stderr)
         sys.exit(2)
     try:
         run(config)
     except Exception as exc:
-        print(f"Erreur: {exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
 

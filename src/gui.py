@@ -1,3 +1,5 @@
+"""Qt GUI for selecting RHS files, parameters, and running analysis / comparison."""
+
 from __future__ import annotations
 
 import contextlib
@@ -54,7 +56,7 @@ def launch_qt_gui(
             QCheckBox,
         )
     except ImportError as exc:
-        raise RuntimeError("PySide6 n'est pas installe. Execute: pip install PySide6") from exc
+        raise RuntimeError("PySide6 is not installed. Run: pip install PySide6") from exc
 
     class AnalysisThread(QThread):
         finished_ok = Signal(str)
@@ -90,7 +92,7 @@ def launch_qt_gui(
     window.setWindowTitle("Intan RHS Trigger Plotter")
     window.resize(860, 720)
 
-    # --- Onglets (fichiers seulement) ---
+    # Tabs (files only)
     tabs = QTabWidget()
 
     tab_single = QWidget()
@@ -101,9 +103,9 @@ def launch_qt_gui(
     rhs_row.addWidget(rhs_path_edit)
     rhs_row.addWidget(browse_rhs_btn)
     fl_single = QFormLayout()
-    fl_single.addRow("Fichier RHS:", rhs_row)
+    fl_single.addRow("RHS file:", rhs_row)
     single_layout.addLayout(fl_single)
-    run_btn = QPushButton("Lancer l'analyse")
+    run_btn = QPushButton("Run analysis")
     single_layout.addWidget(run_btn)
     tabs.addTab(tab_single, "Analysis")
 
@@ -125,16 +127,16 @@ def launch_qt_gui(
     extra_files_layout.setContentsMargins(0, 0, 0, 0)
     extra_files_layout.setSpacing(6)
     fl_cmp = QFormLayout()
-    fl_cmp.addRow("Enregistrement 1 (.rhs):", row1)
-    fl_cmp.addRow("Enregistrement 2 (.rhs):", row2)
+    fl_cmp.addRow("Recording 1 (.rhs):", row1)
+    fl_cmp.addRow("Recording 2 (.rhs):", row2)
     fl_cmp.addRow("", add_rhs_field_btn)
-    fl_cmp.addRow("Fichiers supplementaires (.rhs):", extra_files_widget)
+    fl_cmp.addRow("Extra recordings (.rhs):", extra_files_widget)
     compare_layout.addLayout(fl_cmp)
-    run_compare_btn = QPushButton("Comparer les enregistrements")
+    run_compare_btn = QPushButton("Compare recordings")
     compare_layout.addWidget(run_compare_btn)
     tabs.addTab(tab_compare, "Comparison")
 
-    # --- Parametres communs ---
+    # Shared parameters
     edge_combo = QComboBox()
     edge_combo.addItem("Falling edge", "falling")
     edge_combo.addItem("Rising edge", "rising")
@@ -148,41 +150,41 @@ def launch_qt_gui(
     lowpass_edit = QLineEdit()
     if default_lowpass_hz is not None:
         lowpass_edit.setText(str(default_lowpass_hz))
-    lowpass_edit.setPlaceholderText("ex: 300 — vide = pas de filtre")
+    lowpass_edit.setPlaceholderText("e.g. 300 — empty = no filter")
     spike_threshold_edit = QLineEdit(str(default_spike_threshold_uv))
     spike_threshold_edit.setToolTip(
-        "Seuil en µV (signal amplificateur, éventuellement filtré passe-bande si renseigné). "
-        "Valeur ≥ 0 : spike = front montant (signal dépasse le seuil vers le haut). "
-        "Valeur < 0 : spike = front descendant (signal passe sous le seuil, ex. pic négatif). "
-        "Les instants détectés servent pour le raster, le PSTH / taux de décharge et l’ISI. "
-        "Indépendant du seuil ANALOG_IN pour le trigger."
+        "Threshold in µV (amplifier signal; optionally band-pass filtered). "
+        "Value >= 0 : spike = rising crossing (signal crosses upward). "
+        "Value < 0 : spike = falling crossing (signal crosses downward, e.g. negative peak). "
+        "Detected times feed raster, PSTH / firing rate, and ISI. "
+        "Independent of ANALOG_IN threshold for the trigger."
     )
     firing_rate_window_edit = QLineEdit(str(default_firing_rate_window_s))
     firing_rate_window_edit.setToolTip(
-        "Largeur σ (secondes) du noyau gaussien appliqué au PSTH pour la courbe de taux (Hz)."
+        "Gaussian smoothing σ (seconds) for PSTH firing-rate curve (Hz)."
     )
     zoom_t0_edit = QLineEdit(str(default_zoom_t0_s))
     zoom_t1_edit = QLineEdit(str(default_zoom_t1_s))
-    zoom_t0_edit.setToolTip("Début de la fenêtre de zoom (secondes relatives au trigger).")
-    zoom_t1_edit.setToolTip("Fin de la fenêtre de zoom (secondes relatives au trigger).")
+    zoom_t0_edit.setToolTip("Zoom window start (seconds relative to trigger).")
+    zoom_t1_edit.setToolTip("Zoom window end (seconds relative to trigger).")
     bandpass_spikes_low_edit = QLineEdit()
     bandpass_spikes_high_edit = QLineEdit()
     if default_spike_bandpass_low_hz is not None:
         bandpass_spikes_low_edit.setText(str(default_spike_bandpass_low_hz))
     if default_spike_bandpass_high_hz is not None:
         bandpass_spikes_high_edit.setText(str(default_spike_bandpass_high_hz))
-    bandpass_spikes_low_edit.setPlaceholderText("vide = brut — ex: 300")
-    bandpass_spikes_high_edit.setPlaceholderText("vide = brut — ex: 3000")
+    bandpass_spikes_low_edit.setPlaceholderText("empty = raw — e.g. 300")
+    bandpass_spikes_high_edit.setPlaceholderText("empty = raw — e.g. 3000")
     _bp_tip = (
-        "Passe-bande Butterworth (ordre 4) sur chaque canal avant raster, PSTH et ISI. "
-        "Les deux champs vides = signal brut (mmap). Les deux renseignés = fc basse et fc haute (Hz) ; "
-        "fc haute doit rester sous la fréquence de Nyquist."
+        "Butterworth band-pass (order 4) per channel before raster, PSTH, and ISI. "
+        "Both empty = raw mmap signal. Both set = low and high cutoff (Hz); "
+        "high cutoff must stay below Nyquist."
     )
-    bandpass_spikes_low_edit.setToolTip("Fréquence basse (Hz). " + _bp_tip)
-    bandpass_spikes_high_edit.setToolTip("Fréquence haute (Hz). " + _bp_tip)
-    keep_work_cb = QCheckBox("Conserver le dossier travail (amplifier_raw.npy)")
+    bandpass_spikes_low_edit.setToolTip("Low frequency (Hz). " + _bp_tip)
+    bandpass_spikes_high_edit.setToolTip("High frequency (Hz). " + _bp_tip)
+    keep_work_cb = QCheckBox("Keep work folder (amplifier_raw.npy)")
     keep_work_cb.setToolTip(
-        "Sinon le dossier intermédiaire est supprimé après génération du PDF (économie disque)."
+        "Otherwise the intermediate folder is removed after the PDF is generated (save disk)."
     )
 
     save_row = QHBoxLayout()
@@ -194,15 +196,15 @@ def launch_qt_gui(
     probe_layout_json_edit = QLineEdit()
     if default_probe_layout_json is not None:
         probe_layout_json_edit.setText(str(default_probe_layout_json))
-    probe_layout_json_edit.setPlaceholderText("optionnel — JSON probeinterface (carte MEA)")
-    browse_probe_json_btn = QPushButton("Parcourir…")
+    probe_layout_json_edit.setPlaceholderText("optional — probeinterface JSON (MEA map)")
+    browse_probe_json_btn = QPushButton("Browse…")
     probe_json_row = QHBoxLayout()
     probe_json_row.addWidget(probe_layout_json_edit)
     probe_json_row.addWidget(browse_probe_json_btn)
     channel_workers_edit = QLineEdit()
     if default_channel_workers is not None:
         channel_workers_edit.setText(str(default_channel_workers))
-    channel_workers_edit.setPlaceholderText("auto (defaut)")
+    channel_workers_edit.setPlaceholderText("auto (default)")
     lightweight_plot_cb = QCheckBox("Lightweight PDF mode (raster/ISI downsample, lower dpi)")
     lightweight_plot_cb.setChecked(default_lightweight_plot)
     sampling_percent_edit = QLineEdit(str(default_sampling_percent))
@@ -213,7 +215,7 @@ def launch_qt_gui(
     general_form.addRow("ANALOG_IN 0 trigger threshold:", threshold_edit)
     general_form.addRow("Pre-trigger (s):", pre_edit)
     general_form.addRow("Post-trigger (s):", post_edit)
-    general_form.addRow("Passe-bas Butterworth fc (Hz):", lowpass_edit)
+    general_form.addRow("Butterworth low-pass fc (Hz):", lowpass_edit)
     general_form.addRow("", keep_work_cb)
     general_form.addRow("PDF output folder (empty = .rhs folder):", save_row)
     general_form.addRow("PDF title/name:", pdf_title_edit)
@@ -236,9 +238,9 @@ def launch_qt_gui(
     spike_group = QGroupBox("Raster, firing rate (PSTH) and ISI — amplifier PDF panels")
     spike_group.setLayout(spike_form)
     spike_group.setToolTip(
-        "Ces réglages concernent uniquement les graphiques spikes du PDF. "
-        "Le raster, le PSTH (taux) et l’ISI utilisent les mêmes instants de spike (même seuil et même filtre passe-bande). "
-        "La fenêtre de zoom est configurable dans ce panneau."
+        "These settings apply only to amplifier spike panels in the PDF. "
+        "Raster, PSTH (rate), and ISI share the same spike times (same threshold and band-pass). "
+        "Zoom window is configured in this panel."
     )
 
     params_stack = QWidget()
@@ -250,17 +252,17 @@ def launch_qt_gui(
     status_label = QLabel("Choose a tab, one or more .rhs files, then run.")
     log_view = QTextEdit()
     log_view.setReadOnly(True)
-    log_view.setPlaceholderText("Les logs d'execution s'afficheront ici...")
+    log_view.setPlaceholderText("Execution logs appear here...")
 
     progress = QProgressBar()
     progress.setRange(0, 0)
-    progress.setFormat("Traitement en cours...")
+    progress.setFormat("Processing...")
     progress.setTextVisible(True)
     progress.setVisible(False)
     progress.setMinimumHeight(22)
 
     stop_btn = QPushButton("Stop")
-    stop_btn.setToolTip("Demander l'arrêt du traitement en cours (peut prendre quelques secondes).")
+    stop_btn.setToolTip("Request stop of the current run (may take a few seconds).")
     stop_btn.setEnabled(False)
     stop_btn.setMinimumWidth(100)
 
@@ -316,30 +318,30 @@ def launch_qt_gui(
         if bp_lo_text or bp_hi_text:
             if not bp_lo_text or not bp_hi_text:
                 raise ValueError(
-                    "Passe-bande spikes : renseigner les deux fréquences (Hz) ou laisser les deux champs vides."
+                    "Spike band-pass: set both frequencies (Hz) or leave both fields empty."
                 )
             bp_lo = float(bp_lo_text)
             bp_hi = float(bp_hi_text)
             if bp_lo <= 0 or bp_hi <= 0:
-                raise ValueError("Passe-bande spikes : chaque fréquence doit être > 0 Hz.")
+                raise ValueError("Spike band-pass: each frequency must be > 0 Hz.")
             if bp_lo >= bp_hi:
-                raise ValueError("Passe-bande spikes : la fréquence basse doit être < la fréquence haute.")
+                raise ValueError("Spike band-pass: low frequency must be < high frequency.")
         pdf_title_text = pdf_title_edit.text().strip()
         cw_text = channel_workers_edit.text().strip()
         channel_workers: int | None = None
         if cw_text:
             channel_workers = int(cw_text)
             if channel_workers <= 0:
-                raise ValueError("Workers canaux : valeur > 0 requise (ou laisser vide pour auto).")
+                raise ValueError("Channel workers: value must be > 0 (or leave empty for auto).")
             if channel_workers > 16:
-                raise ValueError("Workers canaux : maximum autorisé = 16.")
+                raise ValueError("Channel workers: maximum allowed is 16.")
         sampling_percent = int(sampling_percent_edit.text().strip())
         if sampling_percent < 1 or sampling_percent > 100:
-            raise ValueError("Sampling (%) : renseigner une valeur entre 1 et 100.")
+            raise ValueError("Sampling (%): enter a value between 1 and 100.")
         zoom_t0_s = float(zoom_t0_edit.text().strip())
         zoom_t1_s = float(zoom_t1_edit.text().strip())
         if zoom_t1_s <= zoom_t0_s:
-            raise ValueError("Fenêtre de zoom : la fin doit être strictement > au début.")
+            raise ValueError("Zoom window: end must be strictly greater than start.")
         return (
             float(threshold_edit.text().strip()),
             edge,
@@ -362,7 +364,7 @@ def launch_qt_gui(
         )
 
     def _suggest_pdf_title() -> str:
-        """Construit un titre PDF à partir des fichiers RHS renseignés."""
+        """Build a PDF title string from the selected RHS file paths."""
         p_single = rhs_path_edit.text().strip()
         compare_paths = []
         p1 = rhs1_edit.text().strip()
@@ -393,7 +395,7 @@ def launch_qt_gui(
             window,
             "Select Intan RHS file",
             "",
-            "Fichiers Intan RHS (*.rhs);;Tous les fichiers (*)",
+            "Intan RHS files (*.rhs);;All files (*)",
         )
         if selected:
             rhs_path_edit.setText(selected)
@@ -404,7 +406,7 @@ def launch_qt_gui(
             window,
             "Recording 1 — RHS file",
             "",
-            "Fichiers Intan RHS (*.rhs);;Tous les fichiers (*)",
+            "Intan RHS files (*.rhs);;All files (*)",
         )
         if selected:
             rhs1_edit.setText(selected)
@@ -415,7 +417,7 @@ def launch_qt_gui(
             window,
             "Recording 2 — RHS file",
             "",
-            "Fichiers Intan RHS (*.rhs);;Tous les fichiers (*)",
+            "Intan RHS files (*.rhs);;All files (*)",
         )
         if selected:
             rhs2_edit.setText(selected)
@@ -434,8 +436,8 @@ def launch_qt_gui(
         path_edit = QLineEdit()
         if initial_path:
             path_edit.setText(initial_path)
-        browse_btn = QPushButton("Parcourir...")
-        remove_btn = QPushButton("Supprimer")
+        browse_btn = QPushButton("Browse...")
+        remove_btn = QPushButton("Remove")
         row_layout.addWidget(path_edit)
         row_layout.addWidget(browse_btn)
         row_layout.addWidget(remove_btn)
@@ -444,9 +446,9 @@ def launch_qt_gui(
         def browse_for_this_field() -> None:
             selected, _ = QFileDialog.getOpenFileName(
                 window,
-                "Enregistrement supplementaire — fichier RHS",
+                "Extra recording — RHS file",
                 "",
-                "Fichiers Intan RHS (*.rhs);;Tous les fichiers (*)",
+                "Intan RHS files (*.rhs);;All files (*)",
             )
             if selected:
                 path_edit.setText(selected)
@@ -483,7 +485,7 @@ def launch_qt_gui(
             window,
             "JSON probeinterface (MEA)",
             "",
-            "JSON (*.json);;Tous les fichiers (*)",
+            "JSON (*.json);;All files (*)",
         )
         if selected:
             probe_layout_json_edit.setText(selected)
@@ -494,24 +496,24 @@ def launch_qt_gui(
             return None
         pp = Path(pj)
         if not pp.exists():
-            raise ValueError(f"Fichier probe JSON introuvable : {pp}")
+            raise ValueError(f"Probe JSON file not found: {pp}")
         try:
             load_probe_layout_json(pp)
         except Exception as exc:
-            raise ValueError(f"JSON probe invalide : {exc}") from exc
+            raise ValueError(f"Invalid probe JSON: {exc}") from exc
         return pp
 
     analysis_thread: QThread | None = None
 
     def stop_analysis_thread_on_exit() -> None:
-        """Évite QThread détruit avant la fin du worker."""
+        """Avoid destroying QThread before the worker finishes."""
         nonlocal analysis_thread
         if analysis_thread is None:
             return
         if analysis_thread.isRunning():
-            append_log("Fermeture: arrêt du traitement en cours...")
+            append_log("Shutdown: stopping current processing...")
             analysis_thread.request_stop()
-            # Au shutdown, on privilégie un arrêt propre plutôt qu'une destruction prématurée.
+            # Prefer graceful shutdown over destroying the thread too early.
             analysis_thread.wait()
         analysis_thread = None
 
@@ -559,20 +561,20 @@ def launch_qt_gui(
         analysis_thread = None
         if output:
             append_log(output.replace("\n", "<br>"))
-        total_m = re.search(r"Nombre total de triggers detectes: (\d+)", output)
-        used_m = re.search(r"Nombre de triggers utilises pour la moyenne: (\d+)", output)
+        total_m = re.search(r"Total triggers detected: (\d+)", output)
+        used_m = re.search(r"Triggers used for average: (\d+)", output)
         if total_m and used_m:
             n_tot, n_used = total_m.group(1), used_m.group(1)
             status_label.setText(
-                f"Termine — {n_tot} trigger(s) detecte(s), {n_used} utilise(s) pour la moyenne."
+                f"Done — {n_tot} trigger(s) detected, {n_used} used for average."
             )
-            append_log(f"Resume: {n_tot} trigger(s) au total, {n_used} pour la moyenne.")
+            append_log(f"Summary: {n_tot} trigger(s) total, {n_used} used for average.")
             QMessageBox.information(
                 window,
                 "Success",
                 f"Analysis completed.\n\n"
-                f"Nombre de triggers detectes: {n_tot}\n"
-                f"Nombre utilises pour la moyenne: {n_used}",
+                f"Total triggers detected: {n_tot}\n"
+                f"Triggers used for average: {n_used}",
             )
         else:
             status_label.setText("Analysis completed successfully.")
@@ -587,7 +589,7 @@ def launch_qt_gui(
         analysis_thread = None
         if output:
             append_log(output.replace("\n", "<br>"))
-        pdf_m = re.search(r"PDF comparaison genere: (.+)", output)
+        pdf_m = re.search(r"Comparison PDF written: (.+)", output)
         if pdf_m:
             status_label.setText(f"Comparison completed — {pdf_m.group(1)}")
         else:
@@ -600,9 +602,9 @@ def launch_qt_gui(
         if analysis_thread is not None:
             analysis_thread.deleteLater()
         analysis_thread = None
-        status_label.setText("Echec.")
-        append_log(f"Erreur: {msg}")
-        QMessageBox.critical(window, "Erreur", msg)
+        status_label.setText("Failed.")
+        append_log(f"Error: {msg}")
+        QMessageBox.critical(window, "Error", msg)
 
     def on_interrupted(msg: str) -> None:
         nonlocal analysis_thread
@@ -610,12 +612,12 @@ def launch_qt_gui(
         if analysis_thread is not None:
             analysis_thread.deleteLater()
         analysis_thread = None
-        status_label.setText("Traitement interrompu.")
+        status_label.setText("Processing interrupted.")
         append_log(msg)
 
     def on_stop_clicked() -> None:
         if analysis_thread is not None and analysis_thread.isRunning():
-            append_log("Arrêt demandé — attente des points de contrôle...")
+            append_log("Stop requested — waiting for safe checkpoints...")
             analysis_thread.request_stop()
 
     def run_analysis() -> None:
@@ -625,12 +627,12 @@ def launch_qt_gui(
         try:
             rhs_text = rhs_path_edit.text().strip()
             if not rhs_text:
-                raise ValueError("Choisis un fichier RHS.")
+                raise ValueError("Choose an RHS file.")
             thr, edge, pre, post, lp_hz, save_p, pdf_title, sp_thr, fr_w, zoom_t0_s, zoom_t1_s, bp_lo, bp_hi, work_p, keep_w, ch_w, light_plot, samp_pct = (
                 build_shared_params()
             )
             if fr_w <= 0:
-                raise ValueError("La fenêtre de lissage du taux (s) doit être > 0.")
+                raise ValueError("Firing-rate smoothing window (s) must be > 0.")
             probe_p = resolve_probe_layout_json_param()
             config = AnalysisConfig(
                 rhs_file=Path(rhs_text),
@@ -655,12 +657,12 @@ def launch_qt_gui(
                 probe_layout_json=probe_p,
             )
         except ValueError as exc:
-            append_log(f"Erreur: {exc}")
+            append_log(f"Error: {exc}")
             QMessageBox.warning(window, "Validation", str(exc))
             return
         except Exception as exc:
-            append_log(f"Erreur: {exc}")
-            QMessageBox.critical(window, "Erreur", str(exc))
+            append_log(f"Error: {exc}")
+            QMessageBox.critical(window, "Error", str(exc))
             return
 
         def task() -> None:
@@ -672,9 +674,9 @@ def launch_qt_gui(
         thread.finished_interrupted.connect(on_interrupted)
 
         status_label.setText("Analysis running...")
-        append_log(f"Debut analyse: {config.rhs_file}")
+        append_log(f"Starting analysis: {config.rhs_file}")
         out_dir = config.save_dir if config.save_dir is not None else config.rhs_file.parent
-        append_log(f"PDF sera enregistre dans: {out_dir}")
+        append_log(f"PDF will be saved to: {out_dir}")
 
         analysis_thread = thread
         set_busy(True)
@@ -704,12 +706,12 @@ def launch_qt_gui(
                     seen.add(pr)
                     uniq_paths.append(p)
             if len(uniq_paths) < 2:
-                raise ValueError("Ajoute au moins deux fichiers RHS pour la comparaison.")
+                raise ValueError("Add at least two RHS files for comparison.")
             thr, edge, pre, post, lp_hz, save_p, pdf_title, sp_thr, fr_w, zoom_t0_s, zoom_t1_s, bp_lo, bp_hi, work_p, keep_w, ch_w, light_plot, samp_pct = (
                 build_shared_params()
             )
             if fr_w <= 0:
-                raise ValueError("La fenêtre de lissage du taux (s) doit être > 0.")
+                raise ValueError("Firing-rate smoothing window (s) must be > 0.")
             probe_p = resolve_probe_layout_json_param()
             cfgs: list[AnalysisConfig] = []
             for p in uniq_paths:
@@ -738,12 +740,12 @@ def launch_qt_gui(
                     )
                 )
         except ValueError as exc:
-            append_log(f"Erreur: {exc}")
+            append_log(f"Error: {exc}")
             QMessageBox.warning(window, "Validation", str(exc))
             return
         except Exception as exc:
-            append_log(f"Erreur: {exc}")
-            QMessageBox.critical(window, "Erreur", str(exc))
+            append_log(f"Error: {exc}")
+            QMessageBox.critical(window, "Error", str(exc))
             return
 
         def task() -> None:
@@ -752,7 +754,7 @@ def launch_qt_gui(
                 return
             if run_multi_comparison_callback is None:
                 raise RuntimeError(
-                    "Comparaison multi-fichiers indisponible dans cette version (backend manquant)."
+                    "Multi-file comparison unavailable in this build (missing backend)."
                 )
             run_multi_comparison_callback(cfgs)
 
@@ -763,14 +765,14 @@ def launch_qt_gui(
 
         status_label.setText("Comparison running...")
         if len(cfgs) == 2:
-            append_log(f"Comparaison: {cfgs[0].rhs_file.name} vs {cfgs[1].rhs_file.name}")
+            append_log(f"Comparison: {cfgs[0].rhs_file.name} vs {cfgs[1].rhs_file.name}")
         else:
             append_log(
-                "Comparaison multi: "
+                "Multi comparison: "
                 + " | ".join(c.rhs_file.name for c in cfgs)
             )
         out_dir = cfgs[0].save_dir if cfgs[0].save_dir is not None else cfgs[0].rhs_file.parent
-        append_log(f"PDF comparaison dans: {out_dir}")
+        append_log(f"Comparison PDF folder: {out_dir}")
 
         analysis_thread = thread
         set_busy(True)

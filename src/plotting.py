@@ -1,6 +1,7 @@
+"""PDF figures for triggered averaged traces, spike raster/PSTH/ISI, comparisons, and optional MEA layout inset."""
+
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
@@ -20,6 +21,7 @@ from core import (
     detect_spikes_at_threshold,
 )
 from impedance_tracking import ImpedanceSession
+from plot_utils import downsample_points, shift_axes_down, shorten_filename_for_windows
 from probe_layout import draw_probe_inset_on_axes, load_probe_layout_json, match_contact_index
 
 # Zoom panel window (s), time relative to trigger (t=0)
@@ -35,57 +37,6 @@ ISI_ABSCISSA_T1_S = 2.0
 
 # X-axis label for all time-relative-to-trigger plots
 TIME_REL_XLABEL = "Time relative to trigger (s)"
-
-
-def _downsample_points(x: np.ndarray, y: np.ndarray, sampling_percent: int) -> tuple[np.ndarray, np.ndarray]:
-    """Deterministically subsample (x, y) points."""
-    pct = int(np.clip(int(sampling_percent), 1, 100))
-    if pct >= 100 or x.size <= 1:
-        return x, y
-    keep = max(1, int(np.ceil(x.size * (pct / 100.0))))
-    idx = np.linspace(0, x.size - 1, keep, dtype=np.int64)
-    return x[idx], y[idx]
-
-
-def _shorten_filename_for_windows(output_dir: Path, filename: str, max_full_len: int = 240) -> str:
-    """Shorten a filename to keep Windows path length under control."""
-    full = str(output_dir / filename)
-    if len(full) <= max_full_len:
-        return filename
-    stem = Path(filename).stem
-    suffix = Path(filename).suffix or ".pdf"
-    overhead = len(str(output_dir / ("_" + suffix)))
-    max_stem = max(8, max_full_len - overhead)
-    return f"{stem[:max_stem]}{suffix}"
-
-
-def _shift_axes_down(axes: Sequence[Any], delta: float) -> None:
-    """Shift a group of axes downward (figure coordinates)."""
-    for ax in axes:
-        pos = ax.get_position()
-        ax.set_position([pos.x0, pos.y0 - delta, pos.width, pos.height])
-
-
-def _shorten_filename_for_windows(output_dir: Path, filename: str, max_total_len: int = 240) -> str:
-    """Shorten filename if total path length may exceed Windows limits."""
-    full_len = len(str(output_dir / filename))
-    if full_len <= max_total_len:
-        return filename
-    stem = Path(filename).stem
-    suffix = Path(filename).suffix or ".pdf"
-    digest = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:10]
-    budget = max_total_len - len(str(output_dir)) - len(suffix) - len(digest) - 2
-    budget = max(24, budget)
-    short_stem = stem[:budget]
-    return f"{short_stem}_{digest}{suffix}"
-
-
-def _downsample_points(x: np.ndarray, y: np.ndarray, sampling_percent: int) -> tuple[np.ndarray, np.ndarray]:
-    if sampling_percent >= 100:
-        return x, y
-    pct = max(1, min(100, int(sampling_percent)))
-    step = max(1, int(np.ceil(100.0 / float(pct))))
-    return x[::step], y[::step]
 
 
 def _spike_times_per_trial(
@@ -240,7 +191,7 @@ def _draw_spike_panels_single_channel(
     ax_fr: Any,
     ax_trial_fr: Any,
     ax_isi: Any,
-    w_ch: np.ndarray,
+    w_ch: Optional[np.ndarray],
     t_rel: np.ndarray,
     fs: float,
     spike_threshold_uv: float,
@@ -251,14 +202,15 @@ def _draw_spike_panels_single_channel(
     t_range_s: Optional[Tuple[float, float]] = None,
     section_title: str = "",
     st_per_tr: Optional[list[np.ndarray]] = None,
-    lightweight_mode: bool = False,
     sampling_percent: int = 100,
 ) -> None:
     """Raster, PSTH / firing rate, ISI (time rel. trigger x duration) for one channel."""
     short, _ = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
-    n_tr = int(w_ch.shape[0])
     if st_per_tr is None:
+        if w_ch is None:
+            raise ValueError("w_ch is required when st_per_tr is not provided.")
         st_per_tr = _spike_times_per_trial(w_ch, t_rel, fs, spike_threshold_uv)
+    n_tr = int(len(st_per_tr))
     if t_range_s is None:
         t_xlim_lo, t_xlim_hi = float(t_rel[0]), float(t_rel[-1])
         psth_t_range: Optional[Tuple[float, float]] = None
@@ -284,7 +236,7 @@ def _draw_spike_panels_single_channel(
             st_plot = st[(st >= t_xlim_lo) & (st <= t_xlim_hi)]
         if st_plot.size:
             y_pts = np.full(st_plot.shape, tri)
-            st_ds, y_ds = _downsample_points(st_plot, y_pts, sampling_percent)
+            st_ds, y_ds = downsample_points(st_plot, y_pts, sampling_percent)
             ax_raster.scatter(
                 st_ds,
                 y_ds,
@@ -334,7 +286,7 @@ def _draw_spike_panels_single_channel(
 
     t_isi, isi_vals_s = _isi_time_and_values_s(st_per_tr, isi_window_s=isi_window)
     if t_isi.size:
-        t_isi, isi_vals_s = _downsample_points(t_isi, isi_vals_s, sampling_percent)
+        t_isi, isi_vals_s = downsample_points(t_isi, isi_vals_s, sampling_percent)
         ax_isi.scatter(
             t_isi,
             isi_vals_s * 1e3,
@@ -368,8 +320,8 @@ def _draw_spike_panels_dual_channel(
     ax_fr: Any,
     ax_trial_fr: Any,
     ax_isi: Any,
-    w_a: np.ndarray,
-    w_b: np.ndarray,
+    w_a: Optional[np.ndarray],
+    w_b: Optional[np.ndarray],
     t_rel: np.ndarray,
     fs: float,
     spike_threshold_uv: float,
@@ -383,17 +335,20 @@ def _draw_spike_panels_dual_channel(
     section_title: str = "",
     sta: Optional[list[np.ndarray]] = None,
     stb: Optional[list[np.ndarray]] = None,
-    lightweight_mode: bool = False,
     sampling_percent: int = 100,
 ) -> None:
     """Overlaid raster / PSTH / ISI for two recordings (same channel, same time axis)."""
     short, _ = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
-    n_a = int(w_a.shape[0])
-    n_b = int(w_b.shape[0])
     if sta is None:
+        if w_a is None:
+            raise ValueError("w_a is required when sta is not provided.")
         sta = _spike_times_per_trial(w_a, t_rel, fs, spike_threshold_uv)
     if stb is None:
+        if w_b is None:
+            raise ValueError("w_b is required when stb is not provided.")
         stb = _spike_times_per_trial(w_b, t_rel, fs, spike_threshold_uv)
+    n_a = int(len(sta))
+    n_b = int(len(stb))
 
     if t_range_s is None:
         t_xlim_lo, t_xlim_hi = float(t_rel[0]), float(t_rel[-1])
@@ -415,7 +370,7 @@ def _draw_spike_panels_dual_channel(
             st_plot = st[(st >= t_xlim_lo) & (st <= t_xlim_hi)]
         if st_plot.size:
             y_pts = np.full(st_plot.shape, tri)
-            st_ds, y_ds = _downsample_points(st_plot, y_pts, sampling_percent)
+            st_ds, y_ds = downsample_points(st_plot, y_pts, sampling_percent)
             ax_raster.scatter(
                 st_ds,
                 y_ds,
@@ -432,7 +387,7 @@ def _draw_spike_panels_dual_channel(
             st_plot = st[(st >= t_xlim_lo) & (st <= t_xlim_hi)]
         if st_plot.size:
             y_pts = np.full(st_plot.shape, offset + tri)
-            st_ds, y_ds = _downsample_points(st_plot, y_pts, sampling_percent)
+            st_ds, y_ds = downsample_points(st_plot, y_pts, sampling_percent)
             ax_raster.scatter(
                 st_ds,
                 y_ds,
@@ -490,9 +445,9 @@ def _draw_spike_panels_dual_channel(
     t_b, isi_b_s = _isi_time_and_values_s(stb, isi_window_s=isi_window)
     if t_a.size or t_b.size:
         if t_a.size:
-            t_a, isi_a_s = _downsample_points(t_a, isi_a_s, sampling_percent)
+            t_a, isi_a_s = downsample_points(t_a, isi_a_s, sampling_percent)
         if t_b.size:
-            t_b, isi_b_s = _downsample_points(t_b, isi_b_s, sampling_percent)
+            t_b, isi_b_s = downsample_points(t_b, isi_b_s, sampling_percent)
         if t_a.size:
             ax_isi.scatter(
                 t_a,
@@ -537,141 +492,9 @@ def _draw_spike_panels_dual_channel(
 def _draw_spike_panels_multi_channel(
     ax_raster: Any,
     ax_fr: Any,
-    ax_isi: Any,
-    windows_list: Sequence[np.ndarray],
-    t_rel: np.ndarray,
-    fs: float,
-    spike_threshold_uv: float,
-    firing_rate_window_s: float,
-    labels: Sequence[str],
-    spike_bandpass_low_hz: Optional[float] = None,
-    spike_bandpass_high_hz: Optional[float] = None,
-    *,
-    t_range_s: Optional[Tuple[float, float]] = None,
-    section_title: str = "",
-    spikes_per_recording: Optional[list[list[np.ndarray]]] = None,
-    lightweight_mode: bool = False,
-    sampling_percent: int = 100,
-) -> None:
-    """Overlaid raster / PSTH / ISI for N recordings."""
-    short, _ = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
-    if spikes_per_recording is None:
-        spikes_per_recording = [
-            _spike_times_per_trial(w, t_rel, fs, spike_threshold_uv) for w in windows_list
-        ]
-
-    if t_range_s is None:
-        t_xlim_lo, t_xlim_hi = float(t_rel[0]), float(t_rel[-1])
-        psth_t_range = None
-        isi_window = None
-        isi_caption = f"±{ISI_HALF_WINDOW_S:g} s of trigger, within-trial"
-        isi_empty_hint = f"±{ISI_HALF_WINDOW_S:g} s of trigger"
-    else:
-        t_xlim_lo, t_xlim_hi = float(t_range_s[0]), float(t_range_s[1])
-        psth_t_range = (t_xlim_lo, t_xlim_hi)
-        isi_window = (t_xlim_lo, t_xlim_hi)
-        isi_caption = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s rel. trigger, within-trial"
-        isi_empty_hint = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s of trigger"
-
-    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
-    sec = f"{section_title} — " if section_title else ""
-    y_offset = 0
-    for rec_idx, st_per_trial in enumerate(spikes_per_recording):
-        color = colors[rec_idx % len(colors)]
-        for tri, st in enumerate(st_per_trial):
-            st_plot = st
-            if t_range_s is not None:
-                st_plot = st[(st >= t_xlim_lo) & (st <= t_xlim_hi)]
-            if st_plot.size:
-                y_pts = np.full(st_plot.shape, y_offset + tri)
-                st_ds, y_ds = _downsample_points(st_plot, y_pts, sampling_percent)
-                ax_raster.scatter(
-                    st_ds,
-                    y_ds,
-                    s=4,
-                    c=color,
-                    alpha=0.75,
-                    linewidths=0,
-                    label=labels[rec_idx] if tri == 0 else "",
-                )
-        y_offset += len(st_per_trial)
-        if rec_idx < len(spikes_per_recording) - 1:
-            ax_raster.axhline(y_offset - 0.5, color="0.55", linestyle="--", linewidth=0.8, alpha=0.7)
-    cap = (
-        f"threshold {spike_threshold_uv:g} µV (falling)"
-        if spike_threshold_uv < 0
-        else f"threshold {spike_threshold_uv:g} µV (rising)"
-    )
-    ax_raster.set_ylabel("Trial # (grouped by file)")
-    ax_raster.set_title(f"{sec}Raster — {short} ({cap})")
-    ax_raster.grid(True, alpha=0.25, axis="x")
-    ax_raster.set_ylim(-0.5, max(y_offset - 0.5, 0.5))
-    ax_raster.set_xlim(t_xlim_lo, t_xlim_hi)
-
-    bin_w = max(1.0 / fs, min(0.002, max(firing_rate_window_s / 12.0, 5e-5)))
-    for rec_idx, st_per_trial in enumerate(spikes_per_recording):
-        tc, rate = _psth_mean_hz(
-            st_per_trial,
-            t_rel,
-            max(len(st_per_trial), 1),
-            bin_w,
-            firing_rate_window_s,
-            t_range_s=psth_t_range,
-        )
-        if tc.size:
-            ax_fr.plot(tc, rate, linewidth=1.3, color=colors[rec_idx % len(colors)], label=labels[rec_idx])
-    ax_fr.set_ylabel("Rate (Hz)")
-    ax_fr.set_title(f"{sec}Firing rate (Gaussian PSTH σ={firing_rate_window_s:g} s) — {short}")
-    ax_fr.grid(True, alpha=0.3)
-    ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
-    ax_raster.set_xlabel(TIME_REL_XLABEL)
-    ax_fr.set_xlabel(TIME_REL_XLABEL)
-    fr_rows: list[tuple[str, float]] = []
-    for rec_idx, st_per_trial in enumerate(spikes_per_recording):
-        mean_fr = _mean_firing_rate_in_window_hz(st_per_trial, (t_xlim_lo, t_xlim_hi))
-        fr_rows.append((labels[rec_idx], mean_fr))
-    _add_psth_mean_table(ax_fr, fr_rows)
-
-    has_isi = False
-    for rec_idx, st_per_trial in enumerate(spikes_per_recording):
-        tx, isi_vals_s = _isi_time_and_values_s(st_per_trial, isi_window_s=isi_window)
-        if tx.size:
-            has_isi = True
-            tx, isi_vals_s = _downsample_points(tx, isi_vals_s, sampling_percent)
-            ax_isi.scatter(
-                tx,
-                isi_vals_s * 1e3,
-                s=10,
-                c=colors[rec_idx % len(colors)],
-                alpha=0.35,
-                linewidths=0,
-                label=labels[rec_idx],
-                rasterized=True,
-            )
-    if has_isi:
-        ax_isi.set_ylabel("ISI (ms)")
-        ax_isi.set_title(f"{sec}ISI — {short} ({isi_caption} ; x-axis = time of 2nd spike)")
-        ax_isi.grid(True, alpha=0.25)
-        ax_isi.set_xlim(ISI_ABSCISSA_T0_S, ISI_ABSCISSA_T1_S)
-        ax_isi.set_xlabel(TIME_REL_XLABEL)
-    else:
-        ax_isi.text(
-            0.5,
-            0.5,
-            f"Not enough spikes for ISI\n({isi_empty_hint})",
-            ha="center",
-            va="center",
-            transform=ax_isi.transAxes,
-        )
-        ax_isi.set_axis_off()
-
-
-def _draw_spike_panels_multi_channel(
-    ax_raster: Any,
-    ax_fr: Any,
     ax_trial_fr: Any,
     ax_isi: Any,
-    windows_list: Sequence[np.ndarray],
+    windows_list: Optional[Sequence[np.ndarray]],
     t_rel: np.ndarray,
     fs: float,
     spike_threshold_uv: float,
@@ -683,12 +506,13 @@ def _draw_spike_panels_multi_channel(
     t_range_s: Optional[Tuple[float, float]] = None,
     section_title: str = "",
     spikes_per_recording: Optional[list[list[np.ndarray]]] = None,
-    lightweight_mode: bool = False,
     sampling_percent: int = 100,
 ) -> None:
     """Overlaid raster / PSTH / ISI for N recordings."""
     short, _ = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
     if spikes_per_recording is None:
+        if windows_list is None:
+            raise ValueError("windows_list is required when spikes_per_recording is not provided.")
         spikes_per_recording = [
             _spike_times_per_trial(w, t_rel, fs, spike_threshold_uv) for w in windows_list
         ]
@@ -717,7 +541,7 @@ def _draw_spike_panels_multi_channel(
                 st_plot = st[(st >= t_xlim_lo) & (st <= t_xlim_hi)]
             if st_plot.size:
                 y_pts = np.full(st_plot.shape, y_offset + tri)
-                st_ds, y_ds = _downsample_points(st_plot, y_pts, sampling_percent)
+                st_ds, y_ds = downsample_points(st_plot, y_pts, sampling_percent)
                 ax_raster.scatter(
                     st_ds,
                     y_ds,
@@ -786,7 +610,7 @@ def _draw_spike_panels_multi_channel(
         tx, isi_vals_s = _isi_time_and_values_s(st_per_trial, isi_window_s=isi_window)
         if tx.size:
             has_isi = True
-            tx, isi_vals_s = _downsample_points(tx, isi_vals_s, sampling_percent)
+            tx, isi_vals_s = downsample_points(tx, isi_vals_s, sampling_percent)
             ax_isi.scatter(
                 tx,
                 isi_vals_s * 1e3,
@@ -1010,7 +834,7 @@ def plot_channel_multi_comparison(
         pdf_stem = safe_title.removesuffix(".pdf")
     else:
         pdf_stem = "multi_comparison"
-    pdf_name = _shorten_filename_for_windows(output_dir, f"{pdf_stem}.pdf")
+    pdf_name = shorten_filename_for_windows(output_dir, f"{pdf_stem}.pdf")
     pdf_path = output_dir / pdf_name
 
     zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
@@ -1081,16 +905,16 @@ def plot_channel_multi_comparison(
             show_mea_panel = probe_layout_loaded is not None and (
                 match_contact_index(probe_layout_loaded, str(channel_names[ch])) is not None
             )
-            fig_w = 18.0 if show_mea_panel else 12.0
-            hdr0 = 0.72 if show_mea_panel else 0.06
+            fig_w = 24.0 if show_mea_panel else 12.0
+            hdr0 = 0.88 if show_mea_panel else 0.06
             hr_multi = [hdr0, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95, 0.06, 1.05, 1.10, 0.90, 0.85, 0.95]
             if impedance_sessions:
                 hr_layout = [*hr_multi, 0.05, 0.95]
-                fig_h = 64.0 if show_mea_panel else 42.0
+                fig_h = 88.0 if show_mea_panel else 42.0
                 fig = plt.figure(figsize=(fig_w, fig_h))
                 gs = fig.add_gridspec(len(hr_layout), 1, height_ratios=hr_layout, hspace=0.88)
             else:
-                fig_h = 58.0 if show_mea_panel else 38.0
+                fig_h = 80.0 if show_mea_panel else 38.0
                 fig = plt.figure(figsize=(fig_w, fig_h))
                 gs = fig.add_gridspec(18, 1, height_ratios=hr_multi, hspace=0.9)
             ax_hdr1 = fig.add_subplot(gs[0, 0]); ax_hdr1.axis("off")
@@ -1207,22 +1031,21 @@ def plot_channel_multi_comparison(
                     src.spike_times_per_trial_for_channel(ch, t_rel, spike_threshold_uv)
                     for src in sources_ok
                 ]
-                w_list = [np.empty((len(st), 1), dtype=np.float32) for st in st_list]
                 _draw_spike_panels_multi_channel(
-                    ax_raster_f, ax_fr_f, ax_trial_fr_f, ax_isi_f, w_list, t_rel, float(fs), spike_threshold_uv,
+                    ax_raster_f, ax_fr_f, ax_trial_fr_f, ax_isi_f, None, t_rel, float(fs), spike_threshold_uv,
                     firing_rate_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
-                    t_range_s=None, spikes_per_recording=st_list, lightweight_mode=lightweight_mode, sampling_percent=sampling_percent,
+                    t_range_s=None, spikes_per_recording=st_list, sampling_percent=sampling_percent,
                 )
                 _draw_spike_panels_multi_channel(
-                    ax_raster_z, ax_fr_z, ax_trial_fr_z, ax_isi_z, w_list, t_rel, float(fs), spike_threshold_uv,
+                    ax_raster_z, ax_fr_z, ax_trial_fr_z, ax_isi_z, None, t_rel, float(fs), spike_threshold_uv,
                     firing_rate_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
-                    t_range_s=(zoom_t0, zoom_t1), spikes_per_recording=st_list, lightweight_mode=lightweight_mode, sampling_percent=sampling_percent,
+                    t_range_s=(zoom_t0, zoom_t1), spikes_per_recording=st_list, sampling_percent=sampling_percent,
                 )
                 if end_zoom_range is not None:
                     _draw_spike_panels_multi_channel(
-                        ax_raster_ze, ax_fr_ze, ax_trial_fr_ze, ax_isi_ze, w_list, t_rel, float(fs), spike_threshold_uv,
+                        ax_raster_ze, ax_fr_ze, ax_trial_fr_ze, ax_isi_ze, None, t_rel, float(fs), spike_threshold_uv,
                         firing_rate_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
-                        t_range_s=end_zoom_range, section_title="Trigger-end zoom", spikes_per_recording=st_list, lightweight_mode=lightweight_mode, sampling_percent=sampling_percent,
+                        t_range_s=end_zoom_range, section_title="Trigger-end zoom", spikes_per_recording=st_list, sampling_percent=sampling_percent,
                     )
                 else:
                     for ax in (ax_raster_ze, ax_fr_ze):
@@ -1261,7 +1084,7 @@ def plot_channel_multi_comparison(
                 ax.tick_params(axis="x", labelbottom=True)
 
             fig.tight_layout()
-            _shift_axes_down(
+            shift_axes_down(
                 [
                     ax_raster_f,
                     ax_fr_f,
@@ -1328,7 +1151,7 @@ def plot_channel_averages(
         pdf_stem = safe_title.removesuffix(".pdf")
     else:
         pdf_stem = rhs_file.stem
-    pdf_name = _shorten_filename_for_windows(output_dir, f"{pdf_stem}.pdf")
+    pdf_name = shorten_filename_for_windows(output_dir, f"{pdf_stem}.pdf")
     pdf_path = output_dir / pdf_name
 
     zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
@@ -1373,9 +1196,9 @@ def plot_channel_averages(
             show_mea_panel = probe_layout_loaded is not None and (
                 match_contact_index(probe_layout_loaded, str(channel_names[ch])) is not None
             )
-            fig_w = 18.0 if show_mea_panel else 12.0
-            hdr_ratio = 0.72 if show_mea_panel else 0.06
-            fig_h = 58.0 if show_mea_panel else 38.0
+            fig_w = 24.0 if show_mea_panel else 12.0
+            hdr_ratio = 0.88 if show_mea_panel else 0.06
+            fig_h = 80.0 if show_mea_panel else 38.0
             fig = plt.figure(figsize=(fig_w, fig_h))
             gs = fig.add_gridspec(
                 18,
@@ -1575,7 +1398,6 @@ def plot_channel_averages(
                     st_per_tr = spike_source.spike_times_per_trial_for_channel(
                         ch, t_rel, spike_threshold_uv
                     )
-                    w_ch = np.empty((len(st_per_tr), 1), dtype=np.float32)
                 else:
                     w_ch = np.asarray(windows[:, ch, :])
                     # Spike detection is computed once per channel,
@@ -1588,7 +1410,7 @@ def plot_channel_averages(
                     ax_fr_f,
                     ax_trial_fr_f,
                     ax_isi_f,
-                    w_ch,
+                    None if spike_source is not None else w_ch,
                     t_rel,
                     float(fs),
                     spike_threshold_uv,
@@ -1597,7 +1419,6 @@ def plot_channel_averages(
                     spike_bandpass_high_hz,
                     t_range_s=None,
                     st_per_tr=st_per_tr,
-                    lightweight_mode=lightweight_mode,
                     sampling_percent=sampling_percent,
                 )
                 _draw_spike_panels_single_channel(
@@ -1605,7 +1426,7 @@ def plot_channel_averages(
                     ax_fr_z,
                     ax_trial_fr_z,
                     ax_isi_z,
-                    w_ch,
+                    None if spike_source is not None else w_ch,
                     t_rel,
                     float(fs),
                     spike_threshold_uv,
@@ -1614,7 +1435,6 @@ def plot_channel_averages(
                     spike_bandpass_high_hz,
                     t_range_s=(zoom_t0, zoom_t1),
                     st_per_tr=st_per_tr,
-                    lightweight_mode=lightweight_mode,
                     sampling_percent=sampling_percent,
                 )
                 if end_zoom_range is not None:
@@ -1623,7 +1443,7 @@ def plot_channel_averages(
                         ax_fr_ze,
                         ax_trial_fr_ze,
                         ax_isi_ze,
-                        w_ch,
+                        None if spike_source is not None else w_ch,
                         t_rel,
                         float(fs),
                         spike_threshold_uv,
@@ -1696,7 +1516,7 @@ def plot_channel_averages(
                 ax.tick_params(axis="x", labelbottom=True)
 
             fig.tight_layout()
-            _shift_axes_down(
+            shift_axes_down(
                 [
                     ax_raster_f,
                     ax_fr_f,
@@ -1760,7 +1580,7 @@ def plot_channel_comparison(
         pdf_stem = safe_title.removesuffix(".pdf")
     else:
         pdf_stem = f"{safe_a}_vs_{safe_b}"
-    pdf_name = _shorten_filename_for_windows(output_dir, f"{pdf_stem}.pdf")
+    pdf_name = shorten_filename_for_windows(output_dir, f"{pdf_stem}.pdf")
     pdf_path = output_dir / pdf_name
 
     zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
@@ -2028,15 +1848,13 @@ def plot_channel_comparison(
                 # then reused for full / zoom / trigger-end zoom.
                 sta = spike_source_a.spike_times_per_trial_for_channel(ch, t_rel, spike_threshold_uv)
                 stb = spike_source_b.spike_times_per_trial_for_channel(ch, t_rel, spike_threshold_uv)
-                w_a = np.empty((len(sta), 1), dtype=np.float32)
-                w_b = np.empty((len(stb), 1), dtype=np.float32)
                 _draw_spike_panels_dual_channel(
                     ax_raster_f,
                     ax_fr_f,
                     ax_trial_fr_f,
                     ax_isi_f,
-                    w_a,
-                    w_b,
+                    None,
+                    None,
                     t_rel,
                     float(fs),
                     spike_threshold_uv,
@@ -2048,7 +1866,6 @@ def plot_channel_comparison(
                     t_range_s=None,
                     sta=sta,
                     stb=stb,
-                    lightweight_mode=lightweight_mode,
                     sampling_percent=sampling_percent,
                 )
                 _draw_spike_panels_dual_channel(
@@ -2056,8 +1873,8 @@ def plot_channel_comparison(
                     ax_fr_z,
                     ax_trial_fr_z,
                     ax_isi_z,
-                    w_a,
-                    w_b,
+                    None,
+                    None,
                     t_rel,
                     float(fs),
                     spike_threshold_uv,
@@ -2069,7 +1886,6 @@ def plot_channel_comparison(
                     t_range_s=(zoom_t0, zoom_t1),
                     sta=sta,
                     stb=stb,
-                    lightweight_mode=lightweight_mode,
                     sampling_percent=sampling_percent,
                 )
                 if end_zoom_range is not None:
@@ -2078,8 +1894,8 @@ def plot_channel_comparison(
                         ax_fr_ze,
                         ax_trial_fr_ze,
                         ax_isi_ze,
-                        w_a,
-                        w_b,
+                        None,
+                        None,
                         t_rel,
                         float(fs),
                         spike_threshold_uv,
@@ -2157,7 +1973,7 @@ def plot_channel_comparison(
                 ax.tick_params(axis="x", labelbottom=True)
 
             fig.tight_layout()
-            _shift_axes_down(
+            shift_axes_down(
                 [
                     ax_raster_f,
                     ax_fr_f,

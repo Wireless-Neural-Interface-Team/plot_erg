@@ -1,4 +1,4 @@
-"""Chargement JSON probeinterface (MEA) et encart position des électrodes."""
+"""Load probeinterface JSON (MEA) and draw the electrode layout inset for PDF figures."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from matplotlib.patches import Circle
 
 @dataclass(frozen=True)
 class ProbeLayout:
-    """Géométrie 2D (µm) + identifiants + mapping vers indices d'enregistrement."""
+    """2D geometry (µm), contact ids, and optional device channel index mapping."""
 
     positions_um: np.ndarray  # (n, 2)
     contact_ids: tuple[str, ...]
@@ -24,11 +24,11 @@ class ProbeLayout:
     def __post_init__(self) -> None:
         n = int(self.positions_um.shape[0])
         if len(self.contact_ids) != n or len(self.device_channel_indices) != n:
-            raise ValueError("positions_um, contact_ids et device_channel_indices doivent avoir la même longueur.")
+            raise ValueError("positions_um, contact_ids, and device_channel_indices must have the same length.")
 
 
-# Bandeau d'entête : [left, bottom, width, height] en transAxes (MEA à droite, titre « Part 1 » à gauche).
-PROBE_INSET_HEADER_RECT: tuple[float, float, float, float] = (0.17, 0.01, 0.82, 0.98)
+# Header band: [left, bottom, width, height] in parent transAxes (MEA inset; Part 1 title on the left).
+PROBE_INSET_HEADER_RECT: tuple[float, float, float, float] = (0.06, 0.01, 0.98, 0.98)
 
 
 def _as_int_or_none(v: Any) -> int | None:
@@ -53,10 +53,10 @@ def _is_nc_contact(cid: str) -> bool:
 
 
 def _contact_name_matches_rhs(cid: str, channel_name: str) -> bool:
-    """True uniquement si le nom de canal RHS désigne le même identifiant que ``contact_id`` (nom entier, ex. A-005).
+    """True only if the recording channel name identifies the same label as ``contact_id`` (full id, e.g. A-005).
 
-    Pas de correspondance sur le seul numéro : ``A-005`` ≠ ``B-005``. On accepte ``_`` ↔ ``-`` et des jetons si le
-    nom Intan contient des séparateurs (ex. préfixe + ``A-005``).
+    No match on the number alone: ``A-005`` != ``B-005``. Underscore vs hyphen and token splitting (prefix + ``A-005``)
+    are accepted when the Intan name contains separators.
     """
     cid_s = str(cid).strip()
     if _is_nc_contact(cid_s):
@@ -74,20 +74,20 @@ def _contact_name_matches_rhs(cid: str, channel_name: str) -> bool:
 
 
 def load_probe_layout_json(path: Path) -> ProbeLayout:
-    """Lit un JSON probeinterface (clé ``probes``). Lève une exception si invalide."""
+    """Read a probeinterface JSON (``probes`` key). Raises if invalid."""
     raw = json.loads(path.read_text(encoding="utf-8"))
     probes = raw.get("probes")
     if not isinstance(probes, list) or not probes:
-        raise ValueError("JSON probe : section 'probes' absente ou vide.")
+        raise ValueError("Probe JSON: missing or empty 'probes' section.")
     p0 = probes[0]
     if not isinstance(p0, dict):
-        raise ValueError("JSON probe : premier élément de 'probes' invalide.")
+        raise ValueError("Probe JSON: invalid first element of 'probes'.")
     pos = p0.get("contact_positions")
     if not isinstance(pos, list) or not pos:
-        raise ValueError("JSON probe : 'contact_positions' manquant ou vide.")
+        raise ValueError("Probe JSON: 'contact_positions' missing or empty.")
     arr = np.asarray(pos, dtype=np.float64)
     if arr.ndim != 2 or arr.shape[1] != 2:
-        raise ValueError("JSON probe : contact_positions doit être une liste de [x, y].")
+        raise ValueError("Probe JSON: contact_positions must be a list of [x, y].")
     n = int(arr.shape[0])
     ids_raw = p0.get("contact_ids")
     dev_raw = p0.get("device_channel_indices")
@@ -111,9 +111,9 @@ def load_probe_layout_json(path: Path) -> ProbeLayout:
 
 
 def match_contact_index(layout: ProbeLayout, channel_name: str) -> int | None:
-    """Trouve l'index de contact si le nom de canal RHS correspond **exactement** au ``contact_id`` (nom entier).
+    """Return the contact index if the recording channel name matches ``contact_id`` (full name).
 
-    Voir ``_contact_name_matches_rhs`` : pas de correspondance partielle sur le numéro seul.
+    See ``_contact_name_matches_rhs``: no partial match on the numeric suffix alone.
     """
     for i, cid in enumerate(layout.contact_ids):
         if _contact_name_matches_rhs(str(cid), channel_name):
@@ -128,7 +128,7 @@ def draw_probe_inset_on_axes(
     *,
     inset_rect: tuple[float, float, float, float] = PROBE_INSET_HEADER_RECT,
 ) -> None:
-    """Encart sur le parent (bandeau) : une pastille par électrode, ``contact_id`` sur chaque point, surbrillance du canal RHS."""
+    """Inset on the header: one marker per electrode, ``contact_id`` labels, highlight for the active channel."""
     idx = match_contact_index(layout, channel_name)
     if idx is None:
         return
