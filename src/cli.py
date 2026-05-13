@@ -207,9 +207,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--rms-window-s",
+        "--rms-smoothing-window-s",
         type=float,
         default=defaults.rms_window_s,
-        help="RMS window duration (s) after trigger onset for RMS-evolution plot.",
+        help="RMS computation window (s) for moving-RMS profile.",
     )
     parser.add_argument(
         "--spike-bandpass-low-hz",
@@ -360,7 +361,7 @@ def run(config: AnalysisConfig) -> None:
             f"firing-rate smooth σ = {config.firing_rate_window_s} s{bp_txt}"
         )
         print(f"PDF zoom window: [{config.zoom_t0_s:.3f}s, {config.zoom_t1_s:.3f}s]")
-        print(f"RMS evolution window: [0.000s, {config.rms_window_s:.3f}s] after trigger onset")
+        print(f"RMS window: {config.rms_window_s:.3f} s")
         print(f"PDF written: {pdf_path}")
         elapsed_s = time.perf_counter() - run_start_time_s
         print(f"Total time (analysis + PDF): {elapsed_s:.2f} s")
@@ -634,7 +635,7 @@ def main() -> None:
         print("Error: --zoom-t1-s must be strictly greater than --zoom-t0-s.", file=sys.stderr)
         sys.exit(2)
     if config.rms_window_s <= 0:
-        print("Error: --rms-window-s must be > 0.", file=sys.stderr)
+        print("Error: --rms-window-s / --rms-smoothing-window-s must be > 0.", file=sys.stderr)
         sys.exit(2)
     try:
         run(config)

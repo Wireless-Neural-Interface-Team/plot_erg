@@ -166,7 +166,7 @@ def launch_qt_gui(
     )
     rms_window_edit = QLineEdit(str(default_rms_window_s))
     rms_window_edit.setToolTip(
-        "RMS window duration (seconds) after trigger onset for the RMS-evolution plot."
+        "RMS computation window (seconds) used for moving-RMS calculation."
     )
     zoom_t0_edit = QLineEdit(str(default_zoom_t0_s))
     zoom_t1_edit = QLineEdit(str(default_zoom_t1_s))
@@ -235,7 +235,7 @@ def launch_qt_gui(
     spike_form = QFormLayout()
     spike_form.addRow("Amplifier spike threshold (µV) — raster, PSTH and ISI:", spike_threshold_edit)
     spike_form.addRow("PSTH / firing-rate Gaussian smoothing (σ, s):", firing_rate_window_edit)
-    spike_form.addRow("RMS window duration (s, after trigger onset):", rms_window_edit)
+    spike_form.addRow("RMS window (s):", rms_window_edit)
     spike_form.addRow("Zoom window start (s, relative to trigger):", zoom_t0_edit)
     spike_form.addRow("Zoom window end (s, relative to trigger):", zoom_t1_edit)
     spike_form.addRow("Band-pass signal (raster, PSTH, ISI) low f (Hz):", bandpass_spikes_low_edit)
@@ -351,7 +351,7 @@ def launch_qt_gui(
             raise ValueError("Zoom window: end must be strictly greater than start.")
         rms_window_s = float(rms_window_edit.text().strip())
         if rms_window_s <= 0:
-            raise ValueError("RMS window duration (s): value must be > 0.")
+            raise ValueError("RMS window (s): value must be > 0.")
         return (
             float(threshold_edit.text().strip()),
             edge,

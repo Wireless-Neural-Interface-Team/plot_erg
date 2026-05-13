@@ -12,7 +12,7 @@ class AnalysisConfig:
     rhs_file: Path
     threshold: float = 1.0
     edge: EdgeKind = "falling"  # falling / rising threshold crossing on ANALOG_IN 0
-    pre_s: float = 2.0
+    pre_s: float = 1.0
     post_s: float = 10.0
     # Butterworth low-pass on amplifier_data (None = disabled)
     lowpass_cutoff_hz: Optional[float] = 250.0
@@ -25,9 +25,9 @@ class AnalysisConfig:
     firing_rate_window_s: float = 0.010
     # PDF zoom-panel window (s, time relative to trigger)
     zoom_t0_s: float = -0.1
-    zoom_t1_s: float = 0.5
-    # RMS window duration (s) after trigger onset for per-trigger RMS evolution plot
-    rms_window_s: float = 0.050
+    zoom_t1_s: float = 0.4
+    # RMS computation window (s): temporal window used for moving-RMS calculation
+    rms_window_s: float = 0.010
     # Butterworth band-pass on amplifier for raster / PSTH / ISI (both None = raw)
     spike_bandpass_low_hz: Optional[float] = 250.0
     spike_bandpass_high_hz: Optional[float] = 7500.0

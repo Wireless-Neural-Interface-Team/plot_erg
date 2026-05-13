@@ -16,6 +16,7 @@ from scipy.ndimage import gaussian_filter1d
 
 from core import (
     AmplifierSpikeSource,
+    apply_butterworth_bandpass,
     apply_butterworth_lowpass,
     check_analysis_cancelled,
     detect_spikes_at_threshold,
@@ -34,6 +35,8 @@ ISI_HALF_WINDOW_S = 1.0
 # X-axis label for all time-relative-to-trigger plots
 TIME_REL_XLABEL = "Time relative to trigger (s)"
 LEGEND_FONT_SIZE = 10
+RMS_INTAN_LIKE_BANDPASS_LOW_HZ = 300.0
+RMS_INTAN_LIKE_BANDPASS_HIGH_HZ = 7500.0
 
 
 def _lightweight_pdf_dpi(lightweight_mode: bool) -> int:
@@ -840,88 +843,214 @@ def _append_mean_impedance_summary_page(
     plt.close(fig)
 
 
-def _mean_rms_per_trigger_from_source(
+def _mean_rms_profile_from_source_window(
     source: AmplifierSpikeSource,
+    t0_s: float,
+    t1_s: float,
     rms_window_s: float,
-) -> np.ndarray:
-    """Mean RMS (across channels) computed for each trigger on [0, rms_window_s]."""
-    if source.valid_triggers.size == 0:
-        return np.array([], dtype=np.float64)
+    channel_index: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mean RMS profile in window [t0_s, t1_s], averaged over triggers.
+
+    Intan-like preprocessing: per-channel DC removal + AP-like band-pass.
+    """
+    if source.valid_triggers.size == 0 or t1_s <= t0_s:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     fs = float(source.fs)
-    rms_n = max(1, int(round(float(rms_window_s) * fs)))
+    start_off = int(round(float(t0_s) * fs))
+    end_off = int(round(float(t1_s) * fs))
+    if end_off <= start_off:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    bp_low = (
+        float(source.bandpass_low_hz)
+        if source.bandpass_low_hz is not None
+        else RMS_INTAN_LIKE_BANDPASS_LOW_HZ
+    )
+    bp_high = (
+        float(source.bandpass_high_hz)
+        if source.bandpass_high_hz is not None
+        else RMS_INTAN_LIKE_BANDPASS_HIGH_HZ
+    )
+    nyq = 0.5 * fs
+    use_bandpass = bp_low > 0 and bp_high > bp_low and bp_high < nyq
     n_samples = int(source.amplifier.shape[1])
-    rms_values = np.full(int(source.valid_triggers.size), np.nan, dtype=np.float64)
-    for i, trig in enumerate(source.valid_triggers):
-        start = int(trig)
-        end = min(start + rms_n, n_samples)
-        if end <= start:
+    n_win = int(end_off - start_off)
+    rms_n = max(1, int(round(float(rms_window_s) * fs)))
+    kernel = np.ones(rms_n, dtype=np.float64) / float(rms_n)
+    acc = np.zeros(n_win, dtype=np.float64)
+    n_ok = 0
+    for trig in source.valid_triggers:
+        start = int(trig + start_off)
+        end = int(trig + end_off)
+        if start < 0 or end > n_samples:
             continue
-        segment = np.asarray(source.amplifier[:, start:end], dtype=np.float64)
-        channel_rms = np.sqrt(np.mean(segment * segment, axis=1))
-        rms_values[i] = float(np.mean(channel_rms))
-    return rms_values[np.isfinite(rms_values)]
+        seg = np.asarray(source.amplifier[:, start:end], dtype=np.float64)
+        if seg.size == 0:
+            continue
+        seg = seg - np.mean(seg, axis=1, keepdims=True)
+        if use_bandpass and seg.shape[1] >= 32:
+            try:
+                seg = apply_butterworth_bandpass(seg, fs, bp_low, bp_high)
+            except Exception:
+                pass
+        if seg.shape[1] != n_win:
+            continue
+        if channel_index is not None:
+            if channel_index < 0 or channel_index >= seg.shape[0]:
+                continue
+            ch_sq = seg[int(channel_index)] * seg[int(channel_index)]
+            rms_t = np.sqrt(np.convolve(ch_sq, kernel, mode="same"))
+        else:
+            ch_rms = np.zeros_like(seg, dtype=np.float64)
+            for c in range(seg.shape[0]):
+                ch_sq = seg[c] * seg[c]
+                ch_rms[c] = np.sqrt(np.convolve(ch_sq, kernel, mode="same"))
+            rms_t = np.mean(ch_rms, axis=0)
+        acc += rms_t
+        n_ok += 1
+    if n_ok == 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    t_axis = np.arange(start_off, end_off, dtype=np.float64) / fs
+    return t_axis, acc / float(n_ok)
 
 
-def _mean_rms_per_trigger_from_windows(
+def _mean_rms_profile_from_windows_window(
     windows: np.ndarray,
     t_rel: np.ndarray,
+    t0_s: float,
+    t1_s: float,
     rms_window_s: float,
-) -> np.ndarray:
-    """Mean RMS (across channels) for each trial using in-memory windows."""
-    if windows is None or windows.ndim != 3 or windows.shape[0] == 0:
-        return np.array([], dtype=np.float64)
-    if t_rel.size < 2:
-        return np.array([], dtype=np.float64)
-    dt = float(np.median(np.diff(t_rel)))
-    if dt <= 0:
-        return np.array([], dtype=np.float64)
-    fs = 1.0 / dt
-    start_idx = int(np.searchsorted(t_rel, 0.0, side="left"))
-    rms_n = max(1, int(round(float(rms_window_s) * fs)))
-    end_idx = min(start_idx + rms_n, int(windows.shape[2]))
+    channel_index: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mean RMS profile in window [t0_s, t1_s], averaged over trials.
+
+    Intan-like preprocessing: per-channel DC removal + AP-like band-pass.
+    """
+    if windows is None or windows.ndim != 3 or windows.shape[0] == 0 or t1_s <= t0_s:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    start_idx = int(np.searchsorted(t_rel, float(t0_s), side="left"))
+    end_idx = int(np.searchsorted(t_rel, float(t1_s), side="left"))
+    start_idx = max(0, min(start_idx, int(windows.shape[2])))
+    end_idx = max(0, min(end_idx, int(windows.shape[2])))
     if end_idx <= start_idx:
-        return np.array([], dtype=np.float64)
-    rms_values = np.full(int(windows.shape[0]), np.nan, dtype=np.float64)
-    for trial_index in range(int(windows.shape[0])):
-        segment = np.asarray(windows[trial_index, :, start_idx:end_idx], dtype=np.float64)
-        channel_rms = np.sqrt(np.mean(segment * segment, axis=1))
-        rms_values[trial_index] = float(np.mean(channel_rms))
-    return rms_values[np.isfinite(rms_values)]
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    seg = np.asarray(windows[:, :, start_idx:end_idx], dtype=np.float64)
+    if seg.size == 0:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+    seg = seg - np.mean(seg, axis=2, keepdims=True)
+    dt = float(np.median(np.diff(t_rel)))
+    fs = 1.0 / dt if dt > 0 else 0.0
+    rms_n = max(1, int(round(float(rms_window_s) * fs))) if fs > 0 else 1
+    kernel = np.ones(rms_n, dtype=np.float64) / float(rms_n)
+    nyq = 0.5 * fs if fs > 0 else 0.0
+    use_bandpass = (
+        fs > 0
+        and RMS_INTAN_LIKE_BANDPASS_LOW_HZ > 0
+        and RMS_INTAN_LIKE_BANDPASS_HIGH_HZ > RMS_INTAN_LIKE_BANDPASS_LOW_HZ
+        and RMS_INTAN_LIKE_BANDPASS_HIGH_HZ < nyq
+        and seg.shape[2] >= 32
+    )
+    if use_bandpass:
+        for trial_idx in range(seg.shape[0]):
+            try:
+                seg[trial_idx] = apply_butterworth_bandpass(
+                    seg[trial_idx], fs, RMS_INTAN_LIKE_BANDPASS_LOW_HZ, RMS_INTAN_LIKE_BANDPASS_HIGH_HZ
+                )
+            except Exception:
+                pass
+    if channel_index is not None:
+        if channel_index < 0 or channel_index >= seg.shape[1]:
+            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+        rms_trials = np.zeros((seg.shape[0], seg.shape[2]), dtype=np.float64)
+        for trial_idx in range(seg.shape[0]):
+            ch_sq = seg[trial_idx, int(channel_index), :] * seg[trial_idx, int(channel_index), :]
+            rms_trials[trial_idx] = np.sqrt(np.convolve(ch_sq, kernel, mode="same"))
+    else:
+        rms_trials = np.zeros((seg.shape[0], seg.shape[2]), dtype=np.float64)
+        for trial_idx in range(seg.shape[0]):
+            ch_rms = np.zeros((seg.shape[1], seg.shape[2]), dtype=np.float64)
+            for ch_idx in range(seg.shape[1]):
+                ch_sq = seg[trial_idx, ch_idx, :] * seg[trial_idx, ch_idx, :]
+                ch_rms[ch_idx] = np.sqrt(np.convolve(ch_sq, kernel, mode="same"))
+            rms_trials[trial_idx] = np.mean(ch_rms, axis=0)
+    profile = np.mean(rms_trials, axis=0)
+    return np.asarray(t_rel[start_idx:end_idx], dtype=np.float64), np.asarray(profile, dtype=np.float64)
+
+
+def _plot_rms_series(
+    ax: Any,
+    rms_series: Sequence[tuple[str, np.ndarray, np.ndarray]],
+    title: str,
+    x_limits: tuple[float, float] | None = None,
+) -> None:
+    """Plot mean RMS profile (time in window) for one or many recordings."""
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
+    has_data = False
+    for i, (label, tx, values) in enumerate(rms_series):
+        if values.size == 0 or tx.size == 0:
+            continue
+        has_data = True
+        ax.plot(
+            tx,
+            values,
+            linewidth=1.35,
+            color=colors[i % len(colors)],
+            marker="o",
+            markersize=2.2,
+            label=label,
+        )
+    if has_data:
+        ax.set_title(title)
+        ax.set_xlabel(TIME_REL_XLABEL)
+        ax.set_ylabel("Mean RMS (µV)")
+        ax.set_ylim(0.0, 10.0)
+        if x_limits is not None:
+            ax.set_xlim(float(x_limits[0]), float(x_limits[1]))
+        ax.grid(True, alpha=0.3)
+    else:
+        ax.text(
+            0.5,
+            0.5,
+            "RMS evolution unavailable\n(no valid trigger window)",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=10,
+        )
+        ax.set_axis_off()
 
 
 def _append_mean_rms_evolution_page(
     pdf: PdfPages,
-    rms_series: Sequence[tuple[str, np.ndarray]],
+    rms_series: Sequence[tuple[str, np.ndarray, np.ndarray]],
     rms_window_s: float,
     lightweight_mode: bool,
 ) -> None:
-    """Append one summary page: mean RMS evolution across triggers."""
+    """Append one summary page: mean RMS profile on analysis timebase."""
     check_analysis_cancelled()
     fig_w, fig_h = _scale_page_size_for_lightweight(12.0, 6.0, lightweight_mode)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
     has_data = False
-    for i, (label, values) in enumerate(rms_series):
-        if values.size == 0:
+    for i, (label, tx, values) in enumerate(rms_series):
+        if values.size == 0 or tx.size == 0:
             continue
         has_data = True
-        x = np.arange(1, int(values.size) + 1, dtype=np.int64)
         ax.plot(
-            x,
+            tx,
             values,
-            linewidth=1.3,
+            linewidth=1.35,
             color=colors[i % len(colors)],
             marker="o",
             markersize=2.4,
             label=label,
         )
     if has_data:
-        ax.set_title(f"Mean RMS evolution across triggers (window: 0 to {rms_window_s:g} s)")
-        ax.set_xlabel("Trigger index")
+        ax.set_title(f"Mean RMS profile (RMS window = {rms_window_s:g} s)")
+        ax.set_xlabel(TIME_REL_XLABEL)
         ax.set_ylabel("Mean RMS across channels (µV)")
+        ax.set_ylim(0.0, 10.0)
         ax.grid(True, alpha=0.3)
-        if len(rms_series) > 1:
-            ax.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
     else:
         ax.text(
             0.5,
@@ -1004,7 +1133,6 @@ def plot_channel_multi_comparison(
     probe_layout_loaded = None
     if probe_layout_json is not None:
         probe_layout_loaded = load_probe_layout_json(Path(probe_layout_json))
-
     with PdfPages(pdf_path) as pdf:
         for ch in range(n_channels):
             check_analysis_cancelled()
@@ -1057,12 +1185,14 @@ def plot_channel_multi_comparison(
                 1.70,
                 1.60,
                 1.30,
+                1.20,
                 1.15,
                 1.05,
                 1.15,
                 0.06,
                 1.70,
                 1.50,
+                1.20,
                 1.30,
                 1.15,
                 1.05,
@@ -1070,6 +1200,7 @@ def plot_channel_multi_comparison(
                 0.06,
                 1.70,
                 1.50,
+                1.20,
                 1.30,
                 1.15,
                 1.05,
@@ -1091,7 +1222,7 @@ def plot_channel_multi_comparison(
                         page_width_in, page_height_in, lightweight_mode
                     )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
-                gs = fig.add_gridspec(21, 1, height_ratios=panel_height_ratios, hspace=0.58)
+                gs = fig.add_gridspec(24, 1, height_ratios=panel_height_ratios, hspace=0.58)
             ax_hdr1 = fig.add_subplot(gs[0, 0])
             if channel_has_mea_layout and probe_layout_loaded is not None:
                 draw_probe_layout_on_axes(ax_hdr1, probe_layout_loaded, channel_name)
@@ -1100,29 +1231,32 @@ def plot_channel_multi_comparison(
                 ax_hdr1.text(0.02, 0.5, "Part 1 — Full view (entire pre/post-trigger window)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr1.transAxes)
             ax_full = fig.add_subplot(gs[1, 0])
             ax_first_trigger = fig.add_subplot(gs[2, 0], sharex=ax_full)
-            ax_raster_f = fig.add_subplot(gs[3, 0], sharex=ax_full)
-            ax_fr_f = fig.add_subplot(gs[4, 0], sharex=ax_full)
-            ax_trial_fr_f = fig.add_subplot(gs[5, 0])
-            ax_isi_f = fig.add_subplot(gs[6, 0])
-            ax_hdr2 = fig.add_subplot(gs[7, 0]); ax_hdr2.axis("off")
+            ax_full_rms = fig.add_subplot(gs[3, 0], sharex=ax_full)
+            ax_raster_f = fig.add_subplot(gs[4, 0], sharex=ax_full)
+            ax_fr_f = fig.add_subplot(gs[5, 0], sharex=ax_full)
+            ax_trial_fr_f = fig.add_subplot(gs[6, 0])
+            ax_isi_f = fig.add_subplot(gs[7, 0])
+            ax_hdr2 = fig.add_subplot(gs[8, 0]); ax_hdr2.axis("off")
             ax_hdr2.text(0.02, 0.5, f"Part 2 — Zoomed view [{zoom_t0:.2f}, {zoom_t1:.2f}] s (relative to trigger)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr2.transAxes)
-            ax_zoom = fig.add_subplot(gs[8, 0])
-            ax_zoom_first = fig.add_subplot(gs[9, 0], sharex=ax_zoom)
-            ax_raster_z = fig.add_subplot(gs[10, 0], sharex=ax_zoom)
-            ax_fr_z = fig.add_subplot(gs[11, 0], sharex=ax_zoom)
-            ax_trial_fr_z = fig.add_subplot(gs[12, 0])
-            ax_isi_z = fig.add_subplot(gs[13, 0])
-            ax_hdr3 = fig.add_subplot(gs[14, 0]); ax_hdr3.axis("off")
+            ax_zoom = fig.add_subplot(gs[9, 0])
+            ax_zoom_first = fig.add_subplot(gs[10, 0], sharex=ax_zoom)
+            ax_zoom_rms = fig.add_subplot(gs[11, 0])
+            ax_raster_z = fig.add_subplot(gs[12, 0], sharex=ax_zoom)
+            ax_fr_z = fig.add_subplot(gs[13, 0], sharex=ax_zoom)
+            ax_trial_fr_z = fig.add_subplot(gs[14, 0])
+            ax_isi_z = fig.add_subplot(gs[15, 0])
+            ax_hdr3 = fig.add_subplot(gs[16, 0]); ax_hdr3.axis("off")
             ax_hdr3.text(0.02, 0.5, "Part 3 — Trigger-end zoom (rising edge)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr3.transAxes)
-            ax_zoom_end = fig.add_subplot(gs[15, 0])
-            ax_zoom_end_first = fig.add_subplot(gs[16, 0], sharex=ax_zoom_end)
-            ax_raster_ze = fig.add_subplot(gs[17, 0], sharex=ax_zoom_end)
-            ax_fr_ze = fig.add_subplot(gs[18, 0], sharex=ax_zoom_end)
-            ax_trial_fr_ze = fig.add_subplot(gs[19, 0])
-            ax_isi_ze = fig.add_subplot(gs[20, 0])
+            ax_zoom_end = fig.add_subplot(gs[17, 0])
+            ax_zoom_end_first = fig.add_subplot(gs[18, 0], sharex=ax_zoom_end)
+            ax_zoom_end_rms = fig.add_subplot(gs[19, 0])
+            ax_raster_ze = fig.add_subplot(gs[20, 0], sharex=ax_zoom_end)
+            ax_fr_ze = fig.add_subplot(gs[21, 0], sharex=ax_zoom_end)
+            ax_trial_fr_ze = fig.add_subplot(gs[22, 0])
+            ax_isi_ze = fig.add_subplot(gs[23, 0])
 
             if impedance_sessions:
-                ax_imp_hdr = fig.add_subplot(gs[21, 0])
+                ax_imp_hdr = fig.add_subplot(gs[24, 0])
                 ax_imp_hdr.axis("off")
                 ax_imp_hdr.text(
                     0.02,
@@ -1134,7 +1268,7 @@ def plot_channel_multi_comparison(
                     fontweight="bold",
                     transform=ax_imp_hdr.transAxes,
                 )
-                ax_imp = fig.add_subplot(gs[22, 0])
+                ax_imp = fig.add_subplot(gs[25, 0])
                 _draw_impedance_evolution_panel(ax_imp, channel_name, impedance_sessions)
 
             show_filtered_and_raw = (
@@ -1146,6 +1280,48 @@ def plot_channel_multi_comparison(
                     for i in range(len(means_ch))
                 )
             )
+            rms_series_full_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
+            rms_series_zoom_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
+            rms_series_zoom_end_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
+            if spike_sources is not None:
+                t0_rms = float(t_rel[0]) if t_rel.size else 0.0
+                t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
+                for i, src in enumerate(spike_sources):
+                    if src is None:
+                        continue
+                    label = labels[i] if i < len(labels) else f"Recording {i + 1}"
+                    tx_full, rms_full_vals = _mean_rms_profile_from_source_window(
+                        src,
+                        t0_rms,
+                        t1_rms,
+                        rms_window_s,
+                        channel_index=ch,
+                    )
+                    rms_series_full_multi.append((label, tx_full, rms_full_vals))
+                    tx_zoom, rms_zoom_vals = _mean_rms_profile_from_source_window(
+                        src,
+                        zoom_t0,
+                        zoom_t1,
+                        rms_window_s,
+                        channel_index=ch,
+                    )
+                    rms_series_zoom_multi.append((label, tx_zoom, rms_zoom_vals))
+                    marker_i = None
+                    if trigger_end_rising_rel_s_list is not None and i < len(trigger_end_rising_rel_s_list):
+                        marker_i = trigger_end_rising_rel_s_list[i]
+                    if marker_i is None:
+                        rms_series_zoom_end_multi.append(
+                            (label, np.array([], dtype=np.float64), np.array([], dtype=np.float64))
+                        )
+                    else:
+                        tx_end, rms_zoom_end_vals = _mean_rms_profile_from_source_window(
+                            src,
+                            float(marker_i + zoom_t0),
+                            float(marker_i + zoom_t1),
+                            rms_window_s,
+                            channel_index=ch,
+                        )
+                        rms_series_zoom_end_multi.append((label, tx_end, rms_zoom_end_vals))
             first_trigger_curves: list[Optional[np.ndarray]] = []
             if spike_sources is not None:
                 for src in spike_sources:
@@ -1226,6 +1402,12 @@ def plot_channel_multi_comparison(
                     transform=ax_first_trigger.transAxes,
                 )
                 ax_first_trigger.set_axis_off()
+            _plot_rms_series(
+                ax_full_rms,
+                rms_series_full_multi,
+                "Part 1 — RMS evolution (full window)",
+                x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
+            )
 
             ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
             ax_zoom.set_xlim(zoom_t0, zoom_t1)
@@ -1256,6 +1438,12 @@ def plot_channel_multi_comparison(
             else:
                 ax_zoom_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_first.transAxes)
                 ax_zoom_first.set_axis_off()
+            _plot_rms_series(
+                ax_zoom_rms,
+                rms_series_zoom_multi,
+                f"Part 2 — RMS evolution (window [{zoom_t0:.3f}, {zoom_t1:.3f}] s)",
+                x_limits=(zoom_t0, zoom_t1),
+            )
 
             end_zoom_range: tuple[float, float] | None = None
             if end_markers:
@@ -1301,11 +1489,19 @@ def plot_channel_multi_comparison(
                 else:
                     ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
                     ax_zoom_end_first.set_axis_off()
+                _plot_rms_series(
+                    ax_zoom_end_rms,
+                    rms_series_zoom_end_multi,
+                    f"Part 3 — RMS evolution (window [{end_zoom_t0:.3f}, {end_zoom_t1:.3f}] s)",
+                    x_limits=(end_zoom_t0, end_zoom_t1),
+                )
             else:
                 ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
                 ax_zoom_end.set_axis_off()
                 ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
                 ax_zoom_end_first.set_axis_off()
+                ax_zoom_end_rms.text(0.5, 0.5, "RMS evolution unavailable", ha="center", va="center", transform=ax_zoom_end_rms.transAxes)
+                ax_zoom_end_rms.set_axis_off()
 
             if _has_spike_cmp and spike_sources is not None:
                 sources_ok = [src for src in spike_sources if src is not None]
@@ -1348,8 +1544,10 @@ def plot_channel_multi_comparison(
             _axes_tick_bottom = [
                 ax_full,
                 ax_first_trigger,
+                ax_full_rms,
                 ax_zoom,
                 ax_zoom_first,
+                ax_zoom_rms,
                 ax_raster_f,
                 ax_fr_f,
                 ax_trial_fr_f,
@@ -1364,6 +1562,7 @@ def plot_channel_multi_comparison(
                 ax_isi_ze,
                 ax_zoom_end,
                 ax_zoom_end_first,
+                ax_zoom_end_rms,
             ]
             if impedance_sessions:
                 _axes_tick_bottom.append(ax_imp)
@@ -1374,6 +1573,7 @@ def plot_channel_multi_comparison(
             shift_axes_down(
                 [
                     ax_first_trigger,
+                    ax_full_rms,
                     ax_raster_f,
                     ax_fr_f,
                     ax_trial_fr_f,
@@ -1381,6 +1581,7 @@ def plot_channel_multi_comparison(
                     ax_hdr2,
                     ax_zoom,
                     ax_zoom_first,
+                    ax_zoom_rms,
                     ax_raster_z,
                     ax_fr_z,
                     ax_trial_fr_z,
@@ -1388,6 +1589,7 @@ def plot_channel_multi_comparison(
                     ax_hdr3,
                     ax_zoom_end,
                     ax_zoom_end_first,
+                    ax_zoom_end_rms,
                     ax_raster_ze,
                     ax_fr_ze,
                     ax_trial_fr_ze,
@@ -1395,17 +1597,20 @@ def plot_channel_multi_comparison(
                 ],
                 delta=0.015,
             )
-            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
+            page_dpi = _lightweight_pdf_dpi(False if channel_has_mea_layout else lightweight_mode)
+            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=page_dpi)
             plt.close(fig)
 
         if spike_sources is not None:
-            rms_series = []
+            rms_series: list[tuple[str, np.ndarray, np.ndarray]] = []
+            t0_rms = float(t_rel[0]) if t_rel.size else 0.0
+            t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
             for i, src in enumerate(spike_sources):
                 if src is None:
                     continue
-                rms_vals = _mean_rms_per_trigger_from_source(src, rms_window_s)
+                tx_rms, rms_vals = _mean_rms_profile_from_source_window(src, t0_rms, t1_rms, rms_window_s)
                 label = labels[i] if i < len(labels) else f"Recording {i + 1}"
-                rms_series.append((label, rms_vals))
+                rms_series.append((label, tx_rms, rms_vals))
             if rms_series:
                 _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s, lightweight_mode)
 
@@ -1484,7 +1689,6 @@ def plot_channel_averages(
         if _has_spike_data
         else ""
     )
-
     probe_layout_loaded = None
     if probe_layout_json is not None:
         probe_layout_loaded = load_probe_layout_json(Path(probe_layout_json))
@@ -1494,6 +1698,47 @@ def plot_channel_averages(
             check_analysis_cancelled()
             channel_name = str(channel_names[ch])
             channel_mean = mean_per_channel[ch]
+            rms_series_zoom: list[tuple[str, np.ndarray, np.ndarray]] = []
+            rms_series_zoom_end: list[tuple[str, np.ndarray, np.ndarray]] = []
+            if spike_source is not None:
+                tx_zoom, rms_zoom_vals = _mean_rms_profile_from_source_window(
+                    spike_source,
+                    zoom_t0,
+                    zoom_t1,
+                    rms_window_s,
+                    channel_index=ch,
+                )
+                rms_series_zoom = [("RMS", tx_zoom, rms_zoom_vals)]
+                if trigger_end_rising_rel_s is not None:
+                    tx_end, rms_zoom_end_vals = _mean_rms_profile_from_source_window(
+                        spike_source,
+                        float(trigger_end_rising_rel_s + zoom_t0),
+                        float(trigger_end_rising_rel_s + zoom_t1),
+                        rms_window_s,
+                        channel_index=ch,
+                    )
+                    rms_series_zoom_end = [("RMS", tx_end, rms_zoom_end_vals)]
+            elif windows is not None and getattr(windows, "ndim", 0) == 3:
+                windows_arr = np.asarray(windows)
+                tx_zoom, rms_zoom_vals = _mean_rms_profile_from_windows_window(
+                    windows_arr,
+                    t_rel,
+                    zoom_t0,
+                    zoom_t1,
+                    rms_window_s,
+                    channel_index=ch,
+                )
+                rms_series_zoom = [("RMS", tx_zoom, rms_zoom_vals)]
+                if trigger_end_rising_rel_s is not None:
+                    tx_end, rms_zoom_end_vals = _mean_rms_profile_from_windows_window(
+                        windows_arr,
+                        t_rel,
+                        float(trigger_end_rising_rel_s + zoom_t0),
+                        float(trigger_end_rising_rel_s + zoom_t1),
+                        rms_window_s,
+                        channel_index=ch,
+                    )
+                    rms_series_zoom_end = [("RMS", tx_end, rms_zoom_end_vals)]
             channel_has_mea_layout = probe_layout_loaded is not None and (
                 match_contact_index(probe_layout_loaded, channel_name) is not None
             )
@@ -1506,19 +1751,21 @@ def plot_channel_averages(
                 )
             fig = plt.figure(figsize=(page_width_in, page_height_in))
             gs = fig.add_gridspec(
-                21,
+                24,
                 1,
                 height_ratios=[
                     mea_row_height_ratio,
                     1.70,
                     1.60,
                     1.30,
+                    1.20,
                     1.15,
                     1.05,
                     1.15,
                     0.06,
                     1.70,
                     1.50,
+                    1.20,
                     1.30,
                     1.15,
                     1.05,
@@ -1526,6 +1773,7 @@ def plot_channel_averages(
                     0.06,
                     1.70,
                     1.50,
+                    1.20,
                     1.30,
                     1.15,
                     1.05,
@@ -1550,11 +1798,12 @@ def plot_channel_averages(
                 )
             ax_full = fig.add_subplot(gs[1, 0])
             ax_first_trigger = fig.add_subplot(gs[2, 0], sharex=ax_full)
-            ax_raster_f = fig.add_subplot(gs[3, 0], sharex=ax_full)
-            ax_fr_f = fig.add_subplot(gs[4, 0], sharex=ax_full)
-            ax_trial_fr_f = fig.add_subplot(gs[5, 0])
-            ax_isi_f = fig.add_subplot(gs[6, 0])
-            ax_hdr2 = fig.add_subplot(gs[7, 0])
+            ax_full_rms = fig.add_subplot(gs[3, 0], sharex=ax_full)
+            ax_raster_f = fig.add_subplot(gs[4, 0], sharex=ax_full)
+            ax_fr_f = fig.add_subplot(gs[5, 0], sharex=ax_full)
+            ax_trial_fr_f = fig.add_subplot(gs[6, 0])
+            ax_isi_f = fig.add_subplot(gs[7, 0])
+            ax_hdr2 = fig.add_subplot(gs[8, 0])
             ax_hdr2.axis("off")
             ax_hdr2.text(
                 0.02,
@@ -1566,13 +1815,14 @@ def plot_channel_averages(
                 fontweight="bold",
                 transform=ax_hdr2.transAxes,
             )
-            ax_zoom = fig.add_subplot(gs[8, 0])
-            ax_zoom_first = fig.add_subplot(gs[9, 0], sharex=ax_zoom)
-            ax_raster_z = fig.add_subplot(gs[10, 0], sharex=ax_zoom)
-            ax_fr_z = fig.add_subplot(gs[11, 0], sharex=ax_zoom)
-            ax_trial_fr_z = fig.add_subplot(gs[12, 0])
-            ax_isi_z = fig.add_subplot(gs[13, 0])
-            ax_hdr3 = fig.add_subplot(gs[14, 0])
+            ax_zoom = fig.add_subplot(gs[9, 0])
+            ax_zoom_first = fig.add_subplot(gs[10, 0], sharex=ax_zoom)
+            ax_zoom_rms = fig.add_subplot(gs[11, 0])
+            ax_raster_z = fig.add_subplot(gs[12, 0], sharex=ax_zoom)
+            ax_fr_z = fig.add_subplot(gs[13, 0], sharex=ax_zoom)
+            ax_trial_fr_z = fig.add_subplot(gs[14, 0])
+            ax_isi_z = fig.add_subplot(gs[15, 0])
+            ax_hdr3 = fig.add_subplot(gs[16, 0])
             ax_hdr3.axis("off")
             ax_hdr3.text(
                 0.02,
@@ -1584,12 +1834,13 @@ def plot_channel_averages(
                 fontweight="bold",
                 transform=ax_hdr3.transAxes,
             )
-            ax_zoom_end = fig.add_subplot(gs[15, 0])
-            ax_zoom_end_first = fig.add_subplot(gs[16, 0], sharex=ax_zoom_end)
-            ax_raster_ze = fig.add_subplot(gs[17, 0], sharex=ax_zoom_end)
-            ax_fr_ze = fig.add_subplot(gs[18, 0], sharex=ax_zoom_end)
-            ax_trial_fr_ze = fig.add_subplot(gs[19, 0])
-            ax_isi_ze = fig.add_subplot(gs[20, 0])
+            ax_zoom_end = fig.add_subplot(gs[17, 0])
+            ax_zoom_end_first = fig.add_subplot(gs[18, 0], sharex=ax_zoom_end)
+            ax_zoom_end_rms = fig.add_subplot(gs[19, 0])
+            ax_raster_ze = fig.add_subplot(gs[20, 0], sharex=ax_zoom_end)
+            ax_fr_ze = fig.add_subplot(gs[21, 0], sharex=ax_zoom_end)
+            ax_trial_fr_ze = fig.add_subplot(gs[22, 0])
+            ax_isi_ze = fig.add_subplot(gs[23, 0])
 
             channel_mean_raw = (
                 mean_per_channel_raw[ch]
@@ -1713,6 +1964,36 @@ def plot_channel_averages(
                 )
                 ax_first_trigger.set_axis_off()
 
+            rms_series_full: list[tuple[str, np.ndarray, np.ndarray]] = []
+            t0_rms = float(t_rel[0]) if t_rel.size else 0.0
+            t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
+            if spike_source is not None:
+                tx_full, rms_full_vals = _mean_rms_profile_from_source_window(
+                    spike_source,
+                    t0_rms,
+                    t1_rms,
+                    rms_window_s,
+                    channel_index=ch,
+                )
+                rms_series_full = [("RMS", tx_full, rms_full_vals)]
+            elif windows is not None and getattr(windows, "ndim", 0) == 3:
+                windows_arr = np.asarray(windows)
+                tx_full, rms_full_vals = _mean_rms_profile_from_windows_window(
+                    windows_arr,
+                    t_rel,
+                    t0_rms,
+                    t1_rms,
+                    rms_window_s,
+                    channel_index=ch,
+                )
+                rms_series_full = [("RMS", tx_full, rms_full_vals)]
+            _plot_rms_series(
+                ax_full_rms,
+                rms_series_full,
+                "Part 1 — RMS evolution (full window)",
+                x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
+            )
+
             zmask = (t_rel >= zoom_t0) & (t_rel <= zoom_t1)
             if show_filtered_and_raw and channel_mean_raw is not None:
                 ax_zoom.plot(
@@ -1778,6 +2059,12 @@ def plot_channel_averages(
                     transform=ax_zoom_first.transAxes,
                 )
                 ax_zoom_first.set_axis_off()
+            _plot_rms_series(
+                ax_zoom_rms,
+                rms_series_zoom,
+                f"Part 2 — RMS evolution (window [{zoom_t0:.3f}, {zoom_t1:.3f}] s)",
+                x_limits=(zoom_t0, zoom_t1),
+            )
             end_zoom_range: tuple[float, float] | None = None
             if trigger_end_rising_rel_s is not None:
                 end_zoom_t0 = float(trigger_end_rising_rel_s + zoom_t0)
@@ -1821,11 +2108,19 @@ def plot_channel_averages(
                         transform=ax_zoom_end_first.transAxes,
                     )
                     ax_zoom_end_first.set_axis_off()
+                _plot_rms_series(
+                    ax_zoom_end_rms,
+                    rms_series_zoom_end,
+                    f"Part 3 — RMS evolution (window [{end_zoom_t0:.3f}, {end_zoom_t1:.3f}] s)",
+                    x_limits=(end_zoom_t0, end_zoom_t1),
+                )
             else:
                 ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
                 ax_zoom_end.set_axis_off()
                 ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
                 ax_zoom_end_first.set_axis_off()
+                ax_zoom_end_rms.text(0.5, 0.5, "RMS evolution unavailable", ha="center", va="center", transform=ax_zoom_end_rms.transAxes)
+                ax_zoom_end_rms.set_axis_off()
 
             if _has_spike_data and (
                 spike_source is not None
@@ -1936,8 +2231,10 @@ def plot_channel_averages(
             for ax in (
                 ax_full,
                 ax_first_trigger,
+                ax_full_rms,
                 ax_zoom,
                 ax_zoom_first,
+                ax_zoom_rms,
                 ax_raster_f,
                 ax_fr_f,
                 ax_trial_fr_f,
@@ -1952,6 +2249,7 @@ def plot_channel_averages(
                 ax_isi_ze,
                 ax_zoom_end,
                 ax_zoom_end_first,
+                ax_zoom_end_rms,
             ):
                 ax.tick_params(axis="x", labelbottom=True)
 
@@ -1959,6 +2257,7 @@ def plot_channel_averages(
             shift_axes_down(
                 [
                     ax_first_trigger,
+                    ax_full_rms,
                     ax_raster_f,
                     ax_fr_f,
                     ax_trial_fr_f,
@@ -1966,6 +2265,7 @@ def plot_channel_averages(
                     ax_hdr2,
                     ax_zoom,
                     ax_zoom_first,
+                    ax_zoom_rms,
                     ax_raster_z,
                     ax_fr_z,
                     ax_trial_fr_z,
@@ -1973,6 +2273,7 @@ def plot_channel_averages(
                     ax_hdr3,
                     ax_zoom_end,
                     ax_zoom_end_first,
+                    ax_zoom_end_rms,
                     ax_raster_ze,
                     ax_fr_ze,
                     ax_trial_fr_ze,
@@ -1980,17 +2281,29 @@ def plot_channel_averages(
                 ],
                 delta=0.015,
             )
-            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
+            page_dpi = _lightweight_pdf_dpi(False if channel_has_mea_layout else lightweight_mode)
+            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=page_dpi)
             plt.close(fig)
 
+        rms_tx = np.array([], dtype=np.float64)
         rms_values = np.array([], dtype=np.float64)
+        t0_rms = float(t_rel[0]) if t_rel.size else 0.0
+        t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
         if spike_source is not None:
-            rms_values = _mean_rms_per_trigger_from_source(spike_source, rms_window_s)
+            rms_tx, rms_values = _mean_rms_profile_from_source_window(
+                spike_source, t0_rms, t1_rms, rms_window_s
+            )
         elif windows is not None and getattr(windows, "ndim", 0) == 3:
-            rms_values = _mean_rms_per_trigger_from_windows(np.asarray(windows), t_rel, rms_window_s)
+            rms_tx, rms_values = _mean_rms_profile_from_windows_window(
+                np.asarray(windows),
+                t_rel,
+                t0_rms,
+                t1_rms,
+                rms_window_s,
+            )
         _append_mean_rms_evolution_page(
             pdf,
-            [("Mean RMS", rms_values)],
+            [("Mean RMS", rms_tx, rms_values)],
             rms_window_s,
             lightweight_mode,
         )
@@ -2057,13 +2370,56 @@ def plot_channel_comparison(
         and spike_source_b is not None
     )
     _, spike_cmp_pipe = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
-
     with PdfPages(pdf_path) as pdf:
         for ch in range(n_channels):
             check_analysis_cancelled()
             channel_name = str(channel_names[ch])
             channel_mean_a = mean_a[ch]
             channel_mean_b = mean_b[ch]
+            rms_zoom_a = (
+                _mean_rms_profile_from_source_window(
+                    spike_source_a,
+                    zoom_t0,
+                    zoom_t1,
+                    rms_window_s,
+                    channel_index=ch,
+                )
+                if spike_source_a is not None
+                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
+            )
+            rms_zoom_b = (
+                _mean_rms_profile_from_source_window(
+                    spike_source_b,
+                    zoom_t0,
+                    zoom_t1,
+                    rms_window_s,
+                    channel_index=ch,
+                )
+                if spike_source_b is not None
+                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
+            )
+            rms_end_a = (
+                _mean_rms_profile_from_source_window(
+                    spike_source_a,
+                    float(trigger_end_rising_rel_s_a + zoom_t0),
+                    float(trigger_end_rising_rel_s_a + zoom_t1),
+                    rms_window_s,
+                    channel_index=ch,
+                )
+                if spike_source_a is not None and trigger_end_rising_rel_s_a is not None
+                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
+            )
+            rms_end_b = (
+                _mean_rms_profile_from_source_window(
+                    spike_source_b,
+                    float(trigger_end_rising_rel_s_b + zoom_t0),
+                    float(trigger_end_rising_rel_s_b + zoom_t1),
+                    rms_window_s,
+                    channel_index=ch,
+                )
+                if spike_source_b is not None and trigger_end_rising_rel_s_b is not None
+                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
+            )
             channel_mean_a_raw = mean_a_raw[ch] if mean_a_raw is not None else None
             channel_mean_b_raw = mean_b_raw[ch] if mean_b_raw is not None else None
             show_filtered_and_raw = (
@@ -2096,9 +2452,9 @@ def plot_channel_comparison(
             )
             fig = plt.figure(figsize=(page_width_in, page_height_in))
             gs = fig.add_gridspec(
-                21,
+                24,
                 1,
-                height_ratios=[0.06, 1.70, 1.60, 1.30, 1.15, 1.05, 1.15, 0.06, 1.70, 1.50, 1.30, 1.15, 1.05, 1.15, 0.06, 1.70, 1.50, 1.30, 1.15, 1.05, 1.15],
+                height_ratios=[0.06, 1.70, 1.60, 1.30, 1.20, 1.15, 1.05, 1.15, 0.06, 1.70, 1.50, 1.20, 1.30, 1.15, 1.05, 1.15, 0.06, 1.70, 1.50, 1.20, 1.30, 1.15, 1.05, 1.15],
                 hspace=0.62,
             )
             ax_hdr1 = fig.add_subplot(gs[0, 0])
@@ -2115,11 +2471,12 @@ def plot_channel_comparison(
             )
             ax_full = fig.add_subplot(gs[1, 0])
             ax_first_trigger = fig.add_subplot(gs[2, 0], sharex=ax_full)
-            ax_raster_f = fig.add_subplot(gs[3, 0], sharex=ax_full)
-            ax_fr_f = fig.add_subplot(gs[4, 0], sharex=ax_full)
-            ax_trial_fr_f = fig.add_subplot(gs[5, 0])
-            ax_isi_f = fig.add_subplot(gs[6, 0])
-            ax_hdr2 = fig.add_subplot(gs[7, 0])
+            ax_full_rms = fig.add_subplot(gs[3, 0], sharex=ax_full)
+            ax_raster_f = fig.add_subplot(gs[4, 0], sharex=ax_full)
+            ax_fr_f = fig.add_subplot(gs[5, 0], sharex=ax_full)
+            ax_trial_fr_f = fig.add_subplot(gs[6, 0])
+            ax_isi_f = fig.add_subplot(gs[7, 0])
+            ax_hdr2 = fig.add_subplot(gs[8, 0])
             ax_hdr2.axis("off")
             ax_hdr2.text(
                 0.02,
@@ -2131,13 +2488,14 @@ def plot_channel_comparison(
                 fontweight="bold",
                 transform=ax_hdr2.transAxes,
             )
-            ax_zoom = fig.add_subplot(gs[8, 0])
-            ax_zoom_first = fig.add_subplot(gs[9, 0], sharex=ax_zoom)
-            ax_raster_z = fig.add_subplot(gs[10, 0], sharex=ax_zoom)
-            ax_fr_z = fig.add_subplot(gs[11, 0], sharex=ax_zoom)
-            ax_trial_fr_z = fig.add_subplot(gs[12, 0])
-            ax_isi_z = fig.add_subplot(gs[13, 0])
-            ax_hdr3 = fig.add_subplot(gs[14, 0])
+            ax_zoom = fig.add_subplot(gs[9, 0])
+            ax_zoom_first = fig.add_subplot(gs[10, 0], sharex=ax_zoom)
+            ax_zoom_rms = fig.add_subplot(gs[11, 0])
+            ax_raster_z = fig.add_subplot(gs[12, 0], sharex=ax_zoom)
+            ax_fr_z = fig.add_subplot(gs[13, 0], sharex=ax_zoom)
+            ax_trial_fr_z = fig.add_subplot(gs[14, 0])
+            ax_isi_z = fig.add_subplot(gs[15, 0])
+            ax_hdr3 = fig.add_subplot(gs[16, 0])
             ax_hdr3.axis("off")
             ax_hdr3.text(
                 0.02,
@@ -2149,12 +2507,13 @@ def plot_channel_comparison(
                 fontweight="bold",
                 transform=ax_hdr3.transAxes,
             )
-            ax_zoom_end = fig.add_subplot(gs[15, 0])
-            ax_zoom_end_first = fig.add_subplot(gs[16, 0], sharex=ax_zoom_end)
-            ax_raster_ze = fig.add_subplot(gs[17, 0], sharex=ax_zoom_end)
-            ax_fr_ze = fig.add_subplot(gs[18, 0], sharex=ax_zoom_end)
-            ax_trial_fr_ze = fig.add_subplot(gs[19, 0])
-            ax_isi_ze = fig.add_subplot(gs[20, 0])
+            ax_zoom_end = fig.add_subplot(gs[17, 0])
+            ax_zoom_end_first = fig.add_subplot(gs[18, 0], sharex=ax_zoom_end)
+            ax_zoom_end_rms = fig.add_subplot(gs[19, 0])
+            ax_raster_ze = fig.add_subplot(gs[20, 0], sharex=ax_zoom_end)
+            ax_fr_ze = fig.add_subplot(gs[21, 0], sharex=ax_zoom_end)
+            ax_trial_fr_ze = fig.add_subplot(gs[22, 0])
+            ax_isi_ze = fig.add_subplot(gs[23, 0])
             if show_filtered_and_raw:
                 ax_full.plot(
                     t_rel,
@@ -2291,6 +2650,36 @@ def plot_channel_comparison(
                     transform=ax_first_trigger.transAxes,
                 )
                 ax_first_trigger.set_axis_off()
+            t0_rms = float(t_rel[0]) if t_rel.size else 0.0
+            t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
+            rms_full_a = (
+                _mean_rms_profile_from_source_window(
+                    spike_source_a,
+                    t0_rms,
+                    t1_rms,
+                    rms_window_s,
+                    channel_index=ch,
+                )
+                if spike_source_a is not None
+                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
+            )
+            rms_full_b = (
+                _mean_rms_profile_from_source_window(
+                    spike_source_b,
+                    t0_rms,
+                    t1_rms,
+                    rms_window_s,
+                    channel_index=ch,
+                )
+                if spike_source_b is not None
+                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
+            )
+            _plot_rms_series(
+                ax_full_rms,
+                [(label_a, rms_full_a[0], rms_full_a[1]), (label_b, rms_full_b[0], rms_full_b[1])],
+                "Part 1 — RMS evolution (full window)",
+                x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
+            )
 
             if show_filtered_and_raw and channel_mean_a_raw is not None and channel_mean_b_raw is not None:
                 ax_zoom.plot(
@@ -2377,6 +2766,12 @@ def plot_channel_comparison(
             else:
                 ax_zoom_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_first.transAxes)
                 ax_zoom_first.set_axis_off()
+            _plot_rms_series(
+                ax_zoom_rms,
+                    [(label_a, rms_zoom_a[0], rms_zoom_a[1]), (label_b, rms_zoom_b[0], rms_zoom_b[1])],
+                f"Part 2 — RMS evolution (window [{zoom_t0:.3f}, {zoom_t1:.3f}] s)",
+                x_limits=(zoom_t0, zoom_t1),
+            )
             end_zoom_range: tuple[float, float] | None = None
             end_markers = [v for v in (trigger_end_rising_rel_s_a, trigger_end_rising_rel_s_b) if v is not None]
             if end_markers:
@@ -2425,11 +2820,19 @@ def plot_channel_comparison(
                 else:
                     ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
                     ax_zoom_end_first.set_axis_off()
+                _plot_rms_series(
+                    ax_zoom_end_rms,
+                    [(label_a, rms_end_a[0], rms_end_a[1]), (label_b, rms_end_b[0], rms_end_b[1])],
+                    f"Part 3 — RMS evolution (window [{end_zoom_t0:.3f}, {end_zoom_t1:.3f}] s)",
+                    x_limits=(end_zoom_t0, end_zoom_t1),
+                )
             else:
                 ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
                 ax_zoom_end.set_axis_off()
                 ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
                 ax_zoom_end_first.set_axis_off()
+                ax_zoom_end_rms.text(0.5, 0.5, "RMS evolution unavailable", ha="center", va="center", transform=ax_zoom_end_rms.transAxes)
+                ax_zoom_end_rms.set_axis_off()
 
             if _has_spike_cmp:
                 # Spike detection is computed once per channel (A/B),
@@ -2544,8 +2947,10 @@ def plot_channel_comparison(
             for ax in (
                 ax_full,
                 ax_first_trigger,
+                ax_full_rms,
                 ax_zoom,
                 ax_zoom_first,
+                ax_zoom_rms,
                 ax_raster_f,
                 ax_fr_f,
                 ax_trial_fr_f,
@@ -2560,6 +2965,7 @@ def plot_channel_comparison(
                 ax_isi_ze,
                 ax_zoom_end,
                 ax_zoom_end_first,
+                ax_zoom_end_rms,
             ):
                 ax.tick_params(axis="x", labelbottom=True)
 
@@ -2567,6 +2973,7 @@ def plot_channel_comparison(
             shift_axes_down(
                 [
                     ax_first_trigger,
+                    ax_full_rms,
                     ax_raster_f,
                     ax_fr_f,
                     ax_trial_fr_f,
@@ -2574,6 +2981,7 @@ def plot_channel_comparison(
                     ax_hdr2,
                     ax_zoom,
                     ax_zoom_first,
+                    ax_zoom_rms,
                     ax_raster_z,
                     ax_fr_z,
                     ax_trial_fr_z,
@@ -2581,6 +2989,7 @@ def plot_channel_comparison(
                     ax_hdr3,
                     ax_zoom_end,
                     ax_zoom_end_first,
+                    ax_zoom_end_rms,
                     ax_raster_ze,
                     ax_fr_ze,
                     ax_trial_fr_ze,
@@ -2591,11 +3000,17 @@ def plot_channel_comparison(
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
             plt.close(fig)
 
-        rms_series: list[tuple[str, np.ndarray]] = []
+        rms_series: list[tuple[str, np.ndarray, np.ndarray]] = []
+        t0_rms = float(t_rel[0]) if t_rel.size else 0.0
+        t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
         if spike_source_a is not None:
-            rms_series.append((label_a, _mean_rms_per_trigger_from_source(spike_source_a, rms_window_s)))
+            rms_series.append(
+                (label_a, *_mean_rms_profile_from_source_window(spike_source_a, t0_rms, t1_rms, rms_window_s))
+            )
         if spike_source_b is not None:
-            rms_series.append((label_b, _mean_rms_per_trigger_from_source(spike_source_b, rms_window_s)))
+            rms_series.append(
+                (label_b, *_mean_rms_profile_from_source_window(spike_source_b, t0_rms, t1_rms, rms_window_s))
+            )
         if rms_series:
             _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s, lightweight_mode)
 
