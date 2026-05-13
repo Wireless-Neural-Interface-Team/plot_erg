@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import functools
 import gc
 import importlib.util
 import os
@@ -44,6 +45,36 @@ def check_analysis_cancelled() -> None:
         raise InterruptedError("Analysis interrupted.")
 
 
+@functools.lru_cache(maxsize=128)
+def _butter_lowpass_coeffs(fs: float, cutoff_hz: float, order: int) -> tuple[np.ndarray, np.ndarray]:
+    nyq = 0.5 * fs
+    if cutoff_hz <= 0:
+        raise ValueError("Cutoff frequency must be > 0.")
+    if cutoff_hz >= nyq:
+        raise ValueError(
+            f"Cutoff ({cutoff_hz} Hz) must be below Nyquist frequency ({nyq:.1f} Hz)."
+        )
+    wn = cutoff_hz / nyq
+    return butter(order, wn, btype="low")
+
+
+@functools.lru_cache(maxsize=128)
+def _butter_bandpass_coeffs(
+    fs: float, low_hz: float, high_hz: float, order: int
+) -> tuple[np.ndarray, np.ndarray]:
+    nyq = 0.5 * fs
+    if low_hz <= 0 or high_hz <= 0:
+        raise ValueError("Band-pass corner frequencies must be > 0.")
+    if low_hz >= high_hz:
+        raise ValueError("Band-pass: low frequency must be < high frequency.")
+    if high_hz >= nyq:
+        raise ValueError(
+            f"High corner ({high_hz} Hz) must be below Nyquist ({nyq:.1f} Hz)."
+        )
+    wn = (low_hz / nyq, high_hz / nyq)
+    return butter(order, wn, btype="band")
+
+
 def apply_butterworth_lowpass(
     data: np.ndarray,
     fs: float,
@@ -54,15 +85,7 @@ def apply_butterworth_lowpass(
     data = np.asarray(data, dtype=np.float64)
     if data.ndim != 2:
         raise RuntimeError("apply_butterworth_lowpass expects [n_channels, n_samples].")
-    nyq = 0.5 * fs
-    if cutoff_hz <= 0:
-        raise ValueError("Cutoff frequency must be > 0.")
-    if cutoff_hz >= nyq:
-        raise ValueError(
-            f"Cutoff ({cutoff_hz} Hz) must be below Nyquist frequency ({nyq:.1f} Hz)."
-        )
-    wn = cutoff_hz / nyq
-    b, a = butter(order, wn, btype="low")
+    b, a = _butter_lowpass_coeffs(float(fs), float(cutoff_hz), int(order))
     return filtfilt(b, a, data, axis=1)
 
 
@@ -77,17 +100,7 @@ def apply_butterworth_bandpass(
     data = np.asarray(data, dtype=np.float64)
     if data.ndim != 2:
         raise RuntimeError("apply_butterworth_bandpass expects [n_channels, n_samples].")
-    nyq = 0.5 * fs
-    if low_hz <= 0 or high_hz <= 0:
-        raise ValueError("Band-pass corner frequencies must be > 0.")
-    if low_hz >= high_hz:
-        raise ValueError("Band-pass: low frequency must be < high frequency.")
-    if high_hz >= nyq:
-        raise ValueError(
-            f"High corner ({high_hz} Hz) must be below Nyquist ({nyq:.1f} Hz)."
-        )
-    wn = (low_hz / nyq, high_hz / nyq)
-    b, a = butter(order, wn, btype="band")
+    b, a = _butter_bandpass_coeffs(float(fs), float(low_hz), float(high_hz), int(order))
     return filtfilt(b, a, data, axis=1)
 
 

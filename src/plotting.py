@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import functools
+import os
+import time
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 
@@ -12,7 +15,7 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
-from scipy.ndimage import gaussian_filter1d
+from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 
 from core import (
     AmplifierSpikeSource,
@@ -37,6 +40,57 @@ TIME_REL_XLABEL = "Time relative to trigger (s)"
 LEGEND_FONT_SIZE = 10
 RMS_INTAN_LIKE_BANDPASS_LOW_HZ = 300.0
 RMS_INTAN_LIKE_BANDPASS_HIGH_HZ = 7500.0
+_PROFILE_ENABLED = os.environ.get("PLOT_ERG_PROFILE", "1").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_PROFILE_STATS: dict[str, tuple[float, int]] = {}
+
+
+def _profile_record(name: str, elapsed_s: float) -> None:
+    if not _PROFILE_ENABLED:
+        return
+    total, count = _PROFILE_STATS.get(name, (0.0, 0))
+    _PROFILE_STATS[name] = (total + float(elapsed_s), count + 1)
+
+
+def _profile_snapshot() -> dict[str, tuple[float, int]]:
+    return dict(_PROFILE_STATS)
+
+
+def _profile_print_delta(title: str, before: dict[str, tuple[float, int]], total_s: float) -> None:
+    if not _PROFILE_ENABLED:
+        return
+    rows: list[tuple[str, float, int]] = []
+    for key, (after_t, after_c) in _PROFILE_STATS.items():
+        before_t, before_c = before.get(key, (0.0, 0))
+        dt = after_t - before_t
+        dc = after_c - before_c
+        if dt > 0 and dc > 0:
+            rows.append((key, dt, dc))
+    rows.sort(key=lambda x: x[1], reverse=True)
+    print(f"[PROFILE] {title}: total={total_s:.3f}s")
+    for key, dt, dc in rows[:10]:
+        print(f"[PROFILE]   {key}: {dt:.3f}s ({dc} calls, {dt / dc:.4f}s/call)")
+
+
+def _profiled(name: str):
+    def _deco(func):
+        @functools.wraps(func)
+        def _wrapped(*args, **kwargs):
+            if not _PROFILE_ENABLED:
+                return func(*args, **kwargs)
+            t0 = time.perf_counter()
+            try:
+                return func(*args, **kwargs)
+            finally:
+                _profile_record(name, time.perf_counter() - t0)
+
+        return _wrapped
+
+    return _deco
 
 
 def _lightweight_pdf_dpi(lightweight_mode: bool) -> int:
@@ -60,6 +114,35 @@ def _scale_page_size_for_lightweight(
         max(10.0, min(14.0, scaled_width_in)),
         max(20.0, min(42.0, scaled_height_in)),
     )
+
+
+def _draw_mea_layout_inset(
+    fig: Any,
+    probe_layout: Any,
+    channel_name: str,
+) -> None:
+    """Draw MEA layout as inset so main panels keep identical geometry."""
+    if probe_layout is None:
+        return
+    if match_contact_index(probe_layout, channel_name) is None:
+        return
+    inset_w = 0.28
+    inset_h = 0.06
+    inset_x = 0.5 - (inset_w / 2.0)
+    inset_y = 0.905
+    inset_ax = fig.add_axes([inset_x, inset_y, inset_w, inset_h])
+    draw_probe_layout_on_axes(inset_ax, probe_layout, channel_name)
+
+
+def _soften_figure_linewidths(fig: Any, scale: float = 0.85, min_width: float = 0.7) -> None:
+    """Reduce line thickness globally for a figure."""
+    for ax in fig.axes:
+        for line in ax.get_lines():
+            try:
+                lw = float(line.get_linewidth())
+            except Exception:
+                continue
+            line.set_linewidth(max(min_width, lw * scale))
 
 
 def _spike_times_per_trial(
@@ -839,10 +922,12 @@ def _append_mean_impedance_summary_page(
                     alpha=0.85,
                 )
 
+    _soften_figure_linewidths(fig)
     pdf.savefig(fig, bbox_inches="tight", pad_inches=0.25, dpi=dpi)
     plt.close(fig)
 
 
+@_profiled("rms_from_source_window")
 def _mean_rms_profile_from_source_window(
     source: AmplifierSpikeSource,
     t0_s: float,
@@ -880,49 +965,59 @@ def _mean_rms_profile_from_source_window(
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     n_win = int(end_off - start_off)
     rms_n = max(1, int(round(float(rms_window_s) * fs)))
-    kernel = np.ones(rms_n, dtype=np.float64) / float(rms_n)
-    acc = np.zeros(n_win, dtype=np.float64)
-    n_ok = 0
+    t_axis = np.arange(start_off, end_off, dtype=np.float64) / fs
+
+    valid_trigs: list[int] = []
     for trig in source.valid_triggers:
         start = int(trig + start_off)
         end = int(trig + end_off)
         if start < 0 or end > n_samples:
             continue
-        if ch_idx is not None:
-            seg_ch = np.asarray(source.amplifier[ch_idx, start:end], dtype=np.float64)
-            if seg_ch.size == 0 or seg_ch.shape[0] != n_win:
-                continue
-            seg_ch = seg_ch - float(np.mean(seg_ch))
-            if use_bandpass and seg_ch.shape[0] >= 32:
-                try:
-                    seg_ch = apply_butterworth_bandpass(seg_ch[np.newaxis, :], fs, bp_low, bp_high)[0]
-                except Exception:
-                    pass
-            ch_sq = seg_ch * seg_ch
-            rms_t = np.sqrt(np.convolve(ch_sq, kernel, mode="same"))
-        else:
-            seg = np.asarray(source.amplifier[:, start:end], dtype=np.float64)
-            if seg.size == 0 or seg.shape[1] != n_win:
-                continue
-            seg = seg - np.mean(seg, axis=1, keepdims=True)
-            if use_bandpass and seg.shape[1] >= 32:
-                try:
-                    seg = apply_butterworth_bandpass(seg, fs, bp_low, bp_high)
-                except Exception:
-                    pass
-            ch_rms = np.zeros_like(seg, dtype=np.float64)
-            for c in range(seg.shape[0]):
-                ch_sq = seg[c] * seg[c]
-                ch_rms[c] = np.sqrt(np.convolve(ch_sq, kernel, mode="same"))
-            rms_t = np.mean(ch_rms, axis=0)
-        acc += rms_t
+        valid_trigs.append(int(trig))
+    if not valid_trigs:
+        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+    if ch_idx is not None:
+        # Fast path: stack all trigger windows for one channel, then filter in batch.
+        seg_stack = np.empty((len(valid_trigs), n_win), dtype=np.float64)
+        for i, trig in enumerate(valid_trigs):
+            start = int(trig + start_off)
+            end = int(trig + end_off)
+            seg_stack[i, :] = np.asarray(source.amplifier[ch_idx, start:end], dtype=np.float64)
+        seg_stack = seg_stack - np.mean(seg_stack, axis=1, keepdims=True)
+        if use_bandpass and n_win >= 32:
+            try:
+                seg_stack = apply_butterworth_bandpass(seg_stack, fs, bp_low, bp_high)
+            except Exception:
+                pass
+        sq = seg_stack * seg_stack
+        rms_trials = np.sqrt(uniform_filter1d(sq, size=rms_n, axis=1, mode="constant", cval=0.0))
+        return t_axis, np.mean(rms_trials, axis=0)
+
+    acc = np.zeros(n_win, dtype=np.float64)
+    n_ok = 0
+    for trig in valid_trigs:
+        start = int(trig + start_off)
+        end = int(trig + end_off)
+        seg = np.asarray(source.amplifier[:, start:end], dtype=np.float64)
+        if seg.size == 0 or seg.shape[1] != n_win:
+            continue
+        seg = seg - np.mean(seg, axis=1, keepdims=True)
+        if use_bandpass and seg.shape[1] >= 32:
+            try:
+                seg = apply_butterworth_bandpass(seg, fs, bp_low, bp_high)
+            except Exception:
+                pass
+        sq = seg * seg
+        ch_rms = np.sqrt(uniform_filter1d(sq, size=rms_n, axis=1, mode="constant", cval=0.0))
+        acc += np.mean(ch_rms, axis=0)
         n_ok += 1
     if n_ok == 0:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-    t_axis = np.arange(start_off, end_off, dtype=np.float64) / fs
     return t_axis, acc / float(n_ok)
 
 
+@_profiled("rms_from_windows_window")
 def _mean_rms_profile_from_windows_window(
     windows: np.ndarray,
     t_rel: np.ndarray,
@@ -956,7 +1051,6 @@ def _mean_rms_profile_from_windows_window(
     dt = float(np.median(np.diff(t_rel)))
     fs = 1.0 / dt if dt > 0 else 0.0
     rms_n = max(1, int(round(float(rms_window_s) * fs))) if fs > 0 else 1
-    kernel = np.ones(rms_n, dtype=np.float64) / float(rms_n)
     nyq = 0.5 * fs if fs > 0 else 0.0
     use_bandpass = (
         fs > 0
@@ -966,27 +1060,20 @@ def _mean_rms_profile_from_windows_window(
         and seg.shape[2] >= 32
     )
     if use_bandpass:
-        for trial_idx in range(seg.shape[0]):
-            try:
-                seg[trial_idx] = apply_butterworth_bandpass(
-                    seg[trial_idx], fs, RMS_INTAN_LIKE_BANDPASS_LOW_HZ, RMS_INTAN_LIKE_BANDPASS_HIGH_HZ
-                )
-            except Exception:
-                pass
+        try:
+            flat = seg.reshape(seg.shape[0] * seg.shape[1], seg.shape[2])
+            flat = apply_butterworth_bandpass(
+                flat, fs, RMS_INTAN_LIKE_BANDPASS_LOW_HZ, RMS_INTAN_LIKE_BANDPASS_HIGH_HZ
+            )
+            seg = flat.reshape(seg.shape[0], seg.shape[1], seg.shape[2])
+        except Exception:
+            pass
+    sq = seg * seg
+    rms_all = np.sqrt(uniform_filter1d(sq, size=rms_n, axis=2, mode="constant", cval=0.0))
     if ch_idx is not None:
-        rms_trials = np.zeros((seg.shape[0], seg.shape[2]), dtype=np.float64)
-        for trial_idx in range(seg.shape[0]):
-            ch_sq = seg[trial_idx, 0, :] * seg[trial_idx, 0, :]
-            rms_trials[trial_idx] = np.sqrt(np.convolve(ch_sq, kernel, mode="same"))
+        profile = np.mean(rms_all[:, 0, :], axis=0)
     else:
-        rms_trials = np.zeros((seg.shape[0], seg.shape[2]), dtype=np.float64)
-        for trial_idx in range(seg.shape[0]):
-            ch_rms = np.zeros((seg.shape[1], seg.shape[2]), dtype=np.float64)
-            for ch_idx in range(seg.shape[1]):
-                ch_sq = seg[trial_idx, ch_idx, :] * seg[trial_idx, ch_idx, :]
-                ch_rms[ch_idx] = np.sqrt(np.convolve(ch_sq, kernel, mode="same"))
-            rms_trials[trial_idx] = np.mean(ch_rms, axis=0)
-    profile = np.mean(rms_trials, axis=0)
+        profile = np.mean(np.mean(rms_all, axis=1), axis=0)
     return np.asarray(t_rel[start_idx:end_idx], dtype=np.float64), np.asarray(profile, dtype=np.float64)
 
 
@@ -1023,8 +1110,6 @@ def _plot_rms_series(
             values,
             linewidth=1.35,
             color=colors[i % len(colors)],
-            marker="o",
-            markersize=2.2,
             label=label,
         )
     if has_data:
@@ -1069,8 +1154,6 @@ def _append_mean_rms_evolution_page(
             values,
             linewidth=1.35,
             color=colors[i % len(colors)],
-            marker="o",
-            markersize=2.4,
             label=label,
         )
     if has_data:
@@ -1090,6 +1173,7 @@ def _append_mean_rms_evolution_page(
             fontsize=11,
         )
         ax.set_axis_off()
+    _soften_figure_linewidths(fig)
     pdf.savefig(fig, bbox_inches="tight", pad_inches=0.25, dpi=_lightweight_pdf_dpi(lightweight_mode))
     plt.close(fig)
 
@@ -1122,6 +1206,8 @@ def plot_channel_multi_comparison(
     impedance_sessions: Optional[Sequence[ImpedanceSession]] = None,
 ) -> Path:
     """Multi-page PDF: overlay of N recordings (same aligned channels)."""
+    _profile_before = _profile_snapshot()
+    _profile_t0 = time.perf_counter()
     n_records = len(labels)
     if n_records < 2:
         raise ValueError("plot_channel_multi_comparison requires at least 2 aligned recordings.")
@@ -1203,11 +1289,8 @@ def plot_channel_multi_comparison(
                 if means_raw is not None and lowpass_cutoff_hz is not None:
                     means_raw_ch = [np.asarray(means_raw[i][ch]) for i in range(n_records)]
 
-            channel_has_mea_layout = probe_layout_loaded is not None and (
-                match_contact_index(probe_layout_loaded, channel_name) is not None
-            )
-            page_width_in = 26.0 if channel_has_mea_layout else 12.0
-            mea_row_height_ratio = 2.20 if channel_has_mea_layout else 0.06
+            page_width_in = 12.0
+            mea_row_height_ratio = 0.06
             panel_height_ratios = [
                 mea_row_height_ratio,
                 1.70,
@@ -1236,27 +1319,23 @@ def plot_channel_multi_comparison(
             ]
             if impedance_sessions:
                 full_height_ratios = [*panel_height_ratios, 0.05, 0.95]
-                page_height_in = 116.0 if channel_has_mea_layout else 56.0
-                if not channel_has_mea_layout:
-                    page_width_in, page_height_in = _scale_page_size_for_lightweight(
-                        page_width_in, page_height_in, lightweight_mode
-                    )
+                page_height_in = 56.0
+                page_width_in, page_height_in = _scale_page_size_for_lightweight(
+                    page_width_in, page_height_in, lightweight_mode
+                )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
-                gs = fig.add_gridspec(len(full_height_ratios), 1, height_ratios=full_height_ratios, hspace=0.58)
+                gs = fig.add_gridspec(len(full_height_ratios), 1, height_ratios=full_height_ratios, hspace=0.70)
             else:
-                page_height_in = 108.0 if channel_has_mea_layout else 52.0
-                if not channel_has_mea_layout:
-                    page_width_in, page_height_in = _scale_page_size_for_lightweight(
-                        page_width_in, page_height_in, lightweight_mode
-                    )
+                page_height_in = 52.0
+                page_width_in, page_height_in = _scale_page_size_for_lightweight(
+                    page_width_in, page_height_in, lightweight_mode
+                )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
-                gs = fig.add_gridspec(24, 1, height_ratios=panel_height_ratios, hspace=0.58)
+                gs = fig.add_gridspec(24, 1, height_ratios=panel_height_ratios, hspace=0.70)
             ax_hdr1 = fig.add_subplot(gs[0, 0])
-            if channel_has_mea_layout and probe_layout_loaded is not None:
-                draw_probe_layout_on_axes(ax_hdr1, probe_layout_loaded, channel_name)
-            else:
-                ax_hdr1.axis("off")
-                ax_hdr1.text(0.02, 0.5, "Part 1 — Full view (entire pre/post-trigger window)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr1.transAxes)
+            ax_hdr1.axis("off")
+            ax_hdr1.text(0.02, 0.5, "Part 1 — Full view (entire pre/post-trigger window)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr1.transAxes)
+            _draw_mea_layout_inset(fig, probe_layout_loaded, channel_name)
             ax_full = fig.add_subplot(gs[1, 0])
             ax_first_trigger = fig.add_subplot(gs[2, 0], sharex=ax_full)
             ax_full_rms = fig.add_subplot(gs[3, 0], sharex=ax_full)
@@ -1623,7 +1702,8 @@ def plot_channel_multi_comparison(
                 ],
                 delta=0.015,
             )
-            page_dpi = _lightweight_pdf_dpi(False if channel_has_mea_layout else lightweight_mode)
+            _soften_figure_linewidths(fig)
+            page_dpi = _lightweight_pdf_dpi(lightweight_mode)
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=page_dpi)
             plt.close(fig)
 
@@ -1643,6 +1723,11 @@ def plot_channel_multi_comparison(
         if impedance_sessions:
             _append_mean_impedance_summary_page(pdf, impedance_sessions, lightweight_mode)
 
+    _profile_print_delta(
+        "plot_channel_multi_comparison",
+        _profile_before,
+        time.perf_counter() - _profile_t0,
+    )
     return pdf_path
 
 
@@ -1675,6 +1760,8 @@ def plot_channel_averages(
     Intan amplifier values are displayed in microvolts (uV), as
     provided by load_intan_rhs_format (amplifier_data).
     """
+    _profile_before = _profile_snapshot()
+    _profile_t0 = time.perf_counter()
     n_channels = mean_per_channel.shape[0]
     output_dir.mkdir(parents=True, exist_ok=True)
     if pdf_title is not None and pdf_title.strip():
@@ -1769,16 +1856,12 @@ def plot_channel_averages(
                         float(trigger_end_rising_rel_s + zoom_t1),
                     )
                     rms_series_zoom_end = [("RMS", tx_end, rms_zoom_end_vals)]
-            channel_has_mea_layout = probe_layout_loaded is not None and (
-                match_contact_index(probe_layout_loaded, channel_name) is not None
+            page_width_in = 12.0
+            mea_row_height_ratio = 0.06
+            page_height_in = 52.0
+            page_width_in, page_height_in = _scale_page_size_for_lightweight(
+                page_width_in, page_height_in, lightweight_mode
             )
-            page_width_in = 26.0 if channel_has_mea_layout else 12.0
-            mea_row_height_ratio = 2.20 if channel_has_mea_layout else 0.06
-            page_height_in = 108.0 if channel_has_mea_layout else 52.0
-            if not channel_has_mea_layout:
-                page_width_in, page_height_in = _scale_page_size_for_lightweight(
-                    page_width_in, page_height_in, lightweight_mode
-                )
             fig = plt.figure(figsize=(page_width_in, page_height_in))
             gs = fig.add_gridspec(
                 24,
@@ -1809,23 +1892,21 @@ def plot_channel_averages(
                     1.05,
                     1.15,
                 ],
-                hspace=0.58,
+                hspace=0.74,
             )
             ax_hdr1 = fig.add_subplot(gs[0, 0])
-            if channel_has_mea_layout and probe_layout_loaded is not None:
-                draw_probe_layout_on_axes(ax_hdr1, probe_layout_loaded, channel_name)
-            else:
-                ax_hdr1.axis("off")
-                ax_hdr1.text(
-                    0.02,
-                    0.5,
-                    "Part 1 — Full view (entire pre/post-trigger window)",
-                    ha="left",
-                    va="center",
-                    fontsize=11,
-                    fontweight="bold",
-                    transform=ax_hdr1.transAxes,
-                )
+            ax_hdr1.axis("off")
+            ax_hdr1.text(
+                0.02,
+                0.5,
+                "Part 1 — Full view (entire pre/post-trigger window)",
+                ha="left",
+                va="center",
+                fontsize=11,
+                fontweight="bold",
+                transform=ax_hdr1.transAxes,
+            )
+            _draw_mea_layout_inset(fig, probe_layout_loaded, channel_name)
             ax_full = fig.add_subplot(gs[1, 0])
             ax_first_trigger = fig.add_subplot(gs[2, 0], sharex=ax_full)
             ax_full_rms = fig.add_subplot(gs[3, 0], sharex=ax_full)
@@ -2288,7 +2369,8 @@ def plot_channel_averages(
                 ],
                 delta=0.015,
             )
-            page_dpi = _lightweight_pdf_dpi(False if channel_has_mea_layout else lightweight_mode)
+            _soften_figure_linewidths(fig)
+            page_dpi = _lightweight_pdf_dpi(lightweight_mode)
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=page_dpi)
             plt.close(fig)
 
@@ -2315,6 +2397,11 @@ def plot_channel_averages(
             lightweight_mode,
         )
 
+    _profile_print_delta(
+        "plot_channel_averages",
+        _profile_before,
+        time.perf_counter() - _profile_t0,
+    )
     return pdf_path
 
 
@@ -2346,6 +2433,8 @@ def plot_channel_comparison(
     sampling_percent: int = 100,
 ) -> Path:
     """Multi-page PDF: per channel, means + zoom + raster / PSTH / ISI (two overlaid recordings)."""
+    _profile_before = _profile_snapshot()
+    _profile_t0 = time.perf_counter()
     output_dir.mkdir(parents=True, exist_ok=True)
     safe_a = "".join(c if c.isalnum() or c in "._-" else "_" for c in label_a)[:80]
     safe_b = "".join(c if c.isalnum() or c in "._-" else "_" for c in label_b)[:80]
@@ -2464,7 +2553,7 @@ def plot_channel_comparison(
                 24,
                 1,
                 height_ratios=[0.06, 1.70, 1.60, 1.30, 1.20, 1.15, 1.05, 1.15, 0.06, 1.70, 1.50, 1.20, 1.30, 1.15, 1.05, 1.15, 0.06, 1.70, 1.50, 1.20, 1.30, 1.15, 1.05, 1.15],
-                hspace=0.62,
+                hspace=0.70,
             )
             ax_hdr1 = fig.add_subplot(gs[0, 0])
             ax_hdr1.axis("off")
@@ -2982,6 +3071,7 @@ def plot_channel_comparison(
                 ],
                 delta=0.015,
             )
+            _soften_figure_linewidths(fig)
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=_lightweight_pdf_dpi(lightweight_mode))
             plt.close(fig)
 
@@ -2999,4 +3089,9 @@ def plot_channel_comparison(
         if rms_series:
             _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s, lightweight_mode)
 
+    _profile_print_delta(
+        "plot_channel_comparison",
+        _profile_before,
+        time.perf_counter() - _profile_t0,
+    )
     return pdf_path
