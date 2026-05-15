@@ -116,22 +116,26 @@ def _scale_page_size_for_lightweight(
     )
 
 
-def _draw_mea_layout_inset(
-    fig: Any,
+def _draw_mea_layout_panel(
+    ax: Any,
     probe_layout: Any,
     channel_name: str,
 ) -> None:
-    """Draw MEA layout as inset so main panels keep identical geometry."""
-    if probe_layout is None:
+    """Draw MEA layout in a dedicated stacked panel (no inset)."""
+    if probe_layout is None or match_contact_index(probe_layout, channel_name) is None:
+        ax.axis("off")
+        ax.text(
+            0.02,
+            0.5,
+            "MEA layout unavailable for this channel",
+            ha="left",
+            va="center",
+            fontsize=10,
+            transform=ax.transAxes,
+        )
         return
-    if match_contact_index(probe_layout, channel_name) is None:
-        return
-    inset_w = 0.28
-    inset_h = 0.06
-    inset_x = 0.5 - (inset_w / 2.0)
-    inset_y = 0.905
-    inset_ax = fig.add_axes([inset_x, inset_y, inset_w, inset_h])
-    draw_probe_layout_on_axes(inset_ax, probe_layout, channel_name)
+    draw_probe_layout_on_axes(ax, probe_layout, channel_name)
+    ax.set_title(f"MEA layout — highlighted channel: {channel_name}", fontsize=10)
 
 
 def _soften_figure_linewidths(fig: Any, scale: float = 0.85, min_width: float = 0.7) -> None:
@@ -1290,7 +1294,7 @@ def plot_channel_multi_comparison(
                     means_raw_ch = [np.asarray(means_raw[i][ch]) for i in range(n_records)]
 
             page_width_in = 12.0
-            mea_row_height_ratio = 0.06
+            mea_row_height_ratio = 1.60
             panel_height_ratios = [
                 mea_row_height_ratio,
                 1.70,
@@ -1332,10 +1336,8 @@ def plot_channel_multi_comparison(
                 )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
                 gs = fig.add_gridspec(24, 1, height_ratios=panel_height_ratios, hspace=0.70)
-            ax_hdr1 = fig.add_subplot(gs[0, 0])
-            ax_hdr1.axis("off")
-            ax_hdr1.text(0.02, 0.5, "Part 1 — Full view (entire pre/post-trigger window)", ha="left", va="center", fontsize=11, fontweight="bold", transform=ax_hdr1.transAxes)
-            _draw_mea_layout_inset(fig, probe_layout_loaded, channel_name)
+            ax_mea = fig.add_subplot(gs[0, 0])
+            _draw_mea_layout_panel(ax_mea, probe_layout_loaded, channel_name)
             ax_full = fig.add_subplot(gs[1, 0])
             ax_first_trigger = fig.add_subplot(gs[2, 0], sharex=ax_full)
             ax_full_rms = fig.add_subplot(gs[3, 0], sharex=ax_full)
@@ -1857,7 +1859,7 @@ def plot_channel_averages(
                     )
                     rms_series_zoom_end = [("RMS", tx_end, rms_zoom_end_vals)]
             page_width_in = 12.0
-            mea_row_height_ratio = 0.06
+            mea_row_height_ratio = 1.60
             page_height_in = 52.0
             page_width_in, page_height_in = _scale_page_size_for_lightweight(
                 page_width_in, page_height_in, lightweight_mode
@@ -1894,19 +1896,8 @@ def plot_channel_averages(
                 ],
                 hspace=0.74,
             )
-            ax_hdr1 = fig.add_subplot(gs[0, 0])
-            ax_hdr1.axis("off")
-            ax_hdr1.text(
-                0.02,
-                0.5,
-                "Part 1 — Full view (entire pre/post-trigger window)",
-                ha="left",
-                va="center",
-                fontsize=11,
-                fontweight="bold",
-                transform=ax_hdr1.transAxes,
-            )
-            _draw_mea_layout_inset(fig, probe_layout_loaded, channel_name)
+            ax_mea = fig.add_subplot(gs[0, 0])
+            _draw_mea_layout_panel(ax_mea, probe_layout_loaded, channel_name)
             ax_full = fig.add_subplot(gs[1, 0])
             ax_first_trigger = fig.add_subplot(gs[2, 0], sharex=ax_full)
             ax_full_rms = fig.add_subplot(gs[3, 0], sharex=ax_full)
