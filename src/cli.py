@@ -24,6 +24,7 @@ from core import (
     load_rhs_file,
     mean_time_to_next_rising_edge_s,
     persist_amplifier_float32,
+    resolve_curve_filter,
     resolve_work_dir,
     valid_triggers_and_timebase,
 )
@@ -188,10 +189,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--psth-bin-window-s",
         "--firing-rate-window-s",
+        dest="psth_bin_window_s",
         type=float,
-        default=defaults.firing_rate_window_s,
-        help="Gaussian smoothing width (s) for PSTH / firing rate (default 0.025)",
+        default=defaults.psth_bin_window_s,
+        help="PSTH time window (s) used for each PSTH point (default: from config)",
     )
     parser.add_argument(
         "--zoom-t0-s",
@@ -295,12 +298,14 @@ def run(config: AnalysisConfig) -> None:
         ) = compute_average_per_channel(config)
         check_analysis_cancelled()
         output_dir = config.save_dir if config.save_dir is not None else config.rhs_file.parent
+        curve_filter_kind, _, _ = resolve_curve_filter(config, fs)
+        curve_filter_enabled = curve_filter_kind != "no filter"
         with tempfile.TemporaryDirectory(prefix="plot_erg_means_") as temporary_dir:
             mmap_dir = Path(temporary_dir)
             mean_per_channel_mmap = _to_temp_mmap(mean_per_channel, mmap_dir, "mean_filtered_or_raw")
             mean_per_channel_raw_mmap = (
                 _to_temp_mmap(mean_per_channel_raw, mmap_dir, "mean_raw")
-                if config.lowpass_cutoff_hz is not None
+                if curve_filter_enabled
                 else None
             )
             del mean_per_channel
@@ -313,12 +318,15 @@ def run(config: AnalysisConfig) -> None:
                 rhs_file=config.rhs_file,
                 pdf_title=config.pdf_title,
                 lowpass_cutoff_hz=config.lowpass_cutoff_hz,
+                curve_filter=config.curve_filter,
+                curve_filter_low_hz=config.curve_filter_low_hz,
+                curve_filter_high_hz=config.curve_filter_high_hz,
                 trigger_end_rising_rel_s=end_rising_s,
                 spike_source=spike_source,
                 windows=None,
                 fs=fs,
                 spike_threshold_uv=config.spike_threshold_uv,
-                firing_rate_window_s=config.firing_rate_window_s,
+                psth_bin_window_s=config.psth_bin_window_s,
                 rms_window_s=config.rms_window_s,
                 zoom_t0_s=config.zoom_t0_s,
                 zoom_t1_s=config.zoom_t1_s,
@@ -342,10 +350,24 @@ def run(config: AnalysisConfig) -> None:
             print(f"Mean delay to next rising edge (typical pulse end): {end_rising_s*1e3:.3f} ms")
         else:
             print("Next rising edge at threshold: not computed (no rising edge after triggers).")
-        if config.lowpass_cutoff_hz is not None:
-            print(f"Butterworth low-pass: fc = {config.lowpass_cutoff_hz} Hz (order 4, filtfilt)")
+        curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(config, fs)
+        if curve_filter_kind == "no filter":
+            print("Butterworth curve filter: disabled")
+        elif curve_filter_kind == "bandpass":
+            print(
+                "Butterworth curve filter: "
+                f"band-pass {curve_filter_low_hz:g}-{curve_filter_high_hz:g} Hz (order 4, filtfilt)"
+            )
+        elif curve_filter_kind == "highpass":
+            print(
+                "Butterworth curve filter: "
+                f"high-pass {curve_filter_low_hz:g} Hz (order 4, filtfilt)"
+            )
         else:
-            print("Butterworth low-pass: disabled")
+            print(
+                "Butterworth curve filter: "
+                f"low-pass {curve_filter_low_hz:g} Hz (order 4, filtfilt)"
+            )
         spike_rule = (
             "falling edge (negative peak)"
             if config.spike_threshold_uv < 0
@@ -358,7 +380,7 @@ def run(config: AnalysisConfig) -> None:
         )
         print(
             f"Spikes (PDF amplifier): threshold {config.spike_threshold_uv} µV ({spike_rule}) | "
-            f"firing-rate smooth σ = {config.firing_rate_window_s} s{bp_txt}"
+            f"PSTH time window = {max(float(config.psth_bin_window_s), 1.0 / float(fs)):g} s{bp_txt}"
         )
         print(f"PDF zoom window: [{config.zoom_t0_s:.3f}s, {config.zoom_t1_s:.3f}s]")
         print(f"RMS window: {config.rms_window_s:.3f} s")
@@ -396,10 +418,18 @@ def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
         print(f"Mean delay to trigger end (rising) — A: {stats['end_markers'][0]*1e3:.3f} ms")
     if stats["end_markers"][1] is not None:
         print(f"Mean delay to trigger end (rising) — B: {stats['end_markers'][1]*1e3:.3f} ms")
-    if config_a.lowpass_cutoff_hz is not None:
-        print(f"Butterworth low-pass: fc = {config_a.lowpass_cutoff_hz} Hz")
+    fs_a = float(stats["fs_values"][0])  # type: ignore[index]
+    curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(
+        config_a, fs_a
+    )
+    if curve_filter_kind == "no filter":
+        print("Butterworth curve filter: disabled")
+    elif curve_filter_kind == "bandpass":
+        print(f"Butterworth curve filter: band-pass {curve_filter_low_hz:g}-{curve_filter_high_hz:g} Hz")
+    elif curve_filter_kind == "highpass":
+        print(f"Butterworth curve filter: high-pass {curve_filter_low_hz:g} Hz")
     else:
-        print("Butterworth low-pass: disabled")
+        print(f"Butterworth curve filter: low-pass {curve_filter_low_hz:g} Hz")
     print(f"Comparison PDF written: {pdf_path}")
     print(f"Total time (comparison + PDF): {stats['t_total_s']:.2f} s")
     return pdf_path
@@ -541,12 +571,15 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             labels=labels,
             pdf_title=tuned[0].pdf_title,
             lowpass_cutoff_hz=tuned[0].lowpass_cutoff_hz,
+            curve_filter=tuned[0].curve_filter,
+            curve_filter_low_hz=tuned[0].curve_filter_low_hz,
+            curve_filter_high_hz=tuned[0].curve_filter_high_hz,
             trigger_end_rising_rel_s_list=end_markers,
             means_raw=None,
             spike_sources=spike_sources,
             fs=float(fs_ref),
             spike_threshold_uv=tuned[0].spike_threshold_uv,
-            firing_rate_window_s=tuned[0].firing_rate_window_s,
+            psth_bin_window_s=tuned[0].psth_bin_window_s,
             rms_window_s=tuned[0].rms_window_s,
             zoom_t0_s=tuned[0].zoom_t0_s,
             zoom_t1_s=tuned[0].zoom_t1_s,
@@ -591,8 +624,10 @@ def main() -> None:
             default_pre_s=args.pre,
             default_post_s=args.post,
             default_lowpass_hz=args.lowpass_hz,
+            default_curve_filter="lowpass" if args.lowpass_hz is not None else "no filter",
+            default_curve_filter_low_hz=args.lowpass_hz,
             default_spike_threshold_uv=args.spike_threshold_uv,
-            default_firing_rate_window_s=args.firing_rate_window_s,
+            default_psth_bin_window_s=args.psth_bin_window_s,
             default_rms_window_s=args.rms_window_s,
             default_zoom_t0_s=args.zoom_t0_s,
             default_zoom_t1_s=args.zoom_t1_s,
@@ -614,10 +649,13 @@ def main() -> None:
         pre_s=args.pre,
         post_s=args.post,
         lowpass_cutoff_hz=args.lowpass_hz,
+        curve_filter="lowpass" if args.lowpass_hz is not None else "no filter",
+        curve_filter_low_hz=args.lowpass_hz,
+        curve_filter_high_hz=None,
         save_dir=args.save_dir,
         pdf_title=args.pdf_title,
         spike_threshold_uv=args.spike_threshold_uv,
-        firing_rate_window_s=args.firing_rate_window_s,
+        psth_bin_window_s=args.psth_bin_window_s,
         rms_window_s=args.rms_window_s,
         zoom_t0_s=args.zoom_t0_s,
         zoom_t1_s=args.zoom_t1_s,

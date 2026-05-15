@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 EdgeKind = Literal["falling", "rising"]
+CurveFilterKind = Literal["highpass", "lowpass", "bandpass", "no filter"]
 
 
 @dataclass(frozen=True)
@@ -14,15 +15,20 @@ class AnalysisConfig:
     edge: EdgeKind = "falling"  # falling / rising threshold crossing on ANALOG_IN 0
     pre_s: float = 1.0
     post_s: float = 10.0
-    # Butterworth low-pass on amplifier_data (None = disabled)
-    lowpass_cutoff_hz: Optional[float] = 250.0
+    # Legacy: Butterworth low-pass on amplifier_data (None = disabled).
+    # Kept for CLI backward compatibility.
+    lowpass_cutoff_hz: Optional[float] = None
+    # Curve filter for amplifier mean traces in PDF.
+    curve_filter: CurveFilterKind = "no filter"
+    curve_filter_low_hz: Optional[float] = None
+    curve_filter_high_hz: Optional[float] = None
     save_dir: Path | None = None
     # Output PDF title / basename (.pdf added if no extension)
     pdf_title: str | None = None
     # Spike threshold (µV): >=0 = upward crossing; <0 = downward crossing
     spike_threshold_uv: float = -15.0
-    # PSTH firing-rate Gaussian smoothing width (s)
-    firing_rate_window_s: float = 0.010
+    # PSTH time window (s) used for each PSTH point
+    psth_bin_window_s: float = 0.010
     # PDF zoom-panel window (s, time relative to trigger)
     zoom_t0_s: float = -0.1
     zoom_t1_s: float = 0.4

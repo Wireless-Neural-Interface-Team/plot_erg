@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 from scipy.signal import butter, filtfilt
 
-from config import AnalysisConfig
+from config import AnalysisConfig, CurveFilterKind
 
 _analysis_cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
     "analysis_cancel_event",
@@ -59,6 +59,19 @@ def _butter_lowpass_coeffs(fs: float, cutoff_hz: float, order: int) -> tuple[np.
 
 
 @functools.lru_cache(maxsize=128)
+def _butter_highpass_coeffs(fs: float, cutoff_hz: float, order: int) -> tuple[np.ndarray, np.ndarray]:
+    nyq = 0.5 * fs
+    if cutoff_hz <= 0:
+        raise ValueError("Cutoff frequency must be > 0.")
+    if cutoff_hz >= nyq:
+        raise ValueError(
+            f"Cutoff ({cutoff_hz} Hz) must be below Nyquist frequency ({nyq:.1f} Hz)."
+        )
+    wn = cutoff_hz / nyq
+    return butter(order, wn, btype="high")
+
+
+@functools.lru_cache(maxsize=128)
 def _butter_bandpass_coeffs(
     fs: float, low_hz: float, high_hz: float, order: int
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -86,6 +99,20 @@ def apply_butterworth_lowpass(
     if data.ndim != 2:
         raise RuntimeError("apply_butterworth_lowpass expects [n_channels, n_samples].")
     b, a = _butter_lowpass_coeffs(float(fs), float(cutoff_hz), int(order))
+    return filtfilt(b, a, data, axis=1)
+
+
+def apply_butterworth_highpass(
+    data: np.ndarray,
+    fs: float,
+    cutoff_hz: float,
+    order: int = 4,
+) -> np.ndarray:
+    """Butterworth high-pass, zero-phase (filtfilt), per channel (axis=1)."""
+    data = np.asarray(data, dtype=np.float64)
+    if data.ndim != 2:
+        raise RuntimeError("apply_butterworth_highpass expects [n_channels, n_samples].")
+    b, a = _butter_highpass_coeffs(float(fs), float(cutoff_hz), int(order))
     return filtfilt(b, a, data, axis=1)
 
 
@@ -389,23 +416,81 @@ def resolve_channel_workers(channel_workers: int | None, n_channels: int) -> int
     return max(1, min(cpu_half, int(MAX_PARALLEL_CHANNELS), int(n_channels)))
 
 
+def resolve_curve_filter(config: AnalysisConfig, fs: float) -> tuple[CurveFilterKind, float | None, float | None]:
+    """Resolve and validate curve filter settings, with legacy low-pass fallback."""
+    kind = str(config.curve_filter).strip().lower()
+    if kind not in {"highpass", "lowpass", "bandpass", "no filter"}:
+        raise ValueError(
+            "Curve filter: expected one of highpass, lowpass, bandpass, no filter."
+        )
+    filter_kind: CurveFilterKind = kind  # type: ignore[assignment]
+    low_hz = config.curve_filter_low_hz
+    high_hz = config.curve_filter_high_hz
+
+    # Backward compatibility for CLI / old configs.
+    if filter_kind == "no filter" and config.lowpass_cutoff_hz is not None:
+        filter_kind = "lowpass"
+        low_hz = float(config.lowpass_cutoff_hz)
+        high_hz = None
+
+    nyq = 0.5 * float(fs)
+    if filter_kind == "no filter":
+        return filter_kind, None, None
+    if filter_kind in {"highpass", "lowpass"}:
+        if low_hz is None:
+            raise ValueError(f"Curve filter '{filter_kind}': provide one cutoff frequency (Hz).")
+        fc = float(low_hz)
+        if fc <= 0:
+            raise ValueError("Curve filter cutoff must be > 0 Hz.")
+        if fc >= nyq:
+            raise ValueError(f"Curve filter cutoff ({fc:g} Hz) must be < Nyquist ({nyq:.1f} Hz).")
+        return filter_kind, fc, None
+    if low_hz is None or high_hz is None:
+        raise ValueError("Curve filter 'bandpass': provide both low and high cutoffs (Hz).")
+    flo = float(low_hz)
+    fhi = float(high_hz)
+    if flo <= 0 or fhi <= 0:
+        raise ValueError("Curve filter bandpass: both frequencies must be > 0 Hz.")
+    if flo >= fhi:
+        raise ValueError("Curve filter bandpass: low cutoff must be < high cutoff.")
+    if fhi >= nyq:
+        raise ValueError(f"Curve filter bandpass high cutoff ({fhi:g} Hz) must be < Nyquist ({nyq:.1f} Hz).")
+    return filter_kind, flo, fhi
+
+
 def mean_filtered_channelwise(
     amplifier_2d: np.ndarray,
     valid_triggers: np.ndarray,
     fs: float,
     pre_n: int,
     post_n: int,
-    cutoff_hz: float,
+    filter_kind: CurveFilterKind,
+    low_hz: float | None,
+    high_hz: float | None,
     channel_workers: int | None = None,
 ) -> np.ndarray:
-    """Low-pass per channel, parallelized up to MAX_PARALLEL_CHANNELS."""
+    """Butterworth filter per channel, parallelized up to MAX_PARALLEL_CHANNELS."""
     channel_count, _ = amplifier_2d.shape
     window_length = pre_n + post_n
     mean_windows = np.zeros((channel_count, window_length), dtype=np.float64)
 
     def _compute_one_channel(c: int) -> tuple[int, np.ndarray]:
         check_analysis_cancelled()
-        filtered_channel = apply_butterworth_lowpass(amplifier_2d[c : c + 1], fs, cutoff_hz)[0]
+        row_2d = amplifier_2d[c : c + 1]
+        if filter_kind == "lowpass":
+            if low_hz is None:
+                raise ValueError("Curve filter low-pass requires cutoff frequency.")
+            filtered_channel = apply_butterworth_lowpass(row_2d, fs, low_hz)[0]
+        elif filter_kind == "highpass":
+            if low_hz is None:
+                raise ValueError("Curve filter high-pass requires cutoff frequency.")
+            filtered_channel = apply_butterworth_highpass(row_2d, fs, low_hz)[0]
+        elif filter_kind == "bandpass":
+            if low_hz is None or high_hz is None:
+                raise ValueError("Curve filter band-pass requires low/high frequencies.")
+            filtered_channel = apply_butterworth_bandpass(row_2d, fs, low_hz, high_hz)[0]
+        else:
+            filtered_channel = np.asarray(row_2d[0], dtype=np.float64)
         summed_windows = np.zeros(window_length, dtype=np.float64)
         for trigger_index in valid_triggers:
             sample_start = int(trigger_index - pre_n)
@@ -581,14 +666,17 @@ def compute_average_per_channel(
         channel_workers=config.channel_workers,
     )
 
-    if config.lowpass_cutoff_hz is not None:
+    curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(config, fs)
+    if curve_filter_kind != "no filter":
         mean_per_channel = mean_filtered_channelwise(
             amplifier_raw,
             valid_triggers,
             fs,
             pre_n,
             post_n,
-            config.lowpass_cutoff_hz,
+            curve_filter_kind,
+            curve_filter_low_hz,
+            curve_filter_high_hz,
             config.channel_workers,
         )
     else:

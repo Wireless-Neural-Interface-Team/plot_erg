@@ -15,11 +15,12 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
-from scipy.ndimage import gaussian_filter1d, uniform_filter1d
+from scipy.ndimage import uniform_filter1d
 
 from core import (
     AmplifierSpikeSource,
     apply_butterworth_bandpass,
+    apply_butterworth_highpass,
     apply_butterworth_lowpass,
     check_analysis_cancelled,
     detect_spikes_at_threshold,
@@ -138,8 +139,14 @@ def _draw_mea_layout_panel(
     ax.set_title(f"MEA layout — highlighted channel: {channel_name}", fontsize=10)
 
 
-def _soften_figure_linewidths(fig: Any, scale: float = 0.85, min_width: float = 0.7) -> None:
-    """Reduce line thickness globally for a figure."""
+def _soften_figure_linewidths(
+    fig: Any,
+    scale: float = 0.75,
+    min_width: float = 0.5,
+    marker_scale: float = 0.8,
+    scatter_scale: float = 0.7,
+) -> None:
+    """Reduce line/marker thickness globally for a figure."""
     for ax in fig.axes:
         for line in ax.get_lines():
             try:
@@ -147,6 +154,24 @@ def _soften_figure_linewidths(fig: Any, scale: float = 0.85, min_width: float = 
             except Exception:
                 continue
             line.set_linewidth(max(min_width, lw * scale))
+            try:
+                ms = float(line.get_markersize())
+                line.set_markersize(max(1.0, ms * marker_scale))
+            except Exception:
+                pass
+        for coll in ax.collections:
+            try:
+                sizes = coll.get_sizes()
+                if sizes is not None and len(sizes) > 0:
+                    coll.set_sizes(np.maximum(1.0, np.asarray(sizes, dtype=np.float64) * scatter_scale))
+            except Exception:
+                pass
+            try:
+                lws = coll.get_linewidths()
+                if lws is not None and len(lws) > 0:
+                    coll.set_linewidths(np.maximum(min_width, np.asarray(lws, dtype=np.float64) * scale))
+            except Exception:
+                pass
 
 
 def _spike_times_per_trial(
@@ -169,20 +194,24 @@ def _psth_mean_hz(
     t_rel: np.ndarray,
     n_trials: int,
     bin_width_s: float,
-    smooth_sigma_s: float,
     t_range_s: Optional[Tuple[float, float]] = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Mean PSTH (Hz): spike count per bin / (n_trials * bin_width).
+    """Mean sliding PSTH (Hz): spike count in moving window / (n_trials * window_width).
 
-    t_range_s: if (t0, t1), histogram only on this interval (out-of-range spikes excluded).
+    The PSTH is evaluated at each sample step (derived from t_rel).
+    t_range_s: if (t0, t1), process only this interval (out-of-range spikes excluded).
     """
     if t_range_s is not None:
         t0, t1 = float(t_range_s[0]), float(t_range_s[1])
     else:
         t0, t1 = float(t_rel[0]), float(t_rel[-1])
-    if t1 <= t0 or bin_width_s <= 0:
+    if t1 <= t0 or bin_width_s <= 0 or t_rel.size < 2:
         return np.array([]), np.array([])
-    edges = np.arange(t0, t1 + bin_width_s, bin_width_s)
+    dt = float(np.median(np.diff(t_rel)))
+    if dt <= 0:
+        return np.array([]), np.array([])
+    # Evaluate PSTH at sampling cadence.
+    edges = np.arange(t0, t1 + dt, dt)
     if edges.size < 2:
         return np.array([]), np.array([])
     counts = np.zeros(edges.size - 1, dtype=np.float64)
@@ -190,12 +219,13 @@ def _psth_mean_hz(
         if st.size == 0:
             continue
         counts += np.histogram(st, bins=edges)[0]
-    rate = counts / (max(n_trials, 1) * bin_width_s)
+    window_bins = max(1, int(round(float(bin_width_s) / dt)))
+    kernel = np.ones(window_bins, dtype=np.float64)
+    sliding_counts = np.convolve(counts, kernel, mode="same")
+    effective_window_s = float(window_bins) * dt
+    rate = sliding_counts / (max(n_trials, 1) * effective_window_s)
     centers = (edges[:-1] + edges[1:]) * 0.5
-    sigma_bins = smooth_sigma_s / bin_width_s if bin_width_s > 0 else 1.0
-    sigma_bins = max(float(sigma_bins), 0.5)
-    rate_s = gaussian_filter1d(rate, sigma=sigma_bins, mode="nearest")
-    return centers, rate_s
+    return centers, rate
 
 
 def _mean_firing_rate_in_window_hz(
@@ -258,6 +288,76 @@ def _spike_pipeline_captions(
         detail = f"Butterworth band-pass {flo:g}–{fhi:g} Hz (order 4, filtfilt)"
         return short, detail
     return "raw", "raw mmap signal (no spike band-pass)"
+
+
+def _curve_filter_captions(
+    curve_filter: str = "no filter",
+    curve_filter_low_hz: Optional[float] = None,
+    curve_filter_high_hz: Optional[float] = None,
+    lowpass_cutoff_hz: Optional[float] = None,
+) -> tuple[bool, str, str]:
+    """Return (enabled, short title note, legend label)."""
+    kind = (curve_filter or "no filter").strip().lower()
+    lo = curve_filter_low_hz
+    hi = curve_filter_high_hz
+    # Backward compatibility with older low-pass-only calls.
+    if kind == "no filter" and lowpass_cutoff_hz is not None:
+        kind = "lowpass"
+        lo = float(lowpass_cutoff_hz)
+    if kind == "no filter":
+        return False, "", ""
+    if kind == "lowpass":
+        if lo is None:
+            raise ValueError("Curve filter lowpass requires one cutoff frequency (Hz).")
+        return True, f" — Butterworth low-pass {lo:g} Hz", f"low-pass {lo:g} Hz"
+    if kind == "highpass":
+        if lo is None:
+            raise ValueError("Curve filter highpass requires one cutoff frequency (Hz).")
+        return True, f" — Butterworth high-pass {lo:g} Hz", f"high-pass {lo:g} Hz"
+    if kind == "bandpass":
+        if lo is None or hi is None:
+            raise ValueError("Curve filter bandpass requires low/high cutoffs (Hz).")
+        return True, f" — Butterworth band-pass {lo:g}–{hi:g} Hz", f"band-pass {lo:g}–{hi:g} Hz"
+    raise ValueError("Curve filter must be highpass, lowpass, bandpass, or no filter.")
+
+
+def _apply_curve_filter_to_row(
+    row: np.ndarray,
+    fs: float,
+    curve_filter: str = "no filter",
+    curve_filter_low_hz: Optional[float] = None,
+    curve_filter_high_hz: Optional[float] = None,
+    lowpass_cutoff_hz: Optional[float] = None,
+) -> np.ndarray:
+    """Apply configured Butterworth filter to one 1D curve."""
+    enabled, _, _ = _curve_filter_captions(
+        curve_filter=curve_filter,
+        curve_filter_low_hz=curve_filter_low_hz,
+        curve_filter_high_hz=curve_filter_high_hz,
+        lowpass_cutoff_hz=lowpass_cutoff_hz,
+    )
+    if not enabled:
+        return np.asarray(row, dtype=np.float64)
+    kind = (curve_filter or "no filter").strip().lower()
+    lo = curve_filter_low_hz
+    hi = curve_filter_high_hz
+    if kind == "no filter" and lowpass_cutoff_hz is not None:
+        kind = "lowpass"
+        lo = float(lowpass_cutoff_hz)
+    row_2d = np.asarray(row, dtype=np.float64).reshape(1, -1)
+    if kind == "lowpass":
+        if lo is None:
+            raise ValueError("Curve filter lowpass requires cutoff.")
+        return apply_butterworth_lowpass(row_2d, fs, float(lo))[0]
+    if kind == "highpass":
+        if lo is None:
+            raise ValueError("Curve filter highpass requires cutoff.")
+        return apply_butterworth_highpass(row_2d, fs, float(lo))[0]
+    if kind == "bandpass":
+        if lo is None or hi is None:
+            raise ValueError("Curve filter bandpass requires low/high cutoffs.")
+        return apply_butterworth_bandpass(row_2d, fs, float(lo), float(hi))[0]
+    return np.asarray(row, dtype=np.float64)
 
 
 def _isi_time_and_values_s(
@@ -327,7 +427,7 @@ def _draw_spike_panels_single_channel(
     t_rel: np.ndarray,
     fs: float,
     spike_threshold_uv: float,
-    firing_rate_window_s: float,
+    psth_bin_window_s: float,
     spike_bandpass_low_hz: Optional[float] = None,
     spike_bandpass_high_hz: Optional[float] = None,
     *,
@@ -388,20 +488,20 @@ def _draw_spike_panels_single_channel(
     ax_raster.set_ylim(-0.5, max(n_tr - 0.5, 0.5))
     ax_raster.set_xlim(t_xlim_lo, t_xlim_hi)
 
-    bin_w = max(1.0 / fs, min(0.002, max(firing_rate_window_s / 12.0, 5e-5)))
+    # Sliding PSTH time window; values are evaluated at sampling cadence in _psth_mean_hz().
+    bin_w = max(float(psth_bin_window_s), 1.0 / fs)
     tc, rate_hz = _psth_mean_hz(
         st_per_tr,
         t_rel,
         n_tr,
         bin_w,
-        firing_rate_window_s,
         t_range_s=psth_t_range,
     )
     if tc.size:
-        ax_fr.plot(tc, rate_hz, linewidth=1.3, color="darkred", label="Smoothed PSTH (Hz)")
+        ax_fr.plot(tc, rate_hz, linewidth=1.3, color="darkred", label="PSTH (Hz)")
     ax_fr.set_ylabel("Rate (Hz)")
     ax_fr.set_title(
-        f"{sec}Mean firing rate — {short} (Gaussian PSTH, σ={firing_rate_window_s:g} s)"
+        f"{sec}Mean firing rate — {short} (PSTH time window = {bin_w:g} s)"
     )
     ax_fr.grid(True, alpha=0.3)
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
@@ -457,7 +557,7 @@ def _draw_spike_panels_dual_channel(
     t_rel: np.ndarray,
     fs: float,
     spike_threshold_uv: float,
-    firing_rate_window_s: float,
+    psth_bin_window_s: float,
     label_a: str,
     label_b: str,
     spike_bandpass_low_hz: Optional[float] = None,
@@ -541,12 +641,13 @@ def _draw_spike_panels_dual_channel(
     ax_raster.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.axhline(offset - 0.5, color="0.5", linestyle="--", linewidth=0.8, alpha=0.7)
 
-    bin_w = max(1.0 / fs, min(0.002, max(firing_rate_window_s / 12.0, 5e-5)))
+    # Sliding PSTH time window; values are evaluated at sampling cadence in _psth_mean_hz().
+    bin_w = max(float(psth_bin_window_s), 1.0 / fs)
     tc_a, rate_a = _psth_mean_hz(
-        sta, t_rel, n_a, bin_w, firing_rate_window_s, t_range_s=psth_t_range
+        sta, t_rel, n_a, bin_w, t_range_s=psth_t_range
     )
     tc_b, rate_b = _psth_mean_hz(
-        stb, t_rel, n_b, bin_w, firing_rate_window_s, t_range_s=psth_t_range
+        stb, t_rel, n_b, bin_w, t_range_s=psth_t_range
     )
     if tc_a.size:
         ax_fr.plot(tc_a, rate_a, linewidth=1.3, color="C0", label=label_a)
@@ -554,7 +655,7 @@ def _draw_spike_panels_dual_channel(
         ax_fr.plot(tc_b, rate_b, linewidth=1.3, color="C1", label=label_b)
     ax_fr.set_ylabel("Rate (Hz)")
     ax_fr.set_title(
-        f"{sec}Firing rate (Gaussian PSTH σ={firing_rate_window_s:g} s) — {short}"
+        f"{sec}Firing rate (PSTH time window = {bin_w:g} s) — {short}"
     )
     ax_fr.grid(True, alpha=0.3)
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
@@ -631,7 +732,7 @@ def _draw_spike_panels_multi_channel(
     t_rel: np.ndarray,
     fs: float,
     spike_threshold_uv: float,
-    firing_rate_window_s: float,
+    psth_bin_window_s: float,
     labels: Sequence[str],
     spike_bandpass_low_hz: Optional[float] = None,
     spike_bandpass_high_hz: Optional[float] = None,
@@ -664,6 +765,13 @@ def _draw_spike_panels_multi_channel(
         isi_empty_hint = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s of trigger"
 
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
+    n_rec = len(spikes_per_recording)
+    dense_overlay = n_rec > 2
+    raster_alpha = 0.75 if not dense_overlay else 0.55
+    psth_lw = 1.3 if not dense_overlay else 0.95
+    trial_marker = "o" if n_rec <= 3 else "None"
+    trial_markersize = 2.2 if n_rec <= 3 else 0.0
+    isi_alpha = 0.35 if not dense_overlay else 0.25
     sec = f"{section_title} — " if section_title else ""
     y_offset = 0
     for rec_idx, st_per_trial in enumerate(spikes_per_recording):
@@ -680,7 +788,7 @@ def _draw_spike_panels_multi_channel(
                     y_ds,
                     s=4,
                     c=color,
-                    alpha=0.75,
+                    alpha=raster_alpha,
                     linewidths=0,
                     label=labels[rec_idx] if tri == 0 else "",
                 )
@@ -698,20 +806,26 @@ def _draw_spike_panels_multi_channel(
     ax_raster.set_ylim(-0.5, max(y_offset - 0.5, 0.5))
     ax_raster.set_xlim(t_xlim_lo, t_xlim_hi)
 
-    bin_w = max(1.0 / fs, min(0.002, max(firing_rate_window_s / 12.0, 5e-5)))
+    # Sliding PSTH time window; values are evaluated at sampling cadence in _psth_mean_hz().
+    bin_w = max(float(psth_bin_window_s), 1.0 / fs)
     for rec_idx, st_per_trial in enumerate(spikes_per_recording):
         tc, rate = _psth_mean_hz(
             st_per_trial,
             t_rel,
             max(len(st_per_trial), 1),
             bin_w,
-            firing_rate_window_s,
             t_range_s=psth_t_range,
         )
         if tc.size:
-            ax_fr.plot(tc, rate, linewidth=1.3, color=colors[rec_idx % len(colors)], label=labels[rec_idx])
+            ax_fr.plot(
+                tc,
+                rate,
+                linewidth=psth_lw,
+                color=colors[rec_idx % len(colors)],
+                label=labels[rec_idx],
+            )
     ax_fr.set_ylabel("Rate (Hz)")
-    ax_fr.set_title(f"{sec}Firing rate (Gaussian PSTH σ={firing_rate_window_s:g} s) — {short}")
+    ax_fr.set_title(f"{sec}Firing rate (PSTH time window = {bin_w:g} s) — {short}")
     ax_fr.grid(True, alpha=0.3)
     ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
     ax_raster.set_xlabel(TIME_REL_XLABEL)
@@ -727,8 +841,8 @@ def _draw_spike_panels_multi_channel(
                 fr_trials,
                 color=colors[rec_idx % len(colors)],
                 linewidth=1.0,
-                marker="o",
-                markersize=2.2,
+                marker=trial_marker,
+                markersize=trial_markersize,
                 label=labels[rec_idx],
             )
     ax_trial_fr.set_title(f"{sec}Mean firing rate per trial — shown window")
@@ -751,7 +865,7 @@ def _draw_spike_panels_multi_channel(
                 isi_vals_s * 1e3,
                 s=10,
                 c=colors[rec_idx % len(colors)],
-                alpha=0.35,
+                alpha=isi_alpha,
                 linewidths=0,
                 label=labels[rec_idx],
                 rasterized=True,
@@ -1190,12 +1304,15 @@ def plot_channel_multi_comparison(
     labels: Sequence[str],
     pdf_title: Optional[str] = None,
     lowpass_cutoff_hz: Optional[float] = None,
+    curve_filter: str = "no filter",
+    curve_filter_low_hz: Optional[float] = None,
+    curve_filter_high_hz: Optional[float] = None,
     trigger_end_rising_rel_s_list: Optional[Sequence[Optional[float]]] = None,
     means_raw: Optional[Sequence[np.ndarray]] = None,
     spike_sources: Optional[Sequence[Optional[AmplifierSpikeSource]]] = None,
     fs: Optional[float] = None,
     spike_threshold_uv: float = -40.0,
-    firing_rate_window_s: float = 0.025,
+    psth_bin_window_s: float = 0.025,
     rms_window_s: float = 0.050,
     zoom_t0_s: float = ZOOM_T0,
     zoom_t1_s: float = ZOOM_T1,
@@ -1229,8 +1346,13 @@ def plot_channel_multi_comparison(
     pdf_path = output_dir / pdf_name
 
     zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
-    filt_note = f" — Butterworth low-pass {lowpass_cutoff_hz:g} Hz" if lowpass_cutoff_hz is not None else ""
-    both_note = " — raw signal overlaid (filtered curve emphasized)" if lowpass_cutoff_hz is not None else ""
+    curve_filter_enabled, filt_note, curve_filter_legend = _curve_filter_captions(
+        curve_filter=curve_filter,
+        curve_filter_low_hz=curve_filter_low_hz,
+        curve_filter_high_hz=curve_filter_high_hz,
+        lowpass_cutoff_hz=lowpass_cutoff_hz,
+    )
+    both_note = " — raw signal overlaid (filtered curve emphasized)" if curve_filter_enabled else ""
     zoom_title = f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){filt_note}{both_note}"
     n_channels = (
         min(src.amplifier.shape[0] for src in spike_sources if src is not None)
@@ -1256,7 +1378,7 @@ def plot_channel_multi_comparison(
             check_analysis_cancelled()
             channel_name = str(channel_names[ch])
             means_ch: list[np.ndarray] = []
-            means_raw_ch: list[np.ndarray] | None = [] if lowpass_cutoff_hz is not None else None
+            means_raw_ch: list[np.ndarray] | None = [] if curve_filter_enabled else None
             if streaming_mode:
                 if pre_n_common is None or post_n_common is None:
                     raise ValueError("Streaming mode: pre_n_common/post_n_common are required.")
@@ -1273,8 +1395,15 @@ def plot_channel_multi_comparison(
                     y_raw = acc_raw / float(max(len(src.valid_triggers), 1))
                     if len(y_raw) != len(t_rel):
                         y_raw = np.asarray(y_raw[: len(t_rel)])
-                    if lowpass_cutoff_hz is not None:
-                        row_f = apply_butterworth_lowpass(row.reshape(1, -1), float(fs or src.fs), lowpass_cutoff_hz)[0]
+                    if curve_filter_enabled:
+                        row_f = _apply_curve_filter_to_row(
+                            row,
+                            float(fs or src.fs),
+                            curve_filter=curve_filter,
+                            curve_filter_low_hz=curve_filter_low_hz,
+                            curve_filter_high_hz=curve_filter_high_hz,
+                            lowpass_cutoff_hz=lowpass_cutoff_hz,
+                        )
                         acc_f = np.zeros(win_len, dtype=np.float64)
                         for trig in src.valid_triggers:
                             start = int(trig - int(pre_n_common))
@@ -1290,18 +1419,18 @@ def plot_channel_multi_comparison(
                         means_ch.append(np.asarray(y_raw))
             else:
                 means_ch = [np.asarray(means[i][ch]) for i in range(n_records)]
-                if means_raw is not None and lowpass_cutoff_hz is not None:
+                if means_raw is not None and curve_filter_enabled:
                     means_raw_ch = [np.asarray(means_raw[i][ch]) for i in range(n_records)]
 
             page_width_in = 12.0
-            mea_row_height_ratio = 1.60
+            mea_row_height_ratio = 3.60
             panel_height_ratios = [
                 mea_row_height_ratio,
                 1.70,
                 1.60,
                 1.30,
                 1.20,
-                1.15,
+                1.45,
                 1.05,
                 1.15,
                 0.06,
@@ -1309,7 +1438,7 @@ def plot_channel_multi_comparison(
                 1.50,
                 1.20,
                 1.30,
-                1.15,
+                1.45,
                 1.05,
                 1.15,
                 0.06,
@@ -1317,7 +1446,7 @@ def plot_channel_multi_comparison(
                 1.50,
                 1.20,
                 1.30,
-                1.15,
+                1.45,
                 1.05,
                 1.15,
             ]
@@ -1381,7 +1510,7 @@ def plot_channel_multi_comparison(
                 _draw_impedance_evolution_panel(ax_imp, channel_name, impedance_sessions)
 
             show_filtered_and_raw = (
-                lowpass_cutoff_hz is not None
+                curve_filter_enabled
                 and means_raw_ch is not None
                 and len(means_raw_ch) == len(means_ch)
                 and any(
@@ -1389,6 +1518,16 @@ def plot_channel_multi_comparison(
                     for i in range(len(means_ch))
                 )
             )
+            dense_overlay = len(means_ch) > 2
+            # Above 2 recordings, avoid doubling traces (raw + filtered) to keep plots readable.
+            show_filtered_and_raw = show_filtered_and_raw and not dense_overlay
+            main_lw = 1.35 if not dense_overlay else 0.95
+            base_lw = 1.2 if not dense_overlay else 0.9
+            raw_lw = 1.0 if not dense_overlay else 0.75
+            raw_alpha = 0.35 if not dense_overlay else 0.20
+            first_lw = 1.1 if not dense_overlay else 0.9
+            legend_cols = 2 if len(means_ch) > 4 else min(4, max(1, len(means_ch)))
+            legend_font = 9 if dense_overlay else LEGEND_FONT_SIZE
             rms_series_full_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
             rms_series_zoom_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
             rms_series_zoom_end_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
@@ -1447,13 +1586,19 @@ def plot_channel_multi_comparison(
                 line_color = colors[recording_index % len(colors)]
                 if show_filtered_and_raw and means_raw_ch is not None:
                     raw_curve = np.asarray(means_raw_ch[recording_index])
-                    ax_full.plot(t_rel, raw_curve, linewidth=1.0, color=line_color, alpha=0.35, label="_nolegend_")
-                    ax_full.plot(t_rel, recording_curve, linewidth=1.35, color=line_color, label=f"{labels[recording_index]} (filtered)")
-                    ax_zoom.plot(t_rel[zmask], raw_curve[zmask], linewidth=1.05, color=line_color, alpha=0.35)
-                    ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=1.35, color=line_color, label=labels[recording_index])
+                    ax_full.plot(t_rel, raw_curve, linewidth=raw_lw, color=line_color, alpha=raw_alpha, label="_nolegend_")
+                    ax_full.plot(
+                        t_rel,
+                        recording_curve,
+                        linewidth=main_lw,
+                        color=line_color,
+                        label=f"{labels[recording_index]} (filtered {curve_filter_legend})",
+                    )
+                    ax_zoom.plot(t_rel[zmask], raw_curve[zmask], linewidth=raw_lw, color=line_color, alpha=raw_alpha)
+                    ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=main_lw, color=line_color, label=labels[recording_index])
                 else:
-                    ax_full.plot(t_rel, recording_curve, linewidth=1.2, color=line_color, label=labels[recording_index])
-                    ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=1.3, color=line_color, label=labels[recording_index])
+                    ax_full.plot(t_rel, recording_curve, linewidth=base_lw, color=line_color, label=labels[recording_index])
+                    ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=main_lw, color=line_color, label=labels[recording_index])
             ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             for v in end_markers:
                 ax_full.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
@@ -1467,7 +1612,7 @@ def plot_channel_multi_comparison(
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
-            ax_full.legend(loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=4, fontsize=LEGEND_FONT_SIZE)
+            ax_full.legend(loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=legend_cols, fontsize=legend_font)
 
             if any(curve is not None for curve in first_trigger_curves):
                 for recording_index, first_curve in enumerate(first_trigger_curves):
@@ -1477,7 +1622,7 @@ def plot_channel_multi_comparison(
                     ax_first_trigger.plot(
                         t_rel,
                         first_curve,
-                        linewidth=1.1,
+                        linewidth=first_lw,
                         color=line_color,
                         label=f"{labels[recording_index]} first trigger raw",
                     )
@@ -1512,7 +1657,7 @@ def plot_channel_multi_comparison(
             _plot_rms_series(
                 ax_full_rms,
                 rms_series_full_multi,
-                "Part 1 — RMS evolution (full window)",
+                f"Part 1 — RMS evolution (RMS time window = {rms_window_s:g} s)",
                 x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
             )
 
@@ -1530,7 +1675,7 @@ def plot_channel_multi_comparison(
                     ax_zoom_first.plot(
                         t_rel[zmask],
                         first_curve[zmask],
-                        linewidth=1.2,
+                        linewidth=first_lw,
                         color=line_color,
                         label=f"{labels[recording_index]} first trigger raw",
                     )
@@ -1548,7 +1693,7 @@ def plot_channel_multi_comparison(
             _plot_rms_series(
                 ax_zoom_rms,
                 rms_series_zoom_multi,
-                f"Part 2 — RMS evolution (window [{zoom_t0:.3f}, {zoom_t1:.3f}] s)",
+                f"Part 2 — RMS evolution (RMS time window = {rms_window_s:g} s)",
                 x_limits=(zoom_t0, zoom_t1),
             )
 
@@ -1562,10 +1707,10 @@ def plot_channel_multi_comparison(
                     line_color = colors[recording_index % len(colors)]
                     if show_filtered_and_raw and means_raw_ch is not None:
                         raw_curve = np.asarray(means_raw_ch[recording_index])
-                        ax_zoom_end.plot(t_rel[end_mask], raw_curve[end_mask], linewidth=1.05, color=line_color, alpha=0.35)
-                        ax_zoom_end.plot(t_rel[end_mask], recording_curve[end_mask], linewidth=1.35, color=line_color, label=labels[recording_index])
+                        ax_zoom_end.plot(t_rel[end_mask], raw_curve[end_mask], linewidth=raw_lw, color=line_color, alpha=raw_alpha)
+                        ax_zoom_end.plot(t_rel[end_mask], recording_curve[end_mask], linewidth=main_lw, color=line_color, label=labels[recording_index])
                     else:
-                        ax_zoom_end.plot(t_rel[end_mask], recording_curve[end_mask], linewidth=1.35, color=line_color, label=labels[recording_index])
+                        ax_zoom_end.plot(t_rel[end_mask], recording_curve[end_mask], linewidth=main_lw, color=line_color, label=labels[recording_index])
                 ax_zoom_end.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
                 for v in end_markers:
                     ax_zoom_end.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
@@ -1582,7 +1727,7 @@ def plot_channel_multi_comparison(
                         ax_zoom_end_first.plot(
                             t_rel[end_mask],
                             first_curve[end_mask],
-                            linewidth=1.2,
+                            linewidth=first_lw,
                             color=line_color,
                             label=f"{labels[recording_index]} first trigger raw",
                         )
@@ -1599,7 +1744,7 @@ def plot_channel_multi_comparison(
                 _plot_rms_series(
                     ax_zoom_end_rms,
                     rms_series_zoom_end_multi,
-                    f"Part 3 — RMS evolution (window [{end_zoom_t0:.3f}, {end_zoom_t1:.3f}] s)",
+                    f"Part 3 — RMS evolution (RMS time window = {rms_window_s:g} s)",
                     x_limits=(end_zoom_t0, end_zoom_t1),
                 )
             else:
@@ -1620,18 +1765,18 @@ def plot_channel_multi_comparison(
                 ]
                 _draw_spike_panels_multi_channel(
                     ax_raster_f, ax_fr_f, ax_trial_fr_f, ax_isi_f, None, t_rel, float(fs), spike_threshold_uv,
-                    firing_rate_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
+                    psth_bin_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
                     t_range_s=None, spikes_per_recording=st_list, sampling_percent=sampling_percent,
                 )
                 _draw_spike_panels_multi_channel(
                     ax_raster_z, ax_fr_z, ax_trial_fr_z, ax_isi_z, None, t_rel, float(fs), spike_threshold_uv,
-                    firing_rate_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
+                    psth_bin_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
                     t_range_s=(zoom_t0, zoom_t1), spikes_per_recording=st_list, sampling_percent=sampling_percent,
                 )
                 if end_zoom_range is not None:
                     _draw_spike_panels_multi_channel(
                         ax_raster_ze, ax_fr_ze, ax_trial_fr_ze, ax_isi_ze, None, t_rel, float(fs), spike_threshold_uv,
-                        firing_rate_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
+                        psth_bin_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
                         t_range_s=end_zoom_range, section_title="Trigger-end zoom", spikes_per_recording=st_list, sampling_percent=sampling_percent,
                     )
                 else:
@@ -1741,12 +1886,15 @@ def plot_channel_averages(
     rhs_file: Path,
     pdf_title: Optional[str] = None,
     lowpass_cutoff_hz: Optional[float] = None,
+    curve_filter: str = "no filter",
+    curve_filter_low_hz: Optional[float] = None,
+    curve_filter_high_hz: Optional[float] = None,
     trigger_end_rising_rel_s: Optional[float] = None,
     windows: Optional[np.ndarray] = None,
     spike_source: Optional[AmplifierSpikeSource] = None,
     fs: Optional[float] = None,
     spike_threshold_uv: float = -40.0,
-    firing_rate_window_s: float = 0.025,
+    psth_bin_window_s: float = 0.025,
     rms_window_s: float = 0.050,
     zoom_t0_s: float = ZOOM_T0,
     zoom_t1_s: float = ZOOM_T1,
@@ -1775,14 +1923,15 @@ def plot_channel_averages(
     pdf_path = output_dir / pdf_name
 
     zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
-    filt_note = (
-        f" — Butterworth low-pass {lowpass_cutoff_hz:g} Hz"
-        if lowpass_cutoff_hz is not None
-        else ""
+    curve_filter_enabled, filt_note, curve_filter_legend = _curve_filter_captions(
+        curve_filter=curve_filter,
+        curve_filter_low_hz=curve_filter_low_hz,
+        curve_filter_high_hz=curve_filter_high_hz,
+        lowpass_cutoff_hz=lowpass_cutoff_hz,
     )
     both_note = (
         " — raw signal overlaid (filtered curve emphasized)"
-        if lowpass_cutoff_hz is not None
+        if curve_filter_enabled
         else ""
     )
     zoom_title = (
@@ -1798,9 +1947,14 @@ def plot_channel_averages(
         spike_source is not None or (windows is not None and getattr(windows, "ndim", 0) == 3)
     )
     _, spike_pipe_detail = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
+    psth_effective_window_s = (
+        max(float(psth_bin_window_s), 1.0 / float(fs))
+        if fs is not None and float(fs) > 0
+        else float(psth_bin_window_s)
+    )
     spike_note = (
         f" — spikes ({spike_pipe_detail}): {_spike_threshold_caption(spike_threshold_uv)}, "
-        f"FR smoothing σ={firing_rate_window_s:g} s"
+        f"PSTH time window={psth_effective_window_s:g} s"
         if _has_spike_data
         else ""
     )
@@ -1874,7 +2028,7 @@ def plot_channel_averages(
                     1.60,
                     1.30,
                     1.20,
-                    1.15,
+                    1.45,
                     1.05,
                     1.15,
                     0.06,
@@ -1882,7 +2036,7 @@ def plot_channel_averages(
                     1.50,
                     1.20,
                     1.30,
-                    1.15,
+                    1.45,
                     1.05,
                     1.15,
                     0.06,
@@ -1890,7 +2044,7 @@ def plot_channel_averages(
                     1.50,
                     1.20,
                     1.30,
-                    1.15,
+                    1.45,
                     1.05,
                     1.15,
                 ],
@@ -1965,7 +2119,7 @@ def plot_channel_averages(
                 if first_trial_window.shape[0] == t_rel.shape[0]:
                     channel_first_trigger_raw = first_trial_window
             show_filtered_and_raw = (
-                lowpass_cutoff_hz is not None
+                curve_filter_enabled
                 and mean_per_channel_raw is not None
                 and channel_mean_raw is not None
                 and not np.allclose(channel_mean, channel_mean_raw, rtol=0.0, atol=1e-9)
@@ -1985,7 +2139,7 @@ def plot_channel_averages(
                     channel_mean,
                     linewidth=1.35,
                     color="C0",
-                    label=f"Mean (filtered, {lowpass_cutoff_hz:g} Hz)",
+                    label=f"Mean (filtered, {curve_filter_legend})",
                     zorder=2,
                 )
             else:
@@ -2069,7 +2223,7 @@ def plot_channel_averages(
             _plot_rms_series(
                 ax_full_rms,
                 rms_series_full,
-                "Part 1 — RMS evolution (full window)",
+                f"Part 1 — RMS evolution (RMS time window = {rms_window_s:g} s)",
                 x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
             )
 
@@ -2088,7 +2242,7 @@ def plot_channel_averages(
                     channel_mean[zmask],
                     linewidth=1.45,
                     color="C0",
-                    label=f"Filtered ({lowpass_cutoff_hz:g} Hz)",
+                    label=f"Filtered ({curve_filter_legend})",
                 )
             else:
                 ax_zoom.plot(t_rel[zmask], channel_mean[zmask], linewidth=1.4, color="C0")
@@ -2141,7 +2295,7 @@ def plot_channel_averages(
             _plot_rms_series(
                 ax_zoom_rms,
                 rms_series_zoom,
-                f"Part 2 — RMS evolution (window [{zoom_t0:.3f}, {zoom_t1:.3f}] s)",
+                f"Part 2 — RMS evolution (RMS time window = {rms_window_s:g} s)",
                 x_limits=(zoom_t0, zoom_t1),
             )
             end_zoom_range: tuple[float, float] | None = None
@@ -2152,7 +2306,13 @@ def plot_channel_averages(
                 end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
                 if show_filtered_and_raw and channel_mean_raw is not None:
                     ax_zoom_end.plot(t_rel[end_mask], channel_mean_raw[end_mask], linewidth=1.15, color="0.35", alpha=0.85, label="Unfiltered")
-                    ax_zoom_end.plot(t_rel[end_mask], channel_mean[end_mask], linewidth=1.45, color="C0", label=f"Filtered ({lowpass_cutoff_hz:g} Hz)")
+                    ax_zoom_end.plot(
+                        t_rel[end_mask],
+                        channel_mean[end_mask],
+                        linewidth=1.45,
+                        color="C0",
+                        label=f"Filtered ({curve_filter_legend})",
+                    )
                 else:
                     ax_zoom_end.plot(t_rel[end_mask], channel_mean[end_mask], linewidth=1.4, color="C0")
                 ax_zoom_end.axvline(trigger_end_rising_rel_s, linestyle="--", linewidth=1.0, color="darkorange")
@@ -2190,7 +2350,7 @@ def plot_channel_averages(
                 _plot_rms_series(
                     ax_zoom_end_rms,
                     rms_series_zoom_end,
-                    f"Part 3 — RMS evolution (window [{end_zoom_t0:.3f}, {end_zoom_t1:.3f}] s)",
+                    f"Part 3 — RMS evolution (RMS time window = {rms_window_s:g} s)",
                     x_limits=(end_zoom_t0, end_zoom_t1),
                 )
             else:
@@ -2225,7 +2385,7 @@ def plot_channel_averages(
                     t_rel,
                     float(fs),
                     spike_threshold_uv,
-                    firing_rate_window_s,
+                    psth_bin_window_s,
                     spike_bandpass_low_hz,
                     spike_bandpass_high_hz,
                     t_range_s=None,
@@ -2241,7 +2401,7 @@ def plot_channel_averages(
                     t_rel,
                     float(fs),
                     spike_threshold_uv,
-                    firing_rate_window_s,
+                    psth_bin_window_s,
                     spike_bandpass_low_hz,
                     spike_bandpass_high_hz,
                     t_range_s=(zoom_t0, zoom_t1),
@@ -2258,7 +2418,7 @@ def plot_channel_averages(
                         t_rel,
                         float(fs),
                         spike_threshold_uv,
-                        firing_rate_window_s,
+                        psth_bin_window_s,
                         spike_bandpass_low_hz,
                         spike_bandpass_high_hz,
                         t_range_s=end_zoom_range,
@@ -2406,6 +2566,9 @@ def plot_channel_comparison(
     label_b: str,
     pdf_title: Optional[str] = None,
     lowpass_cutoff_hz: Optional[float] = None,
+    curve_filter: str = "no filter",
+    curve_filter_low_hz: Optional[float] = None,
+    curve_filter_high_hz: Optional[float] = None,
     trigger_end_rising_rel_s_a: Optional[float] = None,
     trigger_end_rising_rel_s_b: Optional[float] = None,
     mean_a_raw: Optional[np.ndarray] = None,
@@ -2414,7 +2577,7 @@ def plot_channel_comparison(
     spike_source_b: Optional[AmplifierSpikeSource] = None,
     fs: Optional[float] = None,
     spike_threshold_uv: float = -40.0,
-    firing_rate_window_s: float = 0.025,
+    psth_bin_window_s: float = 0.025,
     rms_window_s: float = 0.050,
     zoom_t0_s: float = ZOOM_T0,
     zoom_t1_s: float = ZOOM_T1,
@@ -2438,14 +2601,15 @@ def plot_channel_comparison(
     pdf_path = output_dir / pdf_name
 
     zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
-    filt_note = (
-        f" — Butterworth low-pass {lowpass_cutoff_hz:g} Hz"
-        if lowpass_cutoff_hz is not None
-        else ""
+    curve_filter_enabled, filt_note, curve_filter_legend = _curve_filter_captions(
+        curve_filter=curve_filter,
+        curve_filter_low_hz=curve_filter_low_hz,
+        curve_filter_high_hz=curve_filter_high_hz,
+        lowpass_cutoff_hz=lowpass_cutoff_hz,
     )
     both_note = (
         " — raw signal overlaid (filtered curve emphasized)"
-        if lowpass_cutoff_hz is not None
+        if curve_filter_enabled
         else ""
     )
     zoom_title = f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){filt_note}{both_note}"
@@ -2512,7 +2676,7 @@ def plot_channel_comparison(
             channel_mean_a_raw = mean_a_raw[ch] if mean_a_raw is not None else None
             channel_mean_b_raw = mean_b_raw[ch] if mean_b_raw is not None else None
             show_filtered_and_raw = (
-                lowpass_cutoff_hz is not None
+                curve_filter_enabled
                 and channel_mean_a_raw is not None
                 and channel_mean_b_raw is not None
                 and (
@@ -2543,7 +2707,7 @@ def plot_channel_comparison(
             gs = fig.add_gridspec(
                 24,
                 1,
-                height_ratios=[0.06, 1.70, 1.60, 1.30, 1.20, 1.15, 1.05, 1.15, 0.06, 1.70, 1.50, 1.20, 1.30, 1.15, 1.05, 1.15, 0.06, 1.70, 1.50, 1.20, 1.30, 1.15, 1.05, 1.15],
+                height_ratios=[0.06, 1.70, 1.60, 1.30, 1.20, 1.45, 1.05, 1.15, 0.06, 1.70, 1.50, 1.20, 1.30, 1.45, 1.05, 1.15, 0.06, 1.70, 1.50, 1.20, 1.30, 1.45, 1.05, 1.15],
                 hspace=0.70,
             )
             ax_hdr1 = fig.add_subplot(gs[0, 0])
@@ -2625,14 +2789,14 @@ def plot_channel_comparison(
                     channel_mean_a,
                     linewidth=1.35,
                     color="C0",
-                    label=f"{label_a} (filtered {lowpass_cutoff_hz:g} Hz)",
+                    label=f"{label_a} (filtered {curve_filter_legend})",
                 )
                 ax_full.plot(
                     t_rel,
                     channel_mean_b,
                     linewidth=1.35,
                     color="C1",
-                    label=f"{label_b} (filtered {lowpass_cutoff_hz:g} Hz)",
+                    label=f"{label_b} (filtered {curve_filter_legend})",
                 )
             else:
                 ax_full.plot(t_rel, channel_mean_a, linewidth=1.2, color="C0", label=label_a)
@@ -2742,7 +2906,7 @@ def plot_channel_comparison(
             _plot_rms_series(
                 ax_full_rms,
                 [(label_a, rms_full_a[0], rms_full_a[1]), (label_b, rms_full_b[0], rms_full_b[1])],
-                "Part 1 — RMS evolution (full window)",
+                f"Part 1 — RMS evolution (RMS time window = {rms_window_s:g} s)",
                 x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
             )
 
@@ -2834,7 +2998,7 @@ def plot_channel_comparison(
             _plot_rms_series(
                 ax_zoom_rms,
                     [(label_a, rms_zoom_a[0], rms_zoom_a[1]), (label_b, rms_zoom_b[0], rms_zoom_b[1])],
-                f"Part 2 — RMS evolution (window [{zoom_t0:.3f}, {zoom_t1:.3f}] s)",
+                f"Part 2 — RMS evolution (RMS time window = {rms_window_s:g} s)",
                 x_limits=(zoom_t0, zoom_t1),
             )
             end_zoom_range: tuple[float, float] | None = None
@@ -2888,7 +3052,7 @@ def plot_channel_comparison(
                 _plot_rms_series(
                     ax_zoom_end_rms,
                     [(label_a, rms_end_a[0], rms_end_a[1]), (label_b, rms_end_b[0], rms_end_b[1])],
-                    f"Part 3 — RMS evolution (window [{end_zoom_t0:.3f}, {end_zoom_t1:.3f}] s)",
+                    f"Part 3 — RMS evolution (RMS time window = {rms_window_s:g} s)",
                     x_limits=(end_zoom_t0, end_zoom_t1),
                 )
             else:
@@ -2914,7 +3078,7 @@ def plot_channel_comparison(
                     t_rel,
                     float(fs),
                     spike_threshold_uv,
-                    firing_rate_window_s,
+                    psth_bin_window_s,
                     label_a,
                     label_b,
                     spike_bandpass_low_hz,
@@ -2934,7 +3098,7 @@ def plot_channel_comparison(
                     t_rel,
                     float(fs),
                     spike_threshold_uv,
-                    firing_rate_window_s,
+                    psth_bin_window_s,
                     label_a,
                     label_b,
                     spike_bandpass_low_hz,
@@ -2955,7 +3119,7 @@ def plot_channel_comparison(
                         t_rel,
                         float(fs),
                         spike_threshold_uv,
-                        firing_rate_window_s,
+                        psth_bin_window_s,
                         label_a,
                         label_b,
                         spike_bandpass_low_hz,
