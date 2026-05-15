@@ -53,7 +53,6 @@ def launch_qt_gui(
             QMessageBox,
             QProgressBar,
             QPushButton,
-            QTabWidget,
             QTextEdit,
             QVBoxLayout,
             QWidget,
@@ -96,49 +95,26 @@ def launch_qt_gui(
     window.setWindowTitle("Intan RHS Trigger Plotter")
     window.resize(860, 720)
 
-    # Tabs (files only)
-    tabs = QTabWidget()
-
-    tab_single = QWidget()
-    single_layout = QVBoxLayout(tab_single)
-    rhs_path_edit = QLineEdit()
-    browse_rhs_btn = QPushButton("Browse...")
-    rhs_row = QHBoxLayout()
-    rhs_row.addWidget(rhs_path_edit)
-    rhs_row.addWidget(browse_rhs_btn)
-    fl_single = QFormLayout()
-    fl_single.addRow("RHS file:", rhs_row)
-    single_layout.addLayout(fl_single)
-    run_btn = QPushButton("Run analysis")
-    single_layout.addWidget(run_btn)
-    tabs.addTab(tab_single, "Analysis")
-
-    tab_compare = QWidget()
-    compare_layout = QVBoxLayout(tab_compare)
+    # Unified files panel (1+ recordings), no tabs.
+    files_panel = QWidget()
+    compare_layout = QVBoxLayout(files_panel)
     rhs1_edit = QLineEdit()
-    rhs2_edit = QLineEdit()
     browse1_btn = QPushButton("Browse...")
-    browse2_btn = QPushButton("Browse...")
     add_rhs_field_btn = QPushButton("Add file")
     row1 = QHBoxLayout()
     row1.addWidget(rhs1_edit)
     row1.addWidget(browse1_btn)
-    row2 = QHBoxLayout()
-    row2.addWidget(rhs2_edit)
-    row2.addWidget(browse2_btn)
     extra_files_widget = QWidget()
     extra_files_layout = QVBoxLayout(extra_files_widget)
     extra_files_layout.setContentsMargins(0, 0, 0, 0)
     extra_files_layout.setSpacing(6)
     fl_cmp = QFormLayout()
-    fl_cmp.addRow("Recording 1 (.rhs):", row1)
-    fl_cmp.addRow("Recording 2 (.rhs):", row2)
+    fl_cmp.addRow("Recording (.rhs):", row1)
     fl_cmp.addRow("", add_rhs_field_btn)
-    fl_cmp.addRow("Extra recordings (.rhs):", extra_files_widget)
+    fl_cmp.addRow("Additional recordings (.rhs):", extra_files_widget)
     compare_layout.addLayout(fl_cmp)
-    run_compare_btn = QPushButton("Compare recordings")
+    run_compare_btn = QPushButton("Run analysis")
     compare_layout.addWidget(run_compare_btn)
-    tabs.addTab(tab_compare, "Comparison")
 
     # Shared parameters
     edge_combo = QComboBox()
@@ -309,7 +285,7 @@ def launch_qt_gui(
     params_stack_layout.addWidget(general_group)
     params_stack_layout.addWidget(spike_group)
 
-    status_label = QLabel("Choose a tab, one or more .rhs files, then run.")
+    status_label = QLabel("Choose one or more .rhs files, then run.")
     log_view = QTextEdit()
     log_view.setReadOnly(True)
     log_view.setPlaceholderText("Execution logs appear here...")
@@ -331,7 +307,7 @@ def launch_qt_gui(
     progress_row.addWidget(stop_btn)
 
     main_layout = QVBoxLayout()
-    main_layout.addWidget(tabs)
+    main_layout.addWidget(files_panel)
     main_layout.addWidget(params_stack)
     main_layout.addLayout(progress_row)
     main_layout.addWidget(status_label)
@@ -457,21 +433,15 @@ def launch_qt_gui(
 
     def _suggest_pdf_title() -> str:
         """Build a PDF title string from the selected RHS file paths."""
-        p_single = rhs_path_edit.text().strip()
         compare_paths = []
         p1 = rhs1_edit.text().strip()
-        p2 = rhs2_edit.text().strip()
         if p1:
             compare_paths.append(p1)
-        if p2:
-            compare_paths.append(p2)
         for edit in extra_rhs_edits:
             p = edit.text().strip()
             if p:
                 compare_paths.append(p)
 
-        if p_single:
-            return Path(p_single).stem
         if len(compare_paths) >= 2:
             return f"{Path(compare_paths[0]).stem}_vs_{len(compare_paths) - 1}_autres"
         if len(compare_paths) == 1:
@@ -482,17 +452,6 @@ def launch_qt_gui(
         suggested = _suggest_pdf_title()
         pdf_title_edit.setText(suggested)
 
-    def browse_rhs() -> None:
-        selected, _ = QFileDialog.getOpenFileName(
-            window,
-            "Select Intan RHS file",
-            "",
-            "Intan RHS files (*.rhs);;All files (*)",
-        )
-        if selected:
-            rhs_path_edit.setText(selected)
-            refresh_pdf_title()
-
     def browse_rhs1() -> None:
         selected, _ = QFileDialog.getOpenFileName(
             window,
@@ -502,17 +461,6 @@ def launch_qt_gui(
         )
         if selected:
             rhs1_edit.setText(selected)
-            refresh_pdf_title()
-
-    def browse_rhs2() -> None:
-        selected, _ = QFileDialog.getOpenFileName(
-            window,
-            "Recording 2 — RHS file",
-            "",
-            "Intan RHS files (*.rhs);;All files (*)",
-        )
-        if selected:
-            rhs2_edit.setText(selected)
             refresh_pdf_title()
 
     extra_rhs_edits: list[QLineEdit] = []
@@ -612,11 +560,8 @@ def launch_qt_gui(
     def set_busy(running: bool) -> None:
         progress.setVisible(running)
         stop_btn.setEnabled(running)
-        run_btn.setEnabled(not running)
         run_compare_btn.setEnabled(not running)
-        browse_rhs_btn.setEnabled(not running)
         browse1_btn.setEnabled(not running)
-        browse2_btn.setEnabled(not running)
         add_rhs_field_btn.setEnabled(not running)
         for btn in extra_rhs_browse_buttons:
             btn.setEnabled(not running)
@@ -646,67 +591,33 @@ def launch_qt_gui(
         sampling_percent_edit.setEnabled(not running)
         probe_layout_json_edit.setEnabled(not running)
         browse_probe_json_btn.setEnabled(not running)
-        tabs.setEnabled(not running)
 
-    def on_analysis_ok(output: str) -> None:
+    def _finalize_thread_idle() -> None:
         nonlocal analysis_thread
         set_busy(False)
         if analysis_thread is not None:
             analysis_thread.deleteLater()
         analysis_thread = None
-        if output:
-            append_log(output.replace("\n", "<br>"))
-        total_m = re.search(r"Total triggers detected: (\d+)", output)
-        used_m = re.search(r"Triggers used for average: (\d+)", output)
-        if total_m and used_m:
-            n_tot, n_used = total_m.group(1), used_m.group(1)
-            status_label.setText(
-                f"Done — {n_tot} trigger(s) detected, {n_used} used for average."
-            )
-            append_log(f"Summary: {n_tot} trigger(s) total, {n_used} used for average.")
-            QMessageBox.information(
-                window,
-                "Success",
-                f"Analysis completed.\n\n"
-                f"Total triggers detected: {n_tot}\n"
-                f"Triggers used for average: {n_used}",
-            )
-        else:
-            status_label.setText("Analysis completed successfully.")
-            append_log("Analysis completed successfully.")
-            QMessageBox.information(window, "Success", "Analysis completed.")
 
     def on_compare_ok(output: str) -> None:
-        nonlocal analysis_thread
-        set_busy(False)
-        if analysis_thread is not None:
-            analysis_thread.deleteLater()
-        analysis_thread = None
+        _finalize_thread_idle()
         if output:
             append_log(output.replace("\n", "<br>"))
-        pdf_m = re.search(r"Comparison PDF written: (.+)", output)
+        pdf_m = re.search(r"(?:Comparison )?PDF written: (.+)", output)
         if pdf_m:
-            status_label.setText(f"Comparison completed — {pdf_m.group(1)}")
+            status_label.setText(f"Processing completed — {pdf_m.group(1)}")
         else:
-            status_label.setText("Comparison completed.")
-        QMessageBox.information(window, "Success", "Comparison completed. See log for PDF path.")
+            status_label.setText("Processing completed.")
+        QMessageBox.information(window, "Success", "Processing completed. See log for PDF path.")
 
     def on_analysis_err(msg: str) -> None:
-        nonlocal analysis_thread
-        set_busy(False)
-        if analysis_thread is not None:
-            analysis_thread.deleteLater()
-        analysis_thread = None
+        _finalize_thread_idle()
         status_label.setText("Failed.")
         append_log(f"Error: {msg}")
         QMessageBox.critical(window, "Error", msg)
 
     def on_interrupted(msg: str) -> None:
-        nonlocal analysis_thread
-        set_busy(False)
-        if analysis_thread is not None:
-            analysis_thread.deleteLater()
-        analysis_thread = None
+        _finalize_thread_idle()
         status_label.setText("Processing interrupted.")
         append_log(msg)
 
@@ -715,186 +626,120 @@ def launch_qt_gui(
             append_log("Stop requested — waiting for safe checkpoints...")
             analysis_thread.request_stop()
 
-    def run_analysis() -> None:
-        nonlocal analysis_thread
-        if analysis_thread is not None and analysis_thread.isRunning():
-            return
-        try:
-            rhs_file_path_text = rhs_path_edit.text().strip()
-            if not rhs_file_path_text:
-                raise ValueError("Choose an RHS file.")
-            trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
-                build_shared_params()
-            )
-            if psth_bin_window_s <= 0:
-                raise ValueError("PSTH time window (s) must be > 0.")
-            probe_layout_path = resolve_probe_layout_json_param()
-            config = AnalysisConfig(
-                rhs_file=Path(rhs_file_path_text),
-                threshold=trigger_threshold,
-                edge=edge_mode,
-                pre_s=pre_window_s,
-                post_s=post_window_s,
-                lowpass_cutoff_hz=curve_filter_low_hz if curve_filter_kind == "lowpass" else None,
-                curve_filter=curve_filter_kind,  # type: ignore[arg-type]
-                curve_filter_low_hz=curve_filter_low_hz,
-                curve_filter_high_hz=curve_filter_high_hz,
-                save_dir=save_dir_path,
-                pdf_title=pdf_title,
-                spike_threshold_uv=spike_threshold_uv,
-                psth_bin_window_s=psth_bin_window_s,
-                rms_window_s=rms_window_s,
-                zoom_t0_s=zoom_start_s,
-                zoom_t1_s=zoom_end_s,
-                spike_bandpass_low_hz=bandpass_low_hz,
-                spike_bandpass_high_hz=bandpass_high_hz,
-                work_dir=work_dir_path,
-                keep_intermediate_files=keep_work_files,
-                channel_workers=channel_worker_count,
-                lightweight_plot=lightweight_mode_enabled,
-                sampling_percent=sampling_percent,
-                probe_layout_json=probe_layout_path,
-            )
-        except ValueError as exc:
-            append_log(f"Error: {exc}")
-            QMessageBox.warning(window, "Validation", str(exc))
-            return
-        except Exception as exc:
-            append_log(f"Error: {exc}")
-            QMessageBox.critical(window, "Error", str(exc))
-            return
+    def _dedupe_paths(paths: list[str]) -> list[str]:
+        unique_paths: list[str] = []
+        resolved_seen_paths: set[str] = set()
+        for candidate_path in paths:
+            resolved_path = str(Path(candidate_path).resolve())
+            if resolved_path not in resolved_seen_paths:
+                resolved_seen_paths.add(resolved_path)
+                unique_paths.append(candidate_path)
+        return unique_paths
 
-        def task() -> None:
-            run_callback(config)
-
-        thread = AnalysisThread(task)
-        thread.finished_ok.connect(on_analysis_ok)
-        thread.finished_err.connect(on_analysis_err)
-        thread.finished_interrupted.connect(on_interrupted)
-
-        status_label.setText("Analysis running...")
-        append_log(f"Starting analysis: {config.rhs_file}")
-        output_dir = config.save_dir if config.save_dir is not None else config.rhs_file.parent
-        append_log(f"PDF will be saved to: {output_dir}")
-
-        analysis_thread = thread
-        set_busy(True)
-        thread.start()
-
-    def run_compare() -> None:
-        nonlocal analysis_thread
-        if analysis_thread is not None and analysis_thread.isRunning():
-            return
-        try:
-            selected_paths: list[str] = []
-            recording_path_1 = rhs1_edit.text().strip()
-            recording_path_2 = rhs2_edit.text().strip()
-            if recording_path_1:
-                selected_paths.append(recording_path_1)
-            if recording_path_2:
-                selected_paths.append(recording_path_2)
-            for edit in extra_rhs_edits:
-                path_value = edit.text().strip()
-                if path_value:
-                    selected_paths.append(path_value)
-            unique_paths: list[str] = []
-            resolved_seen_paths: set[str] = set()
-            for candidate_path in selected_paths:
-                resolved_path = str(Path(candidate_path).resolve())
-                if resolved_path not in resolved_seen_paths:
-                    resolved_seen_paths.add(resolved_path)
-                    unique_paths.append(candidate_path)
-            if len(unique_paths) < 2:
-                raise ValueError("Add at least two RHS files for comparison.")
-            trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
-                build_shared_params()
-            )
-            if psth_bin_window_s <= 0:
-                raise ValueError("PSTH time window (s) must be > 0.")
-            probe_layout_path = resolve_probe_layout_json_param()
-            configs_to_compare: list[AnalysisConfig] = []
-            for rhs_path in unique_paths:
-                configs_to_compare.append(
-                    AnalysisConfig(
-                        rhs_file=Path(rhs_path),
-                        threshold=trigger_threshold,
-                        edge=edge_mode,
-                        pre_s=pre_window_s,
-                        post_s=post_window_s,
-                        lowpass_cutoff_hz=curve_filter_low_hz if curve_filter_kind == "lowpass" else None,
-                        curve_filter=curve_filter_kind,  # type: ignore[arg-type]
-                        curve_filter_low_hz=curve_filter_low_hz,
-                        curve_filter_high_hz=curve_filter_high_hz,
-                        save_dir=save_dir_path,
-                        pdf_title=pdf_title,
-                        spike_threshold_uv=spike_threshold_uv,
-                        psth_bin_window_s=psth_bin_window_s,
-                        rms_window_s=rms_window_s,
-                        zoom_t0_s=zoom_start_s,
-                        zoom_t1_s=zoom_end_s,
-                        spike_bandpass_low_hz=bandpass_low_hz,
-                        spike_bandpass_high_hz=bandpass_high_hz,
-                        work_dir=work_dir_path,
-                        keep_intermediate_files=keep_work_files,
-                        channel_workers=channel_worker_count,
-                        lightweight_plot=lightweight_mode_enabled,
-                        sampling_percent=sampling_percent,
-                        probe_layout_json=probe_layout_path,
-                    )
+    def _build_configs_from_paths(paths: list[str]) -> list[AnalysisConfig]:
+        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
+            build_shared_params()
+        )
+        if psth_bin_window_s <= 0:
+            raise ValueError("PSTH time window (s) must be > 0.")
+        probe_layout_path = resolve_probe_layout_json_param()
+        configs: list[AnalysisConfig] = []
+        for rhs_path in paths:
+            configs.append(
+                AnalysisConfig(
+                    rhs_file=Path(rhs_path),
+                    threshold=trigger_threshold,
+                    edge=edge_mode,
+                    pre_s=pre_window_s,
+                    post_s=post_window_s,
+                    lowpass_cutoff_hz=curve_filter_low_hz if curve_filter_kind == "lowpass" else None,
+                    curve_filter=curve_filter_kind,  # type: ignore[arg-type]
+                    curve_filter_low_hz=curve_filter_low_hz,
+                    curve_filter_high_hz=curve_filter_high_hz,
+                    save_dir=save_dir_path,
+                    pdf_title=pdf_title,
+                    spike_threshold_uv=spike_threshold_uv,
+                    psth_bin_window_s=psth_bin_window_s,
+                    rms_window_s=rms_window_s,
+                    zoom_t0_s=zoom_start_s,
+                    zoom_t1_s=zoom_end_s,
+                    spike_bandpass_low_hz=bandpass_low_hz,
+                    spike_bandpass_high_hz=bandpass_high_hz,
+                    work_dir=work_dir_path,
+                    keep_intermediate_files=keep_work_files,
+                    channel_workers=channel_worker_count,
+                    lightweight_plot=lightweight_mode_enabled,
+                    sampling_percent=sampling_percent,
+                    probe_layout_json=probe_layout_path,
                 )
-        except ValueError as exc:
-            append_log(f"Error: {exc}")
-            QMessageBox.warning(window, "Validation", str(exc))
-            return
-        except Exception as exc:
-            append_log(f"Error: {exc}")
-            QMessageBox.critical(window, "Error", str(exc))
+            )
+        return configs
+
+    def _start_batch_processing(configs: list[AnalysisConfig], source_label: str) -> None:
+        nonlocal analysis_thread
+        if analysis_thread is not None and analysis_thread.isRunning():
             return
 
         def task() -> None:
-            if len(configs_to_compare) == 2:
-                run_comparison_callback(configs_to_compare[0], configs_to_compare[1])
+            if run_multi_comparison_callback is not None:
+                run_multi_comparison_callback(configs)
                 return
-            if run_multi_comparison_callback is None:
-                raise RuntimeError(
-                    "Multi-file comparison unavailable in this build (missing backend)."
-                )
-            run_multi_comparison_callback(configs_to_compare)
+            # Backward fallback when unified callback is unavailable.
+            if len(configs) == 1:
+                run_callback(configs[0])
+                return
+            if len(configs) == 2:
+                run_comparison_callback(configs[0], configs[1])
+                return
+            raise RuntimeError("Multi-file processing unavailable in this build.")
 
         thread = AnalysisThread(task)
         thread.finished_ok.connect(on_compare_ok)
         thread.finished_err.connect(on_analysis_err)
         thread.finished_interrupted.connect(on_interrupted)
 
-        status_label.setText("Comparison running...")
-        if len(configs_to_compare) == 2:
-            append_log(f"Comparison: {configs_to_compare[0].rhs_file.name} vs {configs_to_compare[1].rhs_file.name}")
-        else:
-            append_log(
-                "Multi comparison: "
-                + " | ".join(cfg.rhs_file.name for cfg in configs_to_compare)
-            )
+        status_label.setText("Processing running...")
+        append_log(f"{source_label}: " + " | ".join(cfg.rhs_file.name for cfg in configs))
         output_dir = (
-            configs_to_compare[0].save_dir
-            if configs_to_compare[0].save_dir is not None
-            else configs_to_compare[0].rhs_file.parent
+            configs[0].save_dir
+            if configs[0].save_dir is not None
+            else configs[0].rhs_file.parent
         )
-        append_log(f"Comparison PDF folder: {output_dir}")
+        append_log(f"PDF folder: {output_dir}")
 
         analysis_thread = thread
         set_busy(True)
         thread.start()
 
-    browse_rhs_btn.clicked.connect(browse_rhs)
+    def run_compare() -> None:
+        try:
+            selected_paths: list[str] = []
+            recording_path_1 = rhs1_edit.text().strip()
+            if recording_path_1:
+                selected_paths.append(recording_path_1)
+            for edit in extra_rhs_edits:
+                path_value = edit.text().strip()
+                if path_value:
+                    selected_paths.append(path_value)
+            unique_paths = _dedupe_paths(selected_paths)
+            if len(unique_paths) < 1:
+                raise ValueError("Add at least one RHS file.")
+            configs_to_compare = _build_configs_from_paths(unique_paths)
+        except ValueError as exc:
+            append_log(f"Error: {exc}")
+            QMessageBox.warning(window, "Validation", str(exc))
+            return
+        except Exception as exc:
+            append_log(f"Error: {exc}")
+            QMessageBox.critical(window, "Error", str(exc))
+            return
+        _start_batch_processing(configs_to_compare, "Batch processing")
+
     browse1_btn.clicked.connect(browse_rhs1)
-    browse2_btn.clicked.connect(browse_rhs2)
     add_rhs_field_btn.clicked.connect(lambda: add_rhs_field(""))
     browse_save_btn.clicked.connect(browse_save_dir)
     browse_probe_json_btn.clicked.connect(browse_probe_layout_json)
-    rhs_path_edit.textChanged.connect(refresh_pdf_title)
     rhs1_edit.textChanged.connect(refresh_pdf_title)
-    rhs2_edit.textChanged.connect(refresh_pdf_title)
-    run_btn.clicked.connect(run_analysis)
     run_compare_btn.clicked.connect(run_compare)
     stop_btn.clicked.connect(on_stop_clicked)
     app.aboutToQuit.connect(stop_analysis_thread_on_exit)

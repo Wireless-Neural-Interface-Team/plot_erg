@@ -1330,9 +1330,9 @@ def plot_channel_multi_comparison(
     _profile_before = _profile_snapshot()
     _profile_t0 = time.perf_counter()
     n_records = len(labels)
-    if n_records < 2:
-        raise ValueError("plot_channel_multi_comparison requires at least 2 aligned recordings.")
-    if not streaming_mode and (len(means) < 2 or len(means) != n_records):
+    if n_records < 1:
+        raise ValueError("plot_channel_multi_comparison requires at least 1 aligned recording.")
+    if not streaming_mode and (len(means) < 1 or len(means) != n_records):
         raise ValueError("Non-streaming mode: `means` must contain N recordings.")
     if streaming_mode and (spike_sources is None or len(spike_sources) != n_records):
         raise ValueError("Streaming mode: `spike_sources` must contain N recordings.")
@@ -1452,14 +1452,14 @@ def plot_channel_multi_comparison(
             ]
             if impedance_sessions:
                 full_height_ratios = [*panel_height_ratios, 0.05, 0.95]
-                page_height_in = 56.0
+                page_height_in = 58.0
                 page_width_in, page_height_in = _scale_page_size_for_lightweight(
                     page_width_in, page_height_in, lightweight_mode
                 )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
                 gs = fig.add_gridspec(len(full_height_ratios), 1, height_ratios=full_height_ratios, hspace=0.70)
             else:
-                page_height_in = 52.0
+                page_height_in = 54.0
                 page_width_in, page_height_in = _scale_page_size_for_lightweight(
                     page_width_in, page_height_in, lightweight_mode
                 )
@@ -1528,6 +1528,7 @@ def plot_channel_multi_comparison(
             first_lw = 1.1 if not dense_overlay else 0.9
             legend_cols = 2 if len(means_ch) > 4 else min(4, max(1, len(means_ch)))
             legend_font = 9 if dense_overlay else LEGEND_FONT_SIZE
+            aux_legend_label = "_nolegend_" if dense_overlay else None
             rms_series_full_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
             rms_series_zoom_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
             rms_series_zoom_end_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
@@ -1599,20 +1600,55 @@ def plot_channel_multi_comparison(
                 else:
                     ax_full.plot(t_rel, recording_curve, linewidth=base_lw, color=line_color, label=labels[recording_index])
                     ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=main_lw, color=line_color, label=labels[recording_index])
-            ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
+            ax_full.axvline(
+                0.0,
+                linestyle="--",
+                linewidth=1.0,
+                color="red",
+                label=("Trigger (onset)" if aux_legend_label is None else aux_legend_label),
+            )
             for v in end_markers:
                 ax_full.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
                 ax_zoom.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
-            ax_full.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
+            ax_full.axvspan(
+                zoom_t0,
+                zoom_t1,
+                alpha=0.12,
+                color="green",
+                label=("Zoom region" if aux_legend_label is None else aux_legend_label),
+            )
             if end_markers:
                 end_zoom_t0 = float(min(end_markers) + zoom_t0)
                 end_zoom_t1 = float(max(end_markers) + zoom_t1)
-                ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom region")
+                ax_full.axvspan(
+                    end_zoom_t0,
+                    end_zoom_t1,
+                    alpha=0.10,
+                    color="gold",
+                    label=(
+                        "Trigger-end zoom region"
+                        if aux_legend_label is None
+                        else aux_legend_label
+                    ),
+                )
             ax_full.set_title(f"Multi-comparison — {channel_name} (full view){filt_note}{both_note}")
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
-            ax_full.legend(loc="upper center", bbox_to_anchor=(0.5, -0.28), ncol=legend_cols, fontsize=legend_font)
+            if dense_overlay:
+                ax_full.legend(
+                    loc="upper left",
+                    ncol=1,
+                    fontsize=legend_font,
+                    framealpha=0.85,
+                )
+            else:
+                ax_full.legend(
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, -0.28),
+                    ncol=legend_cols,
+                    fontsize=legend_font,
+                )
 
             if any(curve is not None for curve in first_trigger_curves):
                 for recording_index, first_curve in enumerate(first_trigger_curves):
@@ -2014,7 +2050,7 @@ def plot_channel_averages(
                     rms_series_zoom_end = [("RMS", tx_end, rms_zoom_end_vals)]
             page_width_in = 12.0
             mea_row_height_ratio = 1.60
-            page_height_in = 52.0
+            page_height_in = 54.0
             page_width_in, page_height_in = _scale_page_size_for_lightweight(
                 page_width_in, page_height_in, lightweight_mode
             )
@@ -2701,7 +2737,7 @@ def plot_channel_comparison(
                 if first_trigger_b_raw.shape[0] != t_rel.shape[0]:
                     first_trigger_b_raw = None
             page_width_in, page_height_in = _scale_page_size_for_lightweight(
-                12.0, 52.0, lightweight_mode
+                12.0, 54.0, lightweight_mode
             )
             fig = plt.figure(figsize=(page_width_in, page_height_in))
             gs = fig.add_gridspec(

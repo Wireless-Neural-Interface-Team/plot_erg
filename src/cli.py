@@ -30,7 +30,7 @@ from core import (
 )
 from gui import launch_qt_gui
 from impedance_tracking import collect_impedance_sessions
-from plotting import plot_channel_averages, plot_channel_comparison, plot_channel_multi_comparison
+from plotting import plot_channel_averages, plot_channel_multi_comparison
 from probe_layout import load_probe_layout_json
 
 
@@ -40,56 +40,6 @@ def _to_temp_mmap(arr: np.ndarray, folder: Path, name: str) -> np.ndarray:
     path = folder / f"{name}.npy"
     np.save(path, np.ascontiguousarray(arr, dtype=np.float32))
     return np.load(path, mmap_mode="r")
-
-
-def _compute_payload_for_comparison(config: AnalysisConfig) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    list[str],
-    int,
-    int,
-    float,
-    float | None,
-    np.ndarray,
-    np.ndarray,
-    int,
-    int,
-    str,
-]:
-    """Compute a serializable analysis payload for a separate worker process."""
-    worker_cfg = replace(config, keep_intermediate_files=True)
-    (
-        mean_per_channel,
-        t_rel,
-        channel_names,
-        n_valid,
-        n_total,
-        fs,
-        end_rising_s,
-        spike_src,
-        mean_per_channel_raw,
-    ) = compute_average_per_channel(worker_cfg)
-    try:
-        if spike_src.work_dir is None:
-            raise RuntimeError("Spike work dir not found for parallel comparison.")
-        amp_path = spike_src.work_dir / "amplifier_raw.npy"
-        return (
-            mean_per_channel,
-            t_rel,
-            channel_names,
-            n_valid,
-            n_total,
-            fs,
-            end_rising_s,
-            mean_per_channel_raw,
-            spike_src.valid_triggers.copy(),
-            int(spike_src.pre_n),
-            int(spike_src.post_n),
-            str(amp_path),
-        )
-    finally:
-        # Worker releases its mmap; the parent reloads its own mmap.
-        spike_src.close()
 
 
 def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple[
@@ -298,7 +248,7 @@ def run(config: AnalysisConfig) -> None:
         ) = compute_average_per_channel(config)
         check_analysis_cancelled()
         output_dir = config.save_dir if config.save_dir is not None else config.rhs_file.parent
-        curve_filter_kind, _, _ = resolve_curve_filter(config, fs)
+        curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(config, fs)
         curve_filter_enabled = curve_filter_kind != "no filter"
         with tempfile.TemporaryDirectory(prefix="plot_erg_means_") as temporary_dir:
             mmap_dir = Path(temporary_dir)
@@ -350,7 +300,6 @@ def run(config: AnalysisConfig) -> None:
             print(f"Mean delay to next rising edge (typical pulse end): {end_rising_s*1e3:.3f} ms")
         else:
             print("Next rising edge at threshold: not computed (no rising edge after triggers).")
-        curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(config, fs)
         if curve_filter_kind == "no filter":
             print("Butterworth curve filter: disabled")
         elif curve_filter_kind == "bandpass":
@@ -436,7 +385,7 @@ def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
 
 
 def run_multi_comparison(configs: list[AnalysisConfig]) -> None:
-    """Compare N recordings on the same plots (multi-trace overlay)."""
+    """Process N recordings on a unified multi-trace plotting pipeline."""
     pdf_path, stats = _run_streaming_comparison(configs, "multi comparison")
     print("--- Triggers per recording ---")
     for i, cfg in enumerate(configs):
@@ -477,8 +426,8 @@ def _autotune_config(cfg: AnalysisConfig, n_files: int) -> AnalysisConfig:
 
 
 def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tuple[Path, dict[str, object]]:
-    if len(configs) < 2:
-        raise ValueError("Multi-file comparison requires at least 2 recordings.")
+    if len(configs) < 1:
+        raise ValueError("At least 1 recording is required.")
     t0 = time.perf_counter()
     tuned = [_autotune_config(cfg, len(configs)) for cfg in configs]
     workers = max(1, int(tuned[0].comparison_workers))
