@@ -1457,14 +1457,14 @@ def plot_channel_multi_comparison(
                     page_width_in, page_height_in, lightweight_mode
                 )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
-                gs = fig.add_gridspec(len(full_height_ratios), 1, height_ratios=full_height_ratios, hspace=0.70)
+                gs = fig.add_gridspec(len(full_height_ratios), 1, height_ratios=full_height_ratios, hspace=0.86)
             else:
                 page_height_in = 54.0
                 page_width_in, page_height_in = _scale_page_size_for_lightweight(
                     page_width_in, page_height_in, lightweight_mode
                 )
                 fig = plt.figure(figsize=(page_width_in, page_height_in))
-                gs = fig.add_gridspec(24, 1, height_ratios=panel_height_ratios, hspace=0.70)
+                gs = fig.add_gridspec(24, 1, height_ratios=panel_height_ratios, hspace=0.86)
             ax_mea = fig.add_subplot(gs[0, 0])
             _draw_mea_layout_panel(ax_mea, probe_layout_loaded, channel_name)
             ax_full = fig.add_subplot(gs[1, 0])
@@ -1635,20 +1635,13 @@ def plot_channel_multi_comparison(
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
-            if dense_overlay:
-                ax_full.legend(
-                    loc="upper left",
-                    ncol=1,
-                    fontsize=legend_font,
-                    framealpha=0.85,
-                )
-            else:
-                ax_full.legend(
-                    loc="upper center",
-                    bbox_to_anchor=(0.5, -0.28),
-                    ncol=legend_cols,
-                    fontsize=legend_font,
-                )
+            ax_full.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.28),
+                ncol=legend_cols,
+                fontsize=legend_font,
+                framealpha=0.85 if dense_overlay else None,
+            )
 
             if any(curve is not None for curve in first_trigger_curves):
                 for recording_index, first_curve in enumerate(first_trigger_curves):
@@ -2084,7 +2077,7 @@ def plot_channel_averages(
                     1.05,
                     1.15,
                 ],
-                hspace=0.74,
+                hspace=0.86,
             )
             ax_mea = fig.add_subplot(gs[0, 0])
             _draw_mea_layout_panel(ax_mea, probe_layout_loaded, channel_name)
@@ -2296,7 +2289,12 @@ def plot_channel_averages(
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
             if show_filtered_and_raw:
-                ax_zoom.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
+                ax_zoom.legend(
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, -0.28),
+                    ncol=3,
+                    fontsize=LEGEND_FONT_SIZE,
+                )
             if channel_first_trigger_raw is not None:
                 ax_zoom_first.plot(
                     t_rel[zmask],
@@ -2358,7 +2356,12 @@ def plot_channel_averages(
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
                 if show_filtered_and_raw:
-                    ax_zoom_end.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
+                    ax_zoom_end.legend(
+                        loc="upper center",
+                        bbox_to_anchor=(0.5, -0.28),
+                        ncol=3,
+                        fontsize=LEGEND_FONT_SIZE,
+                    )
                 if channel_first_trigger_raw is not None:
                     ax_zoom_end_first.plot(
                         t_rel[end_mask],
@@ -2744,7 +2747,7 @@ def plot_channel_comparison(
                 24,
                 1,
                 height_ratios=[0.06, 1.70, 1.60, 1.30, 1.20, 1.45, 1.05, 1.15, 0.06, 1.70, 1.50, 1.20, 1.30, 1.45, 1.05, 1.15, 0.06, 1.70, 1.50, 1.20, 1.30, 1.45, 1.05, 1.15],
-                hspace=0.70,
+                hspace=0.86,
             )
             ax_hdr1 = fig.add_subplot(gs[0, 0])
             ax_hdr1.axis("off")
@@ -3000,7 +3003,12 @@ def plot_channel_comparison(
             ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
-            ax_zoom.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
+            ax_zoom.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.28),
+                ncol=3,
+                fontsize=LEGEND_FONT_SIZE,
+            )
             if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
                 if first_trigger_a_raw is not None:
                     ax_zoom_first.plot(
@@ -3055,7 +3063,12 @@ def plot_channel_comparison(
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
-                ax_zoom_end.legend(loc="best", fontsize=LEGEND_FONT_SIZE)
+                ax_zoom_end.legend(
+                    loc="upper center",
+                    bbox_to_anchor=(0.5, -0.28),
+                    ncol=3,
+                    fontsize=LEGEND_FONT_SIZE,
+                )
                 if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
                     if first_trigger_a_raw is not None:
                         ax_zoom_end_first.plot(
