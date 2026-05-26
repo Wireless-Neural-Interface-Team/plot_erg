@@ -6,6 +6,7 @@ from typing import Literal, Optional
 
 EdgeKind = Literal["falling", "rising"]
 CurveFilterKind = Literal["highpass", "lowpass", "bandpass", "no filter"]
+SpikeThresholdMode = Literal["fixed", "rms_multiple"]
 
 
 @dataclass(frozen=True)
@@ -26,9 +27,15 @@ class AnalysisConfig:
     # Output PDF title / basename (.pdf added if no extension)
     pdf_title: str | None = None
     # Spike threshold (µV): >=0 = upward crossing; <0 = downward crossing
-    spike_threshold_uv: float = -15.0
+    spike_threshold_uv: float = 15.0
+    # Spike threshold mode:
+    # - fixed: same threshold (µV) for all channels.
+    # - rms_multiple: threshold = spike_threshold_rms_multiplier * mean RMS per channel.
+    spike_threshold_mode: SpikeThresholdMode = "fixed"
+    # Multiplier used when spike_threshold_mode == "rms_multiple"
+    spike_threshold_rms_multiplier: float = 4.0
     # PSTH time window (s) used for each PSTH point
-    psth_bin_window_s: float = 0.010
+    psth_bin_window_s: float = 0.050
     # PDF zoom-panel window (s, time relative to trigger)
     zoom_t0_s: float = -0.1
     zoom_t1_s: float = 0.4

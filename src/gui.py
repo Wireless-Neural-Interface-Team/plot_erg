@@ -27,7 +27,9 @@ def launch_qt_gui(
     default_curve_filter: str = "no filter",
     default_curve_filter_low_hz: float | None = None,
     default_curve_filter_high_hz: float | None = None,
-    default_spike_threshold_uv: float = -40.0,
+    default_spike_threshold_uv: float = 15.0,
+    default_spike_threshold_mode: str = "fixed",
+    default_spike_threshold_rms_multiplier: float = 4.0,
     default_psth_bin_window_s: float = 0.025,
     default_rms_window_s: float = 0.050,
     default_zoom_t0_s: float = -0.1,
@@ -162,14 +164,35 @@ def launch_qt_gui(
         curve_cutoff_low_edit.setText(str(default_curve_filter_low_hz))
     if default_curve_filter_high_hz is not None:
         curve_cutoff_high_edit.setText(str(default_curve_filter_high_hz))
-    spike_threshold_edit = QLineEdit(str(default_spike_threshold_uv))
-    spike_threshold_edit.setToolTip(
-        "Threshold in µV (amplifier signal; optionally band-pass filtered). "
-        "Value >= 0 : spike = rising crossing (signal crosses upward). "
-        "Value < 0 : spike = falling crossing (signal crosses downward, e.g. negative peak). "
-        "Detected times feed raster, PSTH / firing rate, and ISI. "
-        "Independent of ANALOG_IN threshold for the trigger."
+    spike_threshold_mode_combo = QComboBox()
+    spike_threshold_mode_combo.addItem("Fixed threshold (same for all channels)", "fixed")
+    spike_threshold_mode_combo.addItem("Multiplier x mean RMS per channel", "rms_multiple")
+    idx_mode = spike_threshold_mode_combo.findData(default_spike_threshold_mode)
+    if idx_mode < 0:
+        idx_mode = spike_threshold_mode_combo.findData("fixed")
+    if idx_mode >= 0:
+        spike_threshold_mode_combo.setCurrentIndex(idx_mode)
+    spike_threshold_fixed_edit = QLineEdit(str(default_spike_threshold_uv))
+    spike_threshold_fixed_edit.setToolTip(
+        "Fixed threshold in µV (same value for every channel). "
+        "Value >= 0: spike = rising crossing. "
+        "Value < 0: spike = falling crossing (negative peaks)."
     )
+    spike_threshold_rms_multiplier_edit = QLineEdit(str(default_spike_threshold_rms_multiplier))
+    spike_threshold_rms_multiplier_edit.setToolTip(
+        "Multiplier applied to the mean RMS computed for each channel. "
+        "Effective threshold per channel = multiplier x mean RMS(channel)."
+    )
+    spike_threshold_value_row_widget = QWidget()
+    spike_threshold_value_row = QHBoxLayout(spike_threshold_value_row_widget)
+    spike_threshold_value_row.setContentsMargins(0, 0, 0, 0)
+    spike_threshold_value_row.setSpacing(6)
+    spike_threshold_fixed_label = QLabel("Fixed threshold (µV):")
+    spike_threshold_rms_multiplier_label = QLabel("RMS multiplier:")
+    spike_threshold_value_row.addWidget(spike_threshold_fixed_label)
+    spike_threshold_value_row.addWidget(spike_threshold_fixed_edit)
+    spike_threshold_value_row.addWidget(spike_threshold_rms_multiplier_label)
+    spike_threshold_value_row.addWidget(spike_threshold_rms_multiplier_edit)
     psth_bin_window_edit = QLineEdit(str(default_psth_bin_window_s))
     psth_bin_window_edit.setToolTip(
         "PSTH time window (seconds) used for each PSTH point."
@@ -244,6 +267,17 @@ def launch_qt_gui(
     filter_combo.currentIndexChanged.connect(update_curve_filter_inputs_visibility)
     update_curve_filter_inputs_visibility()
 
+    def update_spike_threshold_inputs_visibility() -> None:
+        mode = str(spike_threshold_mode_combo.currentData() or "fixed")
+        is_fixed = mode == "fixed"
+        spike_threshold_fixed_label.setVisible(is_fixed)
+        spike_threshold_fixed_edit.setVisible(is_fixed)
+        spike_threshold_rms_multiplier_label.setVisible(not is_fixed)
+        spike_threshold_rms_multiplier_edit.setVisible(not is_fixed)
+
+    spike_threshold_mode_combo.currentIndexChanged.connect(update_spike_threshold_inputs_visibility)
+    update_spike_threshold_inputs_visibility()
+
     general_form = QFormLayout()
     general_form.addRow("ANALOG_IN 0 edge:", edge_combo)
     general_form.addRow("ANALOG_IN 0 trigger threshold:", threshold_edit)
@@ -263,7 +297,8 @@ def launch_qt_gui(
     general_group.setLayout(general_form)
 
     spike_form = QFormLayout()
-    spike_form.addRow("Amplifier spike threshold (µV) — raster, PSTH and ISI:", spike_threshold_edit)
+    spike_form.addRow("Spike threshold mode — raster, PSTH and ISI:", spike_threshold_mode_combo)
+    spike_form.addRow("Spike threshold parameters:", spike_threshold_value_row_widget)
     spike_form.addRow("PSTH time window (s):", psth_bin_window_edit)
     spike_form.addRow("RMS window (s):", rms_window_edit)
     spike_form.addRow("Zoom window start (s, relative to trigger):", zoom_t0_edit)
@@ -329,6 +364,9 @@ def launch_qt_gui(
         float | None,
         Path | None,
         str | None,
+        float,
+        str,
+        float,
         float,
         float,
         float,
@@ -407,6 +445,15 @@ def launch_qt_gui(
         rms_window_s = float(rms_window_edit.text().strip())
         if rms_window_s <= 0:
             raise ValueError("RMS window (s): value must be > 0.")
+        spike_threshold_mode = str(spike_threshold_mode_combo.currentData() or "fixed")
+        spike_threshold_fixed_uv = float(spike_threshold_fixed_edit.text().strip())
+        spike_threshold_rms_multiplier = float(
+            spike_threshold_rms_multiplier_edit.text().strip()
+        )
+        if spike_threshold_mode not in {"fixed", "rms_multiple"}:
+            raise ValueError("Spike threshold mode: invalid option.")
+        if spike_threshold_mode == "rms_multiple" and spike_threshold_rms_multiplier <= 0:
+            raise ValueError("RMS multiplier: value must be > 0.")
         return (
             float(threshold_edit.text().strip()),
             edge,
@@ -417,7 +464,9 @@ def launch_qt_gui(
             curve_filter_high_hz,
             Path(save_text) if save_text else None,
             pdf_title_text if pdf_title_text else None,
-            float(spike_threshold_edit.text().strip()),
+            spike_threshold_fixed_uv,
+            spike_threshold_mode,
+            spike_threshold_rms_multiplier,
             float(psth_bin_window_edit.text().strip()),
             rms_window_s,
             zoom_t0_s,
@@ -575,7 +624,9 @@ def launch_qt_gui(
         curve_cutoff_low_edit.setEnabled(not running)
         curve_cutoff_high_edit.setEnabled(not running)
         threshold_edit.setEnabled(not running)
-        spike_threshold_edit.setEnabled(not running)
+        spike_threshold_mode_combo.setEnabled(not running)
+        spike_threshold_fixed_edit.setEnabled(not running)
+        spike_threshold_rms_multiplier_edit.setEnabled(not running)
         psth_bin_window_edit.setEnabled(not running)
         rms_window_edit.setEnabled(not running)
         zoom_t0_edit.setEnabled(not running)
@@ -637,7 +688,7 @@ def launch_qt_gui(
         return unique_paths
 
     def _build_configs_from_paths(paths: list[str]) -> list[AnalysisConfig]:
-        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
+        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
             build_shared_params()
         )
         if psth_bin_window_s <= 0:
@@ -659,6 +710,8 @@ def launch_qt_gui(
                     save_dir=save_dir_path,
                     pdf_title=pdf_title,
                     spike_threshold_uv=spike_threshold_uv,
+                    spike_threshold_mode=spike_threshold_mode,  # type: ignore[arg-type]
+                    spike_threshold_rms_multiplier=spike_threshold_rms_multiplier,
                     psth_bin_window_s=psth_bin_window_s,
                     rms_window_s=rms_window_s,
                     zoom_t0_s=zoom_start_s,

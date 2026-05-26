@@ -135,8 +135,20 @@ def parse_args() -> argparse.Namespace:
         default=defaults.spike_threshold_uv,
         help=(
             "Spike threshold (µV) on amplifier: >=0 = upward crossing; "
-            "<0 = downward crossing (negative peaks, default -40)"
+            "<0 = downward crossing (negative peaks, default from config)"
         ),
+    )
+    parser.add_argument(
+        "--spike-threshold-mode",
+        choices=("fixed", "rms_multiple"),
+        default=defaults.spike_threshold_mode,
+        help="Spike threshold mode: fixed value or per-channel RMS multiple.",
+    )
+    parser.add_argument(
+        "--spike-threshold-rms-multiplier",
+        type=float,
+        default=defaults.spike_threshold_rms_multiplier,
+        help="Multiplier applied to mean channel RMS when --spike-threshold-mode=rms_multiple.",
     )
     parser.add_argument(
         "--psth-bin-window-s",
@@ -275,6 +287,8 @@ def run(config: AnalysisConfig) -> None:
                 spike_source=spike_source,
                 fs=fs,
                 spike_threshold_uv=config.spike_threshold_uv,
+                spike_threshold_mode=config.spike_threshold_mode,
+                spike_threshold_rms_multiplier=config.spike_threshold_rms_multiplier,
                 psth_bin_window_s=config.psth_bin_window_s,
                 rms_window_s=config.rms_window_s,
                 zoom_t0_s=config.zoom_t0_s,
@@ -316,18 +330,25 @@ def run(config: AnalysisConfig) -> None:
                 "Butterworth curve filter: "
                 f"low-pass {curve_filter_low_hz:g} Hz (order 4, filtfilt)"
             )
-        spike_rule = (
-            "falling edge (negative peak)"
-            if config.spike_threshold_uv < 0
-            else "rising edge"
-        )
         bp_txt = (
             f" | spike band-pass {config.spike_bandpass_low_hz:g}–{config.spike_bandpass_high_hz:g} Hz"
             if config.spike_bandpass_low_hz is not None
             else " | spike band-pass: disabled (raw)"
         )
+        if config.spike_threshold_mode == "rms_multiple":
+            spike_txt = (
+                f"threshold mode = rms_multiple ({config.spike_threshold_rms_multiplier:g} x "
+                "mean RMS per channel)"
+            )
+        else:
+            spike_rule = (
+                "falling edge (negative peak)"
+                if config.spike_threshold_uv < 0
+                else "rising edge"
+            )
+            spike_txt = f"threshold {config.spike_threshold_uv} µV ({spike_rule})"
         print(
-            f"Spikes (PDF amplifier): threshold {config.spike_threshold_uv} µV ({spike_rule}) | "
+            f"Spikes (PDF amplifier): {spike_txt} | "
             f"PSTH time window = {max(float(config.psth_bin_window_s), 1.0 / float(fs)):g} s{bp_txt}"
         )
         print(f"PDF zoom window: [{config.zoom_t0_s:.3f}s, {config.zoom_t1_s:.3f}s]")
@@ -527,6 +548,8 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             spike_sources=spike_sources,
             fs=float(fs_ref),
             spike_threshold_uv=tuned[0].spike_threshold_uv,
+            spike_threshold_mode=tuned[0].spike_threshold_mode,
+            spike_threshold_rms_multiplier=tuned[0].spike_threshold_rms_multiplier,
             psth_bin_window_s=tuned[0].psth_bin_window_s,
             rms_window_s=tuned[0].rms_window_s,
             zoom_t0_s=tuned[0].zoom_t0_s,
@@ -574,6 +597,8 @@ def main() -> None:
             default_curve_filter="lowpass" if args.lowpass_hz is not None else "no filter",
             default_curve_filter_low_hz=args.lowpass_hz,
             default_spike_threshold_uv=args.spike_threshold_uv,
+            default_spike_threshold_mode=args.spike_threshold_mode,
+            default_spike_threshold_rms_multiplier=args.spike_threshold_rms_multiplier,
             default_psth_bin_window_s=args.psth_bin_window_s,
             default_rms_window_s=args.rms_window_s,
             default_zoom_t0_s=args.zoom_t0_s,
@@ -602,6 +627,8 @@ def main() -> None:
         save_dir=args.save_dir,
         pdf_title=args.pdf_title,
         spike_threshold_uv=args.spike_threshold_uv,
+        spike_threshold_mode=args.spike_threshold_mode,
+        spike_threshold_rms_multiplier=args.spike_threshold_rms_multiplier,
         psth_bin_window_s=args.psth_bin_window_s,
         rms_window_s=args.rms_window_s,
         zoom_t0_s=args.zoom_t0_s,
@@ -621,6 +648,12 @@ def main() -> None:
         sys.exit(2)
     if config.rms_window_s <= 0:
         print("Error: --rms-window-s / --rms-smoothing-window-s must be > 0.", file=sys.stderr)
+        sys.exit(2)
+    if config.spike_threshold_mode == "rms_multiple" and config.spike_threshold_rms_multiplier <= 0:
+        print(
+            "Error: --spike-threshold-rms-multiplier must be > 0 when --spike-threshold-mode=rms_multiple.",
+            file=sys.stderr,
+        )
         sys.exit(2)
     try:
         run(config)

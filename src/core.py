@@ -366,6 +366,16 @@ class AmplifierSpikeSource:
             spike_times_by_trial.append(np.asarray(t_rel[spike_sample_indices], dtype=np.float64))
         return spike_times_by_trial
 
+    def mean_rms_for_channel(self, ch: int) -> float:
+        """Mean RMS value for one channel (same preprocessing path as spike detection)."""
+        channel_trace = np.asarray(self.amplifier[ch], dtype=np.float64)
+        if self.bandpass_low_hz is not None and self.bandpass_high_hz is not None:
+            channel_trace_2d = channel_trace.reshape(1, -1)
+            channel_trace = apply_butterworth_bandpass(
+                channel_trace_2d, self.fs, self.bandpass_low_hz, self.bandpass_high_hz
+            )[0]
+        return float(np.sqrt(np.mean(np.square(channel_trace))))
+
     def close(self) -> None:
         if self._closed:
             return
