@@ -7,6 +7,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
+import math
 
 import matplotlib
 
@@ -39,7 +40,20 @@ ISI_HALF_WINDOW_S = 1.0
 
 # X-axis label for all time-relative-to-trigger plots
 TIME_REL_XLABEL = "Time relative to trigger (s)"
-LEGEND_FONT_SIZE = 10
+LEGEND_FONT_SIZE = 8
+# Three-part channel page layout (inches). Increase width/height to enlarge the PDF page;
+# panel scale below maps page size to subplot height ratios so graphs grow with the page.
+THREE_PART_PAGE_WIDTH_IN = 20.0
+THREE_PART_PAGE_HEIGHT_BASE_NO_IMP = 150.0
+THREE_PART_PAGE_HEIGHT_PER_RECORDING_NO_IMP = 2.0
+THREE_PART_PAGE_HEIGHT_BASE_IMP = 300.0
+THREE_PART_PAGE_HEIGHT_PER_RECORDING_IMP = 2.5
+THREE_PART_PAGE_REFERENCE_WIDTH_IN = 16.0
+THREE_PART_PAGE_REFERENCE_HEIGHT_IN = 120.0
+THREE_PART_PAGE_HEIGHT_SCALE = 1.0
+THREE_PART_GRID_HSPACE = 1.40
+THREE_PART_SUBPLOT_LEFT = 0.04
+THREE_PART_SUBPLOT_RIGHT = 0.99
 RMS_INTAN_LIKE_BANDPASS_LOW_HZ = 300.0
 RMS_INTAN_LIKE_BANDPASS_HIGH_HZ = 7500.0
 _PROFILE_ENABLED = os.environ.get("PLOT_ERG_PROFILE", "1").strip().lower() in {
@@ -204,6 +218,14 @@ def _three_part_height_ratios(first_row_height_ratio: float) -> list[float]:
     ]
 
 
+def _widen_three_part_axes(axes: dict[str, Any]) -> None:
+    """Widen plot panels horizontally without changing their vertical placement."""
+    width = THREE_PART_SUBPLOT_RIGHT - THREE_PART_SUBPLOT_LEFT
+    for ax in axes.values():
+        pos = ax.get_position()
+        ax.set_position([THREE_PART_SUBPLOT_LEFT, pos.y0, width, pos.height])
+
+
 def _build_three_part_page_axes(
     *,
     zoom_t0: float,
@@ -219,21 +241,27 @@ def _build_three_part_page_axes(
     recording_count = max(1, int(n_recordings))
     base_height_ratios = _three_part_height_ratios(first_row_height_ratio)
     if include_impedance_panel:
+        page_height_in = THREE_PART_PAGE_HEIGHT_BASE_IMP + THREE_PART_PAGE_HEIGHT_PER_RECORDING_IMP * float(
+            recording_count - 1
+        )
+    else:
+        page_height_in = THREE_PART_PAGE_HEIGHT_BASE_NO_IMP + THREE_PART_PAGE_HEIGHT_PER_RECORDING_NO_IMP * float(
+            recording_count - 1
+        )
+    requested_page_height_in = page_height_in * THREE_PART_PAGE_HEIGHT_SCALE
+    page_width_in, page_height_in = _scale_page_size_for_lightweight(
+        THREE_PART_PAGE_WIDTH_IN, requested_page_height_in, lightweight_mode
+    )
+    if include_impedance_panel:
         height_ratios = [*base_height_ratios, 0.05, 0.95]
-        page_height_in = 58.0 + 2.2 * float(recording_count - 1)
     else:
         height_ratios = base_height_ratios
-        page_height_in = 54.0 + 2.0 * float(recording_count - 1)
-    page_width_in, page_height_in = _scale_page_size_for_lightweight(
-        12.0, page_height_in, lightweight_mode
-    )
     fig = plt.figure(figsize=(page_width_in, page_height_in))
-    hspace_val = min(1.85, 1.14 + 0.08 * float(recording_count - 1))
     gs = fig.add_gridspec(
         len(height_ratios),
         1,
         height_ratios=height_ratios,
-        hspace=hspace_val,
+        hspace=THREE_PART_GRID_HSPACE,
     )
     ax_top = fig.add_subplot(gs[0, 0])
     if first_row_mea_channel_name is not None:
@@ -377,93 +405,70 @@ def _finalize_and_save_three_part_page(
         axes[key].tick_params(axis="x", labelbottom=True)
     fig.tight_layout()
     recording_count = max(1, int(n_recordings))
-    delta_main = min(0.08, 0.022 + 0.007 * float(recording_count - 1))
-    delta_first_gap = max(0.0, delta_main * 0.55)
-    shift_axes_down(
-        [axes["ax_first_trigger"]],
-        delta=delta_first_gap,
+    if "ax_imp" in axes:
+        layout_page_height_in = THREE_PART_PAGE_HEIGHT_BASE_IMP + THREE_PART_PAGE_HEIGHT_PER_RECORDING_IMP * float(
+            recording_count - 1
+        )
+    else:
+        layout_page_height_in = THREE_PART_PAGE_HEIGHT_BASE_NO_IMP + THREE_PART_PAGE_HEIGHT_PER_RECORDING_NO_IMP * float(
+            recording_count - 1
+        )
+    page_height_scale = max(
+        1.0,
+        layout_page_height_in
+        * THREE_PART_PAGE_HEIGHT_SCALE
+        / THREE_PART_PAGE_REFERENCE_HEIGHT_IN,
     )
-    shift_axes_down(
-        [
-            axes["ax_full_rms"],
-            axes["ax_raster_f"],
-            axes["ax_fr_f"],
-            axes["ax_trial_fr_f"],
-            axes["ax_isi_f"],
-            axes["ax_hdr2"],
-            axes["ax_zoom"],
-            axes["ax_zoom_first"],
-            axes["ax_zoom_rms"],
-            axes["ax_raster_z"],
-            axes["ax_fr_z"],
-            axes["ax_trial_fr_z"],
-            axes["ax_isi_z"],
-            axes["ax_hdr3"],
-            axes["ax_zoom_end"],
-            axes["ax_zoom_end_first"],
-            axes["ax_zoom_end_rms"],
-            axes["ax_raster_ze"],
-            axes["ax_fr_ze"],
-            axes["ax_trial_fr_ze"],
-            axes["ax_isi_ze"],
-        ],
-        delta=delta_main,
-    )
-    raster_fr_extra_gap = min(0.05, 0.010 + 0.004 * float(recording_count - 1))
-    after_fr_f = [
-        axes["ax_fr_f"],
-        axes["ax_trial_fr_f"],
-        axes["ax_isi_f"],
-        axes["ax_hdr2"],
-        axes["ax_zoom"],
-        axes["ax_zoom_first"],
-        axes["ax_zoom_rms"],
-        axes["ax_raster_z"],
-        axes["ax_fr_z"],
-        axes["ax_trial_fr_z"],
-        axes["ax_isi_z"],
-        axes["ax_hdr3"],
-        axes["ax_zoom_end"],
-        axes["ax_zoom_end_first"],
-        axes["ax_zoom_end_rms"],
-        axes["ax_raster_ze"],
-        axes["ax_fr_ze"],
-        axes["ax_trial_fr_ze"],
-        axes["ax_isi_ze"],
-    ]
+    gap_1_2 = min(0.040, (0.016 + 0.004 * float(recording_count - 1)) * page_height_scale)
+    gap_4_5 = min(0.036, (0.016 + 0.003 * float(recording_count - 1)) * page_height_scale)
+
+    imp_tail_keys: list[str] = []
     if "ax_imp_hdr" in axes:
-        after_fr_f.append(axes["ax_imp_hdr"])
+        imp_tail_keys.append("ax_imp_hdr")
     if "ax_imp" in axes:
-        after_fr_f.append(axes["ax_imp"])
-    shift_axes_down(after_fr_f, delta=raster_fr_extra_gap)
-    after_fr_z = [
-        axes["ax_fr_z"],
-        axes["ax_trial_fr_z"],
-        axes["ax_isi_z"],
-        axes["ax_hdr3"],
-        axes["ax_zoom_end"],
-        axes["ax_zoom_end_first"],
-        axes["ax_zoom_end_rms"],
-        axes["ax_raster_ze"],
-        axes["ax_fr_ze"],
-        axes["ax_trial_fr_ze"],
-        axes["ax_isi_ze"],
+        imp_tail_keys.append("ax_imp")
+
+    axis_order = [
+        "ax_first_trigger",
+        "ax_full_rms",
+        "ax_raster_f",
+        "ax_fr_f",
+        "ax_trial_fr_f",
+        "ax_isi_f",
+        "ax_hdr2",
+        "ax_zoom",
+        "ax_zoom_first",
+        "ax_zoom_rms",
+        "ax_raster_z",
+        "ax_fr_z",
+        "ax_trial_fr_z",
+        "ax_isi_z",
+        "ax_hdr3",
+        "ax_zoom_end",
+        "ax_zoom_end_first",
+        "ax_zoom_end_rms",
+        "ax_raster_ze",
+        "ax_fr_ze",
+        "ax_trial_fr_ze",
+        "ax_isi_ze",
+        *imp_tail_keys,
     ]
-    if "ax_imp_hdr" in axes:
-        after_fr_z.append(axes["ax_imp_hdr"])
-    if "ax_imp" in axes:
-        after_fr_z.append(axes["ax_imp"])
-    shift_axes_down(after_fr_z, delta=raster_fr_extra_gap)
-    after_fr_ze = [
-        axes["ax_fr_ze"],
-        axes["ax_trial_fr_ze"],
-        axes["ax_isi_ze"],
-    ]
-    if "ax_imp_hdr" in axes:
-        after_fr_ze.append(axes["ax_imp_hdr"])
-    if "ax_imp" in axes:
-        after_fr_ze.append(axes["ax_imp"])
-    shift_axes_down(after_fr_ze, delta=raster_fr_extra_gap)
+
+    def _axis_group(start_key: str) -> list[Any]:
+        start_idx = axis_order.index(start_key)
+        return [axes[key] for key in axis_order[start_idx:] if key in axes]
+
+    # Graph 1<->2: extra space for legends under the first trace of each section.
+    shift_axes_down(_axis_group("ax_first_trigger"), delta=gap_1_2)
+    shift_axes_down(_axis_group("ax_zoom_first"), delta=gap_1_2)
+    shift_axes_down(_axis_group("ax_zoom_end_first"), delta=gap_1_2)
+
+    # Graph 4<->5: extra space for raster threshold legends in each section.
+    # Each shift must propagate through the following section headers/content.
+    shift_axes_down(_axis_group("ax_fr_f"), delta=gap_4_5)
+    shift_axes_down(_axis_group("ax_fr_z"), delta=gap_4_5)
+    shift_axes_down(_axis_group("ax_fr_ze"), delta=gap_4_5)
+    _widen_three_part_axes(axes)
     _soften_figure_linewidths(fig)
     page_dpi = _lightweight_pdf_dpi(lightweight_mode)
     pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=page_dpi)
@@ -714,6 +719,22 @@ def _set_adaptive_x_limits(
     ax.set_xlim(x_min - pad, x_max + pad)
 
 
+def _add_trace_panel_legend(
+    ax: Any,
+    *,
+    ncol: int = 3,
+    fontsize: float = LEGEND_FONT_SIZE,
+) -> None:
+    """Place legend below the first trace panel of a section."""
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.48),
+        ncol=ncol,
+        fontsize=fontsize,
+        framealpha=None,
+    )
+
+
 def _add_raster_threshold_legend(
     ax_raster: Any,
     threshold_caption: str,
@@ -754,19 +775,30 @@ def _add_raster_threshold_legend(
         unique_handles = [Line2D([0], [0], color="0.25", linestyle="--", linewidth=1.0)]
         unique_labels = [f"Threshold: {threshold_caption}"]
     entry_count = len(unique_labels)
-    legend_y = -(0.52 + 0.14 * float(max(0, entry_count - 1)))
-    ax_raster.legend(
+    # Keep the legend compact with many recordings, and avoid letting it drive
+    # global subplot compression in tight_layout().
+    if entry_count <= 4:
+        ncol = 1
+    elif entry_count <= 10:
+        ncol = 2
+    else:
+        ncol = 3
+    rows = max(1, int(math.ceil(entry_count / float(ncol))))
+    legend_y = -(0.64 + 0.16 * float(max(0, rows - 1)))
+    legend = ax_raster.legend(
         unique_handles,
         unique_labels,
         loc="upper center",
         bbox_to_anchor=(0.5, legend_y),
-        ncol=1,
+        ncol=ncol,
         fontsize=8,
         framealpha=0.95,
         borderaxespad=0.0,
         handlelength=1.8,
         columnspacing=1.2,
     )
+    if legend is not None:
+        legend.set_in_layout(False)
 
 
 def _draw_spike_panels_single_channel(
@@ -1344,7 +1376,7 @@ def _draw_impedance_evolution_panel(
             xytext=(0, 6),
             ha="center",
             va="bottom",
-            fontsize=7,
+        fontsize=6,
             alpha=0.9,
             zorder=4,
         )
@@ -1377,7 +1409,8 @@ def _append_mean_impedance_summary_page(
         return
     check_analysis_cancelled()
     dpi = _lightweight_pdf_dpi(lightweight_mode)
-    fig, ax = plt.subplots(figsize=(11, 6))
+    fig_w, fig_h = _scale_page_size_for_lightweight(16.0, 9.0, lightweight_mode)
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     times_num = np.array([mdates.date2num(s.when) for s in sessions], dtype=np.float64)
     means_z: list[float] = []
     stem_labels: list[str] = []
@@ -1664,7 +1697,7 @@ def _append_mean_rms_evolution_page(
 ) -> None:
     """Append one summary page: mean RMS profile on analysis timebase."""
     check_analysis_cancelled()
-    fig_w, fig_h = _scale_page_size_for_lightweight(12.0, 6.0, lightweight_mode)
+    fig_w, fig_h = _scale_page_size_for_lightweight(16.0, 9.0, lightweight_mode)
     fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
     has_data = False
@@ -1945,8 +1978,14 @@ def plot_channel_multi_comparison(
                         color=line_color,
                         label=f"{labels[recording_index]} (filtered {curve_filter_legend})",
                     )
-                    ax_zoom.plot(t_rel[zmask], raw_curve[zmask], linewidth=raw_lw, color=line_color, alpha=raw_alpha)
-                    ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=main_lw, color=line_color, label=labels[recording_index])
+                    ax_zoom.plot(t_rel[zmask], raw_curve[zmask], linewidth=raw_lw, color=line_color, alpha=raw_alpha, label="_nolegend_")
+                    ax_zoom.plot(
+                        t_rel[zmask],
+                        recording_curve[zmask],
+                        linewidth=main_lw,
+                        color=line_color,
+                        label=f"{labels[recording_index]} (filtered {curve_filter_legend})",
+                    )
                 else:
                     ax_full.plot(t_rel, recording_curve, linewidth=base_lw, color=line_color, label=labels[recording_index])
                     ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=main_lw, color=line_color, label=labels[recording_index])
@@ -1987,7 +2026,7 @@ def plot_channel_multi_comparison(
             ax_full.grid(True, alpha=0.3)
             ax_full.legend(
                 loc="upper center",
-                bbox_to_anchor=(0.5, -0.36),
+                bbox_to_anchor=(0.5, -0.48),
                 ncol=legend_cols,
                 fontsize=legend_font,
                 framealpha=None,
@@ -2040,12 +2079,19 @@ def plot_channel_multi_comparison(
                 x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
             )
 
-            ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
+            ax_zoom.axvline(
+                0.0,
+                linestyle="--",
+                linewidth=1.0,
+                color="red",
+                label=("Trigger (onset)" if aux_legend_label is None else aux_legend_label),
+            )
             ax_zoom.set_xlim(zoom_t0, zoom_t1)
             ax_zoom.set_title(zoom_title)
             ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
+            _add_trace_panel_legend(ax_zoom, ncol=legend_cols, fontsize=legend_font)
             if any(curve is not None for curve in first_trigger_curves):
                 for recording_index, first_curve in enumerate(first_trigger_curves):
                     if first_curve is None:
@@ -2086,11 +2132,23 @@ def plot_channel_multi_comparison(
                     line_color = colors[recording_index % len(colors)]
                     if show_filtered_and_raw and means_raw_ch is not None:
                         raw_curve = np.asarray(means_raw_ch[recording_index])
-                        ax_zoom_end.plot(t_rel[end_mask], raw_curve[end_mask], linewidth=raw_lw, color=line_color, alpha=raw_alpha)
-                        ax_zoom_end.plot(t_rel[end_mask], recording_curve[end_mask], linewidth=main_lw, color=line_color, label=labels[recording_index])
+                        ax_zoom_end.plot(t_rel[end_mask], raw_curve[end_mask], linewidth=raw_lw, color=line_color, alpha=raw_alpha, label="_nolegend_")
+                        ax_zoom_end.plot(
+                            t_rel[end_mask],
+                            recording_curve[end_mask],
+                            linewidth=main_lw,
+                            color=line_color,
+                            label=f"{labels[recording_index]} (filtered {curve_filter_legend})",
+                        )
                     else:
                         ax_zoom_end.plot(t_rel[end_mask], recording_curve[end_mask], linewidth=main_lw, color=line_color, label=labels[recording_index])
-                ax_zoom_end.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
+                ax_zoom_end.axvline(
+                    0.0,
+                    linestyle="--",
+                    linewidth=1.0,
+                    color="red",
+                    label=("Trigger (onset)" if aux_legend_label is None else aux_legend_label),
+                )
                 for v in end_markers:
                     ax_zoom_end.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
@@ -2098,6 +2156,7 @@ def plot_channel_multi_comparison(
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
+                _add_trace_panel_legend(ax_zoom_end, ncol=legend_cols, fontsize=legend_font)
                 if any(curve is not None for curve in first_trigger_curves):
                     for recording_index, first_curve in enumerate(first_trigger_curves):
                         if first_curve is None:
@@ -2439,7 +2498,7 @@ def plot_channel_averages(
             ax_full.grid(True, alpha=0.3)
             ax_full.legend(
                 loc="upper center",
-                bbox_to_anchor=(0.5, -0.36),
+                bbox_to_anchor=(0.5, -0.48),
                 ncol=3,
                 fontsize=LEGEND_FONT_SIZE,
             )
@@ -2518,27 +2577,22 @@ def plot_channel_averages(
                     label=f"Filtered ({curve_filter_legend})",
                 )
             else:
-                ax_zoom.plot(t_rel[zmask], channel_mean[zmask], linewidth=1.4, color="C0")
-            ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
+                ax_zoom.plot(t_rel[zmask], channel_mean[zmask], linewidth=1.4, color="C0", label="Mean")
+            ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             if trigger_end_rising_rel_s is not None:
                 ax_zoom.axvline(
                     trigger_end_rising_rel_s,
                     linestyle=":",
                     linewidth=1.0,
                     color="darkorange",
+                    label="Trigger end (rising)",
                 )
             ax_zoom.set_xlim(zoom_t0, zoom_t1)
             ax_zoom.set_title(zoom_title)
             ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
-            if show_filtered_and_raw:
-                ax_zoom.legend(
-                    loc="upper center",
-                    bbox_to_anchor=(0.5, -0.28),
-                    ncol=3,
-                    fontsize=LEGEND_FONT_SIZE,
-                )
+            _add_trace_panel_legend(ax_zoom)
             if channel_first_trigger_raw is not None:
                 ax_zoom_first.plot(
                     t_rel[zmask],
@@ -2592,20 +2646,21 @@ def plot_channel_averages(
                         label=f"Filtered ({curve_filter_legend})",
                     )
                 else:
-                    ax_zoom_end.plot(t_rel[end_mask], channel_mean[end_mask], linewidth=1.4, color="C0")
-                ax_zoom_end.axvline(trigger_end_rising_rel_s, linestyle="--", linewidth=1.0, color="darkorange")
+                    ax_zoom_end.plot(t_rel[end_mask], channel_mean[end_mask], linewidth=1.4, color="C0", label="Mean")
+                ax_zoom_end.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
+                ax_zoom_end.axvline(
+                    trigger_end_rising_rel_s,
+                    linestyle="--",
+                    linewidth=1.0,
+                    color="darkorange",
+                    label="Trigger end (rising)",
+                )
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
                 ax_zoom_end.set_title(f"Part 3 — Trigger-end zoom [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
-                if show_filtered_and_raw:
-                    ax_zoom_end.legend(
-                        loc="upper center",
-                        bbox_to_anchor=(0.5, -0.28),
-                        ncol=3,
-                        fontsize=LEGEND_FONT_SIZE,
-                    )
+                _add_trace_panel_legend(ax_zoom_end)
                 if channel_first_trigger_raw is not None:
                     ax_zoom_end_first.plot(
                         t_rel[end_mask],
@@ -3028,7 +3083,7 @@ def plot_channel_comparison(
             ax_full.grid(True, alpha=0.3)
             ax_full.legend(
                 loc="upper center",
-                bbox_to_anchor=(0.5, -0.36),
+                bbox_to_anchor=(0.5, -0.48),
                 ncol=3,
                 fontsize=LEGEND_FONT_SIZE,
             )
@@ -3135,13 +3190,14 @@ def plot_channel_comparison(
             else:
                 ax_zoom.plot(t_rel[zmask], channel_mean_a[zmask], linewidth=1.4, color="C0", label=label_a)
                 ax_zoom.plot(t_rel[zmask], channel_mean_b[zmask], linewidth=1.4, color="C1", label=label_b)
-            ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
+            ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             if trigger_end_rising_rel_s_a is not None:
                 ax_zoom.axvline(
                     trigger_end_rising_rel_s_a,
                     linestyle=":",
                     linewidth=1.0,
                     color="darkorange",
+                    label=f"End (rising) {label_a}",
                 )
             if trigger_end_rising_rel_s_b is not None:
                 ax_zoom.axvline(
@@ -3149,18 +3205,14 @@ def plot_channel_comparison(
                     linestyle=":",
                     linewidth=1.0,
                     color="purple",
+                    label=f"End (rising) {label_b}",
                 )
             ax_zoom.set_xlim(zoom_t0, zoom_t1)
             ax_zoom.set_title(zoom_title)
             ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
-            ax_zoom.legend(
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.28),
-                ncol=3,
-                fontsize=LEGEND_FONT_SIZE,
-            )
+            _add_trace_panel_legend(ax_zoom)
             if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
                 if first_trigger_a_raw is not None:
                     ax_zoom_first.plot(
@@ -3206,21 +3258,29 @@ def plot_channel_comparison(
                 end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
                 ax_zoom_end.plot(t_rel[end_mask], channel_mean_a[end_mask], linewidth=1.35, color="C0", label=label_a)
                 ax_zoom_end.plot(t_rel[end_mask], channel_mean_b[end_mask], linewidth=1.35, color="C1", label=label_b)
+                ax_zoom_end.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
                 if trigger_end_rising_rel_s_a is not None:
-                    ax_zoom_end.axvline(trigger_end_rising_rel_s_a, linestyle=":", linewidth=1.0, color="darkorange")
+                    ax_zoom_end.axvline(
+                        trigger_end_rising_rel_s_a,
+                        linestyle=":",
+                        linewidth=1.0,
+                        color="darkorange",
+                        label=f"End (rising) {label_a}",
+                    )
                 if trigger_end_rising_rel_s_b is not None:
-                    ax_zoom_end.axvline(trigger_end_rising_rel_s_b, linestyle=":", linewidth=1.0, color="purple")
+                    ax_zoom_end.axvline(
+                        trigger_end_rising_rel_s_b,
+                        linestyle=":",
+                        linewidth=1.0,
+                        color="purple",
+                        label=f"End (rising) {label_b}",
+                    )
                 ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
                 ax_zoom_end.set_title(f"Part 3 — Trigger-end zoom [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
-                ax_zoom_end.legend(
-                    loc="upper center",
-                    bbox_to_anchor=(0.5, -0.28),
-                    ncol=3,
-                    fontsize=LEGEND_FONT_SIZE,
-                )
+                _add_trace_panel_legend(ax_zoom_end)
                 if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
                     if first_trigger_a_raw is not None:
                         ax_zoom_end_first.plot(

@@ -6,7 +6,6 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -15,8 +14,6 @@ import numpy as np
 from config import AnalysisConfig
 from core import (
     AmplifierSpikeSource,
-    check_analysis_cancelled,
-    compute_average_per_channel,
     detect_edges,
     get_analog_in0_signal,
     get_channel_names,
@@ -30,16 +27,8 @@ from core import (
 )
 from gui import launch_qt_gui
 from impedance_tracking import collect_impedance_sessions
-from plotting import plot_channel_averages, plot_channel_multi_comparison
+from plotting import plot_channel_multi_comparison
 from probe_layout import load_probe_layout_json
-
-
-def _to_temp_mmap(arr: np.ndarray, folder: Path, name: str) -> np.ndarray:
-    """Persist array to temporary .npy and reopen as read-only memmap."""
-    folder.mkdir(parents=True, exist_ok=True)
-    path = folder / f"{name}.npy"
-    np.save(path, np.ascontiguousarray(arr, dtype=np.float32))
-    return np.load(path, mmap_mode="r")
 
 
 def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple[
@@ -239,134 +228,44 @@ def parse_args() -> argparse.Namespace:
 
 
 def run(config: AnalysisConfig) -> None:
-    spike_source: AmplifierSpikeSource | None = None
-    run_start_time_s = time.perf_counter()
-    try:
-        if config.probe_layout_json is not None:
-            probe_json_path = config.probe_layout_json
-            if not probe_json_path.exists():
-                raise FileNotFoundError(f"Probe JSON not found: {probe_json_path}")
-            load_probe_layout_json(probe_json_path)
-        (
-            mean_per_channel,
-            t_rel,
-            channel_names,
-            n_valid,
-            n_total,
-            fs,
-            end_rising_s,
-            spike_source,
-            mean_per_channel_raw,
-        ) = compute_average_per_channel(config)
-        check_analysis_cancelled()
-        output_dir = config.save_dir if config.save_dir is not None else config.rhs_file.parent
-        curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(config, fs)
-        curve_filter_enabled = curve_filter_kind != "no filter"
-        with tempfile.TemporaryDirectory(prefix="plot_erg_means_") as temporary_dir:
-            mmap_dir = Path(temporary_dir)
-            mean_per_channel_mmap = _to_temp_mmap(mean_per_channel, mmap_dir, "mean_filtered_or_raw")
-            mean_per_channel_raw_mmap = (
-                _to_temp_mmap(mean_per_channel_raw, mmap_dir, "mean_raw")
-                if curve_filter_enabled
-                else None
-            )
-            del mean_per_channel
-            del mean_per_channel_raw
-            pdf_path = plot_channel_averages(
-                t_rel=t_rel,
-                mean_per_channel=mean_per_channel_mmap,
-                channel_names=channel_names,
-                output_dir=output_dir,
-                rhs_file=config.rhs_file,
-                pdf_title=config.pdf_title,
-                lowpass_cutoff_hz=config.lowpass_cutoff_hz,
-                curve_filter=config.curve_filter,
-                curve_filter_low_hz=config.curve_filter_low_hz,
-                curve_filter_high_hz=config.curve_filter_high_hz,
-                trigger_end_rising_rel_s=end_rising_s,
-                spike_source=spike_source,
-                fs=fs,
-                spike_threshold_uv=config.spike_threshold_uv,
-                spike_threshold_mode=config.spike_threshold_mode,
-                spike_threshold_rms_multiplier=config.spike_threshold_rms_multiplier,
-                psth_bin_window_s=config.psth_bin_window_s,
-                rms_window_s=config.rms_window_s,
-                zoom_t0_s=config.zoom_t0_s,
-                zoom_t1_s=config.zoom_t1_s,
-                mean_per_channel_raw=mean_per_channel_raw_mmap,
-                spike_bandpass_low_hz=config.spike_bandpass_low_hz,
-                spike_bandpass_high_hz=config.spike_bandpass_high_hz,
-                lightweight_mode=config.lightweight_plot,
-                sampling_percent=config.sampling_percent,
-                probe_layout_json=config.probe_layout_json,
-            )
-        print(f"Sample rate: {fs:.2f} Hz")
-        print("--- Triggers (ANALOG_IN 0) ---")
-        print(f"Total triggers detected: {n_total}")
-        print(f"Triggers used for average: {n_valid}")
-        if n_total > n_valid:
-            print(f"  ({n_total - n_valid} trigger(s) excluded: [-pre,+post] window outside signal)")
-        print(f"Amplifier channels: {len(channel_names)}")
-        print(f"Time window: [-{config.pre_s:.3f}s, +{config.post_s:.3f}s]")
-        print(f"ANALOG_IN 0 edge: {config.edge}")
-        if end_rising_s is not None:
-            print(f"Mean delay to next rising edge (typical pulse end): {end_rising_s*1e3:.3f} ms")
-        else:
-            print("Next rising edge at threshold: not computed (no rising edge after triggers).")
-        if curve_filter_kind == "no filter":
-            print("Butterworth curve filter: disabled")
-        elif curve_filter_kind == "bandpass":
-            print(
-                "Butterworth curve filter: "
-                f"band-pass {curve_filter_low_hz:g}-{curve_filter_high_hz:g} Hz (order 4, filtfilt)"
-            )
-        elif curve_filter_kind == "highpass":
-            print(
-                "Butterworth curve filter: "
-                f"high-pass {curve_filter_low_hz:g} Hz (order 4, filtfilt)"
-            )
-        else:
-            print(
-                "Butterworth curve filter: "
-                f"low-pass {curve_filter_low_hz:g} Hz (order 4, filtfilt)"
-            )
-        bp_txt = (
-            f" | spike band-pass {config.spike_bandpass_low_hz:g}–{config.spike_bandpass_high_hz:g} Hz"
-            if config.spike_bandpass_low_hz is not None
-            else " | spike band-pass: disabled (raw)"
-        )
-        if config.spike_threshold_mode == "rms_multiple":
-            spike_txt = (
-                f"threshold mode = rms_multiple ({config.spike_threshold_rms_multiplier:g} x "
-                "mean RMS per channel)"
-            )
-        else:
-            spike_rule = (
-                "falling edge (negative peak)"
-                if config.spike_threshold_uv < 0
-                else "rising edge"
-            )
-            spike_txt = f"threshold {config.spike_threshold_uv} µV ({spike_rule})"
-        print(
-            f"Spikes (PDF amplifier): {spike_txt} | "
-            f"PSTH time window = {max(float(config.psth_bin_window_s), 1.0 / float(fs)):g} s{bp_txt}"
-        )
-        print(f"PDF zoom window: [{config.zoom_t0_s:.3f}s, {config.zoom_t1_s:.3f}s]")
-        print(f"RMS window: {config.rms_window_s:.3f} s")
-        print(f"PDF written: {pdf_path}")
-        elapsed_s = time.perf_counter() - run_start_time_s
-        print(f"Total time (analysis + PDF): {elapsed_s:.2f} s")
-        print(
-            f"Work dir (amplifier mmap): {resolve_work_dir(config)} — "
-            + (
-                "kept (--keep-intermediate)."
-                if config.keep_intermediate_files
-                else "removed after success (save disk)."
-            )
-        )
-    finally:
-        if spike_source is not None:
-            spike_source.close()
+    if config.probe_layout_json is not None:
+        probe_json_path = config.probe_layout_json
+        if not probe_json_path.exists():
+            raise FileNotFoundError(f"Probe JSON not found: {probe_json_path}")
+        load_probe_layout_json(probe_json_path)
+
+    pdf_path, stats = _run_streaming_comparison([config], "analysis")
+    fs = float(stats["fs_values"][0])  # type: ignore[index]
+    n_total = int(stats["n_totals"][0])  # type: ignore[index]
+    n_valid = int(stats["n_valids"][0])  # type: ignore[index]
+    end_marker = stats["end_markers"][0]  # type: ignore[index]
+
+    print(f"Sample rate: {fs:.2f} Hz")
+    print("--- Triggers (ANALOG_IN 0) ---")
+    print(f"Total triggers detected: {n_total}")
+    print(f"Triggers used for average: {n_valid}")
+    if n_total > n_valid:
+        print(f"  ({n_total - n_valid} trigger(s) excluded: [-pre,+post] window outside signal)")
+    print(f"Channels compared (overlay): {stats['n_ch']}")
+    print(f"Time window: [-{config.pre_s:.3f}s, +{config.post_s:.3f}s]")
+    print(f"ANALOG_IN 0 edge: {config.edge}")
+    if end_marker is not None:
+        print(f"Mean delay to trigger end (rising): {float(end_marker)*1e3:.3f} ms")
+    else:
+        print("Next rising edge at threshold: not computed (no rising edge after triggers).")
+    curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(config, fs)
+    if curve_filter_kind == "no filter":
+        print("Butterworth curve filter: disabled")
+    elif curve_filter_kind == "bandpass":
+        print(f"Butterworth curve filter: band-pass {curve_filter_low_hz:g}-{curve_filter_high_hz:g} Hz")
+    elif curve_filter_kind == "highpass":
+        print(f"Butterworth curve filter: high-pass {curve_filter_low_hz:g} Hz")
+    else:
+        print(f"Butterworth curve filter: low-pass {curve_filter_low_hz:g} Hz")
+    print(f"PDF written: {pdf_path}")
+    print(f"Compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
+    print(f"PDF render time: {stats['t_render_s']:.2f} s")
+    print(f"Total time (analysis + PDF): {stats['t_total_s']:.2f} s")
 
 
 def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
@@ -421,6 +320,8 @@ def run_multi_comparison(configs: list[AnalysisConfig]) -> None:
 
 def _autotune_config(cfg: AnalysisConfig, n_files: int) -> AnalysisConfig:
     """Auto-tuning policy biased toward stable throughput."""
+    if n_files <= 1:
+        return replace(cfg, comparison_workers=1)
     workers = max(1, min(int(cfg.comparison_workers), max(1, min(6, n_files))))
     channel_workers = cfg.channel_workers
     if channel_workers is None:
