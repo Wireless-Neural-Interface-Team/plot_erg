@@ -61,7 +61,7 @@ SUMMARY_PAGE_WIDTH_IN = 16.0
 SUMMARY_PAGE_HEIGHT_IN = 9.0
 TRACE_PANEL_LEGEND_KWARGS = {
     "loc": "upper center",
-    "bbox_to_anchor": (0.5, -0.3),
+    "bbox_to_anchor": (0.5, -0.1),
     "fontsize": LEGEND_FONT_SIZE,
     "framealpha": None,
 }
@@ -416,8 +416,8 @@ def _finalize_and_save_three_part_page(
         1.0,
         _three_part_page_height(recording_count, include_imp=include_imp) / THREE_PART_PAGE_HEIGHT_REF,
     )
-    gap_1_2 = (0.016 + 0.004 * float(recording_count - 1)) * page_height_scale
-    gap_4_5 = (0.016 + 0.003 * float(recording_count - 1)) * page_height_scale
+    gap_1_2 = (0.001 + 0.001 * float(recording_count - 1)) * page_height_scale
+    gap_4_5 = (0.001 + 0.001 * float(recording_count - 1)) * page_height_scale
 
     axis_order = list(THREE_PART_AXIS_ORDER)
     if include_imp:
@@ -742,7 +742,7 @@ def _add_raster_threshold_legend(
     else:
         ncol = 3
     rows = max(1, int(math.ceil(entry_count / float(ncol))))
-    legend_y = -(0.3 + 0.10 * float(max(0, rows - 1)))
+    legend_y = -0.1
     legend = ax_raster.legend(
         unique_handles,
         unique_labels,
