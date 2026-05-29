@@ -37,7 +37,6 @@ def launch_qt_gui(
     default_spike_bandpass_low_hz: float | None = None,
     default_spike_bandpass_high_hz: float | None = None,
     default_channel_workers: int | None = None,
-    default_lightweight_plot: bool = False,
     default_sampling_percent: int = 100,
     default_probe_layout_json: Path | None = None,
 ) -> int:
@@ -243,8 +242,6 @@ def launch_qt_gui(
     if default_channel_workers is not None:
         channel_workers_edit.setText(str(default_channel_workers))
     channel_workers_edit.setPlaceholderText("auto (default)")
-    lightweight_plot_cb = QCheckBox("Lightweight PDF mode (raster/ISI downsample, lower dpi)")
-    lightweight_plot_cb.setChecked(default_lightweight_plot)
     sampling_percent_edit = QLineEdit(str(default_sampling_percent))
     sampling_percent_edit.setPlaceholderText("1..100")
 
@@ -290,7 +287,6 @@ def launch_qt_gui(
     general_form.addRow("PDF title/name:", pdf_title_edit)
     general_form.addRow("Probe MEA (JSON probeinterface):", probe_json_row)
     general_form.addRow("Channel workers (max 16, empty = auto):", channel_workers_edit)
-    general_form.addRow("", lightweight_plot_cb)
     general_form.addRow("Spike display sampling (%):", sampling_percent_edit)
 
     general_group = QGroupBox("General settings — ANALOG_IN trigger, amplifier averages, files")
@@ -375,7 +371,6 @@ def launch_qt_gui(
         Path | None,
         bool,
         int | None,
-        bool,
         int,
     ]:
         curve_filter_kind = str(filter_combo.currentData() or "no filter")
@@ -476,7 +471,6 @@ def launch_qt_gui(
             None,
             keep_work_cb.isChecked(),
             channel_workers,
-            lightweight_plot_cb.isChecked(),
             sampling_percent,
         )
 
@@ -638,7 +632,6 @@ def launch_qt_gui(
         save_dir_edit.setEnabled(not running)
         keep_work_cb.setEnabled(not running)
         channel_workers_edit.setEnabled(not running)
-        lightweight_plot_cb.setEnabled(not running)
         sampling_percent_edit.setEnabled(not running)
         probe_layout_json_edit.setEnabled(not running)
         browse_probe_json_btn.setEnabled(not running)
@@ -653,7 +646,9 @@ def launch_qt_gui(
     def on_compare_ok(output: str) -> None:
         _finalize_thread_idle()
         if output:
-            append_log(output.replace("\n", "<br>"))
+            for line in output.splitlines():
+                if line.strip():
+                    append_log(line)
         pdf_m = re.search(r"(?:Comparison )?PDF written: (.+)", output)
         if pdf_m:
             status_label.setText(f"Processing completed — {pdf_m.group(1)}")
@@ -688,7 +683,7 @@ def launch_qt_gui(
         return unique_paths
 
     def _build_configs_from_paths(paths: list[str]) -> list[AnalysisConfig]:
-        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, lightweight_mode_enabled, sampling_percent = (
+        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, sampling_percent = (
             build_shared_params()
         )
         if psth_bin_window_s <= 0:
@@ -721,7 +716,6 @@ def launch_qt_gui(
                     work_dir=work_dir_path,
                     keep_intermediate_files=keep_work_files,
                     channel_workers=channel_worker_count,
-                    lightweight_plot=lightweight_mode_enabled,
                     sampling_percent=sampling_percent,
                     probe_layout_json=probe_layout_path,
                 )
@@ -734,15 +728,14 @@ def launch_qt_gui(
             return
 
         def task() -> None:
-            if run_multi_comparison_callback is not None:
-                run_multi_comparison_callback(configs)
-                return
-            # Backward fallback when unified callback is unavailable.
             if len(configs) == 1:
                 run_callback(configs[0])
                 return
             if len(configs) == 2:
                 run_comparison_callback(configs[0], configs[1])
+                return
+            if run_multi_comparison_callback is not None:
+                run_multi_comparison_callback(configs)
                 return
             raise RuntimeError("Multi-file processing unavailable in this build.")
 

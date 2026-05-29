@@ -332,7 +332,7 @@ class AmplifierSpikeSource:
         if trial_count * window_length > 25_000_000:
             raise RuntimeError(
                 "Spike window too large for 2D RAM extraction. "
-                "Reduce pre/post, sampling %, or enable lightweight mode."
+                "Reduce pre/post window or spike display sampling (%)."
             )
         trial_windows = np.empty((trial_count, window_length), dtype=np.float64)
         for trial_index, trigger_index in enumerate(self.valid_triggers):

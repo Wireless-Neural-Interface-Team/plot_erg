@@ -52,8 +52,6 @@ class AnalysisConfig:
     comparison_workers: int = 32
     # Max channel worker threads (None = auto, cap 16)
     channel_workers: int | None = None
-    # Lightweight PDF mode (raster/ISI downsample + lower DPI)
-    lightweight_plot: bool = False
     # Fraction of spike-plot points to keep (1..100)
     sampling_percent: int = 100
     # probeinterface JSON (MEA map inset in PDF when channel maps)

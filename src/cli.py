@@ -208,11 +208,6 @@ def parse_args() -> argparse.Namespace:
         help="Max channel worker threads (default: auto, cap 16).",
     )
     parser.add_argument(
-        "--lightweight-plot",
-        action="store_true",
-        help="Lightweight PDF mode (raster/ISI downsample + reduced dpi).",
-    )
-    parser.add_argument(
         "--sampling-percent",
         type=int,
         default=100,
@@ -330,19 +325,15 @@ def _autotune_config(cfg: AnalysisConfig, n_files: int) -> AnalysisConfig:
         workers = min(workers, 3)
         channel_workers = min(channel_workers, 4)
     sampling_percent = cfg.sampling_percent
-    lightweight = cfg.lightweight_plot
     if n_files >= 4 and sampling_percent > 35:
         sampling_percent = 35
     if n_files >= 6 and sampling_percent > 20:
         sampling_percent = 20
-    if n_files >= 4:
-        lightweight = True
     return replace(
         cfg,
         comparison_workers=workers,
         channel_workers=channel_workers,
         sampling_percent=sampling_percent,
-        lightweight_plot=lightweight,
     )
 
 
@@ -359,13 +350,16 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
         print("Guardrail mode: large window detected, parallelism limited for memory stability.")
     if tuned[0].sampling_percent != configs[0].sampling_percent:
         print(f"Auto-tuning sampling: {configs[0].sampling_percent}% -> {tuned[0].sampling_percent}%")
-
     payloads = []
     t_compute0 = time.perf_counter()
-    with ProcessPoolExecutor(max_workers=min(workers, len(tuned))) as pool:
-        futures = [pool.submit(_compute_payload_for_streaming, cfg) for cfg in tuned]
-        for fut in futures:
-            payloads.append(fut.result())
+    if len(tuned) == 1:
+        # In-process load so RHS reader progress appears in the GUI log (stdout redirect).
+        payloads = [_compute_payload_for_streaming(tuned[0])]
+    else:
+        with ProcessPoolExecutor(max_workers=min(workers, len(tuned))) as pool:
+            futures = [pool.submit(_compute_payload_for_streaming, cfg) for cfg in tuned]
+            for fut in futures:
+                payloads.append(fut.result())
     t_compute_s = time.perf_counter() - t_compute0
 
     spike_sources: list[AmplifierSpikeSource] = []
@@ -457,7 +451,6 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             zoom_t1_s=tuned[0].zoom_t1_s,
             spike_bandpass_low_hz=tuned[0].spike_bandpass_low_hz,
             spike_bandpass_high_hz=tuned[0].spike_bandpass_high_hz,
-            lightweight_mode=tuned[0].lightweight_plot,
             sampling_percent=tuned[0].sampling_percent,
             pre_n_common=pre_n_common,
             post_n_common=post_n_common,
@@ -507,7 +500,6 @@ def main() -> None:
             default_spike_bandpass_low_hz=args.spike_bandpass_low_hz,
             default_spike_bandpass_high_hz=args.spike_bandpass_high_hz,
             default_channel_workers=args.channel_workers,
-            default_lightweight_plot=args.lightweight_plot,
             default_sampling_percent=args.sampling_percent,
             default_probe_layout_json=args.probe_layout_json,
         )
@@ -540,7 +532,6 @@ def main() -> None:
         keep_intermediate_files=args.keep_intermediate,
         comparison_workers=args.workers,
         channel_workers=args.channel_workers,
-        lightweight_plot=args.lightweight_plot,
         sampling_percent=args.sampling_percent,
         probe_layout_json=args.probe_layout_json,
     )

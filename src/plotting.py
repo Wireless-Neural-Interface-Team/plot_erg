@@ -41,19 +41,79 @@ ISI_HALF_WINDOW_S = 1.0
 # X-axis label for all time-relative-to-trigger plots
 TIME_REL_XLABEL = "Time relative to trigger (s)"
 LEGEND_FONT_SIZE = 8
-# Three-part channel page layout (inches). Increase width/height to enlarge the PDF page;
-# panel scale below maps page size to subplot height ratios so graphs grow with the page.
-THREE_PART_PAGE_WIDTH_IN = 20.0
-THREE_PART_PAGE_HEIGHT_BASE_NO_IMP = 150.0
-THREE_PART_PAGE_HEIGHT_PER_RECORDING_NO_IMP = 2.0
-THREE_PART_PAGE_HEIGHT_BASE_IMP = 300.0
-THREE_PART_PAGE_HEIGHT_PER_RECORDING_IMP = 2.5
-THREE_PART_PAGE_REFERENCE_WIDTH_IN = 16.0
-THREE_PART_PAGE_REFERENCE_HEIGHT_IN = 120.0
-THREE_PART_PAGE_HEIGHT_SCALE = 1.0
-THREE_PART_GRID_HSPACE = 1.40
+AXIS_TITLE_FONT_SIZE = 9
+AXIS_LABEL_FONT_SIZE = 8
+TICK_LABEL_FONT_SIZE = 7
+# Three-part PDF layout (inches). Panel height in the PDF is controlled by:
+#   1. THREE_PART_PAGE_HEIGHT_*  — total page height
+#   2. THREE_PART_PANEL_HEIGHT_SCALE — global multiplier on panel height
+#   3. THREE_PART_GRID_HSPACE — lower = more height for plots, less for row gaps
+THREE_PART_PAGE_WIDTH_IN = 12.0
+THREE_PART_PAGE_HEIGHT_NO_IMP = (110.0, 2.0)  # base height, +per extra recording
+THREE_PART_PAGE_HEIGHT_IMP = (120.0, 2.5)
+THREE_PART_PANEL_HEIGHT_SCALE = 1.0  # e.g. 1.25 for 25% taller panels (same width)
+THREE_PART_PAGE_HEIGHT_REF = 120.0
+THREE_PART_GRID_HSPACE = 0.4
 THREE_PART_SUBPLOT_LEFT = 0.04
 THREE_PART_SUBPLOT_RIGHT = 0.99
+PDF_DPI = 120
+SUMMARY_PAGE_WIDTH_IN = 16.0
+SUMMARY_PAGE_HEIGHT_IN = 9.0
+TRACE_PANEL_LEGEND_KWARGS = {
+    "loc": "upper center",
+    "bbox_to_anchor": (0.5, -0.3),
+    "fontsize": LEGEND_FONT_SIZE,
+    "framealpha": None,
+}
+THREE_PART_ROW_HEIGHTS = [
+    1.70,
+    1.60,
+    1.30,
+    1.20,
+    1.45,
+    1.05,
+    1.15,
+    0.06,
+    1.70,
+    1.50,
+    1.20,
+    1.30,
+    1.45,
+    1.05,
+    1.15,
+    0.06,
+    1.70,
+    1.50,
+    1.20,
+    1.30,
+    1.45,
+    1.05,
+    1.15,
+]
+THREE_PART_AXIS_ORDER = [
+    "ax_first_trigger",
+    "ax_full_rms",
+    "ax_raster_f",
+    "ax_fr_f",
+    "ax_trial_fr_f",
+    "ax_isi_f",
+    "ax_hdr2",
+    "ax_zoom",
+    "ax_zoom_first",
+    "ax_zoom_rms",
+    "ax_raster_z",
+    "ax_fr_z",
+    "ax_trial_fr_z",
+    "ax_isi_z",
+    "ax_hdr3",
+    "ax_zoom_end",
+    "ax_zoom_end_first",
+    "ax_zoom_end_rms",
+    "ax_raster_ze",
+    "ax_fr_ze",
+    "ax_trial_fr_ze",
+    "ax_isi_ze",
+]
 RMS_INTAN_LIKE_BANDPASS_LOW_HZ = 300.0
 RMS_INTAN_LIKE_BANDPASS_HIGH_HZ = 7500.0
 _PROFILE_ENABLED = os.environ.get("PLOT_ERG_PROFILE", "1").strip().lower() in {
@@ -107,29 +167,6 @@ def _profiled(name: str):
         return _wrapped
 
     return _deco
-
-
-def _lightweight_pdf_dpi(lightweight_mode: bool) -> int:
-    """Lower DPI aggressively in lightweight mode to speed up rendering."""
-    return 60 if lightweight_mode else 120
-
-
-def _scale_page_size_for_lightweight(
-    width_in: float,
-    height_in: float,
-    lightweight_mode: bool,
-) -> tuple[float, float]:
-    """Scale page size down when lightweight mode is enabled."""
-    if not lightweight_mode:
-        return width_in, height_in
-    # Clamp to a strict lightweight envelope to keep rendering fast even
-    # when upstream page sizes are very large.
-    scaled_width_in = width_in * 0.55
-    scaled_height_in = height_in * 0.45
-    return (
-        max(10.0, min(14.0, scaled_width_in)),
-        max(20.0, min(42.0, scaled_height_in)),
-    )
 
 
 def _draw_mea_layout_panel(
@@ -189,48 +226,30 @@ def _soften_figure_linewidths(
                 pass
 
 
-def _three_part_height_ratios(first_row_height_ratio: float) -> list[float]:
-    return [
-        first_row_height_ratio,
-        1.70,
-        1.60,
-        1.30,
-        1.20,
-        1.45,
-        1.05,
-        1.15,
-        0.06,
-        1.70,
-        1.50,
-        1.20,
-        1.30,
-        1.45,
-        1.05,
-        1.15,
-        0.06,
-        1.70,
-        1.50,
-        1.20,
-        1.30,
-        1.45,
-        1.05,
-        1.15,
-    ]
+def _three_part_page_height(recording_count: int, *, include_imp: bool) -> float:
+    base, per_recording = (
+        THREE_PART_PAGE_HEIGHT_IMP if include_imp else THREE_PART_PAGE_HEIGHT_NO_IMP
+    )
+    height_in = base + per_recording * float(max(1, recording_count) - 1)
+    return height_in * max(0.5, float(THREE_PART_PANEL_HEIGHT_SCALE))
 
 
-def _widen_three_part_axes(axes: dict[str, Any]) -> None:
-    """Widen plot panels horizontally without changing their vertical placement."""
-    width = THREE_PART_SUBPLOT_RIGHT - THREE_PART_SUBPLOT_LEFT
-    for ax in axes.values():
-        pos = ax.get_position()
-        ax.set_position([THREE_PART_SUBPLOT_LEFT, pos.y0, width, pos.height])
+def _apply_compact_axis_fonts(fig: Any) -> None:
+    """Reduce subplot titles and axis label/tick font sizes on a figure."""
+    for ax in fig.axes:
+        if ax.get_title():
+            ax.title.set_fontsize(AXIS_TITLE_FONT_SIZE)
+        if ax.get_xlabel():
+            ax.xaxis.label.set_fontsize(AXIS_LABEL_FONT_SIZE)
+        if ax.get_ylabel():
+            ax.yaxis.label.set_fontsize(AXIS_LABEL_FONT_SIZE)
+        ax.tick_params(axis="both", labelsize=TICK_LABEL_FONT_SIZE)
 
 
 def _build_three_part_page_axes(
     *,
     zoom_t0: float,
     zoom_t1: float,
-    lightweight_mode: bool,
     n_recordings: int,
     first_row_height_ratio: float,
     first_row_text: Optional[str],
@@ -239,23 +258,11 @@ def _build_three_part_page_axes(
     include_impedance_panel: bool,
 ) -> tuple[Any, dict[str, Any]]:
     recording_count = max(1, int(n_recordings))
-    base_height_ratios = _three_part_height_ratios(first_row_height_ratio)
+    page_height_in = _three_part_page_height(recording_count, include_imp=include_impedance_panel)
+    page_width_in = THREE_PART_PAGE_WIDTH_IN
+    height_ratios = [first_row_height_ratio, *THREE_PART_ROW_HEIGHTS]
     if include_impedance_panel:
-        page_height_in = THREE_PART_PAGE_HEIGHT_BASE_IMP + THREE_PART_PAGE_HEIGHT_PER_RECORDING_IMP * float(
-            recording_count - 1
-        )
-    else:
-        page_height_in = THREE_PART_PAGE_HEIGHT_BASE_NO_IMP + THREE_PART_PAGE_HEIGHT_PER_RECORDING_NO_IMP * float(
-            recording_count - 1
-        )
-    requested_page_height_in = page_height_in * THREE_PART_PAGE_HEIGHT_SCALE
-    page_width_in, page_height_in = _scale_page_size_for_lightweight(
-        THREE_PART_PAGE_WIDTH_IN, requested_page_height_in, lightweight_mode
-    )
-    if include_impedance_panel:
-        height_ratios = [*base_height_ratios, 0.05, 0.95]
-    else:
-        height_ratios = base_height_ratios
+        height_ratios = [*height_ratios, 0.05, 0.95]
     fig = plt.figure(figsize=(page_width_in, page_height_in))
     gs = fig.add_gridspec(
         len(height_ratios),
@@ -373,7 +380,6 @@ def _finalize_and_save_three_part_page(
     fig: Any,
     pdf: PdfPages,
     axes: dict[str, Any],
-    lightweight_mode: bool,
     n_recordings: int,
 ) -> None:
     tick_keys = [
@@ -405,73 +411,41 @@ def _finalize_and_save_three_part_page(
         axes[key].tick_params(axis="x", labelbottom=True)
     fig.tight_layout()
     recording_count = max(1, int(n_recordings))
-    if "ax_imp" in axes:
-        layout_page_height_in = THREE_PART_PAGE_HEIGHT_BASE_IMP + THREE_PART_PAGE_HEIGHT_PER_RECORDING_IMP * float(
-            recording_count - 1
-        )
-    else:
-        layout_page_height_in = THREE_PART_PAGE_HEIGHT_BASE_NO_IMP + THREE_PART_PAGE_HEIGHT_PER_RECORDING_NO_IMP * float(
-            recording_count - 1
-        )
+    include_imp = "ax_imp" in axes
     page_height_scale = max(
         1.0,
-        layout_page_height_in
-        * THREE_PART_PAGE_HEIGHT_SCALE
-        / THREE_PART_PAGE_REFERENCE_HEIGHT_IN,
+        _three_part_page_height(recording_count, include_imp=include_imp) / THREE_PART_PAGE_HEIGHT_REF,
     )
-    gap_1_2 = min(0.040, (0.016 + 0.004 * float(recording_count - 1)) * page_height_scale)
-    gap_4_5 = min(0.036, (0.016 + 0.003 * float(recording_count - 1)) * page_height_scale)
+    gap_1_2 = (0.016 + 0.004 * float(recording_count - 1)) * page_height_scale
+    gap_4_5 = (0.016 + 0.003 * float(recording_count - 1)) * page_height_scale
 
-    imp_tail_keys: list[str] = []
-    if "ax_imp_hdr" in axes:
-        imp_tail_keys.append("ax_imp_hdr")
-    if "ax_imp" in axes:
-        imp_tail_keys.append("ax_imp")
-
-    axis_order = [
-        "ax_first_trigger",
-        "ax_full_rms",
-        "ax_raster_f",
-        "ax_fr_f",
-        "ax_trial_fr_f",
-        "ax_isi_f",
-        "ax_hdr2",
-        "ax_zoom",
-        "ax_zoom_first",
-        "ax_zoom_rms",
-        "ax_raster_z",
-        "ax_fr_z",
-        "ax_trial_fr_z",
-        "ax_isi_z",
-        "ax_hdr3",
-        "ax_zoom_end",
-        "ax_zoom_end_first",
-        "ax_zoom_end_rms",
-        "ax_raster_ze",
-        "ax_fr_ze",
-        "ax_trial_fr_ze",
-        "ax_isi_ze",
-        *imp_tail_keys,
-    ]
-
-    def _axis_group(start_key: str) -> list[Any]:
+    axis_order = list(THREE_PART_AXIS_ORDER)
+    if include_imp:
+        if "ax_imp_hdr" in axes:
+            axis_order.append("ax_imp_hdr")
+        if "ax_imp" in axes:
+            axis_order.append("ax_imp")
+    for start_key, gap in (
+        ("ax_first_trigger", gap_1_2),
+        ("ax_zoom_first", gap_1_2),
+        ("ax_zoom_end_first", gap_1_2),
+        ("ax_fr_f", gap_4_5),
+        ("ax_fr_z", gap_4_5),
+        ("ax_fr_ze", gap_4_5),
+    ):
         start_idx = axis_order.index(start_key)
-        return [axes[key] for key in axis_order[start_idx:] if key in axes]
+        shift_axes_down(
+            [axes[key] for key in axis_order[start_idx:] if key in axes],
+            delta=gap,
+        )
 
-    # Graph 1<->2: extra space for legends under the first trace of each section.
-    shift_axes_down(_axis_group("ax_first_trigger"), delta=gap_1_2)
-    shift_axes_down(_axis_group("ax_zoom_first"), delta=gap_1_2)
-    shift_axes_down(_axis_group("ax_zoom_end_first"), delta=gap_1_2)
-
-    # Graph 4<->5: extra space for raster threshold legends in each section.
-    # Each shift must propagate through the following section headers/content.
-    shift_axes_down(_axis_group("ax_fr_f"), delta=gap_4_5)
-    shift_axes_down(_axis_group("ax_fr_z"), delta=gap_4_5)
-    shift_axes_down(_axis_group("ax_fr_ze"), delta=gap_4_5)
-    _widen_three_part_axes(axes)
+    panel_width = THREE_PART_SUBPLOT_RIGHT - THREE_PART_SUBPLOT_LEFT
+    for ax in axes.values():
+        pos = ax.get_position()
+        ax.set_position([THREE_PART_SUBPLOT_LEFT, pos.y0, panel_width, pos.height])
     _soften_figure_linewidths(fig)
-    page_dpi = _lightweight_pdf_dpi(lightweight_mode)
-    pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=page_dpi)
+    _apply_compact_axis_fonts(fig)
+    pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=PDF_DPI)
     plt.close(fig)
 
 
@@ -719,22 +693,6 @@ def _set_adaptive_x_limits(
     ax.set_xlim(x_min - pad, x_max + pad)
 
 
-def _add_trace_panel_legend(
-    ax: Any,
-    *,
-    ncol: int = 3,
-    fontsize: float = LEGEND_FONT_SIZE,
-) -> None:
-    """Place legend below the first trace panel of a section."""
-    ax.legend(
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.48),
-        ncol=ncol,
-        fontsize=fontsize,
-        framealpha=None,
-    )
-
-
 def _add_raster_threshold_legend(
     ax_raster: Any,
     threshold_caption: str,
@@ -784,7 +742,7 @@ def _add_raster_threshold_legend(
     else:
         ncol = 3
     rows = max(1, int(math.ceil(entry_count / float(ncol))))
-    legend_y = -(0.64 + 0.16 * float(max(0, rows - 1)))
+    legend_y = -(0.3 + 0.10 * float(max(0, rows - 1)))
     legend = ax_raster.legend(
         unique_handles,
         unique_labels,
@@ -1376,24 +1334,18 @@ def _draw_impedance_evolution_panel(
             xytext=(0, 6),
             ha="center",
             va="bottom",
-        fontsize=6,
+            fontsize=6,
             alpha=0.9,
             zorder=4,
         )
     ax_imp.set_ylabel("|Z| @ 1 kHz (Ω)", fontsize=8)
     ax_imp.set_xlabel("Session time (_YYMMDD_HHMMSS)", fontsize=8)
-    valid_times = times_num[valid]
-    day_start = np.floor(np.min(valid_times))
-    day_end = np.ceil(np.max(valid_times))
-    if day_end <= day_start:
-        day_end = day_start + 1.0
-    ax_imp.set_xlim(day_start, day_end)
-    ax_imp.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-    ax_imp.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
-    ax_imp.set_xticks(valid_times.tolist(), minor=True)
+    ax_imp.margins(x=0.08)
+    date_locator = mdates.AutoDateLocator()
+    ax_imp.xaxis.set_major_locator(date_locator)
+    ax_imp.xaxis.set_major_formatter(mdates.ConciseDateFormatter(date_locator))
     ax_imp.tick_params(axis="both", labelsize=7)
     ax_imp.grid(True, which="major", alpha=0.35)
-    ax_imp.grid(True, which="minor", alpha=0.12)
     for label in ax_imp.get_xticklabels():
         label.set_rotation(18)
         label.set_ha("right")
@@ -1402,15 +1354,12 @@ def _draw_impedance_evolution_panel(
 def _append_mean_impedance_summary_page(
     pdf: PdfPages,
     sessions: Sequence[ImpedanceSession],
-    lightweight_mode: bool,
 ) -> None:
     """Final PDF page: mean |Z|@1 kHz averaged over CSV channels vs session time."""
     if not sessions:
         return
     check_analysis_cancelled()
-    dpi = _lightweight_pdf_dpi(lightweight_mode)
-    fig_w, fig_h = _scale_page_size_for_lightweight(16.0, 9.0, lightweight_mode)
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    fig, ax = plt.subplots(figsize=(SUMMARY_PAGE_WIDTH_IN, SUMMARY_PAGE_HEIGHT_IN))
     times_num = np.array([mdates.date2num(s.when) for s in sessions], dtype=np.float64)
     means_z: list[float] = []
     stem_labels: list[str] = []
@@ -1479,7 +1428,8 @@ def _append_mean_impedance_summary_page(
                 )
 
     _soften_figure_linewidths(fig)
-    pdf.savefig(fig, bbox_inches="tight", pad_inches=0.25, dpi=dpi)
+    _apply_compact_axis_fonts(fig)
+    pdf.savefig(fig, dpi=PDF_DPI)
     plt.close(fig)
 
 
@@ -1693,12 +1643,10 @@ def _append_mean_rms_evolution_page(
     pdf: PdfPages,
     rms_series: Sequence[tuple[str, np.ndarray, np.ndarray]],
     rms_window_s: float,
-    lightweight_mode: bool,
 ) -> None:
     """Append one summary page: mean RMS profile on analysis timebase."""
     check_analysis_cancelled()
-    fig_w, fig_h = _scale_page_size_for_lightweight(16.0, 9.0, lightweight_mode)
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+    fig, ax = plt.subplots(figsize=(SUMMARY_PAGE_WIDTH_IN, SUMMARY_PAGE_HEIGHT_IN))
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
     has_data = False
     for i, (label, tx, values) in enumerate(rms_series):
@@ -1730,7 +1678,8 @@ def _append_mean_rms_evolution_page(
         )
         ax.set_axis_off()
     _soften_figure_linewidths(fig)
-    pdf.savefig(fig, bbox_inches="tight", pad_inches=0.25, dpi=_lightweight_pdf_dpi(lightweight_mode))
+    _apply_compact_axis_fonts(fig)
+    pdf.savefig(fig, dpi=PDF_DPI)
     plt.close(fig)
 
 
@@ -1758,7 +1707,6 @@ def plot_channel_multi_comparison(
     zoom_t1_s: float = ZOOM_T1,
     spike_bandpass_low_hz: Optional[float] = None,
     spike_bandpass_high_hz: Optional[float] = None,
-    lightweight_mode: bool = False,
     sampling_percent: int = 100,
     probe_layout_json: Optional[Path] = None,
     streaming_mode: bool = False,
@@ -1865,9 +1813,8 @@ def plot_channel_multi_comparison(
             fig, _axes = _build_three_part_page_axes(
                 zoom_t0=zoom_t0,
                 zoom_t1=zoom_t1,
-                lightweight_mode=lightweight_mode,
                 n_recordings=n_records,
-                first_row_height_ratio=3.60,
+                first_row_height_ratio=2.0,
                 first_row_text=None,
                 first_row_mea_channel_name=channel_name,
                 probe_layout=probe_layout_loaded,
@@ -2024,13 +1971,7 @@ def plot_channel_multi_comparison(
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
-            ax_full.legend(
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.48),
-                ncol=legend_cols,
-                fontsize=legend_font,
-                framealpha=None,
-            )
+            ax_full.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
 
             if any(curve is not None for curve in first_trigger_curves):
                 for recording_index, first_curve in enumerate(first_trigger_curves):
@@ -2091,7 +2032,7 @@ def plot_channel_multi_comparison(
             ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
-            _add_trace_panel_legend(ax_zoom, ncol=legend_cols, fontsize=legend_font)
+            ax_zoom.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
             if any(curve is not None for curve in first_trigger_curves):
                 for recording_index, first_curve in enumerate(first_trigger_curves):
                     if first_curve is None:
@@ -2156,7 +2097,7 @@ def plot_channel_multi_comparison(
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
-                _add_trace_panel_legend(ax_zoom_end, ncol=legend_cols, fontsize=legend_font)
+                ax_zoom_end.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
                 if any(curve is not None for curve in first_trigger_curves):
                     for recording_index, first_curve in enumerate(first_trigger_curves):
                         if first_curve is None:
@@ -2262,7 +2203,6 @@ def plot_channel_multi_comparison(
                 fig=fig,
                 pdf=pdf,
                 axes=_axes,
-                lightweight_mode=lightweight_mode,
                 n_recordings=n_records,
             )
 
@@ -2274,10 +2214,10 @@ def plot_channel_multi_comparison(
             label = labels[i] if i < len(labels) else f"Recording {i + 1}"
             rms_series.append((label, tx_rms, rms_vals))
         if rms_series:
-            _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s, lightweight_mode)
+            _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s)
 
         if impedance_sessions:
-            _append_mean_impedance_summary_page(pdf, impedance_sessions, lightweight_mode)
+            _append_mean_impedance_summary_page(pdf, impedance_sessions)
 
     _profile_print_delta(
         "plot_channel_multi_comparison",
@@ -2312,7 +2252,6 @@ def plot_channel_averages(
     mean_per_channel_raw: Optional[np.ndarray] = None,
     spike_bandpass_low_hz: Optional[float] = None,
     spike_bandpass_high_hz: Optional[float] = None,
-    lightweight_mode: bool = False,
     sampling_percent: int = 100,
     probe_layout_json: Optional[Path] = None,
 ) -> Path:
@@ -2404,7 +2343,6 @@ def plot_channel_averages(
             fig, _axes = _build_three_part_page_axes(
                 zoom_t0=zoom_t0,
                 zoom_t1=zoom_t1,
-                lightweight_mode=lightweight_mode,
                 n_recordings=1,
                 first_row_height_ratio=1.60,
                 first_row_text=None,
@@ -2496,12 +2434,7 @@ def plot_channel_averages(
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
-            ax_full.legend(
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.48),
-                ncol=3,
-                fontsize=LEGEND_FONT_SIZE,
-            )
+            ax_full.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
 
             if channel_first_trigger_raw is not None:
                 ax_first_trigger.plot(
@@ -2592,7 +2525,7 @@ def plot_channel_averages(
             ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
-            _add_trace_panel_legend(ax_zoom)
+            ax_zoom.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
             if channel_first_trigger_raw is not None:
                 ax_zoom_first.plot(
                     t_rel[zmask],
@@ -2660,7 +2593,7 @@ def plot_channel_averages(
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
-                _add_trace_panel_legend(ax_zoom_end)
+                ax_zoom_end.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
                 if channel_first_trigger_raw is not None:
                     ax_zoom_end_first.plot(
                         t_rel[end_mask],
@@ -2808,7 +2741,6 @@ def plot_channel_averages(
                 fig=fig,
                 pdf=pdf,
                 axes=_axes,
-                lightweight_mode=lightweight_mode,
                 n_recordings=1,
             )
 
@@ -2824,7 +2756,6 @@ def plot_channel_averages(
             pdf,
             [("Mean RMS", rms_tx, rms_values)],
             rms_window_s,
-            lightweight_mode,
         )
 
     _profile_print_delta(
@@ -2864,7 +2795,6 @@ def plot_channel_comparison(
     zoom_t1_s: float = ZOOM_T1,
     spike_bandpass_low_hz: Optional[float] = None,
     spike_bandpass_high_hz: Optional[float] = None,
-    lightweight_mode: bool = False,
     sampling_percent: int = 100,
 ) -> Path:
     """Multi-page PDF: per channel, means + zoom + raster / PSTH / ISI (two overlaid recordings)."""
@@ -2984,7 +2914,6 @@ def plot_channel_comparison(
             fig, _axes = _build_three_part_page_axes(
                 zoom_t0=zoom_t0,
                 zoom_t1=zoom_t1,
-                lightweight_mode=lightweight_mode,
                 n_recordings=2,
                 first_row_height_ratio=0.06,
                 first_row_text="Part 1 — Full view (entire pre/post-trigger window)",
@@ -3081,12 +3010,7 @@ def plot_channel_comparison(
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
-            ax_full.legend(
-                loc="upper center",
-                bbox_to_anchor=(0.5, -0.48),
-                ncol=3,
-                fontsize=LEGEND_FONT_SIZE,
-            )
+            ax_full.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
             if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
                 if first_trigger_a_raw is not None:
                     ax_first_trigger.plot(
@@ -3212,7 +3136,7 @@ def plot_channel_comparison(
             ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
-            _add_trace_panel_legend(ax_zoom)
+            ax_zoom.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
             if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
                 if first_trigger_a_raw is not None:
                     ax_zoom_first.plot(
@@ -3280,7 +3204,7 @@ def plot_channel_comparison(
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
-                _add_trace_panel_legend(ax_zoom_end)
+                ax_zoom_end.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
                 if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
                     if first_trigger_a_raw is not None:
                         ax_zoom_end_first.plot(
@@ -3466,7 +3390,6 @@ def plot_channel_comparison(
                 fig=fig,
                 pdf=pdf,
                 axes=_axes,
-                lightweight_mode=lightweight_mode,
                 n_recordings=2,
             )
 
@@ -3482,7 +3405,7 @@ def plot_channel_comparison(
                 (label_b, *_mean_rms_profile_from_source_window(spike_source_b, t0_rms, t1_rms, rms_window_s))
             )
         if rms_series:
-            _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s, lightweight_mode)
+            _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s)
 
     _profile_print_delta(
         "plot_channel_comparison",
