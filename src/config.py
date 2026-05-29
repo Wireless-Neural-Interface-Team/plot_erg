@@ -46,8 +46,6 @@ class AnalysisConfig:
     spike_bandpass_high_hz: Optional[float] = 7500.0
     # None = auto: (save_dir or .rhs folder) / ".plot_erg" / <stem>
     work_dir: Path | None = None
-    # Do not delete work_dir after run (keeps amplifier .npy, etc.)
-    keep_intermediate_files: bool = False
     # Process workers for A/B comparison (>=1)
     comparison_workers: int = 32
     # Max channel worker threads (None = auto, cap 16)

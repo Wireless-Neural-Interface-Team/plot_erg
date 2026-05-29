@@ -44,15 +44,14 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple[
     str,
 ]:
     """Lightweight payload for multi-recording streaming (no global means)."""
-    worker_cfg = replace(config, keep_intermediate_files=True)
-    if not worker_cfg.rhs_file.exists():
-        raise FileNotFoundError(f"File not found: {worker_cfg.rhs_file}")
-    data = load_rhs_file(worker_cfg.rhs_file)
+    if not config.rhs_file.exists():
+        raise FileNotFoundError(f"File not found: {config.rhs_file}")
+    data = load_rhs_file(config.rhs_file)
     fs = get_sampling_rate(data)
     analog_in0 = get_analog_in0_signal(data)
-    trigger_indices = detect_edges(analog_in0, threshold=worker_cfg.threshold, edge=worker_cfg.edge)
+    trigger_indices = detect_edges(analog_in0, threshold=config.threshold, edge=config.edge)
     if trigger_indices.size == 0:
-        edge_fr = "falling" if worker_cfg.edge == "falling" else "rising"
+        edge_fr = "falling" if config.edge == "falling" else "rising"
         raise RuntimeError(f"No {edge_fr} edge detected on ANALOG_IN 0.")
     amplifier_raw = np.asarray(data.get("amplifier_data"))
     if amplifier_raw.size == 0:
@@ -62,14 +61,14 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple[
         n_samples=n_samples,
         trigger_indices=trigger_indices,
         fs=fs,
-        pre_s=worker_cfg.pre_s,
-        post_s=worker_cfg.post_s,
+        pre_s=config.pre_s,
+        post_s=config.post_s,
     )
     channel_names = get_channel_names(data, amplifier_raw.shape[0])
     n_valid = int(valid_triggers.shape[0])
     n_total = int(trigger_indices.size)
-    end_rising_s = mean_time_to_next_rising_edge_s(analog_in0, trigger_indices, worker_cfg.threshold, fs)
-    work_dir = resolve_work_dir(worker_cfg)
+    end_rising_s = mean_time_to_next_rising_edge_s(analog_in0, trigger_indices, config.threshold, fs)
+    work_dir = resolve_work_dir(config)
     amp_path = work_dir / "amplifier_raw.npy"
     persist_amplifier_float32(amplifier_raw, amp_path)
     return (
@@ -189,11 +188,6 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Intermediate files folder (amplifier .npy mmap). Default: auto next to PDF",
-    )
-    parser.add_argument(
-        "--keep-intermediate",
-        action="store_true",
-        help="Keep work folder (amplifier_raw.npy) after the PDF",
     )
     parser.add_argument(
         "--workers",
@@ -393,7 +387,6 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
                     pre_n=int(pre_n),
                     post_n=int(post_n),
                     work_dir=Path(amp_path).parent,
-                    keep_intermediate_files=cfg.keep_intermediate_files,
                     fs=float(fs),
                     bandpass_low_hz=cfg.spike_bandpass_low_hz,
                     bandpass_high_hz=cfg.spike_bandpass_high_hz,
@@ -529,7 +522,6 @@ def main() -> None:
         spike_bandpass_low_hz=args.spike_bandpass_low_hz,
         spike_bandpass_high_hz=args.spike_bandpass_high_hz,
         work_dir=args.work_dir,
-        keep_intermediate_files=args.keep_intermediate,
         comparison_workers=args.workers,
         channel_workers=args.channel_workers,
         sampling_percent=args.sampling_percent,

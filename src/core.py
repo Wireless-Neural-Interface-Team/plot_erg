@@ -302,7 +302,6 @@ class AmplifierSpikeSource:
         pre_n: int,
         post_n: int,
         work_dir: Path | None,
-        keep_intermediate_files: bool,
         fs: float,
         bandpass_low_hz: float | None = None,
         bandpass_high_hz: float | None = None,
@@ -313,7 +312,6 @@ class AmplifierSpikeSource:
         self.post_n = post_n
         self._offsets = np.arange(-pre_n, post_n, dtype=np.int64)
         self.work_dir = work_dir
-        self.keep_intermediate_files = keep_intermediate_files
         self.fs = float(fs)
         self.bandpass_low_hz = bandpass_low_hz
         self.bandpass_high_hz = bandpass_high_hz
@@ -387,7 +385,7 @@ class AmplifierSpikeSource:
         except Exception:
             pass
         self.amplifier = np.empty((0,))  # drop reference
-        if self.work_dir is not None and self.work_dir.exists() and not self.keep_intermediate_files:
+        if self.work_dir is not None and self.work_dir.exists():
             shutil.rmtree(self.work_dir, ignore_errors=True)
             cleanup_plot_erg_root_if_empty(self.work_dir)
 
@@ -733,7 +731,6 @@ def compute_average_per_channel(
         pre_n=pre_n,
         post_n=post_n,
         work_dir=work_dir,
-        keep_intermediate_files=config.keep_intermediate_files,
         fs=fs,
         bandpass_low_hz=bp_lo,
         bandpass_high_hz=bp_hi,

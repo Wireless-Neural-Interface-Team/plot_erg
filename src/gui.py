@@ -219,10 +219,6 @@ def launch_qt_gui(
     )
     bandpass_spikes_low_edit.setToolTip("Low frequency (Hz). " + _bp_tip)
     bandpass_spikes_high_edit.setToolTip("High frequency (Hz). " + _bp_tip)
-    keep_work_cb = QCheckBox("Keep work folder (amplifier_raw.npy)")
-    keep_work_cb.setToolTip(
-        "Otherwise the intermediate folder is removed after the PDF is generated (save disk)."
-    )
 
     save_row = QHBoxLayout()
     save_row.addWidget(save_dir_edit)
@@ -282,7 +278,6 @@ def launch_qt_gui(
     general_form.addRow("Post-trigger (s):", post_edit)
     general_form.addRow("Filter:", filter_combo)
     general_form.addRow("", curve_cutoff_row_widget)
-    general_form.addRow("", keep_work_cb)
     general_form.addRow("PDF output folder (empty = .rhs folder):", save_row)
     general_form.addRow("PDF title/name:", pdf_title_edit)
     general_form.addRow("Probe MEA (JSON probeinterface):", probe_json_row)
@@ -369,7 +364,6 @@ def launch_qt_gui(
         float | None,
         float | None,
         Path | None,
-        bool,
         int | None,
         int,
     ]:
@@ -469,7 +463,6 @@ def launch_qt_gui(
             bp_lo,
             bp_hi,
             None,
-            keep_work_cb.isChecked(),
             channel_workers,
             sampling_percent,
         )
@@ -630,7 +623,6 @@ def launch_qt_gui(
         pre_edit.setEnabled(not running)
         post_edit.setEnabled(not running)
         save_dir_edit.setEnabled(not running)
-        keep_work_cb.setEnabled(not running)
         channel_workers_edit.setEnabled(not running)
         sampling_percent_edit.setEnabled(not running)
         probe_layout_json_edit.setEnabled(not running)
@@ -683,7 +675,7 @@ def launch_qt_gui(
         return unique_paths
 
     def _build_configs_from_paths(paths: list[str]) -> list[AnalysisConfig]:
-        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, keep_work_files, channel_worker_count, sampling_percent = (
+        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, channel_worker_count, sampling_percent = (
             build_shared_params()
         )
         if psth_bin_window_s <= 0:
@@ -714,7 +706,6 @@ def launch_qt_gui(
                     spike_bandpass_low_hz=bandpass_low_hz,
                     spike_bandpass_high_hz=bandpass_high_hz,
                     work_dir=work_dir_path,
-                    keep_intermediate_files=keep_work_files,
                     channel_workers=channel_worker_count,
                     sampling_percent=sampling_percent,
                     probe_layout_json=probe_layout_path,
