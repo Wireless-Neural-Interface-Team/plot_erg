@@ -11,7 +11,7 @@ import threading
 from typing import Callable
 
 from config import AnalysisConfig
-from core import analysis_cancel_scope
+from core import analysis_cancel_scope, peek_rhs_recording_info, validate_section_trigger_window
 from probe_layout import load_probe_layout_json
 
 
@@ -23,6 +23,11 @@ def launch_qt_gui(
     default_edge: str = "falling",
     default_pre_s: float = 2.0,
     default_post_s: float = 10.0,
+    default_section_count: int = 10,
+    default_section_duration_s: float | None = None,
+    default_section_spec: str = "count",
+    default_section_trigger_start_s: float = 1.0,
+    default_section_trigger_end_s: float = 4.0,
     default_lowpass_hz: float | None = None,
     default_curve_filter: str = "no filter",
     default_curve_filter_low_hz: float | None = None,
@@ -121,12 +126,34 @@ def launch_qt_gui(
     edge_combo = QComboBox()
     edge_combo.addItem("Falling edge", "falling")
     edge_combo.addItem("Rising edge", "rising")
-    idx = edge_combo.findData(default_edge)
+    edge_combo.addItem("No trigger", "none")
+    idx = edge_combo.findData(default_edge if default_edge in {"falling", "rising", "none"} else "falling")
     if idx >= 0:
         edge_combo.setCurrentIndex(idx)
     threshold_edit = QLineEdit(str(default_threshold))
     pre_edit = QLineEdit(str(default_pre_s))
     post_edit = QLineEdit(str(default_post_s))
+    section_count_edit = QLineEdit(str(default_section_count))
+    section_count_edit.setToolTip(
+        "Number of equal contiguous sections per recording (each section is averaged like one trigger)."
+    )
+    section_duration_edit = QLineEdit(
+        "" if default_section_duration_s is None else str(default_section_duration_s)
+    )
+    section_duration_edit.setToolTip(
+        "Duration of each section (s). Linked to section count from the shortest selected recording."
+    )
+    section_trigger_start_edit = QLineEdit(str(default_section_trigger_start_s))
+    section_trigger_start_edit.setToolTip(
+        "Imaginary trigger onset within each segment (seconds from segment start). Default: 1 s."
+    )
+    section_trigger_end_edit = QLineEdit(str(default_section_trigger_end_s))
+    section_trigger_end_edit.setToolTip(
+        "Imaginary trigger end within each segment (seconds from segment start). Default: 4 s."
+    )
+    _section_spec = str(default_section_spec if default_section_spec in {"count", "duration"} else "count")
+    _section_sync_guard = False
+    _cached_duration_s: float | None = None
     save_dir_edit = QLineEdit()
     filter_combo = QComboBox()
     filter_combo.addItem("highpass", "highpass")
@@ -271,11 +298,103 @@ def launch_qt_gui(
     spike_threshold_mode_combo.currentIndexChanged.connect(update_spike_threshold_inputs_visibility)
     update_spike_threshold_inputs_visibility()
 
+    def _selected_rhs_paths() -> list[str]:
+        paths: list[str] = []
+        p1 = rhs1_edit.text().strip()
+        if p1:
+            paths.append(p1)
+        for edit in extra_rhs_edits:
+            p = edit.text().strip()
+            if p:
+                paths.append(p)
+        return paths
+
+    def refresh_recording_duration() -> None:
+        nonlocal _cached_duration_s
+        paths = _selected_rhs_paths()
+        if not paths:
+            _cached_duration_s = None
+            return
+        durations: list[float] = []
+        for path_text in paths:
+            try:
+                n_samples, fs = peek_rhs_recording_info(Path(path_text))
+                durations.append(float(n_samples) / float(fs))
+            except Exception:
+                continue
+        _cached_duration_s = min(durations) if durations else None
+        if edge_combo.currentData() == "none":
+            sync_section_fields(_section_spec)
+
+    def sync_section_fields(changed: str) -> None:
+        nonlocal _section_sync_guard, _section_spec
+        if _section_sync_guard or edge_combo.currentData() != "none":
+            return
+        if _cached_duration_s is None or _cached_duration_s <= 0:
+            return
+        _section_sync_guard = True
+        try:
+            _section_spec = changed
+            if changed == "count":
+                count_text = section_count_edit.text().strip()
+                if not count_text:
+                    return
+                count = max(1, int(count_text))
+                duration = _cached_duration_s / float(count)
+                section_duration_edit.setText(f"{duration:.6g}")
+            else:
+                dur_text = section_duration_edit.text().strip()
+                if not dur_text:
+                    return
+                duration = float(dur_text)
+                if duration <= 0:
+                    raise ValueError("Section duration must be > 0.")
+                count = max(1, int(_cached_duration_s / duration))
+                exact_duration = _cached_duration_s / float(count)
+                section_count_edit.setText(str(count))
+                section_duration_edit.setText(f"{exact_duration:.6g}")
+        except ValueError:
+            pass
+        finally:
+            _section_sync_guard = False
+
+    def update_trigger_mode_visibility() -> None:
+        is_no_trigger = str(edge_combo.currentData() or "falling") == "none"
+        threshold_edit.setVisible(not is_no_trigger)
+        pre_edit.setVisible(not is_no_trigger)
+        post_edit.setVisible(not is_no_trigger)
+        threshold_label.setVisible(not is_no_trigger)
+        pre_label.setVisible(not is_no_trigger)
+        post_label.setVisible(not is_no_trigger)
+        section_count_edit.setVisible(is_no_trigger)
+        section_duration_edit.setVisible(is_no_trigger)
+        section_count_label.setVisible(is_no_trigger)
+        section_duration_label.setVisible(is_no_trigger)
+        section_trigger_start_edit.setVisible(is_no_trigger)
+        section_trigger_end_edit.setVisible(is_no_trigger)
+        section_trigger_start_label.setVisible(is_no_trigger)
+        section_trigger_end_label.setVisible(is_no_trigger)
+        if is_no_trigger:
+            refresh_recording_duration()
+
+    edge_combo.currentIndexChanged.connect(update_trigger_mode_visibility)
+
     general_form = QFormLayout()
-    general_form.addRow("ANALOG_IN 0 edge:", edge_combo)
-    general_form.addRow("ANALOG_IN 0 trigger threshold:", threshold_edit)
-    general_form.addRow("Pre-trigger (s):", pre_edit)
-    general_form.addRow("Post-trigger (s):", post_edit)
+    general_form.addRow("Trigger mode:", edge_combo)
+    threshold_label = QLabel("ANALOG_IN 0 trigger threshold:")
+    pre_label = QLabel("Pre-trigger (s):")
+    post_label = QLabel("Post-trigger (s):")
+    section_count_label = QLabel("Number of sections:")
+    section_duration_label = QLabel("Section duration (s):")
+    section_trigger_start_label = QLabel("Imaginary trigger start (s in segment):")
+    section_trigger_end_label = QLabel("Imaginary trigger end (s in segment):")
+    general_form.addRow(threshold_label, threshold_edit)
+    general_form.addRow(pre_label, pre_edit)
+    general_form.addRow(post_label, post_edit)
+    general_form.addRow(section_count_label, section_count_edit)
+    general_form.addRow(section_duration_label, section_duration_edit)
+    general_form.addRow(section_trigger_start_label, section_trigger_start_edit)
+    general_form.addRow(section_trigger_end_label, section_trigger_end_edit)
     general_form.addRow("Filter:", filter_combo)
     general_form.addRow("", curve_cutoff_row_widget)
     general_form.addRow("PDF output folder (empty = .rhs folder):", save_row)
@@ -284,7 +403,7 @@ def launch_qt_gui(
     general_form.addRow("Channel workers (max 16, empty = auto):", channel_workers_edit)
     general_form.addRow("Spike display sampling (%):", sampling_percent_edit)
 
-    general_group = QGroupBox("General settings — ANALOG_IN trigger, amplifier averages, files")
+    general_group = QGroupBox("General settings — segmentation, amplifier averages, files")
     general_group.setLayout(general_form)
 
     spike_form = QFormLayout()
@@ -364,6 +483,11 @@ def launch_qt_gui(
         float | None,
         float | None,
         Path | None,
+        int,
+        float | None,
+        str,
+        float,
+        float,
         int | None,
         int,
     ]:
@@ -397,9 +521,33 @@ def launch_qt_gui(
         else:
             raise ValueError("Filter: invalid option.")
         save_text = save_dir_edit.text().strip()
-        edge = edge_combo.currentData()
-        if edge not in ("falling", "rising"):
+        edge = str(edge_combo.currentData() or "falling")
+        if edge not in ("falling", "rising", "none"):
             edge = "falling"
+        section_count = int(section_count_edit.text().strip() or "0")
+        section_duration_text = section_duration_edit.text().strip()
+        section_duration_s: float | None = None
+        if section_duration_text:
+            section_duration_s = float(section_duration_text)
+        section_trigger_start_s = float(section_trigger_start_edit.text().strip())
+        section_trigger_end_s = float(section_trigger_end_edit.text().strip())
+        if edge == "none":
+            if section_count < 1:
+                raise ValueError("Number of sections must be >= 1.")
+            if _section_spec == "duration":
+                if section_duration_s is None or section_duration_s <= 0:
+                    raise ValueError("Section duration (s) must be > 0.")
+            segment_duration_s: float | None = None
+            if _section_spec == "duration" and section_duration_s is not None:
+                segment_duration_s = float(section_duration_s)
+            elif _cached_duration_s is not None and section_count >= 1:
+                segment_duration_s = float(_cached_duration_s) / float(section_count)
+            if segment_duration_s is not None:
+                validate_section_trigger_window(
+                    segment_duration_s,
+                    section_trigger_start_s,
+                    section_trigger_end_s,
+                )
         bp_lo_text = bandpass_spikes_low_edit.text().strip()
         bp_hi_text = bandpass_spikes_high_edit.text().strip()
         bp_lo: float | None = None
@@ -463,6 +611,11 @@ def launch_qt_gui(
             bp_lo,
             bp_hi,
             None,
+            section_count,
+            section_duration_s,
+            _section_spec,
+            section_trigger_start_s,
+            section_trigger_end_s,
             channel_workers,
             sampling_percent,
         )
@@ -498,6 +651,7 @@ def launch_qt_gui(
         if selected:
             rhs1_edit.setText(selected)
             refresh_pdf_title()
+            refresh_recording_duration()
 
     extra_rhs_edits: list[QLineEdit] = []
     extra_rhs_browse_buttons: list[QPushButton] = []
@@ -529,6 +683,7 @@ def launch_qt_gui(
             if selected:
                 path_edit.setText(selected)
                 refresh_pdf_title()
+                refresh_recording_duration()
 
         def remove_this_field() -> None:
             if row_widget in extra_rhs_rows:
@@ -540,10 +695,12 @@ def launch_qt_gui(
             extra_files_layout.removeWidget(row_widget)
             row_widget.deleteLater()
             refresh_pdf_title()
+            refresh_recording_duration()
 
         browse_btn.clicked.connect(browse_for_this_field)
         remove_btn.clicked.connect(remove_this_field)
         path_edit.textChanged.connect(refresh_pdf_title)
+        path_edit.textChanged.connect(refresh_recording_duration)
 
         extra_rhs_rows.append(row_widget)
         extra_rhs_edits.append(path_edit)
@@ -622,6 +779,10 @@ def launch_qt_gui(
         bandpass_spikes_high_edit.setEnabled(not running)
         pre_edit.setEnabled(not running)
         post_edit.setEnabled(not running)
+        section_count_edit.setEnabled(not running)
+        section_duration_edit.setEnabled(not running)
+        section_trigger_start_edit.setEnabled(not running)
+        section_trigger_end_edit.setEnabled(not running)
         save_dir_edit.setEnabled(not running)
         channel_workers_edit.setEnabled(not running)
         sampling_percent_edit.setEnabled(not running)
@@ -675,7 +836,7 @@ def launch_qt_gui(
         return unique_paths
 
     def _build_configs_from_paths(paths: list[str]) -> list[AnalysisConfig]:
-        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, channel_worker_count, sampling_percent = (
+        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, section_count, section_duration_s, section_spec, section_trigger_start_s, section_trigger_end_s, channel_worker_count, sampling_percent = (
             build_shared_params()
         )
         if psth_bin_window_s <= 0:
@@ -687,9 +848,14 @@ def launch_qt_gui(
                 AnalysisConfig(
                     rhs_file=Path(rhs_path),
                     threshold=trigger_threshold,
-                    edge=edge_mode,
+                    edge=edge_mode,  # type: ignore[arg-type]
                     pre_s=pre_window_s,
                     post_s=post_window_s,
+                    section_count=section_count,
+                    section_duration_s=section_duration_s,
+                    section_spec=section_spec,  # type: ignore[arg-type]
+                    section_trigger_start_s=section_trigger_start_s,
+                    section_trigger_end_s=section_trigger_end_s,
                     lowpass_cutoff_hz=curve_filter_low_hz if curve_filter_kind == "lowpass" else None,
                     curve_filter=curve_filter_kind,  # type: ignore[arg-type]
                     curve_filter_low_hz=curve_filter_low_hz,
@@ -777,9 +943,14 @@ def launch_qt_gui(
     browse_save_btn.clicked.connect(browse_save_dir)
     browse_probe_json_btn.clicked.connect(browse_probe_layout_json)
     rhs1_edit.textChanged.connect(refresh_pdf_title)
+    rhs1_edit.textChanged.connect(refresh_recording_duration)
+    section_count_edit.textChanged.connect(lambda _text: sync_section_fields("count"))
+    section_duration_edit.textChanged.connect(lambda _text: sync_section_fields("duration"))
     run_compare_btn.clicked.connect(run_compare)
     stop_btn.clicked.connect(on_stop_clicked)
     app.aboutToQuit.connect(stop_analysis_thread_on_exit)
+
+    update_trigger_mode_visibility()
 
     window.show()
     return app.exec()

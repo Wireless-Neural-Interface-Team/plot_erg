@@ -4,18 +4,26 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Optional
 
-EdgeKind = Literal["falling", "rising"]
+EdgeKind = Literal["falling", "rising", "none"]
 CurveFilterKind = Literal["highpass", "lowpass", "bandpass", "no filter"]
 SpikeThresholdMode = Literal["fixed", "rms_multiple"]
+SectionSpecKind = Literal["count", "duration"]
 
 
 @dataclass(frozen=True)
 class AnalysisConfig:
     rhs_file: Path
     threshold: float = 1.0
-    edge: EdgeKind = "falling"  # falling / rising threshold crossing on ANALOG_IN 0
+    edge: EdgeKind = "falling"  # falling / rising on ANALOG_IN 0, or none (fixed sections)
     pre_s: float = 1.0
     post_s: float = 10.0
+    # No-trigger mode: split each recording into equal sections for averaging.
+    section_count: int = 10
+    section_duration_s: float | None = None
+    section_spec: SectionSpecKind = "count"  # which GUI field drives the other
+    # No-trigger mode: imaginary trigger window inside each section (seconds from segment start).
+    section_trigger_start_s: float = 1.0
+    section_trigger_end_s: float = 4.0
     # Legacy: Butterworth low-pass on amplifier_data (None = disabled).
     # Kept for CLI backward compatibility.
     lowpass_cutoff_hz: Optional[float] = None

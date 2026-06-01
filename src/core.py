@@ -7,6 +7,7 @@ import contextvars
 import functools
 import gc
 import importlib.util
+import io
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
@@ -19,7 +20,7 @@ from typing import Any
 import numpy as np
 from scipy.signal import butter, filtfilt
 
-from config import AnalysisConfig, CurveFilterKind
+from config import AnalysisConfig, CurveFilterKind, SectionSpecKind
 
 _analysis_cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
     "analysis_cancel_event",
@@ -193,6 +194,153 @@ def get_analog_in0_signal(data: dict[str, Any]) -> np.ndarray:
     if board_adc_data.shape[0] < 1:
         raise RuntimeError("No ADC channel found.")
     return board_adc_data[0]
+
+
+def uses_analog_trigger(config: AnalysisConfig) -> bool:
+    """True when segmentation uses ANALOG_IN 0 edges (not fixed sections)."""
+    return config.edge != "none"
+
+
+def peek_rhs_recording_info(rhs_path: Path) -> tuple[int, float]:
+    """Read RHS header only: return (num_samples, sample_rate_hz)."""
+    if not rhs_path.exists():
+        raise FileNotFoundError(f"File not found: {rhs_path}")
+    from intanutil.data import calculate_num_samples, get_bytes_per_data_block
+    from intanutil.header import read_header
+
+    with open(rhs_path, "rb") as fid:
+        with contextlib.redirect_stdout(io.StringIO()):
+            header = read_header(fid)
+        fs = float(header["sample_rate"])
+        bytes_per_block = get_bytes_per_data_block(header)
+        bytes_remaining = os.path.getsize(rhs_path) - fid.tell()
+        if bytes_remaining <= 0:
+            raise RuntimeError(f"RHS file contains no data: {rhs_path}")
+        if bytes_remaining % bytes_per_block != 0:
+            raise RuntimeError(f"Invalid RHS file size: {rhs_path}")
+        num_blocks = int(bytes_remaining / bytes_per_block)
+        num_samples = int(calculate_num_samples(header, num_blocks))
+    if num_samples < 2:
+        raise RuntimeError(f"Recording too short: {rhs_path}")
+    return num_samples, fs
+
+
+def validate_section_trigger_window(
+    section_duration_s: float,
+    trigger_start_s: float,
+    trigger_end_s: float,
+) -> None:
+    """Raise if the imaginary trigger window falls outside a segment."""
+    if trigger_start_s < 0:
+        raise ValueError(
+            f"Imaginary trigger start ({trigger_start_s:g} s) must be >= 0 within each segment."
+        )
+    if trigger_end_s > section_duration_s:
+        raise ValueError(
+            f"Imaginary trigger end ({trigger_end_s:g} s) exceeds segment duration "
+            f"({section_duration_s:g} s)."
+        )
+    if trigger_start_s >= trigger_end_s:
+        raise ValueError(
+            f"Imaginary trigger start ({trigger_start_s:g} s) must be strictly before "
+            f"end ({trigger_end_s:g} s)."
+        )
+
+
+def no_trigger_sections_and_timebase(
+    n_samples: int,
+    fs: float,
+    section_count: int,
+    section_duration_s: float | None,
+    section_spec: SectionSpecKind,
+    section_trigger_start_s: float,
+    section_trigger_end_s: float,
+) -> tuple[np.ndarray, np.ndarray, int, int, int, float]:
+    """Split recording into sections; average an imaginary trigger window in each."""
+    if n_samples < 2:
+        raise RuntimeError("Recording too short for section averaging.")
+    total_s = float(n_samples) / float(fs)
+    if section_spec == "duration":
+        if section_duration_s is None or float(section_duration_s) <= 0:
+            raise ValueError("Section duration (s) must be > 0.")
+        n_sections = max(1, int(total_s / float(section_duration_s)))
+    else:
+        if int(section_count) < 1:
+            raise ValueError("Section count must be >= 1.")
+        n_sections = int(section_count)
+    section_len = int(n_samples // n_sections)
+    if section_len < 2:
+        raise RuntimeError(
+            f"Too many sections ({n_sections}) for recording length ({total_s:.3f} s)."
+        )
+    n_sections = int(n_samples // section_len)
+    section_duration_resolved = section_len / float(fs)
+    validate_section_trigger_window(
+        section_duration_resolved,
+        float(section_trigger_start_s),
+        float(section_trigger_end_s),
+    )
+    start_n = int(round(float(section_trigger_start_s) * fs))
+    end_n = int(round(float(section_trigger_end_s) * fs))
+    start_n = max(0, min(start_n, section_len - 1))
+    end_n = max(start_n + 1, min(end_n, section_len))
+    window_n = end_n - start_n
+    if window_n < 2:
+        raise RuntimeError("Imaginary trigger window too short (< 2 samples).")
+    starts = np.arange(n_sections, dtype=np.int64) * section_len
+    triggers = starts + start_n
+    if np.any(triggers + window_n > n_samples):
+        raise RuntimeError(
+            "Imaginary trigger window extends beyond the recording for at least one section."
+        )
+    pre_n = 0
+    post_n = window_n
+    t_rel = np.arange(0, window_n, dtype=np.float64) / float(fs)
+    return triggers, t_rel, pre_n, post_n, n_sections, section_duration_resolved
+
+
+def resolve_recording_windows(
+    config: AnalysisConfig,
+    n_samples: int,
+    fs: float,
+    analog_in0: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, int, int, int, int, float | None]:
+    """Return segmentation windows: triggers or fixed sections."""
+    if config.edge == "none":
+        starts, t_rel, pre_n, post_n, n_sections, _section_duration_s = no_trigger_sections_and_timebase(
+            n_samples=n_samples,
+            fs=fs,
+            section_count=config.section_count,
+            section_duration_s=config.section_duration_s,
+            section_spec=config.section_spec,
+            section_trigger_start_s=config.section_trigger_start_s,
+            section_trigger_end_s=config.section_trigger_end_s,
+        )
+        return starts, t_rel, pre_n, post_n, n_sections, n_sections, None
+
+    trigger_indices = detect_edges(analog_in0, threshold=config.threshold, edge=config.edge)
+    if trigger_indices.size == 0:
+        edge_fr = "falling" if config.edge == "falling" else "rising"
+        raise RuntimeError(f"No {edge_fr} edge detected on ANALOG_IN 0.")
+    valid_triggers, t_rel, pre_n, post_n = valid_triggers_and_timebase(
+        n_samples=n_samples,
+        trigger_indices=trigger_indices,
+        fs=fs,
+        pre_s=config.pre_s,
+        post_s=config.post_s,
+    )
+    end_rising_rel_s = mean_time_to_next_rising_edge_s(
+        analog_in0, trigger_indices, config.threshold, fs
+    )
+    return (
+        valid_triggers,
+        t_rel,
+        pre_n,
+        post_n,
+        int(valid_triggers.size),
+        int(trigger_indices.size),
+        end_rising_rel_s,
+    )
 
 
 def detect_edges(signal: np.ndarray, threshold: float, edge: str) -> np.ndarray:
@@ -641,29 +789,22 @@ def compute_average_per_channel(
     data = load_rhs_file(config.rhs_file)
     check_analysis_cancelled()
     fs = get_sampling_rate(data)
-    analog_in0 = get_analog_in0_signal(data)
-    trigger_indices = detect_edges(analog_in0, threshold=config.threshold, edge=config.edge)
-    if trigger_indices.size == 0:
-        edge_fr = "falling" if config.edge == "falling" else "rising"
-        raise RuntimeError(f"No {edge_fr} edge detected on ANALOG_IN 0.")
+    analog_in0 = get_analog_in0_signal(data) if uses_analog_trigger(config) else np.array([], dtype=np.float64)
 
     amplifier_raw = np.asarray(data.get("amplifier_data"))
     if amplifier_raw.size == 0:
         raise RuntimeError("RHS file has no amplifier_data.")
 
     _, n_samples = amplifier_raw.shape
-    valid_triggers, t_rel, pre_n, post_n = valid_triggers_and_timebase(
+    valid_triggers, t_rel, pre_n, post_n, n_valid, n_total, end_rising_rel_s = resolve_recording_windows(
+        config=config,
         n_samples=n_samples,
-        trigger_indices=trigger_indices,
         fs=fs,
-        pre_s=config.pre_s,
-        post_s=config.post_s,
+        analog_in0=analog_in0,
     )
     check_analysis_cancelled()
 
     channel_names = get_channel_names(data, amplifier_raw.shape[0])
-    n_valid = int(valid_triggers.shape[0])
-    n_total = int(trigger_indices.size)
 
     # Raw mean in streaming mode (avoids large RAM allocations).
     mean_per_channel_raw = mean_triggered_windows_channelwise(
@@ -689,10 +830,6 @@ def compute_average_per_channel(
         )
     else:
         mean_per_channel = mean_per_channel_raw
-
-    end_rising_rel_s = mean_time_to_next_rising_edge_s(
-        analog_in0, trigger_indices, config.threshold, fs
-    )
 
     bp_lo: float | None = None
     bp_hi: float | None = None

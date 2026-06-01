@@ -14,16 +14,15 @@ import numpy as np
 from config import AnalysisConfig
 from core import (
     AmplifierSpikeSource,
-    detect_edges,
     get_analog_in0_signal,
     get_channel_names,
     get_sampling_rate,
     load_rhs_file,
-    mean_time_to_next_rising_edge_s,
     persist_amplifier_float32,
     resolve_curve_filter,
+    resolve_recording_windows,
     resolve_work_dir,
-    valid_triggers_and_timebase,
+    uses_analog_trigger,
 )
 from gui import launch_qt_gui
 from impedance_tracking import collect_impedance_sessions
@@ -48,26 +47,18 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple[
         raise FileNotFoundError(f"File not found: {config.rhs_file}")
     data = load_rhs_file(config.rhs_file)
     fs = get_sampling_rate(data)
-    analog_in0 = get_analog_in0_signal(data)
-    trigger_indices = detect_edges(analog_in0, threshold=config.threshold, edge=config.edge)
-    if trigger_indices.size == 0:
-        edge_fr = "falling" if config.edge == "falling" else "rising"
-        raise RuntimeError(f"No {edge_fr} edge detected on ANALOG_IN 0.")
+    analog_in0 = get_analog_in0_signal(data) if uses_analog_trigger(config) else np.array([], dtype=np.float64)
     amplifier_raw = np.asarray(data.get("amplifier_data"))
     if amplifier_raw.size == 0:
         raise RuntimeError("RHS file does not contain amplifier_data.")
     _, n_samples = amplifier_raw.shape
-    valid_triggers, t_rel, pre_n, post_n = valid_triggers_and_timebase(
+    valid_triggers, t_rel, pre_n, post_n, n_valid, n_total, end_rising_s = resolve_recording_windows(
+        config=config,
         n_samples=n_samples,
-        trigger_indices=trigger_indices,
         fs=fs,
-        pre_s=config.pre_s,
-        post_s=config.post_s,
+        analog_in0=analog_in0,
     )
     channel_names = get_channel_names(data, amplifier_raw.shape[0])
-    n_valid = int(valid_triggers.shape[0])
-    n_total = int(trigger_indices.size)
-    end_rising_s = mean_time_to_next_rising_edge_s(analog_in0, trigger_indices, config.threshold, fs)
     work_dir = resolve_work_dir(config)
     amp_path = work_dir / "amplifier_raw.npy"
     persist_amplifier_float32(amplifier_raw, amp_path)
@@ -97,13 +88,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gui", action="store_true", help="Launch the Qt GUI")
     parser.add_argument(
         "--edge",
-        choices=("falling", "rising"),
+        choices=("falling", "rising", "none"),
         default=defaults.edge,
-        help="ANALOG_IN 0 edge type: falling vs rising (default: falling)",
+        help="ANALOG_IN 0 edge (falling/rising) or none for fixed equal sections",
     )
     parser.add_argument("--threshold", type=float, default=defaults.threshold, help="Detection threshold (default: 1.0)")
     parser.add_argument("--pre", type=float, default=defaults.pre_s, help="Time before trigger (seconds)")
     parser.add_argument("--post", type=float, default=defaults.post_s, help="Time after trigger (seconds)")
+    parser.add_argument(
+        "--section-count",
+        type=int,
+        default=defaults.section_count,
+        help="No-trigger mode: number of equal sections per recording (default: 10)",
+    )
+    parser.add_argument(
+        "--section-duration-s",
+        type=float,
+        default=None,
+        help="No-trigger mode: section duration (s); sets section count from recording length",
+    )
+    parser.add_argument(
+        "--section-spec",
+        choices=("count", "duration"),
+        default=defaults.section_spec,
+        help="No-trigger mode: whether --section-count or --section-duration-s is authoritative",
+    )
+    parser.add_argument(
+        "--section-trigger-start-s",
+        type=float,
+        default=defaults.section_trigger_start_s,
+        help="No-trigger mode: imaginary trigger start within each segment (s, default: 1.0)",
+    )
+    parser.add_argument(
+        "--section-trigger-end-s",
+        type=float,
+        default=defaults.section_trigger_end_s,
+        help="No-trigger mode: imaginary trigger end within each segment (s, default: 4.0)",
+    )
     parser.add_argument("--save-dir", type=Path, default=None, help="Folder for the output PDF")
     parser.add_argument(
         "--pdf-title",
@@ -230,18 +251,34 @@ def run(config: AnalysisConfig) -> None:
     end_marker = stats["end_markers"][0]  # type: ignore[index]
 
     print(f"Sample rate: {fs:.2f} Hz")
-    print("--- Triggers (ANALOG_IN 0) ---")
-    print(f"Total triggers detected: {n_total}")
-    print(f"Triggers used for average: {n_valid}")
-    if n_total > n_valid:
-        print(f"  ({n_total - n_valid} trigger(s) excluded: [-pre,+post] window outside signal)")
-    print(f"Channels compared (overlay): {stats['n_ch']}")
-    print(f"Time window: [-{config.pre_s:.3f}s, +{config.post_s:.3f}s]")
-    print(f"ANALOG_IN 0 edge: {config.edge}")
-    if end_marker is not None:
-        print(f"Mean delay to trigger end (rising): {float(end_marker)*1e3:.3f} ms")
+    if config.edge == "none":
+        print("--- Sections (no ANALOG_IN trigger) ---")
+        print(f"Section spec: {config.section_spec}")
+        if config.section_spec == "duration" and config.section_duration_s is not None:
+            print(f"Target section duration: {config.section_duration_s:g} s")
+        else:
+            print(f"Target section count: {config.section_count}")
+        print(f"Sections used for average: {n_valid}")
+        print(
+            f"Imaginary trigger window per segment: "
+            f"{config.section_trigger_start_s:g}–{config.section_trigger_end_s:g} s "
+            f"(t=0 at segment start + {config.section_trigger_start_s:g} s)"
+        )
     else:
-        print("Next rising edge at threshold: not computed (no rising edge after triggers).")
+        print("--- Triggers (ANALOG_IN 0) ---")
+        print(f"Total triggers detected: {n_total}")
+        print(f"Triggers used for average: {n_valid}")
+        if n_total > n_valid:
+            print(f"  ({n_total - n_valid} trigger(s) excluded: [-pre,+post] window outside signal)")
+        print(f"Time window: [-{config.pre_s:.3f}s, +{config.post_s:.3f}s]")
+        print(f"ANALOG_IN 0 edge: {config.edge}")
+        if end_marker is not None:
+            print(f"Mean delay to trigger end (rising): {float(end_marker)*1e3:.3f} ms")
+        else:
+            print("Next rising edge at threshold: not computed (no rising edge after triggers).")
+    print(f"Channels compared (overlay): {stats['n_ch']}")
+    if config.edge == "none":
+        print("Segmentation: equal sections with imaginary trigger window")
     curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(config, fs)
     if curve_filter_kind == "no filter":
         print("Butterworth curve filter: disabled")
@@ -261,20 +298,26 @@ def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
     """Two recordings via the unified streaming engine."""
     pdf_path, stats = _run_streaming_comparison([config_a, config_b], "A/B comparison")
     print(f"Sample rate A: {stats['fs_values'][0]:.2f} Hz | B: {stats['fs_values'][1]:.2f} Hz")
-    print("--- Recording A ---")
-    print(f"  Triggers detected: {stats['n_totals'][0]} | used: {stats['n_valids'][0]}")
-    print("--- Recording B ---")
-    print(f"  Triggers detected: {stats['n_totals'][1]} | used: {stats['n_valids'][1]}")
+    if config_a.edge == "none":
+        print("--- Sections per recording (no ANALOG_IN trigger) ---")
+        for i, cfg in enumerate((config_a, config_b)):
+            label = "A" if i == 0 else "B"
+            print(f"  Recording {label}: sections used={stats['n_valids'][i]}")
+    else:
+        print("--- Recording A ---")
+        print(f"  Triggers detected: {stats['n_totals'][0]} | used: {stats['n_valids'][0]}")
+        print("--- Recording B ---")
+        print(f"  Triggers detected: {stats['n_totals'][1]} | used: {stats['n_valids'][1]}")
+        print(f"Time window: [-{config_a.pre_s:.3f}s, +{config_a.post_s:.3f}s]")
+        print(f"ANALOG_IN 0 edge: {config_a.edge}")
+        if stats["end_markers"][0] is not None:
+            print(f"Mean delay to trigger end (rising) — A: {stats['end_markers'][0]*1e3:.3f} ms")
+        if stats["end_markers"][1] is not None:
+            print(f"Mean delay to trigger end (rising) — B: {stats['end_markers'][1]*1e3:.3f} ms")
     print(f"Channels compared (overlay): {stats['n_ch']}")
     print(f"Multiprocessing workers (A/B comparison): {stats['workers']}")
     print(f"A/B compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
     print(f"A/B PDF render time: {stats['t_render_s']:.2f} s")
-    print(f"Time window: [-{config_a.pre_s:.3f}s, +{config_a.post_s:.3f}s]")
-    print(f"ANALOG_IN 0 edge: {config_a.edge}")
-    if stats["end_markers"][0] is not None:
-        print(f"Mean delay to trigger end (rising) — A: {stats['end_markers'][0]*1e3:.3f} ms")
-    if stats["end_markers"][1] is not None:
-        print(f"Mean delay to trigger end (rising) — B: {stats['end_markers'][1]*1e3:.3f} ms")
     fs_a = float(stats["fs_values"][0])  # type: ignore[index]
     curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(
         config_a, fs_a
@@ -295,14 +338,22 @@ def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
 def run_multi_comparison(configs: list[AnalysisConfig]) -> None:
     """Process N recordings on a unified multi-trace plotting pipeline."""
     pdf_path, stats = _run_streaming_comparison(configs, "multi comparison")
-    print("--- Triggers per recording ---")
-    for i, cfg in enumerate(configs):
-        print(f"{cfg.rhs_file.name}: detected={stats['n_totals'][i]} | used={stats['n_valids'][i]}")
+    if configs[0].edge == "none":
+        print("--- Sections per recording (no ANALOG_IN trigger) ---")
+        for i, cfg in enumerate(configs):
+            print(f"{cfg.rhs_file.name}: sections used={stats['n_valids'][i]}")
+    else:
+        print("--- Triggers per recording ---")
+        for i, cfg in enumerate(configs):
+            print(f"{cfg.rhs_file.name}: detected={stats['n_totals'][i]} | used={stats['n_valids'][i]}")
     print(f"Channels compared (overlay): {stats['n_ch']}")
     print(f"Multiprocessing workers (multi comparison): {stats['workers']}")
     print(f"Multi compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
     print(f"Multi PDF render time: {stats['t_render_s']:.2f} s")
-    print(f"ANALOG_IN 0 edge: {configs[0].edge}")
+    if configs[0].edge == "none":
+        print("Segmentation: no trigger — equal contiguous sections")
+    else:
+        print(f"ANALOG_IN 0 edge: {configs[0].edge}")
     print(f"Comparison PDF written: {pdf_path}")
     print(f"Total time (comparison + PDF): {stats['t_total_s']:.2f} s")
 
@@ -315,7 +366,7 @@ def _autotune_config(cfg: AnalysisConfig, n_files: int) -> AnalysisConfig:
     channel_workers = cfg.channel_workers
     if channel_workers is None:
         channel_workers = 8 if n_files <= 2 else 4
-    if cfg.pre_s + cfg.post_s > 20:
+    if uses_analog_trigger(cfg) and cfg.pre_s + cfg.post_s > 20:
         workers = min(workers, 3)
         channel_workers = min(channel_workers, 4)
     sampling_percent = cfg.sampling_percent
@@ -340,7 +391,7 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
     labels = [cfg.rhs_file.stem for cfg in tuned]
     print(f"{label.capitalize()}: {len(tuned)} file(s).")
     print("Files: " + " | ".join(cfg.rhs_file.name for cfg in tuned))
-    if tuned[0].pre_s + tuned[0].post_s > 20:
+    if uses_analog_trigger(tuned[0]) and tuned[0].pre_s + tuned[0].post_s > 20:
         print("Guardrail mode: large window detected, parallelism limited for memory stability.")
     if tuned[0].sampling_percent != configs[0].sampling_percent:
         print(f"Auto-tuning sampling: {configs[0].sampling_percent}% -> {tuned[0].sampling_percent}%")
@@ -506,6 +557,11 @@ def main() -> None:
         edge=args.edge,
         pre_s=args.pre,
         post_s=args.post,
+        section_count=args.section_count,
+        section_duration_s=args.section_duration_s,
+        section_spec=args.section_spec,
+        section_trigger_start_s=args.section_trigger_start_s,
+        section_trigger_end_s=args.section_trigger_end_s,
         lowpass_cutoff_hz=args.lowpass_hz,
         curve_filter="lowpass" if args.lowpass_hz is not None else "no filter",
         curve_filter_low_hz=args.lowpass_hz,
