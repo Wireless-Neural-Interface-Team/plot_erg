@@ -419,7 +419,7 @@ def scale_analog_data(header, data):
     units (microVolts, Volts, microAmps).
     """
     # Scale amplifier data (units = microVolts).
-    # Conversion mémoire-robuste: évite l'allocation intermédiaire int32 géante.
+    # Memory-safe path: avoids a huge intermediate int32 allocation.
     amp = data['amplifier_data'].astype(np.float32, copy=True)
     amp -= np.float32(32768.0)
     amp *= np.float32(0.195)
