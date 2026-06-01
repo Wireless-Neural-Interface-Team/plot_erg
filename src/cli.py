@@ -18,7 +18,7 @@ from core import (
     get_channel_names,
     get_sampling_rate,
     load_rhs_file,
-    persist_amplifier_float32,
+    persist_intan_high_stack,
     resolve_curve_filter,
     resolve_recording_windows,
     resolve_work_dir,
@@ -60,8 +60,7 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple[
     )
     channel_names = get_channel_names(data, amplifier_raw.shape[0])
     work_dir = resolve_work_dir(config)
-    amp_path = work_dir / "amplifier_raw.npy"
-    persist_amplifier_float32(amplifier_raw, amp_path)
+    amp_path, _, _ = persist_intan_high_stack(amplifier_raw, data, config, work_dir)
     return (
         t_rel,
         channel_names,
@@ -430,17 +429,21 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
                 post_n,
                 amp_path,
             ) = payload
+            work = Path(amp_path).parent
             amp_mm = np.load(Path(amp_path), mmap_mode="r")
+            high_mm = np.load(work / "high_intan.npy", mmap_mode="r")
+            from intan_rhx_dsp import IntanDspSettings
+
+            intan_dsp = IntanDspSettings.load_json(work / "intan_dsp.json")
             spike_sources.append(
                 AmplifierSpikeSource(
                     amplifier=amp_mm,
+                    highpass=high_mm,
                     valid_triggers=valid_triggers,
                     pre_n=int(pre_n),
                     post_n=int(post_n),
-                    work_dir=Path(amp_path).parent,
-                    fs=float(fs),
-                    bandpass_low_hz=cfg.spike_bandpass_low_hz,
-                    bandpass_high_hz=cfg.spike_bandpass_high_hz,
+                    work_dir=work,
+                    intan_dsp=intan_dsp,
                 )
             )
             t_arrays.append(np.asarray(t_rel))

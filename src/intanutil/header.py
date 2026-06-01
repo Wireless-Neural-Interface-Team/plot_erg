@@ -344,6 +344,7 @@ def header_to_result(header, result):
         result['amplifier_channels'] = header['amplifier_channels']
 
     result['notes'] = header['notes']
+    result['version'] = header['version']
     result['frequency_parameters'] = header['frequency_parameters']
     result['reference_channel'] = header['reference_channel']
 

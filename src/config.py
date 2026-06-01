@@ -34,8 +34,8 @@ class AnalysisConfig:
     save_dir: Path | None = None
     # Output PDF title / basename (.pdf added if no extension)
     pdf_title: str | None = None
-    # Spike threshold (µV): >=0 = upward crossing; <0 = downward crossing
-    spike_threshold_uv: float = 15.0
+    # Spike threshold (µV) on Intan HIGH: >=0 rising, <0 falling (RHX default -70)
+    spike_threshold_uv: float = -70.0
     # Spike threshold mode:
     # - fixed: same threshold (µV) for all channels.
     # - rms_multiple: threshold = spike_threshold_rms_multiplier * mean RMS per channel.
@@ -47,11 +47,17 @@ class AnalysisConfig:
     # PDF zoom-panel window (s, time relative to trigger)
     zoom_t0_s: float = -0.1
     zoom_t1_s: float = 0.4
-    # RMS computation window (s): temporal window used for moving-RMS calculation
-    rms_window_s: float = 0.030
-    # Butterworth band-pass on amplifier for raster / PSTH / ISI (both None = raw)
-    spike_bandpass_low_hz: Optional[float] = 250.0
-    spike_bandpass_high_hz: Optional[float] = 7500.0
+    # RMS window (s): fixed to 1.0 in Intan Spike Scope (kept for CLI/GUI compatibility)
+    rms_window_s: float = 1.0
+    # Intan RHX software HIGH filter (systemstate defaults)
+    intan_high_order: int = 2
+    intan_high_type: Literal["bessel", "butterworth"] = "bessel"
+    intan_high_cutoff_hz: float = 250.0
+    intan_artifact_threshold_uv: float = 2500.0
+    intan_artifact_suppression_enabled: bool = True
+    # Deprecated: ignored; spikes/RMS use Intan HIGH above
+    spike_bandpass_low_hz: Optional[float] = None
+    spike_bandpass_high_hz: Optional[float] = None
     # None = auto: (save_dir or .rhs folder) / ".plot_erg" / <stem>
     work_dir: Path | None = None
     # Process workers for A/B comparison (>=1)

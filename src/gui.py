@@ -32,11 +32,11 @@ def launch_qt_gui(
     default_curve_filter: str = "no filter",
     default_curve_filter_low_hz: float | None = None,
     default_curve_filter_high_hz: float | None = None,
-    default_spike_threshold_uv: float = 15.0,
+    default_spike_threshold_uv: float = -70.0,
     default_spike_threshold_mode: str = "fixed",
     default_spike_threshold_rms_multiplier: float = 4.0,
     default_psth_bin_window_s: float = 0.025,
-    default_rms_window_s: float = 0.050,
+    default_rms_window_s: float = 1.0,
     default_zoom_t0_s: float = -0.1,
     default_zoom_t1_s: float = 0.2,
     default_spike_bandpass_low_hz: float | None = None,
@@ -225,8 +225,9 @@ def launch_qt_gui(
     )
     rms_window_edit = QLineEdit(str(default_rms_window_s))
     rms_window_edit.setToolTip(
-        "RMS computation window (seconds) used for moving-RMS calculation."
+        "Intan Spike Scope uses a fixed 1 s RMS window on the HIGH signal (value kept for compatibility)."
     )
+    rms_window_edit.setEnabled(False)
     zoom_t0_edit = QLineEdit(str(default_zoom_t0_s))
     zoom_t1_edit = QLineEdit(str(default_zoom_t1_s))
     zoom_t0_edit.setToolTip("Zoom window start (seconds relative to trigger).")
@@ -237,8 +238,10 @@ def launch_qt_gui(
         bandpass_spikes_low_edit.setText(str(default_spike_bandpass_low_hz))
     if default_spike_bandpass_high_hz is not None:
         bandpass_spikes_high_edit.setText(str(default_spike_bandpass_high_hz))
-    bandpass_spikes_low_edit.setPlaceholderText("empty = raw — e.g. 300")
-    bandpass_spikes_high_edit.setPlaceholderText("empty = raw — e.g. 3000")
+    bandpass_spikes_low_edit.setPlaceholderText("ignored — Intan RHX HIGH")
+    bandpass_spikes_high_edit.setPlaceholderText("ignored — Intan RHX HIGH")
+    bandpass_spikes_low_edit.setEnabled(False)
+    bandpass_spikes_high_edit.setEnabled(False)
     _bp_tip = (
         "Butterworth band-pass (order 4) per channel before raster, PSTH, and ISI. "
         "Both empty = raw mmap signal. Both set = low and high cutoff (Hz); "
@@ -772,11 +775,11 @@ def launch_qt_gui(
         spike_threshold_fixed_edit.setEnabled(not running)
         spike_threshold_rms_multiplier_edit.setEnabled(not running)
         psth_bin_window_edit.setEnabled(not running)
-        rms_window_edit.setEnabled(not running)
+        rms_window_edit.setEnabled(False)
         zoom_t0_edit.setEnabled(not running)
         zoom_t1_edit.setEnabled(not running)
-        bandpass_spikes_low_edit.setEnabled(not running)
-        bandpass_spikes_high_edit.setEnabled(not running)
+        bandpass_spikes_low_edit.setEnabled(False)
+        bandpass_spikes_high_edit.setEnabled(False)
         pre_edit.setEnabled(not running)
         post_edit.setEnabled(not running)
         section_count_edit.setEnabled(not running)

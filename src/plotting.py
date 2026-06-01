@@ -27,6 +27,7 @@ from core import (
     check_analysis_cancelled,
     detect_spikes_at_threshold,
 )
+from intan_rhx_dsp import IntanDspSettings, detect_spikes_intan, sliding_rms_intan_profile
 from impedance_tracking import ImpedanceSession
 from plot_utils import downsample_points, shift_axes_down, shorten_filename_for_windows
 from probe_layout import draw_probe_layout_on_axes, load_probe_layout_json, match_contact_index
@@ -114,8 +115,6 @@ THREE_PART_AXIS_ORDER = [
     "ax_trial_fr_ze",
     "ax_isi_ze",
 ]
-RMS_INTAN_LIKE_BANDPASS_LOW_HZ = 300.0
-RMS_INTAN_LIKE_BANDPASS_HIGH_HZ = 7500.0
 _PROFILE_ENABLED = os.environ.get("PLOT_ERG_PROFILE", "1").strip().lower() in {
     "1",
     "true",
@@ -454,12 +453,24 @@ def _spike_times_per_trial(
     t_rel: np.ndarray,
     fs: float,
     threshold: float,
+    intan_dsp: IntanDspSettings | None = None,
 ) -> list[np.ndarray]:
     """For one channel: list of spike-time arrays (s rel. trigger), one per trial."""
+    from dataclasses import replace
+
     n_trials = int(windows_ch.shape[0])
     out: list[np.ndarray] = []
     for i in range(n_trials):
-        idx = detect_spikes_at_threshold(windows_ch[i], fs, threshold)
+        if intan_dsp is not None:
+            dsp = replace(intan_dsp, spike_threshold_uv=float(threshold))
+            idx = detect_spikes_intan(
+                windows_ch[i],
+                dsp,
+                start_sample=0,
+                end_sample=int(windows_ch.shape[1]),
+            )
+        else:
+            idx = detect_spikes_at_threshold(windows_ch[i], fs, threshold)
         out.append(np.asarray(t_rel[idx], dtype=np.float64))
     return out
 
@@ -552,17 +563,26 @@ def _trial_mean_firing_rate_hz(
 
 
 def _spike_pipeline_captions(
-    spike_bandpass_low_hz: Optional[float],
-    spike_bandpass_high_hz: Optional[float],
+    spike_bandpass_low_hz: Optional[float] = None,
+    spike_bandpass_high_hz: Optional[float] = None,
+    intan_dsp: IntanDspSettings | None = None,
 ) -> Tuple[str, str]:
     """(short for subtitles, detailed for footer note)"""
-    if spike_bandpass_low_hz is not None and spike_bandpass_high_hz is not None:
-        flo = float(spike_bandpass_low_hz)
-        fhi = float(spike_bandpass_high_hz)
-        short = f"band-pass {flo:g}–{fhi:g} Hz"
-        detail = f"Butterworth band-pass {flo:g}–{fhi:g} Hz (order 4, filtfilt)"
-        return short, detail
-    return "raw", "raw mmap signal (no spike band-pass)"
+    del spike_bandpass_low_hz, spike_bandpass_high_hz
+    if intan_dsp is None:
+        return "Intan HIGH", "Intan RHX HIGH (default software filter)"
+    short = (
+        f"Intan HIGH {intan_dsp.high_type} ord.{intan_dsp.high_order} "
+        f"@ {intan_dsp.high_cutoff_hz:g} Hz"
+    )
+    detail = (
+        f"Intan RHX: notch→HIGH ({intan_dsp.high_type} HP {intan_dsp.high_cutoff_hz:g} Hz, "
+        f"order {intan_dsp.high_order}); RMS window {intan_dsp.rms_window_s:g} s; "
+        f"spike thr. {intan_dsp.spike_threshold_uv:g} µV"
+    )
+    if intan_dsp.artifact_suppression_enabled:
+        detail += f"; artifact {intan_dsp.artifact_threshold_uv:g} µV"
+    return short, detail
 
 
 def _curve_filter_captions(
@@ -1441,10 +1461,8 @@ def _mean_rms_profile_from_source_window(
     rms_window_s: float,
     channel_index: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Mean RMS profile in window [t0_s, t1_s], averaged over triggers.
-
-    Intan-like preprocessing: per-channel DC removal + AP-like band-pass.
-    """
+    """Mean RMS profile in [t0_s, t1_s], averaged over triggers (Intan Spike Scope, 1 s on HIGH)."""
+    del rms_window_s  # Intan uses source.intan_dsp.rms_window_s (1 s).
     if source.valid_triggers.size == 0 or t1_s <= t0_s:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     fs = float(source.fs)
@@ -1452,25 +1470,12 @@ def _mean_rms_profile_from_source_window(
     end_off = int(round(float(t1_s) * fs))
     if end_off <= start_off:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-    bp_low = (
-        float(source.bandpass_low_hz)
-        if source.bandpass_low_hz is not None
-        else RMS_INTAN_LIKE_BANDPASS_LOW_HZ
-    )
-    bp_high = (
-        float(source.bandpass_high_hz)
-        if source.bandpass_high_hz is not None
-        else RMS_INTAN_LIKE_BANDPASS_HIGH_HZ
-    )
-    nyq = 0.5 * fs
-    use_bandpass = bp_low > 0 and bp_high > bp_low and bp_high < nyq
-    n_channels = int(source.amplifier.shape[0])
-    n_samples = int(source.amplifier.shape[1])
+    n_channels = int(source.highpass.shape[0])
+    n_samples = int(source.highpass.shape[1])
     ch_idx = int(channel_index) if channel_index is not None else None
     if ch_idx is not None and (ch_idx < 0 or ch_idx >= n_channels):
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     n_win = int(end_off - start_off)
-    rms_n = max(1, int(round(float(rms_window_s) * fs)))
     t_axis = np.arange(start_off, end_off, dtype=np.float64) / fs
 
     valid_trigs: list[int] = []
@@ -1483,40 +1488,18 @@ def _mean_rms_profile_from_source_window(
     if not valid_trigs:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
 
-    if ch_idx is not None:
-        # Fast path: stack all trigger windows for one channel, then filter in batch.
-        seg_stack = np.empty((len(valid_trigs), n_win), dtype=np.float64)
-        for i, trig in enumerate(valid_trigs):
-            start = int(trig + start_off)
-            end = int(trig + end_off)
-            seg_stack[i, :] = np.asarray(source.amplifier[ch_idx, start:end], dtype=np.float64)
-        seg_stack = seg_stack - np.mean(seg_stack, axis=1, keepdims=True)
-        if use_bandpass and n_win >= 32:
-            try:
-                seg_stack = apply_butterworth_bandpass(seg_stack, fs, bp_low, bp_high)
-            except Exception:
-                pass
-        sq = seg_stack * seg_stack
-        rms_trials = np.sqrt(uniform_filter1d(sq, size=rms_n, axis=1, mode="constant", cval=0.0))
-        return t_axis, np.mean(rms_trials, axis=0)
+    channel_indices = [ch_idx] if ch_idx is not None else list(range(n_channels))
+    rms_full: dict[int, np.ndarray] = {}
+    for ch in channel_indices:
+        rms_full[ch] = sliding_rms_intan_profile(source.high_trace_for_channel(ch), source.intan_dsp)
 
     acc = np.zeros(n_win, dtype=np.float64)
     n_ok = 0
     for trig in valid_trigs:
-        start = int(trig + start_off)
-        end = int(trig + end_off)
-        seg = np.asarray(source.amplifier[:, start:end], dtype=np.float64)
-        if seg.size == 0 or seg.shape[1] != n_win:
-            continue
-        seg = seg - np.mean(seg, axis=1, keepdims=True)
-        if use_bandpass and seg.shape[1] >= 32:
-            try:
-                seg = apply_butterworth_bandpass(seg, fs, bp_low, bp_high)
-            except Exception:
-                pass
-        sq = seg * seg
-        ch_rms = np.sqrt(uniform_filter1d(sq, size=rms_n, axis=1, mode="constant", cval=0.0))
-        acc += np.mean(ch_rms, axis=0)
+        seg_stack = np.empty((len(channel_indices), n_win), dtype=np.float64)
+        for i, ch in enumerate(channel_indices):
+            seg_stack[i, :] = rms_full[ch][trig + start_off : trig + end_off]
+        acc += np.mean(seg_stack, axis=0)
         n_ok += 1
     if n_ok == 0:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
@@ -1531,11 +1514,9 @@ def _mean_rms_profile_from_windows_window(
     t1_s: float,
     rms_window_s: float,
     channel_index: int | None = None,
+    intan_dsp: IntanDspSettings | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Mean RMS profile in window [t0_s, t1_s], averaged over trials.
-
-    Intan-like preprocessing: per-channel DC removal + AP-like band-pass.
-    """
+    """Mean RMS on trial windows (expects HIGH waveforms if intan_dsp is set)."""
     if windows is None or windows.ndim != 3 or windows.shape[0] == 0 or t1_s <= t0_s:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     start_idx = int(np.searchsorted(t_rel, float(t0_s), side="left"))
@@ -1551,31 +1532,19 @@ def _mean_rms_profile_from_windows_window(
     if ch_idx is not None:
         if ch_idx < 0 or ch_idx >= seg.shape[1]:
             return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-        # Performance: in per-channel mode, process only one channel.
         seg = seg[:, ch_idx : ch_idx + 1, :]
-    seg = seg - np.mean(seg, axis=2, keepdims=True)
-    dt = float(np.median(np.diff(t_rel)))
-    fs = 1.0 / dt if dt > 0 else 0.0
-    rms_n = max(1, int(round(float(rms_window_s) * fs))) if fs > 0 else 1
-    nyq = 0.5 * fs if fs > 0 else 0.0
-    use_bandpass = (
-        fs > 0
-        and RMS_INTAN_LIKE_BANDPASS_LOW_HZ > 0
-        and RMS_INTAN_LIKE_BANDPASS_HIGH_HZ > RMS_INTAN_LIKE_BANDPASS_LOW_HZ
-        and RMS_INTAN_LIKE_BANDPASS_HIGH_HZ < nyq
-        and seg.shape[2] >= 32
-    )
-    if use_bandpass:
-        try:
-            flat = seg.reshape(seg.shape[0] * seg.shape[1], seg.shape[2])
-            flat = apply_butterworth_bandpass(
-                flat, fs, RMS_INTAN_LIKE_BANDPASS_LOW_HZ, RMS_INTAN_LIKE_BANDPASS_HIGH_HZ
-            )
-            seg = flat.reshape(seg.shape[0], seg.shape[1], seg.shape[2])
-        except Exception:
-            pass
-    sq = seg * seg
-    rms_all = np.sqrt(uniform_filter1d(sq, size=rms_n, axis=2, mode="constant", cval=0.0))
+    if intan_dsp is not None:
+        n_t, n_c, n_s = seg.shape
+        rms_all = np.empty((n_t, n_c, n_s), dtype=np.float64)
+        for t in range(n_t):
+            for c in range(n_c):
+                rms_all[t, c, :] = sliding_rms_intan_profile(seg[t, c, :], intan_dsp)
+    else:
+        dt = float(np.median(np.diff(t_rel)))
+        fs = 1.0 / dt if dt > 0 else 0.0
+        rms_n = max(1, int(round(float(rms_window_s) * fs))) if fs > 0 else 1
+        sq = seg * seg
+        rms_all = np.sqrt(uniform_filter1d(sq, size=rms_n, axis=2, mode="constant", cval=0.0))
     if ch_idx is not None:
         profile = np.mean(rms_all[:, 0, :], axis=0)
     else:
@@ -1661,7 +1630,7 @@ def _append_mean_rms_evolution_page(
             label=label,
         )
     if has_data:
-        ax.set_title(f"Mean RMS profile (RMS window = {rms_window_s:g} s)")
+        ax.set_title("Mean RMS profile (Intan HIGH, RMS window = 1 s)")
         ax.set_xlabel(TIME_REL_XLABEL)
         ax.set_ylabel("Mean RMS across channels (µV)")
         ax.set_ylim(0.0, 10.0)
@@ -1764,7 +1733,7 @@ def plot_channel_multi_comparison(
         fs is not None
         and len(spike_sources) == n_records
     )
-    _, spike_cmp_pipe = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
+    _, spike_cmp_pipe = _spike_pipeline_captions(intan_dsp=spike_sources[0].intan_dsp)
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
 
     probe_layout_loaded = None
@@ -2016,7 +1985,7 @@ def plot_channel_multi_comparison(
             _plot_rms_series(
                 ax_full_rms,
                 rms_series_full_multi,
-                f"Part 1 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                f"Part 1 — RMS evolution (Intan HIGH, RMS window = 1 s)",
                 x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
             )
 
@@ -2059,7 +2028,7 @@ def plot_channel_multi_comparison(
             _plot_rms_series(
                 ax_zoom_rms,
                 rms_series_zoom_multi,
-                f"Part 2 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                f"Part 2 — RMS evolution (Intan HIGH, RMS window = 1 s)",
                 x_limits=(zoom_t0, zoom_t1),
             )
 
@@ -2123,7 +2092,7 @@ def plot_channel_multi_comparison(
                 _plot_rms_series(
                     ax_zoom_end_rms,
                     rms_series_zoom_end_multi,
-                    f"Part 3 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                    f"Part 3 — RMS evolution (Intan HIGH, RMS window = 1 s)",
                     x_limits=(end_zoom_t0, end_zoom_t1),
                 )
             else:
@@ -2295,7 +2264,8 @@ def plot_channel_averages(
     # Legacy arg `windows` is kept for API compatibility.
     # Rendering always uses the source-based pipeline when available.
     _has_spike_data = fs is not None and spike_source is not None
-    _, spike_pipe_detail = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
+    intan_dsp = spike_source.intan_dsp if spike_source is not None else None
+    _, spike_pipe_detail = _spike_pipeline_captions(intan_dsp=intan_dsp)
     psth_effective_window_s = (
         max(float(psth_bin_window_s), 1.0 / float(fs))
         if fs is not None and float(fs) > 0
@@ -2488,7 +2458,7 @@ def plot_channel_averages(
             _plot_rms_series(
                 ax_full_rms,
                 rms_series_full,
-                f"Part 1 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                f"Part 1 — RMS evolution (Intan HIGH, RMS window = 1 s)",
                 x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
             )
 
@@ -2560,7 +2530,7 @@ def plot_channel_averages(
             _plot_rms_series(
                 ax_zoom_rms,
                 rms_series_zoom,
-                f"Part 2 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                f"Part 2 — RMS evolution (Intan HIGH, RMS window = 1 s)",
                 x_limits=(zoom_t0, zoom_t1),
             )
             end_zoom_range: tuple[float, float] | None = None
@@ -2621,7 +2591,7 @@ def plot_channel_averages(
                 _plot_rms_series(
                     ax_zoom_end_rms,
                     rms_series_zoom_end,
-                    f"Part 3 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                    f"Part 3 — RMS evolution (Intan HIGH, RMS window = 1 s)",
                     x_limits=(end_zoom_t0, end_zoom_t1),
                 )
             else:
@@ -2831,7 +2801,8 @@ def plot_channel_comparison(
         and spike_source_a is not None
         and spike_source_b is not None
     )
-    _, spike_cmp_pipe = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
+    intan_dsp_ab = spike_source_a.intan_dsp if spike_source_a is not None else None
+    _, spike_cmp_pipe = _spike_pipeline_captions(intan_dsp=intan_dsp_ab)
     with PdfPages(pdf_path) as pdf:
         for ch in range(n_channels):
             check_analysis_cancelled()
@@ -3076,7 +3047,7 @@ def plot_channel_comparison(
             _plot_rms_series(
                 ax_full_rms,
                 [(label_a, rms_full_a[0], rms_full_a[1]), (label_b, rms_full_b[0], rms_full_b[1])],
-                f"Part 1 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                f"Part 1 — RMS evolution (Intan HIGH, RMS window = 1 s)",
                 x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
             )
 
@@ -3170,7 +3141,7 @@ def plot_channel_comparison(
             _plot_rms_series(
                 ax_zoom_rms,
                     [(label_a, rms_zoom_a[0], rms_zoom_a[1]), (label_b, rms_zoom_b[0], rms_zoom_b[1])],
-                f"Part 2 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                f"Part 2 — RMS evolution (Intan HIGH, RMS window = 1 s)",
                 x_limits=(zoom_t0, zoom_t1),
             )
             end_zoom_range: tuple[float, float] | None = None
@@ -3237,7 +3208,7 @@ def plot_channel_comparison(
                 _plot_rms_series(
                     ax_zoom_end_rms,
                     [(label_a, rms_end_a[0], rms_end_a[1]), (label_b, rms_end_b[0], rms_end_b[1])],
-                    f"Part 3 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                    f"Part 3 — RMS evolution (Intan HIGH, RMS window = 1 s)",
                     x_limits=(end_zoom_t0, end_zoom_t1),
                 )
             else:

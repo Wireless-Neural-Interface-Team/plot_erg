@@ -21,6 +21,12 @@ import numpy as np
 from scipy.signal import butter, filtfilt
 
 from config import AnalysisConfig, CurveFilterKind, SectionSpecKind
+from intan_rhx_dsp import (
+    IntanDspSettings,
+    compute_high_channel_stack,
+    detect_spikes_intan,
+    mean_rms_intan_channel,
+)
 
 _analysis_cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
     "analysis_cancel_event",
@@ -441,40 +447,36 @@ def cleanup_plot_erg_root_if_empty(work_dir: Path | None) -> None:
 
 
 class AmplifierSpikeSource:
-    """Per-trigger windows, one channel at a time (no full 3D tensor)."""
+    """Per-trigger windows on Intan RHX HIGH waveforms (spikeplot / cpuinterface)."""
 
     def __init__(
         self,
         amplifier: np.ndarray,
+        highpass: np.ndarray,
         valid_triggers: np.ndarray,
         pre_n: int,
         post_n: int,
         work_dir: Path | None,
-        fs: float,
-        bandpass_low_hz: float | None = None,
-        bandpass_high_hz: float | None = None,
+        intan_dsp: IntanDspSettings,
     ) -> None:
         self.amplifier = amplifier
+        self.highpass = highpass
         self.valid_triggers = np.asarray(valid_triggers, dtype=np.int64)
         self.pre_n = pre_n
         self.post_n = post_n
         self._offsets = np.arange(-pre_n, post_n, dtype=np.int64)
         self.work_dir = work_dir
-        self.fs = float(fs)
-        self.bandpass_low_hz = bandpass_low_hz
-        self.bandpass_high_hz = bandpass_high_hz
+        self.fs = float(intan_dsp.fs)
+        self.intan_dsp = intan_dsp
         self._closed = False
 
+    def high_trace_for_channel(self, ch: int) -> np.ndarray:
+        return np.asarray(self.highpass[ch], dtype=np.float64)
+
     def windows_2d_for_channel(self, ch: int) -> np.ndarray:
-        channel_trace = np.asarray(self.amplifier[ch], dtype=np.float64)
-        if self.bandpass_low_hz is not None and self.bandpass_high_hz is not None:
-            channel_trace_2d = channel_trace.reshape(1, -1)
-            channel_trace = apply_butterworth_bandpass(
-                channel_trace_2d, self.fs, self.bandpass_low_hz, self.bandpass_high_hz
-            )[0]
+        channel_trace = self.high_trace_for_channel(ch)
         trial_count = int(self.valid_triggers.size)
         window_length = int(self._offsets.size)
-        # Guard: avoid huge spike-window allocations.
         if trial_count * window_length > 25_000_000:
             raise RuntimeError(
                 "Spike window too large for 2D RAM extraction. "
@@ -494,45 +496,43 @@ class AmplifierSpikeSource:
         threshold: float,
         refractory_s: float = 0.001,
     ) -> list[np.ndarray]:
-        """Detect spikes trial by trial without building a giant 2D matrix in RAM."""
-        channel_trace = np.asarray(self.amplifier[ch], dtype=np.float64)
-        if self.bandpass_low_hz is not None and self.bandpass_high_hz is not None:
-            channel_trace_2d = channel_trace.reshape(1, -1)
-            channel_trace = apply_butterworth_bandpass(
-                channel_trace_2d, self.fs, self.bandpass_low_hz, self.bandpass_high_hz
-            )[0]
+        """Detect spikes per trial on HIGH (Intan cpuinterface, no hoops)."""
+        del refractory_s  # Intan uses snippet_size refractory instead.
+        from dataclasses import replace
+
+        channel_trace = self.high_trace_for_channel(ch)
+        dsp = replace(self.intan_dsp, spike_threshold_uv=float(threshold))
         spike_times_by_trial: list[np.ndarray] = []
         for trigger_index in self.valid_triggers:
             sample_start = int(trigger_index - self.pre_n)
             sample_end = int(trigger_index + self.post_n)
-            trial_trace = channel_trace[sample_start:sample_end]
-            spike_sample_indices = detect_spikes_at_threshold(
-                trial_trace, self.fs, threshold, refractory_s=refractory_s
+            spike_sample_indices = detect_spikes_intan(
+                channel_trace,
+                dsp,
+                start_sample=sample_start,
+                end_sample=sample_end,
             )
-            spike_times_by_trial.append(np.asarray(t_rel[spike_sample_indices], dtype=np.float64))
+            rel = spike_sample_indices - int(trigger_index) + int(self.pre_n)
+            rel = rel[(rel >= 0) & (rel < int(t_rel.size))]
+            spike_times_by_trial.append(np.asarray(t_rel[rel], dtype=np.float64))
         return spike_times_by_trial
 
     def mean_rms_for_channel(self, ch: int) -> float:
-        """Mean RMS value for one channel (same preprocessing path as spike detection)."""
-        channel_trace = np.asarray(self.amplifier[ch], dtype=np.float64)
-        if self.bandpass_low_hz is not None and self.bandpass_high_hz is not None:
-            channel_trace_2d = channel_trace.reshape(1, -1)
-            channel_trace = apply_butterworth_bandpass(
-                channel_trace_2d, self.fs, self.bandpass_low_hz, self.bandpass_high_hz
-            )[0]
-        return float(np.sqrt(np.mean(np.square(channel_trace))))
+        """RMS over the last 1 s of HIGH (Spike Scope, spikeplot.cpp)."""
+        return mean_rms_intan_channel(self.high_trace_for_channel(ch), self.intan_dsp)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        amplifier_array = self.amplifier
-        try:
-            if isinstance(amplifier_array, np.memmap):
-                amplifier_array._mmap.close()
-        except Exception:
-            pass
-        self.amplifier = np.empty((0,))  # drop reference
+        for arr in (self.amplifier, self.highpass):
+            try:
+                if isinstance(arr, np.memmap):
+                    arr._mmap.close()
+            except Exception:
+                pass
+        self.amplifier = np.empty((0,))
+        self.highpass = np.empty((0,))
         if self.work_dir is not None and self.work_dir.exists():
             shutil.rmtree(self.work_dir, ignore_errors=True)
             cleanup_plot_erg_root_if_empty(self.work_dir)
@@ -664,6 +664,42 @@ def mean_filtered_channelwise(
 def persist_amplifier_float32(amplifier_2d: np.ndarray, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, np.ascontiguousarray(amplifier_2d, dtype=np.float32))
+
+
+def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> IntanDspSettings:
+    """RHX-compatible DSP settings from RHS metadata + analysis config."""
+    return IntanDspSettings.from_rhs_data(
+        data,
+        spike_threshold_uv=float(config.spike_threshold_uv),
+        high_order=int(config.intan_high_order),
+        high_type=config.intan_high_type,  # type: ignore[arg-type]
+        high_cutoff_hz=float(config.intan_high_cutoff_hz),
+        artifact_threshold_uv=float(config.intan_artifact_threshold_uv),
+        artifact_suppression_enabled=bool(config.intan_artifact_suppression_enabled),
+    )
+
+
+def persist_intan_high_stack(
+    amplifier_2d: np.ndarray,
+    data: dict[str, Any],
+    config: AnalysisConfig,
+    work_dir: Path,
+) -> tuple[Path, Path, IntanDspSettings]:
+    """Write wideband + Intan HIGH mmaps under work_dir."""
+    intan_dsp = build_intan_dsp_settings(data, config)
+    amp_path = work_dir / "amplifier_raw.npy"
+    high_path = work_dir / "high_intan.npy"
+    persist_amplifier_float32(amplifier_2d, amp_path)
+    intan_dsp.save_json(work_dir / "intan_dsp.json")
+    check_analysis_cancelled()
+    high_stack = compute_high_channel_stack(
+        amplifier_2d,
+        intan_dsp,
+        config.channel_workers,
+        cancel_check=check_analysis_cancelled,
+    )
+    np.save(high_path, high_stack)
+    return amp_path, high_path, intan_dsp
 
 
 def extract_triggered_windows(
@@ -831,30 +867,11 @@ def compute_average_per_channel(
     else:
         mean_per_channel = mean_per_channel_raw
 
-    bp_lo: float | None = None
-    bp_hi: float | None = None
-    if config.spike_bandpass_low_hz is not None or config.spike_bandpass_high_hz is not None:
-        if config.spike_bandpass_low_hz is None or config.spike_bandpass_high_hz is None:
-            raise ValueError(
-                "Spike band-pass: set both spike_bandpass_low_hz and spike_bandpass_high_hz, "
-                "or leave both unset (raw signal)."
-            )
-        bp_lo = float(config.spike_bandpass_low_hz)
-        bp_hi = float(config.spike_bandpass_high_hz)
-        nyq = 0.5 * fs
-        if bp_lo <= 0 or bp_hi <= 0:
-            raise ValueError("Spike band-pass: frequencies must be > 0 Hz.")
-        if bp_lo >= bp_hi:
-            raise ValueError("Spike band-pass: low frequency must be < high frequency.")
-        if bp_hi >= nyq:
-            raise ValueError(
-                f"Spike band-pass: high frequency ({bp_hi:g} Hz) must be < Nyquist ({nyq:.1f} Hz)."
-            )
-
-    # mmap file: drop RHS dict and in-RAM amplifier copy before PDF.
     work_dir = resolve_work_dir(config)
-    amp_path = work_dir / "amplifier_raw.npy"
-    persist_amplifier_float32(amplifier_raw, amp_path)
+    amp_path, high_path, intan_dsp = persist_intan_high_stack(
+        amplifier_raw, data, config, work_dir
+    )
+
     del amplifier_raw
     if isinstance(data, dict):
         data.pop("amplifier_data", None)
@@ -862,15 +879,15 @@ def compute_average_per_channel(
     gc.collect()
 
     amp_mm = np.load(amp_path, mmap_mode="r")
+    high_mm = np.load(high_path, mmap_mode="r")
     spike_source = AmplifierSpikeSource(
         amplifier=amp_mm,
+        highpass=high_mm,
         valid_triggers=valid_triggers,
         pre_n=pre_n,
         post_n=post_n,
         work_dir=work_dir,
-        fs=fs,
-        bandpass_low_hz=bp_lo,
-        bandpass_high_hz=bp_hi,
+        intan_dsp=intan_dsp,
     )
 
     return (
