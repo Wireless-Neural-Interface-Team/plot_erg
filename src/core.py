@@ -671,9 +671,10 @@ def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> In
     return IntanDspSettings.from_rhs_data(
         data,
         spike_threshold_uv=float(config.spike_threshold_uv),
-        high_order=int(config.intan_high_order),
-        high_type=config.intan_high_type,  # type: ignore[arg-type]
-        high_cutoff_hz=float(config.intan_high_cutoff_hz),
+        spike_filter_kind=config.intan_spike_filter_kind,  # type: ignore[arg-type]
+        filter_order=int(config.intan_filter_order),
+        filter_type=config.intan_filter_type,  # type: ignore[arg-type]
+        filter_cutoff_hz=float(config.intan_filter_cutoff_hz),
         artifact_threshold_uv=float(config.intan_artifact_threshold_uv),
         artifact_suppression_enabled=bool(config.intan_artifact_suppression_enabled),
     )

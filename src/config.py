@@ -7,6 +7,8 @@ from typing import Literal, Optional
 EdgeKind = Literal["falling", "rising", "none"]
 CurveFilterKind = Literal["highpass", "lowpass", "bandpass", "no filter"]
 SpikeThresholdMode = Literal["fixed", "rms_multiple"]
+SpikeFilterKind = Literal["highpass", "lowpass"]
+IntanFilterType = Literal["bessel", "butterworth"]
 SectionSpecKind = Literal["count", "duration"]
 
 
@@ -49,10 +51,11 @@ class AnalysisConfig:
     zoom_t1_s: float = 0.4
     # RMS window (s): fixed to 1.0 in Intan Spike Scope (kept for CLI/GUI compatibility)
     rms_window_s: float = 1.0
-    # Intan RHX software HIGH filter (systemstate defaults)
-    intan_high_order: int = 2
-    intan_high_type: Literal["bessel", "butterworth"] = "bessel"
-    intan_high_cutoff_hz: float = 250.0
+    # Intan RHX-style software filter for raster / PSTH / ISI / RMS (default = HIGH)
+    intan_spike_filter_kind: SpikeFilterKind = "highpass"
+    intan_filter_order: int = 2
+    intan_filter_type: IntanFilterType = "bessel"
+    intan_filter_cutoff_hz: float = 250.0
     intan_artifact_threshold_uv: float = 2500.0
     intan_artifact_suppression_enabled: bool = True
     # Deprecated: ignored; spikes/RMS use Intan HIGH above

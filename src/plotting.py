@@ -570,14 +570,13 @@ def _spike_pipeline_captions(
     """(short for subtitles, detailed for footer note)"""
     del spike_bandpass_low_hz, spike_bandpass_high_hz
     if intan_dsp is None:
-        return "Intan HIGH", "Intan RHX HIGH (default software filter)"
-    short = (
-        f"Intan HIGH {intan_dsp.high_type} ord.{intan_dsp.high_order} "
-        f"@ {intan_dsp.high_cutoff_hz:g} Hz"
-    )
+        return "Intan filtered", "Intan RHX software filter (default high-pass)"
+    short = f"Intan {intan_dsp.filter_short_label()}"
+    hp_lp = "HP" if intan_dsp.spike_filter_kind == "highpass" else "LP"
     detail = (
-        f"Intan RHX: notch→HIGH ({intan_dsp.high_type} HP {intan_dsp.high_cutoff_hz:g} Hz, "
-        f"order {intan_dsp.high_order}); RMS window {intan_dsp.rms_window_s:g} s; "
+        f"Intan RHX: notch→{hp_lp} ({intan_dsp.filter_type} {hp_lp} "
+        f"{intan_dsp.filter_cutoff_hz:g} Hz, order {intan_dsp.filter_order}); "
+        f"RMS window {intan_dsp.rms_window_s:g} s; "
         f"spike thr. {intan_dsp.spike_threshold_uv:g} µV"
     )
     if intan_dsp.artifact_suppression_enabled:

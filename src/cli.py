@@ -186,22 +186,28 @@ def parse_args() -> argparse.Namespace:
         help="RMS computation window (s) for moving-RMS profile.",
     )
     parser.add_argument(
-        "--spike-bandpass-low-hz",
-        type=float,
-        default=defaults.spike_bandpass_low_hz,
-        help=(
-            "Spike band-pass low corner (Hz) on amplifier for raster / PSTH / ISI "
-            "(use with --spike-bandpass-high-hz; default: disabled = raw mmap)"
-        ),
+        "--intan-spike-filter",
+        choices=("highpass", "lowpass"),
+        default=defaults.intan_spike_filter_kind,
+        help="Intan software filter for raster/PSTH/ISI (default: highpass).",
     )
     parser.add_argument(
-        "--spike-bandpass-high-hz",
+        "--intan-filter-order",
+        type=int,
+        default=defaults.intan_filter_order,
+        help="Intan software filter order 1–8 (default: 2).",
+    )
+    parser.add_argument(
+        "--intan-filter-type",
+        choices=("bessel", "butterworth"),
+        default=defaults.intan_filter_type,
+        help="Intan filter prototype: bessel or butterworth (default: bessel).",
+    )
+    parser.add_argument(
+        "--intan-filter-cutoff-hz",
         type=float,
-        default=defaults.spike_bandpass_high_hz,
-        help=(
-            "Spike band-pass high corner (Hz) "
-            "(use with --spike-bandpass-low-hz; default: disabled = raw mmap)"
-        ),
+        default=defaults.intan_filter_cutoff_hz,
+        help="Intan software filter cutoff in Hz (default: 250).",
     )
     parser.add_argument(
         "--work-dir",
@@ -544,8 +550,10 @@ def main() -> None:
             default_rms_window_s=args.rms_window_s,
             default_zoom_t0_s=args.zoom_t0_s,
             default_zoom_t1_s=args.zoom_t1_s,
-            default_spike_bandpass_low_hz=args.spike_bandpass_low_hz,
-            default_spike_bandpass_high_hz=args.spike_bandpass_high_hz,
+            default_intan_spike_filter_kind=args.intan_spike_filter,
+            default_intan_filter_order=args.intan_filter_order,
+            default_intan_filter_type=args.intan_filter_type,
+            default_intan_filter_cutoff_hz=args.intan_filter_cutoff_hz,
             default_channel_workers=args.channel_workers,
             default_sampling_percent=args.sampling_percent,
             default_probe_layout_json=args.probe_layout_json,
@@ -578,8 +586,10 @@ def main() -> None:
         rms_window_s=args.rms_window_s,
         zoom_t0_s=args.zoom_t0_s,
         zoom_t1_s=args.zoom_t1_s,
-        spike_bandpass_low_hz=args.spike_bandpass_low_hz,
-        spike_bandpass_high_hz=args.spike_bandpass_high_hz,
+        intan_spike_filter_kind=args.intan_spike_filter,
+        intan_filter_order=args.intan_filter_order,
+        intan_filter_type=args.intan_filter_type,
+        intan_filter_cutoff_hz=args.intan_filter_cutoff_hz,
         work_dir=args.work_dir,
         comparison_workers=args.workers,
         channel_workers=args.channel_workers,
@@ -591,6 +601,12 @@ def main() -> None:
         sys.exit(2)
     if config.rms_window_s <= 0:
         print("Error: --rms-window-s / --rms-smoothing-window-s must be > 0.", file=sys.stderr)
+        sys.exit(2)
+    if config.intan_filter_order < 1 or config.intan_filter_order > 8:
+        print("Error: --intan-filter-order must be between 1 and 8.", file=sys.stderr)
+        sys.exit(2)
+    if config.intan_filter_cutoff_hz <= 0:
+        print("Error: --intan-filter-cutoff-hz must be > 0.", file=sys.stderr)
         sys.exit(2)
     if config.spike_threshold_mode == "rms_multiple" and config.spike_threshold_rms_multiplier <= 0:
         print(

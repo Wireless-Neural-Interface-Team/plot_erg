@@ -22,18 +22,41 @@ INTAN_NOTCH_BANDWIDTH_HZ = 10.0
 INTAN_RMS_WINDOW_S = 1.0
 
 FilterType = Literal["bessel", "butterworth"]
+SpikeFilterKind = Literal["highpass", "lowpass"]
+
+_BESSEL_SPECS: dict[int, list[tuple[float, float]]] = {
+    1: [(1.0, 0.0)],
+    2: [(1 / 1.2736, 0.5773)],
+    3: [(1 / 1.3270, 0.0), (1 / 1.4524, 0.6910)],
+    4: [(1 / 1.4192, 0.5219), (1 / 1.5912, 0.8055)],
+    5: [(1 / 1.5069, 0.0), (1 / 1.5611, 0.5635), (1 / 1.7607, 0.9165)],
+    6: [(1 / 1.6060, 0.5103), (1 / 1.6913, 0.6112), (1 / 1.9071, 1.0234)],
+    7: [(1 / 1.6853, 0.0), (1 / 1.7174, 0.5324), (1 / 1.8235, 0.6608), (1 / 2.0507, 1.1262)],
+    8: [(1 / 1.7837, 0.5060), (1 / 1.8376, 0.5596), (1 / 1.9591, 0.7109), (1 / 2.1953, 1.2258)],
+}
+_BUTTERWORTH_SPECS: dict[int, list[tuple[float, float]]] = {
+    1: [(1.0, 0.0)],
+    2: [(1.0, 0.7071)],
+    3: [(1.0, 0.0), (1.0, 1.0)],
+    4: [(1.0, 1.3065), (1.0, 0.5412)],
+    5: [(1.0, 0.0), (1.0, 0.6180), (1.0, 1.6181)],
+    6: [(1.0, 0.5177), (1.0, 0.7071), (1.0, 1.9320)],
+    7: [(1.0, 0.0), (1.0, 0.5549), (1.0, 0.8019), (1.0, 2.2472)],
+    8: [(1.0, 0.5098), (1.0, 0.6013), (1.0, 0.8999), (1.0, 2.5628)],
+}
 
 
 @dataclass(frozen=True)
 class IntanDspSettings:
-    """Defaults match Intan RHX SystemState (v3.5.1)."""
+    """Defaults match Intan RHX SystemState (v3.5.1) HIGH filter."""
 
     fs: float
     rhs_version_major: int = 3
     notch_filter_frequency_hz: float = 0.0
-    high_order: int = 2
-    high_type: FilterType = "bessel"
-    high_cutoff_hz: float = 250.0
+    spike_filter_kind: SpikeFilterKind = "highpass"
+    filter_order: int = 2
+    filter_type: FilterType = "bessel"
+    filter_cutoff_hz: float = 250.0
     spike_threshold_uv: float = -70.0
     artifact_threshold_uv: float = 2500.0
     artifact_suppression_enabled: bool = True
@@ -45,8 +68,31 @@ class IntanDspSettings:
         return max(1, int(math.ceil(float(self.fs) * float(self.rms_window_s))))
 
     def apply_notch_to_wideband(self) -> bool:
-        """True when wideband must be notch-filtered before HIGH (pre-RHX v3 files)."""
+        """True when wideband must be notch-filtered before software filter (pre-RHX v3)."""
         return self.notch_filter_frequency_hz > 0 and self.rhs_version_major < 3
+
+    def validate_filter(self) -> None:
+        fc = float(self.filter_cutoff_hz)
+        if fc <= 0:
+            raise ValueError("Spike filter cutoff frequency must be > 0 Hz.")
+        order = int(self.filter_order)
+        if order < 1 or order > 8:
+            raise ValueError("Spike filter order must be between 1 and 8.")
+        kind = self.spike_filter_kind
+        if kind not in ("highpass", "lowpass"):
+            raise ValueError("Spike filter kind must be highpass or lowpass.")
+        nyq = float(self.fs) / 2.0
+        if fc >= nyq:
+            raise ValueError(
+                f"Spike filter cutoff ({fc:g} Hz) must be below Nyquist ({nyq:g} Hz)."
+            )
+
+    def filter_short_label(self) -> str:
+        tag = "HP" if self.spike_filter_kind == "highpass" else "LP"
+        return (
+            f"{self.filter_type} {tag} ord.{self.filter_order} "
+            f"@ {self.filter_cutoff_hz:g} Hz"
+        )
 
     @classmethod
     def from_rhs_data(
@@ -54,9 +100,10 @@ class IntanDspSettings:
         data: dict[str, Any],
         *,
         spike_threshold_uv: float = -70.0,
-        high_order: int = 2,
-        high_type: FilterType = "bessel",
-        high_cutoff_hz: float = 250.0,
+        spike_filter_kind: SpikeFilterKind = "highpass",
+        filter_order: int = 2,
+        filter_type: FilterType = "bessel",
+        filter_cutoff_hz: float = 250.0,
         artifact_threshold_uv: float = 2500.0,
         artifact_suppression_enabled: bool = True,
     ) -> IntanDspSettings:
@@ -67,17 +114,20 @@ class IntanDspSettings:
         version = data.get("version") or {}
         major = int(version.get("major", 3))
         notch = float(freq.get("notch_filter_frequency") or 0.0)
-        return cls(
+        settings = cls(
             fs=fs,
             rhs_version_major=major,
             notch_filter_frequency_hz=notch,
-            high_order=int(high_order),
-            high_type=high_type,
-            high_cutoff_hz=float(high_cutoff_hz),
+            spike_filter_kind=spike_filter_kind,
+            filter_order=int(filter_order),
+            filter_type=filter_type,
+            filter_cutoff_hz=float(filter_cutoff_hz),
             spike_threshold_uv=float(spike_threshold_uv),
             artifact_threshold_uv=float(artifact_threshold_uv),
             artifact_suppression_enabled=bool(artifact_suppression_enabled),
         )
+        settings.validate_filter()
+        return settings
 
     def save_json(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,8 +135,20 @@ class IntanDspSettings:
 
     @classmethod
     def load_json(cls, path: Path) -> IntanDspSettings:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        return cls(**raw)
+        raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+        if "filter_cutoff_hz" not in raw:
+            raw.setdefault("spike_filter_kind", "highpass")
+            if "high_order" in raw:
+                raw["filter_order"] = raw.pop("high_order")
+            if "high_type" in raw:
+                raw["filter_type"] = raw.pop("high_type")
+            if "high_cutoff_hz" in raw:
+                raw["filter_cutoff_hz"] = raw.pop("high_cutoff_hz")
+        field_names = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        filtered = {k: v for k, v in raw.items() if k in field_names}
+        settings = cls(**filtered)
+        settings.validate_filter()
+        return settings
 
 
 @dataclass
@@ -176,40 +238,35 @@ def _second_order_notch(f_notch: float, bandwidth: float, fs: float) -> _BiquadC
     return _BiquadCoeffs(a, -b, a, b, d * d, False)
 
 
-def _highpass_biquad_chain(order: int, fc: float, fs: float, ftype: FilterType) -> list[_BiquadCoeffs]:
-    """Coefficients for BesselHighpassFilter / ButterworthHighpassFilter (filter.cpp)."""
+def _filter_biquad_chain(
+    kind: SpikeFilterKind,
+    order: int,
+    fc: float,
+    fs: float,
+    ftype: FilterType,
+) -> list[_BiquadCoeffs]:
+    """Bessel/Butterworth HP or LP chain (Intan filter.cpp)."""
     if order < 1 or order > 8:
-        raise ValueError("Intan high-pass order must be 1..8.")
-    if ftype == "bessel":
-        specs: dict[int, list[tuple[float, float]]] = {
-            1: [(1.0, 0.0)],
-            2: [(1 / 1.2736, 0.5773)],
-            3: [(1 / 1.3270, 0.0), (1 / 1.4524, 0.6910)],
-            4: [(1 / 1.4192, 0.5219), (1 / 1.5912, 0.8055)],
-            5: [(1 / 1.5069, 0.0), (1 / 1.5611, 0.5635), (1 / 1.7607, 0.9165)],
-            6: [(1 / 1.6060, 0.5103), (1 / 1.6913, 0.6112), (1 / 1.9071, 1.0234)],
-            7: [(1 / 1.6853, 0.0), (1 / 1.7174, 0.5324), (1 / 1.8235, 0.6608), (1 / 2.0507, 1.1262)],
-            8: [(1 / 1.7837, 0.5060), (1 / 1.8376, 0.5596), (1 / 1.9591, 0.7109), (1 / 2.1953, 1.2258)],
-        }
-    else:
-        specs = {
-            1: [(1.0, 0.0)],
-            2: [(1.0, 0.7071)],
-            3: [(1.0, 0.0), (1.0, 1.0)],
-            4: [(1.0, 1.3065), (1.0, 0.5412)],
-            5: [(1.0, 0.0), (1.0, 0.6180), (1.0, 1.6181)],
-            6: [(1.0, 0.5177), (1.0, 0.7071), (1.0, 1.9320)],
-            7: [(1.0, 0.0), (1.0, 0.5549), (1.0, 0.8019), (1.0, 2.2472)],
-            8: [(1.0, 0.5098), (1.0, 0.6013), (1.0, 0.8999), (1.0, 2.5628)],
-        }
+        raise ValueError("Intan filter order must be 1..8.")
+    specs = _BESSEL_SPECS if ftype == "bessel" else _BUTTERWORTH_SPECS
     chain: list[_BiquadCoeffs] = []
     for scale, q in specs[order]:
         f = fc / scale if scale > 0 else fc
-        if q <= 0:
-            chain.append(_first_order_highpass(f, fs))
+        if kind == "highpass":
+            if q <= 0:
+                chain.append(_first_order_highpass(f, fs))
+            else:
+                chain.append(_second_order_highpass(f, q, fs))
         else:
-            chain.append(_second_order_highpass(f, q, fs))
+            if q <= 0:
+                chain.append(_first_order_lowpass(f, fs))
+            else:
+                chain.append(_second_order_lowpass(f, q, fs))
     return chain
+
+
+def _highpass_biquad_chain(order: int, fc: float, fs: float, ftype: FilterType) -> list[_BiquadCoeffs]:
+    return _filter_biquad_chain("highpass", order, fc, fs, ftype)
 
 
 def _cascade(signal: np.ndarray, coeffs: list[_BiquadCoeffs]) -> np.ndarray:
@@ -219,11 +276,11 @@ def _cascade(signal: np.ndarray, coeffs: list[_BiquadCoeffs]) -> np.ndarray:
     return out
 
 
-def wideband_to_high(
+def wideband_to_filtered(
     wideband_uv: np.ndarray,
     settings: IntanDspSettings,
 ) -> np.ndarray:
-    """Convert wideband amplifier (µV) to Intan HIGH waveform."""
+    """Convert wideband amplifier (µV) to Intan software-filtered waveform (HIGH or LOW)."""
     x = np.asarray(wideband_uv, dtype=np.float64).ravel()
     if settings.apply_notch_to_wideband():
         wide = _BiquadStream(
@@ -235,22 +292,31 @@ def wideband_to_high(
         ).process(x)
     else:
         wide = x
-    high_chain = _highpass_biquad_chain(
-        settings.high_order,
-        settings.high_cutoff_hz,
+    filt_chain = _filter_biquad_chain(
+        settings.spike_filter_kind,
+        settings.filter_order,
+        settings.filter_cutoff_hz,
         settings.fs,
-        settings.high_type,
+        settings.filter_type,
     )
-    return _cascade(wide, high_chain)
+    return _cascade(wide, filt_chain)
 
 
-def compute_high_channel_stack(
+def wideband_to_high(
+    wideband_uv: np.ndarray,
+    settings: IntanDspSettings,
+) -> np.ndarray:
+    """Alias: HIGH path when spike_filter_kind is highpass."""
+    return wideband_to_filtered(wideband_uv, settings)
+
+
+def compute_filtered_channel_stack(
     amplifier_2d: np.ndarray,
     settings: IntanDspSettings,
     channel_workers: int | None = None,
     cancel_check: Any | None = None,
 ) -> np.ndarray:
-    """HIGH waveforms for all channels [n_channels, n_samples]."""
+    """Software-filtered waveforms for all channels [n_channels, n_samples]."""
     import os
     from concurrent.futures import ThreadPoolExecutor
 
@@ -260,7 +326,7 @@ def compute_high_channel_stack(
     def _one(ch: int) -> tuple[int, np.ndarray]:
         if cancel_check is not None:
             cancel_check()
-        hi = wideband_to_high(np.asarray(amplifier_2d[ch], dtype=np.float64), settings)
+        hi = wideband_to_filtered(np.asarray(amplifier_2d[ch], dtype=np.float64), settings)
         return ch, hi.astype(np.float32, copy=False)
 
     if channel_workers is not None:
@@ -277,6 +343,18 @@ def compute_high_channel_stack(
         for ch, row in pool.map(_one, range(n_ch)):
             out[ch, :] = row
     return out
+
+
+def compute_high_channel_stack(
+    amplifier_2d: np.ndarray,
+    settings: IntanDspSettings,
+    channel_workers: int | None = None,
+    cancel_check: Any | None = None,
+) -> np.ndarray:
+    """Backward-compatible alias for compute_filtered_channel_stack."""
+    return compute_filtered_channel_stack(
+        amplifier_2d, settings, channel_workers=channel_workers, cancel_check=cancel_check
+    )
 
 
 def rms_intan_at_index(high: np.ndarray, end_index: int, settings: IntanDspSettings) -> float:

@@ -39,8 +39,10 @@ def launch_qt_gui(
     default_rms_window_s: float = 1.0,
     default_zoom_t0_s: float = -0.1,
     default_zoom_t1_s: float = 0.2,
-    default_spike_bandpass_low_hz: float | None = None,
-    default_spike_bandpass_high_hz: float | None = None,
+    default_intan_spike_filter_kind: str = "highpass",
+    default_intan_filter_order: int = 2,
+    default_intan_filter_type: str = "bessel",
+    default_intan_filter_cutoff_hz: float = 250.0,
     default_channel_workers: int | None = None,
     default_sampling_percent: int = 100,
     default_probe_layout_json: Path | None = None,
@@ -232,23 +234,29 @@ def launch_qt_gui(
     zoom_t1_edit = QLineEdit(str(default_zoom_t1_s))
     zoom_t0_edit.setToolTip("Zoom window start (seconds relative to trigger).")
     zoom_t1_edit.setToolTip("Zoom window end (seconds relative to trigger).")
-    bandpass_spikes_low_edit = QLineEdit()
-    bandpass_spikes_high_edit = QLineEdit()
-    if default_spike_bandpass_low_hz is not None:
-        bandpass_spikes_low_edit.setText(str(default_spike_bandpass_low_hz))
-    if default_spike_bandpass_high_hz is not None:
-        bandpass_spikes_high_edit.setText(str(default_spike_bandpass_high_hz))
-    bandpass_spikes_low_edit.setPlaceholderText("ignored — Intan RHX HIGH")
-    bandpass_spikes_high_edit.setPlaceholderText("ignored — Intan RHX HIGH")
-    bandpass_spikes_low_edit.setEnabled(False)
-    bandpass_spikes_high_edit.setEnabled(False)
-    _bp_tip = (
-        "Butterworth band-pass (order 4) per channel before raster, PSTH, and ISI. "
-        "Both empty = raw mmap signal. Both set = low and high cutoff (Hz); "
-        "high cutoff must stay below Nyquist."
+    spike_filter_kind_combo = QComboBox()
+    spike_filter_kind_combo.addItem("High-pass", "highpass")
+    spike_filter_kind_combo.addItem("Low-pass", "lowpass")
+    idx_sf_kind = spike_filter_kind_combo.findData(default_intan_spike_filter_kind)
+    if idx_sf_kind >= 0:
+        spike_filter_kind_combo.setCurrentIndex(idx_sf_kind)
+    spike_filter_kind_combo.setToolTip(
+        "Intan RHX software filter type for raster, PSTH, ISI and RMS "
+        "(high-pass = Spike Scope HIGH, low-pass = LFP-style LOW)."
     )
-    bandpass_spikes_low_edit.setToolTip("Low frequency (Hz). " + _bp_tip)
-    bandpass_spikes_high_edit.setToolTip("High frequency (Hz). " + _bp_tip)
+    spike_filter_type_combo = QComboBox()
+    spike_filter_type_combo.addItem("Bessel", "bessel")
+    spike_filter_type_combo.addItem("Butterworth", "butterworth")
+    idx_sf_type = spike_filter_type_combo.findData(default_intan_filter_type)
+    if idx_sf_type >= 0:
+        spike_filter_type_combo.setCurrentIndex(idx_sf_type)
+    spike_filter_type_combo.setToolTip("Filter prototype (Intan RHX Bandwidth tab).")
+    spike_filter_order_edit = QLineEdit(str(default_intan_filter_order))
+    spike_filter_order_edit.setToolTip("Filter order (1–8), as in Intan RHX.")
+    spike_filter_cutoff_edit = QLineEdit(str(default_intan_filter_cutoff_hz))
+    spike_filter_cutoff_edit.setToolTip(
+        "Cutoff frequency (Hz). Must be below Nyquist (half the amplifier sample rate)."
+    )
 
     save_row = QHBoxLayout()
     save_row.addWidget(save_dir_edit)
@@ -416,14 +424,16 @@ def launch_qt_gui(
     spike_form.addRow("RMS window (s):", rms_window_edit)
     spike_form.addRow("Zoom window start (s, relative to trigger):", zoom_t0_edit)
     spike_form.addRow("Zoom window end (s, relative to trigger):", zoom_t1_edit)
-    spike_form.addRow("Band-pass signal (raster, PSTH, ISI) low f (Hz):", bandpass_spikes_low_edit)
-    spike_form.addRow("Band-pass signal (raster, PSTH, ISI) high f (Hz):", bandpass_spikes_high_edit)
+    spike_form.addRow("Spike signal filter (raster, PSTH, ISI):", spike_filter_kind_combo)
+    spike_form.addRow("Filter type:", spike_filter_type_combo)
+    spike_form.addRow("Filter order (1–8):", spike_filter_order_edit)
+    spike_form.addRow("Cutoff frequency (Hz):", spike_filter_cutoff_edit)
 
     spike_group = QGroupBox("Raster, firing rate (PSTH) and ISI — amplifier PDF panels")
     spike_group.setLayout(spike_form)
     spike_group.setToolTip(
         "These settings apply only to amplifier spike panels in the PDF. "
-        "Raster, PSTH (rate), and ISI share the same spike times (same threshold and band-pass). "
+        "Raster, PSTH (rate), and ISI share the same spike times (threshold + Intan software filter). "
         "Zoom window is configured in this panel."
     )
 
@@ -551,21 +561,18 @@ def launch_qt_gui(
                     section_trigger_start_s,
                     section_trigger_end_s,
                 )
-        bp_lo_text = bandpass_spikes_low_edit.text().strip()
-        bp_hi_text = bandpass_spikes_high_edit.text().strip()
-        bp_lo: float | None = None
-        bp_hi: float | None = None
-        if bp_lo_text or bp_hi_text:
-            if not bp_lo_text or not bp_hi_text:
-                raise ValueError(
-                    "Spike band-pass: set both frequencies (Hz) or leave both fields empty."
-                )
-            bp_lo = float(bp_lo_text)
-            bp_hi = float(bp_hi_text)
-            if bp_lo <= 0 or bp_hi <= 0:
-                raise ValueError("Spike band-pass: each frequency must be > 0 Hz.")
-            if bp_lo >= bp_hi:
-                raise ValueError("Spike band-pass: low frequency must be < high frequency.")
+        spike_filter_kind = str(spike_filter_kind_combo.currentData() or "highpass")
+        if spike_filter_kind not in ("highpass", "lowpass"):
+            raise ValueError("Spike filter: invalid option (high-pass or low-pass).")
+        spike_filter_type = str(spike_filter_type_combo.currentData() or "bessel")
+        if spike_filter_type not in ("bessel", "butterworth"):
+            raise ValueError("Spike filter type: choose Bessel or Butterworth.")
+        spike_filter_order = int(spike_filter_order_edit.text().strip())
+        if spike_filter_order < 1 or spike_filter_order > 8:
+            raise ValueError("Spike filter order: enter an integer from 1 to 8.")
+        spike_filter_cutoff_hz = float(spike_filter_cutoff_edit.text().strip())
+        if spike_filter_cutoff_hz <= 0:
+            raise ValueError("Spike filter cutoff (Hz): value must be > 0.")
         pdf_title_text = pdf_title_edit.text().strip()
         cw_text = channel_workers_edit.text().strip()
         channel_workers: int | None = None
@@ -611,8 +618,10 @@ def launch_qt_gui(
             rms_window_s,
             zoom_t0_s,
             zoom_t1_s,
-            bp_lo,
-            bp_hi,
+            spike_filter_kind,
+            spike_filter_type,
+            spike_filter_order,
+            spike_filter_cutoff_hz,
             None,
             section_count,
             section_duration_s,
@@ -778,8 +787,10 @@ def launch_qt_gui(
         rms_window_edit.setEnabled(False)
         zoom_t0_edit.setEnabled(not running)
         zoom_t1_edit.setEnabled(not running)
-        bandpass_spikes_low_edit.setEnabled(False)
-        bandpass_spikes_high_edit.setEnabled(False)
+        spike_filter_kind_combo.setEnabled(not running)
+        spike_filter_type_combo.setEnabled(not running)
+        spike_filter_order_edit.setEnabled(not running)
+        spike_filter_cutoff_edit.setEnabled(not running)
         pre_edit.setEnabled(not running)
         post_edit.setEnabled(not running)
         section_count_edit.setEnabled(not running)
@@ -839,7 +850,7 @@ def launch_qt_gui(
         return unique_paths
 
     def _build_configs_from_paths(paths: list[str]) -> list[AnalysisConfig]:
-        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, bandpass_low_hz, bandpass_high_hz, work_dir_path, section_count, section_duration_s, section_spec, section_trigger_start_s, section_trigger_end_s, channel_worker_count, sampling_percent = (
+        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, spike_filter_kind, spike_filter_type, spike_filter_order, spike_filter_cutoff_hz, work_dir_path, section_count, section_duration_s, section_spec, section_trigger_start_s, section_trigger_end_s, channel_worker_count, sampling_percent = (
             build_shared_params()
         )
         if psth_bin_window_s <= 0:
@@ -872,8 +883,10 @@ def launch_qt_gui(
                     rms_window_s=rms_window_s,
                     zoom_t0_s=zoom_start_s,
                     zoom_t1_s=zoom_end_s,
-                    spike_bandpass_low_hz=bandpass_low_hz,
-                    spike_bandpass_high_hz=bandpass_high_hz,
+                    intan_spike_filter_kind=spike_filter_kind,  # type: ignore[arg-type]
+                    intan_filter_order=spike_filter_order,
+                    intan_filter_type=spike_filter_type,  # type: ignore[arg-type]
+                    intan_filter_cutoff_hz=spike_filter_cutoff_hz,
                     work_dir=work_dir_path,
                     channel_workers=channel_worker_count,
                     sampling_percent=sampling_percent,
