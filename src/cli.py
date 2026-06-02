@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
+import gc
 import sys
 import time
 from pathlib import Path
@@ -14,16 +15,18 @@ import numpy as np
 from config import AnalysisConfig
 from core import (
     AmplifierSpikeSource,
+    build_intan_dsp_settings,
     get_analog_in0_signal,
     get_channel_names,
     get_sampling_rate,
     load_rhs_file,
-    persist_intan_high_stack,
+    persist_amp_and_filtered_stacks,
     resolve_curve_filter,
     resolve_recording_windows,
     resolve_work_dir,
     uses_analog_trigger,
 )
+from memmap_io import load_readonly_memmap
 from gui import launch_qt_gui
 from impedance_tracking import collect_impedance_sessions
 from plotting import plot_channel_multi_comparison
@@ -60,7 +63,19 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple[
     )
     channel_names = get_channel_names(data, amplifier_raw.shape[0])
     work_dir = resolve_work_dir(config)
-    amp_path, _, _ = persist_intan_high_stack(amplifier_raw, data, config, work_dir)
+    intan_dsp = build_intan_dsp_settings(data, config)
+    stack_shape = (int(amplifier_raw.shape[0]), int(amplifier_raw.shape[1]))
+    amp_path, _ = persist_amp_and_filtered_stacks(
+        work_dir,
+        intan_dsp,
+        stack_shape,
+        amplifier_2d=amplifier_raw,
+        channel_workers=config.channel_workers,
+    )
+    del amplifier_raw
+    if isinstance(data, dict):
+        data.pop("amplifier_data", None)
+    gc.collect()
     return (
         t_rel,
         channel_names,
@@ -436,8 +451,8 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
                 amp_path,
             ) = payload
             work = Path(amp_path).parent
-            amp_mm = np.load(Path(amp_path), mmap_mode="r")
-            high_mm = np.load(work / "high_intan.npy", mmap_mode="r")
+            amp_mm = load_readonly_memmap(Path(amp_path))
+            high_mm = load_readonly_memmap(work / "high_intan.npy")
             from intan_rhx_dsp import IntanDspSettings
 
             intan_dsp = IntanDspSettings.load_json(work / "intan_dsp.json")

@@ -23,10 +23,13 @@ from scipy.signal import butter, filtfilt
 from config import AnalysisConfig, CurveFilterKind, SectionSpecKind
 from intan_rhx_dsp import (
     IntanDspSettings,
-    compute_high_channel_stack,
+    build_intan_filter_sos,
     detect_spikes_intan,
+    filter_wideband_with_sos,
     mean_rms_intan_channel,
+    write_filtered_stack_channelwise,
 )
+from memmap_io import load_readonly_memmap, write_2d_channelwise
 
 _analysis_cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
     "analysis_cancel_event",
@@ -470,11 +473,15 @@ class AmplifierSpikeSource:
         self.intan_dsp = intan_dsp
         self._closed = False
 
+    def _high_row(self, ch: int) -> np.ndarray:
+        """1D mmap/view for one channel (no full-array copy)."""
+        return np.asarray(self.highpass[ch])
+
     def high_trace_for_channel(self, ch: int) -> np.ndarray:
-        return np.asarray(self.highpass[ch], dtype=np.float64)
+        return self._high_row(ch)
 
     def windows_2d_for_channel(self, ch: int) -> np.ndarray:
-        channel_trace = self.high_trace_for_channel(ch)
+        row = self._high_row(ch)
         trial_count = int(self.valid_triggers.size)
         window_length = int(self._offsets.size)
         if trial_count * window_length > 25_000_000:
@@ -486,7 +493,9 @@ class AmplifierSpikeSource:
         for trial_index, trigger_index in enumerate(self.valid_triggers):
             sample_start = int(trigger_index - self.pre_n)
             sample_end = int(trigger_index + self.post_n)
-            trial_windows[trial_index] = channel_trace[sample_start:sample_end]
+            trial_windows[trial_index] = np.asarray(
+                row[sample_start:sample_end], dtype=np.float64
+            )
         return trial_windows
 
     def spike_times_per_trial_for_channel(
@@ -496,18 +505,18 @@ class AmplifierSpikeSource:
         threshold: float,
         refractory_s: float = 0.001,
     ) -> list[np.ndarray]:
-        """Detect spikes per trial on HIGH (Intan cpuinterface, no hoops)."""
+        """Detect spikes per trial on filtered trace (mmap slices per trial)."""
         del refractory_s  # Intan uses snippet_size refractory instead.
         from dataclasses import replace
 
-        channel_trace = self.high_trace_for_channel(ch)
+        row = self._high_row(ch)
         dsp = replace(self.intan_dsp, spike_threshold_uv=float(threshold))
         spike_times_by_trial: list[np.ndarray] = []
         for trigger_index in self.valid_triggers:
             sample_start = int(trigger_index - self.pre_n)
             sample_end = int(trigger_index + self.post_n)
             spike_sample_indices = detect_spikes_intan(
-                channel_trace,
+                row,
                 dsp,
                 start_sample=sample_start,
                 end_sample=sample_end,
@@ -518,8 +527,8 @@ class AmplifierSpikeSource:
         return spike_times_by_trial
 
     def mean_rms_for_channel(self, ch: int) -> float:
-        """RMS over the last 1 s of HIGH (Spike Scope, spikeplot.cpp)."""
-        return mean_rms_intan_channel(self.high_trace_for_channel(ch), self.intan_dsp)
+        """RMS over the last 1 s of filtered trace (Spike Scope, spikeplot.cpp)."""
+        return mean_rms_intan_channel(self._high_row(ch), self.intan_dsp)
 
     def close(self) -> None:
         if self._closed:
@@ -563,13 +572,13 @@ def valid_triggers_and_timebase(
 
 
 def resolve_channel_workers(channel_workers: int | None, n_channels: int) -> int:
-    """Channel worker count with safety cap."""
+    """Auto: use all CPU cores up to MAX_PARALLEL_CHANNELS (16)."""
     if n_channels <= 0:
         return 1
     if channel_workers is not None:
         return max(1, min(int(channel_workers), int(MAX_PARALLEL_CHANNELS), int(n_channels)))
-    cpu_half = max(1, (os.cpu_count() or 2) // 2)
-    return max(1, min(cpu_half, int(MAX_PARALLEL_CHANNELS), int(n_channels)))
+    n_cpu = int(os.cpu_count() or 2)
+    return max(1, min(int(n_channels), int(MAX_PARALLEL_CHANNELS), n_cpu))
 
 
 def resolve_curve_filter(config: AnalysisConfig, fs: float) -> tuple[CurveFilterKind, float | None, float | None]:
@@ -625,10 +634,12 @@ def mean_filtered_channelwise(
     high_hz: float | None,
     channel_workers: int | None = None,
 ) -> np.ndarray:
-    """Butterworth filter per channel, parallelized up to MAX_PARALLEL_CHANNELS."""
-    channel_count, _ = amplifier_2d.shape
+    """Butterworth filter per channel (parallel up to MAX_PARALLEL_CHANNELS)."""
+    channel_count, _ = np.asarray(amplifier_2d).shape
     window_length = pre_n + post_n
     mean_windows = np.zeros((channel_count, window_length), dtype=np.float64)
+    valid_triggers = np.asarray(valid_triggers, dtype=np.int64)
+    n_trig = float(valid_triggers.size)
 
     def _compute_one_channel(c: int) -> tuple[int, np.ndarray]:
         check_analysis_cancelled()
@@ -652,7 +663,7 @@ def mean_filtered_channelwise(
             sample_start = int(trigger_index - pre_n)
             sample_end = int(trigger_index + post_n)
             summed_windows += filtered_channel[sample_start:sample_end]
-        return c, summed_windows / float(valid_triggers.size)
+        return c, summed_windows / n_trig
 
     worker_count = resolve_channel_workers(channel_workers, channel_count)
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
@@ -661,9 +672,104 @@ def mean_filtered_channelwise(
     return mean_windows
 
 
-def persist_amplifier_float32(amplifier_2d: np.ndarray, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.save(path, np.ascontiguousarray(amplifier_2d, dtype=np.float32))
+def persist_amplifier_float32(amplifier_2d: np.ndarray, path: Path) -> Path:
+    """Write amplifier stack channel-by-channel (float32 memmap)."""
+    return write_2d_channelwise(amplifier_2d, path, dtype=np.dtype(np.float32))
+
+
+def intan_memmap_cache_valid(
+    work_dir: Path,
+    intan_dsp: IntanDspSettings,
+    shape: tuple[int, int],
+) -> bool:
+    """True when on-disk amplifier + filtered stacks match current DSP settings."""
+    amp_path = work_dir / "amplifier_raw.npy"
+    high_path = work_dir / "high_intan.npy"
+    json_path = work_dir / "intan_dsp.json"
+    if not (amp_path.exists() and high_path.exists() and json_path.exists()):
+        return False
+    try:
+        if tuple(np.load(amp_path, mmap_mode="r").shape) != shape:
+            return False
+        if tuple(np.load(high_path, mmap_mode="r").shape) != shape:
+            return False
+        return IntanDspSettings.load_json(json_path) == intan_dsp
+    except Exception:
+        return False
+
+
+def persist_amp_and_filtered_stacks(
+    work_dir: Path,
+    intan_dsp: IntanDspSettings,
+    shape: tuple[int, int],
+    *,
+    amplifier_2d: np.ndarray | None = None,
+    amplifier_memmap: np.memmap | None = None,
+    channel_workers: int | None = None,
+) -> tuple[Path, Path]:
+    """One pass per channel: write amplifier_raw + high_intan (fast SOS filter)."""
+    from memmap_io import open_writable_memmap
+
+    amp_path = work_dir / "amplifier_raw.npy"
+    high_path = work_dir / "high_intan.npy"
+
+    if intan_memmap_cache_valid(work_dir, intan_dsp, shape):
+        print("Reusing cached amplifier / filtered memmaps (.plot_erg).")
+        return amp_path, high_path
+
+    intan_dsp.save_json(work_dir / "intan_dsp.json")
+
+    n_ch, n_samp = int(shape[0]), int(shape[1])
+    workers = resolve_channel_workers(channel_workers, n_ch)
+    notch_sos, filter_sos = build_intan_filter_sos(intan_dsp)
+    progress_every = max(1, n_ch // 10) if n_ch >= 20 else 0
+
+    if amplifier_2d is not None:
+        src = np.asarray(amplifier_2d)
+        amp_mm = open_writable_memmap(amp_path, (n_ch, n_samp), np.dtype(np.float32))
+        high_mm = open_writable_memmap(high_path, (n_ch, n_samp), np.dtype(np.float32))
+        print(f"Writing amplifier + Intan filter ({workers} worker(s), fused pass)...")
+
+        def _fused(ch: int) -> tuple[int, np.ndarray, np.ndarray]:
+            check_analysis_cancelled()
+            row = np.asarray(src[ch], dtype=np.float32)
+            filtered = filter_wideband_with_sos(row, notch_sos, filter_sos)
+            return ch, row, np.asarray(filtered, dtype=np.float32)
+
+        try:
+            if workers <= 1 or n_ch == 1:
+                for ch in range(n_ch):
+                    _, amp_row, hi_row = _fused(ch)
+                    amp_mm[ch] = amp_row
+                    high_mm[ch] = hi_row
+                    if progress_every > 0 and (ch + 1) % progress_every == 0:
+                        print(f"  fused pass: channel {ch + 1}/{n_ch}")
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    for ch, amp_row, hi_row in pool.map(_fused, range(n_ch)):
+                        amp_mm[ch] = amp_row
+                        high_mm[ch] = hi_row
+                if progress_every > 0:
+                    print(f"  fused pass: {n_ch} channels ({workers} workers)")
+            amp_mm.flush()
+            high_mm.flush()
+        finally:
+            del amp_mm, high_mm
+        return amp_path, high_path
+
+    if amplifier_memmap is not None:
+        print(f"Computing Intan software filter ({workers} worker(s), channel batches)...")
+        write_filtered_stack_channelwise(
+            amplifier_memmap,
+            high_path,
+            intan_dsp,
+            channel_workers=workers,
+            cancel_check=check_analysis_cancelled,
+            progress_every=progress_every,
+        )
+        return amp_path, high_path
+
+    raise ValueError("persist_amp_and_filtered_stacks requires amplifier_2d or amplifier_memmap.")
 
 
 def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> IntanDspSettings:
@@ -681,25 +787,53 @@ def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> In
 
 
 def persist_intan_high_stack(
-    amplifier_2d: np.ndarray,
-    data: dict[str, Any],
-    config: AnalysisConfig,
+    amplifier_2d: np.ndarray | None,
+    data: dict[str, Any] | None,
+    config: AnalysisConfig | None,
     work_dir: Path,
+    *,
+    amplifier_memmap: np.memmap | None = None,
+    intan_dsp: IntanDspSettings | None = None,
+    channel_workers: int | None = None,
 ) -> tuple[Path, Path, IntanDspSettings]:
-    """Write wideband + Intan HIGH mmaps under work_dir."""
-    intan_dsp = build_intan_dsp_settings(data, config)
+    """Write wideband + filtered Intan stacks under work_dir (channel batches)."""
+    if intan_dsp is None:
+        if data is None or config is None:
+            raise ValueError("data and config are required when intan_dsp is not provided.")
+        intan_dsp = build_intan_dsp_settings(data, config)
     amp_path = work_dir / "amplifier_raw.npy"
     high_path = work_dir / "high_intan.npy"
-    persist_amplifier_float32(amplifier_2d, amp_path)
     intan_dsp.save_json(work_dir / "intan_dsp.json")
     check_analysis_cancelled()
-    high_stack = compute_high_channel_stack(
-        amplifier_2d,
-        intan_dsp,
-        config.channel_workers,
-        cancel_check=check_analysis_cancelled,
-    )
-    np.save(high_path, high_stack)
+
+    n_ch, n_samp = 0, 0
+    if amplifier_memmap is not None:
+        n_ch, n_samp = int(amplifier_memmap.shape[0]), int(amplifier_memmap.shape[1])
+    elif amplifier_2d is not None:
+        n_ch, n_samp = int(np.asarray(amplifier_2d).shape[0]), int(np.asarray(amplifier_2d).shape[1])
+
+    workers = channel_workers
+    if workers is None and config is not None:
+        workers = config.channel_workers
+
+    if amplifier_2d is not None:
+        persist_amp_and_filtered_stacks(
+            work_dir,
+            intan_dsp,
+            (n_ch, n_samp),
+            amplifier_2d=amplifier_2d,
+            channel_workers=workers,
+        )
+    elif amplifier_memmap is not None:
+        persist_amp_and_filtered_stacks(
+            work_dir,
+            intan_dsp,
+            (n_ch, n_samp),
+            amplifier_memmap=amplifier_memmap,
+            channel_workers=workers,
+        )
+    else:
+        raise ValueError("amplifier_2d or amplifier_memmap is required.")
     return amp_path, high_path, intan_dsp
 
 
@@ -759,7 +893,7 @@ def mean_triggered_windows_channelwise(
     post_n: int,
     channel_workers: int | None = None,
 ) -> np.ndarray:
-    """Raw mean per channel, parallelized up to MAX_PARALLEL_CHANNELS."""
+    """Raw mean per channel (parallel, mmap-friendly row reads)."""
     amplifier_data = np.asarray(amplifier_data)
     if amplifier_data.ndim != 2:
         raise RuntimeError("Unexpected amplifier_data shape (expected [n_channels, n_samples]).")
@@ -772,8 +906,8 @@ def mean_triggered_windows_channelwise(
     if valid_triggers.size == 0:
         raise RuntimeError("No valid window around triggers.")
 
-    # float32 is enough for PDF display and cuts RAM a lot.
     out = np.zeros((n_ch, win_len), dtype=np.float32)
+    n_trig = float(valid_triggers.size)
 
     def _compute_one_channel(c: int) -> tuple[int, np.ndarray]:
         check_analysis_cancelled()
@@ -783,12 +917,12 @@ def mean_triggered_windows_channelwise(
             start = int(trig - pre_n)
             end = int(trig + post_n)
             acc += row[start:end]
-        return c, acc / float(valid_triggers.size)
+        return c, acc / n_trig
 
-    n_workers = resolve_channel_workers(channel_workers, n_ch)
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        for c, m in pool.map(_compute_one_channel, range(n_ch)):
-            out[c] = m
+    worker_count = resolve_channel_workers(channel_workers, n_ch)
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        for c, mean_row in pool.map(_compute_one_channel, range(n_ch)):
+            out[c] = mean_row
     return out
 
 
@@ -841,9 +975,13 @@ def compute_average_per_channel(
     )
     check_analysis_cancelled()
 
-    channel_names = get_channel_names(data, amplifier_raw.shape[0])
+    n_ch, n_samples = amplifier_raw.shape
+    channel_names = get_channel_names(data, n_ch)
 
-    # Raw mean in streaming mode (avoids large RAM allocations).
+    work_dir = resolve_work_dir(config)
+    intan_dsp = build_intan_dsp_settings(data, config)
+    stack_shape = (int(amplifier_raw.shape[0]), int(amplifier_raw.shape[1]))
+
     mean_per_channel_raw = mean_triggered_windows_channelwise(
         amplifier_data=amplifier_raw,
         valid_triggers=valid_triggers,
@@ -866,21 +1004,25 @@ def compute_average_per_channel(
             config.channel_workers,
         )
     else:
-        mean_per_channel = mean_per_channel_raw
+        mean_per_channel = mean_per_channel_raw.astype(np.float64, copy=False)
 
-    work_dir = resolve_work_dir(config)
-    amp_path, high_path, intan_dsp = persist_intan_high_stack(
-        amplifier_raw, data, config, work_dir
+    persist_amp_and_filtered_stacks(
+        work_dir,
+        intan_dsp,
+        stack_shape,
+        amplifier_2d=amplifier_raw,
+        channel_workers=config.channel_workers,
     )
-
     del amplifier_raw
     if isinstance(data, dict):
         data.pop("amplifier_data", None)
     del data
     gc.collect()
 
-    amp_mm = np.load(amp_path, mmap_mode="r")
-    high_mm = np.load(high_path, mmap_mode="r")
+    amp_path = work_dir / "amplifier_raw.npy"
+    high_path = work_dir / "high_intan.npy"
+    amp_mm = load_readonly_memmap(amp_path)
+    high_mm = load_readonly_memmap(high_path)
     spike_source = AmplifierSpikeSource(
         amplifier=amp_mm,
         highpass=high_mm,

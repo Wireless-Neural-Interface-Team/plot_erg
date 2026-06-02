@@ -27,7 +27,12 @@ from core import (
     check_analysis_cancelled,
     detect_spikes_at_threshold,
 )
-from intan_rhx_dsp import IntanDspSettings, detect_spikes_intan, sliding_rms_intan_profile
+from intan_rhx_dsp import (
+    IntanDspSettings,
+    detect_spikes_intan,
+    sliding_rms_intan_profile,
+    sliding_rms_intan_profile_range,
+)
 from impedance_tracking import ImpedanceSession
 from plot_utils import downsample_points, shift_axes_down, shorten_filename_for_windows
 from probe_layout import draw_probe_layout_on_axes, load_probe_layout_json, match_contact_index
@@ -38,6 +43,9 @@ ZOOM_T1 = 0.2
 
 # ISI: only spikes within [-ISI_HALF_WINDOW_S, +ISI_HALF_WINDOW_S] (s relative to trigger)
 ISI_HALF_WINDOW_S = 1.0
+
+# Butterworth curve filter for mean traces (see core.apply_butterworth_*, order=4)
+CURVE_FILTER_BUTTERWORTH_ORDER = 4
 
 # X-axis label for all time-relative-to-trigger plots
 TIME_REL_XLABEL = "Time relative to trigger (s)"
@@ -415,8 +423,8 @@ def _finalize_and_save_three_part_page(
         1.0,
         _three_part_page_height(recording_count, include_imp=include_imp) / THREE_PART_PAGE_HEIGHT_REF,
     )
-    gap_1_2 = (0.001 + 0.001 * float(recording_count - 1)) * page_height_scale
-    gap_4_5 = (0.001 + 0.001 * float(recording_count - 1)) * page_height_scale
+    gap_1_2 = (0.001 + 0.002 * float(recording_count - 1)) * page_height_scale
+    gap_4_5 = (0.005 + 0.002 * float(recording_count - 1)) * page_height_scale
 
     axis_order = list(THREE_PART_AXIS_ORDER)
     if include_imp:
@@ -590,7 +598,7 @@ def _curve_filter_captions(
     curve_filter_high_hz: Optional[float] = None,
     lowpass_cutoff_hz: Optional[float] = None,
 ) -> tuple[bool, str, str]:
-    """Return (enabled, short title note, legend label)."""
+    """Return (enabled, title suffix, compact legend spec for mean traces)."""
     kind = (curve_filter or "no filter").strip().lower()
     lo = curve_filter_low_hz
     hi = curve_filter_high_hz
@@ -600,19 +608,53 @@ def _curve_filter_captions(
         lo = float(lowpass_cutoff_hz)
     if kind == "no filter":
         return False, "", ""
+    order = CURVE_FILTER_BUTTERWORTH_ORDER
+    zp = "zero-phase filtfilt"
     if kind == "lowpass":
         if lo is None:
             raise ValueError("Curve filter lowpass requires one cutoff frequency (Hz).")
-        return True, f" — Butterworth low-pass {lo:g} Hz", f"low-pass {lo:g} Hz"
+        spec = f"low-pass {lo:g} Hz, order {order}, {zp}"
+        return True, f" — mean trace: Butterworth {spec}", spec
     if kind == "highpass":
         if lo is None:
             raise ValueError("Curve filter highpass requires one cutoff frequency (Hz).")
-        return True, f" — Butterworth high-pass {lo:g} Hz", f"high-pass {lo:g} Hz"
+        spec = f"high-pass {lo:g} Hz, order {order}, {zp}"
+        return True, f" — mean trace: Butterworth {spec}", spec
     if kind == "bandpass":
         if lo is None or hi is None:
             raise ValueError("Curve filter bandpass requires low/high cutoffs (Hz).")
-        return True, f" — Butterworth band-pass {lo:g}–{hi:g} Hz", f"band-pass {lo:g}–{hi:g} Hz"
+        spec = f"band-pass {lo:g}–{hi:g} Hz, order {order}, {zp}"
+        return True, f" — mean trace: Butterworth {spec}", spec
     raise ValueError("Curve filter must be highpass, lowpass, bandpass, or no filter.")
+
+
+def _mean_trace_label(
+    name: str,
+    *,
+    curve_filter_enabled: bool,
+    curve_filter_legend: str,
+) -> str:
+    """Legend label for an averaged trace (filtered or not)."""
+    if curve_filter_enabled:
+        return f"{name} — Butterworth {curve_filter_legend}"
+    return name
+
+
+def _annotate_mean_axis_filter(ax: Any, curve_filter_enabled: bool, curve_filter_legend: str) -> None:
+    """Small in-panel reminder when mean traces are Butterworth-filtered."""
+    if not curve_filter_enabled:
+        return
+    ax.text(
+        0.01,
+        0.99,
+        f"Mean: Butterworth {curve_filter_legend}",
+        transform=ax.transAxes,
+        ha="left",
+        va="top",
+        fontsize=7,
+        color="0.25",
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.75"},
+    )
 
 
 def _apply_curve_filter_to_row(
@@ -752,16 +794,10 @@ def _add_raster_threshold_legend(
         unique_handles = [Line2D([0], [0], color="0.25", linestyle="--", linewidth=1.0)]
         unique_labels = [f"Threshold: {threshold_caption}"]
     entry_count = len(unique_labels)
-    # Keep the legend compact with many recordings, and avoid letting it drive
-    # global subplot compression in tight_layout().
-    if entry_count <= 4:
-        ncol = 1
-    elif entry_count <= 10:
-        ncol = 2
-    else:
-        ncol = 3
-    rows = max(1, int(math.ceil(entry_count / float(ncol))))
-    legend_y = -0.1
+    ncol = 1
+    rows = max(1, entry_count)
+    # Extra vertical offset when many stacked legend rows (single column).
+    legend_y = -0.08 - 0.035 * max(0, rows - 1)
     legend = ax_raster.legend(
         unique_handles,
         unique_labels,
@@ -1488,16 +1524,20 @@ def _mean_rms_profile_from_source_window(
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
 
     channel_indices = [ch_idx] if ch_idx is not None else list(range(n_channels))
-    rms_full: dict[int, np.ndarray] = {}
-    for ch in channel_indices:
-        rms_full[ch] = sliding_rms_intan_profile(source.high_trace_for_channel(ch), source.intan_dsp)
-
+    pad = source.intan_dsp.rms_window_samples
     acc = np.zeros(n_win, dtype=np.float64)
     n_ok = 0
     for trig in valid_trigs:
         seg_stack = np.empty((len(channel_indices), n_win), dtype=np.float64)
         for i, ch in enumerate(channel_indices):
-            seg_stack[i, :] = rms_full[ch][trig + start_off : trig + end_off]
+            row = source.highpass[ch]
+            seg_start = int(trig + start_off)
+            seg_end = int(trig + end_off)
+            r0 = max(0, seg_start - pad)
+            rms_seg = sliding_rms_intan_profile_range(
+                row, source.intan_dsp, r0, seg_end
+            )
+            seg_stack[i, :] = rms_seg[seg_start - r0 : seg_end - r0]
         acc += np.mean(seg_stack, axis=0)
         n_ok += 1
     if n_ok == 0:
@@ -1590,7 +1630,7 @@ def _plot_rms_series(
         ax.set_title(title)
         ax.set_xlabel(TIME_REL_XLABEL)
         ax.set_ylabel("Mean RMS (µV)")
-        ax.set_ylim(0.0, 10.0)
+        ax.set_ylim(0.0, 20.0)
         if x_limits is not None:
             ax.set_xlim(float(x_limits[0]), float(x_limits[1]))
         ax.grid(True, alpha=0.3)
@@ -1746,12 +1786,12 @@ def plot_channel_multi_comparison(
             means_raw_ch: list[np.ndarray] | None = [] if curve_filter_enabled else None
             win_len = int(pre_n_common) + int(post_n_common)
             for src in spike_sources:
-                row = np.asarray(src.amplifier[ch], dtype=np.float64)
+                row = src.amplifier[ch]
                 acc_raw = np.zeros(win_len, dtype=np.float64)
                 for trig in src.valid_triggers:
                     start = int(trig - int(pre_n_common))
                     end = int(trig + int(post_n_common))
-                    acc_raw += row[start:end]
+                    acc_raw += np.asarray(row[start:end], dtype=np.float64)
                 y_raw = acc_raw / float(max(len(src.valid_triggers), 1))
                 if len(y_raw) != len(t_rel):
                     y_raw = np.asarray(y_raw[: len(t_rel)])
@@ -1891,7 +1931,11 @@ def plot_channel_multi_comparison(
                         recording_curve,
                         linewidth=main_lw,
                         color=line_color,
-                        label=f"{labels[recording_index]} (filtered {curve_filter_legend})",
+                        label=_mean_trace_label(
+                            labels[recording_index],
+                            curve_filter_enabled=True,
+                            curve_filter_legend=curve_filter_legend,
+                        ),
                     )
                     ax_zoom.plot(t_rel[zmask], raw_curve[zmask], linewidth=raw_lw, color=line_color, alpha=raw_alpha, label="_nolegend_")
                     ax_zoom.plot(
@@ -1899,11 +1943,20 @@ def plot_channel_multi_comparison(
                         recording_curve[zmask],
                         linewidth=main_lw,
                         color=line_color,
-                        label=f"{labels[recording_index]} (filtered {curve_filter_legend})",
+                        label=_mean_trace_label(
+                            labels[recording_index],
+                            curve_filter_enabled=True,
+                            curve_filter_legend=curve_filter_legend,
+                        ),
                     )
                 else:
-                    ax_full.plot(t_rel, recording_curve, linewidth=base_lw, color=line_color, label=labels[recording_index])
-                    ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=main_lw, color=line_color, label=labels[recording_index])
+                    lbl = _mean_trace_label(
+                        labels[recording_index],
+                        curve_filter_enabled=curve_filter_enabled,
+                        curve_filter_legend=curve_filter_legend,
+                    )
+                    ax_full.plot(t_rel, recording_curve, linewidth=base_lw, color=line_color, label=lbl)
+                    ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=main_lw, color=line_color, label=lbl)
             ax_full.axvline(
                 0.0,
                 linestyle="--",
@@ -1939,6 +1992,7 @@ def plot_channel_multi_comparison(
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
+            _annotate_mean_axis_filter(ax_full, curve_filter_enabled, curve_filter_legend)
             ax_full.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
 
             if any(curve is not None for curve in first_trigger_curves):
@@ -2000,6 +2054,7 @@ def plot_channel_multi_comparison(
             ax_zoom.set_ylabel("Potential (µV)")
             ax_zoom.set_xlabel(TIME_REL_XLABEL)
             ax_zoom.grid(True, alpha=0.3)
+            _annotate_mean_axis_filter(ax_zoom, curve_filter_enabled, curve_filter_legend)
             ax_zoom.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
             if any(curve is not None for curve in first_trigger_curves):
                 for recording_index, first_curve in enumerate(first_trigger_curves):
@@ -2047,10 +2102,24 @@ def plot_channel_multi_comparison(
                             recording_curve[end_mask],
                             linewidth=main_lw,
                             color=line_color,
-                            label=f"{labels[recording_index]} (filtered {curve_filter_legend})",
+                            label=_mean_trace_label(
+                                labels[recording_index],
+                                curve_filter_enabled=True,
+                                curve_filter_legend=curve_filter_legend,
+                            ),
                         )
                     else:
-                        ax_zoom_end.plot(t_rel[end_mask], recording_curve[end_mask], linewidth=main_lw, color=line_color, label=labels[recording_index])
+                        ax_zoom_end.plot(
+                            t_rel[end_mask],
+                            recording_curve[end_mask],
+                            linewidth=main_lw,
+                            color=line_color,
+                            label=_mean_trace_label(
+                                labels[recording_index],
+                                curve_filter_enabled=curve_filter_enabled,
+                                curve_filter_legend=curve_filter_legend,
+                            ),
+                        )
                 ax_zoom_end.axvline(
                     0.0,
                     linestyle="--",
@@ -2065,6 +2134,7 @@ def plot_channel_multi_comparison(
                 ax_zoom_end.set_ylabel("Potential (µV)")
                 ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
                 ax_zoom_end.grid(True, alpha=0.3)
+                _annotate_mean_axis_filter(ax_zoom_end, curve_filter_enabled, curve_filter_legend)
                 ax_zoom_end.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
                 if any(curve is not None for curve in first_trigger_curves):
                     for recording_index, first_curve in enumerate(first_trigger_curves):
@@ -2378,11 +2448,25 @@ def plot_channel_averages(
                     channel_mean,
                     linewidth=1.35,
                     color="C0",
-                    label=f"Mean (filtered, {curve_filter_legend})",
+                    label=_mean_trace_label(
+                        "Mean",
+                        curve_filter_enabled=True,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
                     zorder=2,
                 )
             else:
-                ax_full.plot(t_rel, channel_mean, linewidth=1.2, color="C0", label="Mean")
+                ax_full.plot(
+                    t_rel,
+                    channel_mean,
+                    linewidth=1.2,
+                    color="C0",
+                    label=_mean_trace_label(
+                        "Mean",
+                        curve_filter_enabled=curve_filter_enabled,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
+                )
             ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             if trigger_end_rising_rel_s is not None:
                 ax_full.axvline(
@@ -2403,6 +2487,7 @@ def plot_channel_averages(
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
+            _annotate_mean_axis_filter(ax_full, curve_filter_enabled, curve_filter_legend)
             ax_full.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
 
             if channel_first_trigger_raw is not None:
@@ -2476,10 +2561,25 @@ def plot_channel_averages(
                     channel_mean[zmask],
                     linewidth=1.45,
                     color="C0",
-                    label=f"Filtered ({curve_filter_legend})",
+                    label=_mean_trace_label(
+                        "Mean",
+                        curve_filter_enabled=True,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
                 )
             else:
-                ax_zoom.plot(t_rel[zmask], channel_mean[zmask], linewidth=1.4, color="C0", label="Mean")
+                ax_zoom.plot(
+                    t_rel[zmask],
+                    channel_mean[zmask],
+                    linewidth=1.4,
+                    color="C0",
+                    label=_mean_trace_label(
+                        "Mean",
+                        curve_filter_enabled=curve_filter_enabled,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
+                )
+            _annotate_mean_axis_filter(ax_zoom, curve_filter_enabled, curve_filter_legend)
             ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             if trigger_end_rising_rel_s is not None:
                 ax_zoom.axvline(
@@ -2545,10 +2645,25 @@ def plot_channel_averages(
                         channel_mean[end_mask],
                         linewidth=1.45,
                         color="C0",
-                        label=f"Filtered ({curve_filter_legend})",
+                        label=_mean_trace_label(
+                            "Mean",
+                            curve_filter_enabled=True,
+                            curve_filter_legend=curve_filter_legend,
+                        ),
                     )
                 else:
-                    ax_zoom_end.plot(t_rel[end_mask], channel_mean[end_mask], linewidth=1.4, color="C0", label="Mean")
+                    ax_zoom_end.plot(
+                        t_rel[end_mask],
+                        channel_mean[end_mask],
+                        linewidth=1.4,
+                        color="C0",
+                        label=_mean_trace_label(
+                            "Mean",
+                            curve_filter_enabled=curve_filter_enabled,
+                            curve_filter_legend=curve_filter_legend,
+                        ),
+                    )
+                _annotate_mean_axis_filter(ax_zoom_end, curve_filter_enabled, curve_filter_legend)
                 ax_zoom_end.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
                 ax_zoom_end.axvline(
                     trigger_end_rising_rel_s,
@@ -2934,18 +3049,46 @@ def plot_channel_comparison(
                     channel_mean_a,
                     linewidth=1.35,
                     color="C0",
-                    label=f"{label_a} (filtered {curve_filter_legend})",
+                    label=_mean_trace_label(
+                        label_a,
+                        curve_filter_enabled=True,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
                 )
                 ax_full.plot(
                     t_rel,
                     channel_mean_b,
                     linewidth=1.35,
                     color="C1",
-                    label=f"{label_b} (filtered {curve_filter_legend})",
+                    label=_mean_trace_label(
+                        label_b,
+                        curve_filter_enabled=True,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
                 )
             else:
-                ax_full.plot(t_rel, channel_mean_a, linewidth=1.2, color="C0", label=label_a)
-                ax_full.plot(t_rel, channel_mean_b, linewidth=1.2, color="C1", label=label_b)
+                ax_full.plot(
+                    t_rel,
+                    channel_mean_a,
+                    linewidth=1.2,
+                    color="C0",
+                    label=_mean_trace_label(
+                        label_a,
+                        curve_filter_enabled=curve_filter_enabled,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
+                )
+                ax_full.plot(
+                    t_rel,
+                    channel_mean_b,
+                    linewidth=1.2,
+                    color="C1",
+                    label=_mean_trace_label(
+                        label_b,
+                        curve_filter_enabled=curve_filter_enabled,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
+                )
             ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             if trigger_end_rising_rel_s_a is not None:
                 ax_full.axvline(
@@ -2980,6 +3123,7 @@ def plot_channel_comparison(
             ax_full.set_ylabel("Potential (µV)")
             ax_full.set_xlabel(TIME_REL_XLABEL)
             ax_full.grid(True, alpha=0.3)
+            _annotate_mean_axis_filter(ax_full, curve_filter_enabled, curve_filter_legend)
             ax_full.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
             if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
                 if first_trigger_a_raw is not None:
@@ -3072,18 +3216,47 @@ def plot_channel_comparison(
                     channel_mean_a[zmask],
                     linewidth=1.45,
                     color="C0",
-                    label=f"{label_a} filtered",
+                    label=_mean_trace_label(
+                        label_a,
+                        curve_filter_enabled=True,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
                 )
                 ax_zoom.plot(
                     t_rel[zmask],
                     channel_mean_b[zmask],
                     linewidth=1.45,
                     color="C1",
-                    label=f"{label_b} filtered",
+                    label=_mean_trace_label(
+                        label_b,
+                        curve_filter_enabled=True,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
                 )
             else:
-                ax_zoom.plot(t_rel[zmask], channel_mean_a[zmask], linewidth=1.4, color="C0", label=label_a)
-                ax_zoom.plot(t_rel[zmask], channel_mean_b[zmask], linewidth=1.4, color="C1", label=label_b)
+                ax_zoom.plot(
+                    t_rel[zmask],
+                    channel_mean_a[zmask],
+                    linewidth=1.4,
+                    color="C0",
+                    label=_mean_trace_label(
+                        label_a,
+                        curve_filter_enabled=curve_filter_enabled,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
+                )
+                ax_zoom.plot(
+                    t_rel[zmask],
+                    channel_mean_b[zmask],
+                    linewidth=1.4,
+                    color="C1",
+                    label=_mean_trace_label(
+                        label_b,
+                        curve_filter_enabled=curve_filter_enabled,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
+                )
+            _annotate_mean_axis_filter(ax_zoom, curve_filter_enabled, curve_filter_legend)
             ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
             if trigger_end_rising_rel_s_a is not None:
                 ax_zoom.axvline(
@@ -3150,8 +3323,46 @@ def plot_channel_comparison(
                 end_zoom_t1 = float(max(end_markers) + zoom_t1)
                 end_zoom_range = (end_zoom_t0, end_zoom_t1)
                 end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
-                ax_zoom_end.plot(t_rel[end_mask], channel_mean_a[end_mask], linewidth=1.35, color="C0", label=label_a)
-                ax_zoom_end.plot(t_rel[end_mask], channel_mean_b[end_mask], linewidth=1.35, color="C1", label=label_b)
+                if show_filtered_and_raw and channel_mean_a_raw is not None and channel_mean_b_raw is not None:
+                    ax_zoom_end.plot(
+                        t_rel[end_mask],
+                        channel_mean_a_raw[end_mask],
+                        linewidth=1.15,
+                        color="C0",
+                        alpha=0.85,
+                        label=f"{label_a} raw",
+                    )
+                    ax_zoom_end.plot(
+                        t_rel[end_mask],
+                        channel_mean_b_raw[end_mask],
+                        linewidth=1.15,
+                        color="C1",
+                        alpha=0.85,
+                        label=f"{label_b} raw",
+                    )
+                ax_zoom_end.plot(
+                    t_rel[end_mask],
+                    channel_mean_a[end_mask],
+                    linewidth=1.35,
+                    color="C0",
+                    label=_mean_trace_label(
+                        label_a,
+                        curve_filter_enabled=curve_filter_enabled,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
+                )
+                ax_zoom_end.plot(
+                    t_rel[end_mask],
+                    channel_mean_b[end_mask],
+                    linewidth=1.35,
+                    color="C1",
+                    label=_mean_trace_label(
+                        label_b,
+                        curve_filter_enabled=curve_filter_enabled,
+                        curve_filter_legend=curve_filter_legend,
+                    ),
+                )
+                _annotate_mean_axis_filter(ax_zoom_end, curve_filter_enabled, curve_filter_legend)
                 ax_zoom_end.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
                 if trigger_end_rising_rel_s_a is not None:
                     ax_zoom_end.axvline(

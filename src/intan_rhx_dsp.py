@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
+from scipy.signal import sosfilt
 
 # systemstate.h
 INTAN_SNIPPET_SIZE = 50
@@ -269,29 +270,36 @@ def _highpass_biquad_chain(order: int, fc: float, fs: float, ftype: FilterType) 
     return _filter_biquad_chain("highpass", order, fc, fs, ftype)
 
 
+def _coeffs_to_sos(coeffs: list[_BiquadCoeffs]) -> np.ndarray:
+    sos = np.empty((len(coeffs), 6), dtype=np.float64)
+    for i, c in enumerate(coeffs):
+        sos[i] = (c.b0, c.b1, c.b2, 1.0, c.a1, c.a2)
+    return sos
+
+
 def _cascade(signal: np.ndarray, coeffs: list[_BiquadCoeffs]) -> np.ndarray:
-    out = np.asarray(signal, dtype=np.float64)
-    for c in coeffs:
-        out = _BiquadStream(c).process(out)
-    return out
+    """Vectorized IIR cascade (scipy SOS, ~100× faster than sample-wise Python)."""
+    if not coeffs:
+        return np.asarray(signal, dtype=np.float64).ravel()
+    x = np.asarray(signal, dtype=np.float64).ravel()
+    return sosfilt(_coeffs_to_sos(coeffs), x)
 
 
-def wideband_to_filtered(
-    wideband_uv: np.ndarray,
+def build_intan_filter_sos(
     settings: IntanDspSettings,
-) -> np.ndarray:
-    """Convert wideband amplifier (µV) to Intan software-filtered waveform (HIGH or LOW)."""
-    x = np.asarray(wideband_uv, dtype=np.float64).ravel()
+) -> tuple[np.ndarray | None, np.ndarray]:
+    """Precompute SOS sections for notch (optional) + software HP/LP (reuse per channel)."""
+    notch_sos: np.ndarray | None = None
     if settings.apply_notch_to_wideband():
-        wide = _BiquadStream(
-            _second_order_notch(
-                settings.notch_filter_frequency_hz,
-                INTAN_NOTCH_BANDWIDTH_HZ,
-                settings.fs,
-            )
-        ).process(x)
-    else:
-        wide = x
+        notch_sos = _coeffs_to_sos(
+            [
+                _second_order_notch(
+                    settings.notch_filter_frequency_hz,
+                    INTAN_NOTCH_BANDWIDTH_HZ,
+                    settings.fs,
+                )
+            ]
+        )
     filt_chain = _filter_biquad_chain(
         settings.spike_filter_kind,
         settings.filter_order,
@@ -299,7 +307,27 @@ def wideband_to_filtered(
         settings.fs,
         settings.filter_type,
     )
-    return _cascade(wide, filt_chain)
+    return notch_sos, _coeffs_to_sos(filt_chain)
+
+
+def filter_wideband_with_sos(
+    wideband_uv: np.ndarray,
+    notch_sos: np.ndarray | None,
+    filter_sos: np.ndarray,
+) -> np.ndarray:
+    x = np.asarray(wideband_uv, dtype=np.float64).ravel()
+    if notch_sos is not None:
+        x = sosfilt(notch_sos, x)
+    return sosfilt(filter_sos, x)
+
+
+def wideband_to_filtered(
+    wideband_uv: np.ndarray,
+    settings: IntanDspSettings,
+) -> np.ndarray:
+    """Convert wideband amplifier (µV) to Intan software-filtered waveform (HIGH or LOW)."""
+    notch_sos, filter_sos = build_intan_filter_sos(settings)
+    return filter_wideband_with_sos(wideband_uv, notch_sos, filter_sos)
 
 
 def wideband_to_high(
@@ -310,38 +338,88 @@ def wideband_to_high(
     return wideband_to_filtered(wideband_uv, settings)
 
 
+def write_filtered_stack_channelwise(
+    amplifier: np.ndarray,
+    path: Path,
+    settings: IntanDspSettings,
+    *,
+    channel_workers: int = 1,
+    cancel_check: Any | None = None,
+    progress_every: int = 0,
+) -> Path:
+    """Filter wideband to disk per channel (parallel workers, no full output stack in RAM)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from memmap_io import open_writable_memmap
+
+    arr = np.asarray(amplifier)
+    if arr.ndim != 2:
+        raise ValueError("write_filtered_stack_channelwise expects [n_channels, n_samples].")
+    n_ch, n_samp = int(arr.shape[0]), int(arr.shape[1])
+    workers = max(1, min(int(channel_workers), 16, n_ch))
+    out = open_writable_memmap(path, (n_ch, n_samp), np.dtype(np.float32))
+    notch_sos, filter_sos = build_intan_filter_sos(settings)
+
+    def _one(ch: int) -> tuple[int, np.ndarray]:
+        if cancel_check is not None:
+            cancel_check()
+        filtered = filter_wideband_with_sos(np.asarray(arr[ch], dtype=np.float64), notch_sos, filter_sos)
+        return ch, np.asarray(filtered, dtype=np.float32)
+
+    try:
+        if workers <= 1 or n_ch == 1:
+            for ch in range(n_ch):
+                _, row = _one(ch)
+                out[ch] = row
+                if progress_every > 0 and (ch + 1) % progress_every == 0:
+                    print(f"  filter → {path.name}: channel {ch + 1}/{n_ch}")
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                for ch, row in pool.map(_one, range(n_ch)):
+                    out[ch] = row
+            if progress_every > 0:
+                print(f"  filter → {path.name}: {n_ch} channels ({workers} workers)")
+        out.flush()
+    finally:
+        del out
+    return path
+
+
 def compute_filtered_channel_stack(
     amplifier_2d: np.ndarray,
     settings: IntanDspSettings,
     channel_workers: int | None = None,
     cancel_check: Any | None = None,
 ) -> np.ndarray:
-    """Software-filtered waveforms for all channels [n_channels, n_samples]."""
+    """In-RAM filtered stack (legacy); prefer write_filtered_stack_channelwise for large files."""
     import os
     from concurrent.futures import ThreadPoolExecutor
 
-    n_ch, _ = amplifier_2d.shape
-    out = np.empty_like(np.asarray(amplifier_2d, dtype=np.float32), dtype=np.float32)
+    n_ch, n_samp = np.asarray(amplifier_2d).shape
+    if channel_workers is not None:
+        workers = max(1, min(int(channel_workers), 16, n_ch))
+    else:
+        workers = max(1, min(n_ch, 16, int(os.cpu_count() or 2)))
+    out = np.empty((n_ch, n_samp), dtype=np.float32)
+    notch_sos, filter_sos = build_intan_filter_sos(settings)
 
     def _one(ch: int) -> tuple[int, np.ndarray]:
         if cancel_check is not None:
             cancel_check()
-        hi = wideband_to_filtered(np.asarray(amplifier_2d[ch], dtype=np.float64), settings)
-        return ch, hi.astype(np.float32, copy=False)
+        row = np.asarray(
+            filter_wideband_with_sos(np.asarray(amplifier_2d[ch], dtype=np.float64), notch_sos, filter_sos),
+            dtype=np.float32,
+        )
+        return ch, row
 
-    if channel_workers is not None:
-        workers = max(1, min(int(channel_workers), 16, n_ch))
-    else:
-        workers = max(1, min((os.cpu_count() or 2) // 2, 16, n_ch))
     if workers <= 1 or n_ch == 1:
-        for c in range(n_ch):
-            _, row = _one(c)
-            out[c, :] = row
-        return out
-
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for ch, row in pool.map(_one, range(n_ch)):
-            out[ch, :] = row
+        for ch in range(n_ch):
+            _, row = _one(ch)
+            out[ch] = row
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for ch, row in pool.map(_one, range(n_ch)):
+                out[ch] = row
     return out
 
 
@@ -379,19 +457,31 @@ def mean_rms_intan_channel(high: np.ndarray, settings: IntanDspSettings) -> floa
 
 def sliding_rms_intan_profile(high: np.ndarray, settings: IntanDspSettings) -> np.ndarray:
     """RMS (µV) at each sample: sqrt(mean(x²)) over the preceding rms_window."""
+    return sliding_rms_intan_profile_range(high, settings, 0, None)
+
+
+def sliding_rms_intan_profile_range(
+    high: np.ndarray,
+    settings: IntanDspSettings,
+    start_index: int = 0,
+    end_index: int | None = None,
+) -> np.ndarray:
+    """RMS profile on [start_index, end_index) only (reads high[:end_index] from mmap)."""
     x = np.asarray(high, dtype=np.float64).ravel()
     n = x.size
     if n == 0:
         return np.array([], dtype=np.float64)
+    start = max(0, int(start_index))
+    end = n if end_index is None else min(n, int(end_index))
+    if end <= start:
+        return np.array([], dtype=np.float64)
     n_win = settings.rms_window_samples
-    sq = x * x
+    sq = x[:end] * x[:end]
     cs = np.concatenate(([0.0], np.cumsum(sq)))
-    out = np.empty(n, dtype=np.float64)
-    for i in range(n):
-        start = max(0, i + 1 - n_win)
-        count = i + 1 - start
-        out[i] = math.sqrt((cs[i + 1] - cs[start]) / count)
-    return out
+    idx = np.arange(start, end, dtype=np.int64)
+    seg_start = np.maximum(0, idx + 1 - n_win)
+    counts = idx + 1 - seg_start
+    return np.sqrt((cs[idx + 1] - cs[seg_start]) / counts)
 
 
 def detect_spikes_intan(

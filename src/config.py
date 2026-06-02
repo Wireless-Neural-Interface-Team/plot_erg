@@ -65,7 +65,7 @@ class AnalysisConfig:
     work_dir: Path | None = None
     # Process workers for A/B comparison (>=1)
     comparison_workers: int = 32
-    # Max channel worker threads (None = auto, cap 16)
+    # Channel worker threads (None = all CPU cores up to 16; explicit value capped at 16)
     channel_workers: int | None = None
     # Fraction of spike-plot points to keep (1..100)
     sampling_percent: int = 100

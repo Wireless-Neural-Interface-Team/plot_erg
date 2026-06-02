@@ -275,7 +275,7 @@ def launch_qt_gui(
     channel_workers_edit = QLineEdit()
     if default_channel_workers is not None:
         channel_workers_edit.setText(str(default_channel_workers))
-    channel_workers_edit.setPlaceholderText("auto (default)")
+    channel_workers_edit.setPlaceholderText("empty = max CPU (up to 16)")
     sampling_percent_edit = QLineEdit(str(default_sampling_percent))
     sampling_percent_edit.setPlaceholderText("1..100")
 
@@ -411,7 +411,7 @@ def launch_qt_gui(
     general_form.addRow("PDF output folder (empty = .rhs folder):", save_row)
     general_form.addRow("PDF title/name:", pdf_title_edit)
     general_form.addRow("Probe MEA (JSON probeinterface):", probe_json_row)
-    general_form.addRow("Channel workers (max 16, empty = auto):", channel_workers_edit)
+    general_form.addRow("Channel workers (empty = max CPU, max 16):", channel_workers_edit)
     general_form.addRow("Spike display sampling (%):", sampling_percent_edit)
 
     general_group = QGroupBox("General settings — segmentation, amplifier averages, files")
