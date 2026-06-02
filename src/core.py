@@ -22,6 +22,7 @@ from scipy.signal import butter, filtfilt
 
 from config import AnalysisConfig, CurveFilterKind, SectionSpecKind
 from intan_rhx_dsp import (
+    effective_spike_threshold_uv,
     IntanDspSettings,
     build_intan_filter_sos,
     detect_spikes_intan,
@@ -776,7 +777,10 @@ def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> In
     """RHX-compatible DSP settings from RHS metadata + analysis config."""
     return IntanDspSettings.from_rhs_data(
         data,
-        spike_threshold_uv=float(config.spike_threshold_uv),
+        spike_threshold_uv=effective_spike_threshold_uv(
+            config.spike_threshold_uv,
+            config.spike_threshold_polarity,
+        ),
         spike_filter_kind=config.intan_spike_filter_kind,  # type: ignore[arg-type]
         filter_order=int(config.intan_filter_order),
         filter_type=config.intan_filter_type,  # type: ignore[arg-type]

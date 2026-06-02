@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 
 from config import AnalysisConfig
+from intan_rhx_dsp import normalize_spike_threshold
 from core import (
     AmplifierSpikeSource,
     build_intan_dsp_settings,
@@ -157,8 +158,17 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=defaults.spike_threshold_uv,
         help=(
-            "Spike threshold (µV) on amplifier: >=0 = upward crossing; "
-            "<0 = downward crossing (negative peaks, default from config)"
+            "Spike threshold magnitude (µV). Use --spike-threshold-polarity for above vs below "
+            "(legacy: negative value implies negative polarity)."
+        ),
+    )
+    parser.add_argument(
+        "--spike-threshold-polarity",
+        choices=("negative", "positive"),
+        default=defaults.spike_threshold_polarity,
+        help=(
+            "Spike detection polarity: negative = below threshold (default), "
+            "positive = above threshold."
         ),
     )
     parser.add_argument(
@@ -511,6 +521,7 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             spike_sources=spike_sources,
             fs=float(fs_ref),
             spike_threshold_uv=tuned[0].spike_threshold_uv,
+            spike_threshold_polarity=tuned[0].spike_threshold_polarity,
             spike_threshold_mode=tuned[0].spike_threshold_mode,
             spike_threshold_rms_multiplier=tuned[0].spike_threshold_rms_multiplier,
             psth_bin_window_s=tuned[0].psth_bin_window_s,
@@ -558,7 +569,12 @@ def main() -> None:
             default_lowpass_hz=args.lowpass_hz,
             default_curve_filter="lowpass" if args.lowpass_hz is not None else "no filter",
             default_curve_filter_low_hz=args.lowpass_hz,
-            default_spike_threshold_uv=args.spike_threshold_uv,
+            default_spike_threshold_uv=normalize_spike_threshold(
+                args.spike_threshold_uv, args.spike_threshold_polarity
+            )[0],
+            default_spike_threshold_polarity=normalize_spike_threshold(
+                args.spike_threshold_uv, args.spike_threshold_polarity
+            )[1],
             default_spike_threshold_mode=args.spike_threshold_mode,
             default_spike_threshold_rms_multiplier=args.spike_threshold_rms_multiplier,
             default_psth_bin_window_s=args.psth_bin_window_s,
@@ -594,7 +610,12 @@ def main() -> None:
         curve_filter_high_hz=None,
         save_dir=args.save_dir,
         pdf_title=args.pdf_title,
-        spike_threshold_uv=args.spike_threshold_uv,
+        spike_threshold_uv=normalize_spike_threshold(
+            args.spike_threshold_uv, args.spike_threshold_polarity
+        )[0],
+        spike_threshold_polarity=normalize_spike_threshold(
+            args.spike_threshold_uv, args.spike_threshold_polarity
+        )[1],
         spike_threshold_mode=args.spike_threshold_mode,
         spike_threshold_rms_multiplier=args.spike_threshold_rms_multiplier,
         psth_bin_window_s=args.psth_bin_window_s,

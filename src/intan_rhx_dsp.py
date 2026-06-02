@@ -24,6 +24,29 @@ INTAN_RMS_WINDOW_S = 1.0
 
 FilterType = Literal["bessel", "butterworth"]
 SpikeFilterKind = Literal["highpass", "lowpass"]
+SpikeThresholdPolarity = Literal["negative", "positive"]
+
+
+def normalize_spike_threshold(
+    threshold_uv: float,
+    polarity: SpikeThresholdPolarity | None = None,
+) -> tuple[float, SpikeThresholdPolarity]:
+    """Return (magnitude µV, polarity). Legacy: sign of threshold_uv sets polarity."""
+    if polarity in ("negative", "positive"):
+        return abs(float(threshold_uv)), polarity
+    uv = float(threshold_uv)
+    if uv >= 0:
+        return abs(uv), "positive"
+    return abs(uv), "negative"
+
+
+def effective_spike_threshold_uv(
+    threshold_uv: float,
+    polarity: SpikeThresholdPolarity | None = None,
+) -> float:
+    """Signed threshold for detection: positive = above, negative = below."""
+    mag, pol = normalize_spike_threshold(threshold_uv, polarity)
+    return mag if pol == "positive" else -mag
 
 _BESSEL_SPECS: dict[int, list[tuple[float, float]]] = {
     1: [(1.0, 0.0)],

@@ -1315,28 +1315,45 @@ def _draw_spike_panels_multi_channel(
         ax_isi.set_axis_off()
 
 
-def _spike_threshold_caption(threshold_uv: float) -> str:
-    if threshold_uv >= 0:
-        return f"threshold {threshold_uv:g} µV (rising edge)"
-    return f"threshold {threshold_uv:g} µV (falling edge, negative spike)"
+def _spike_threshold_caption(
+    threshold_uv: float,
+    polarity: str | None = None,
+) -> str:
+    from intan_rhx_dsp import normalize_spike_threshold
+
+    mag, pol = normalize_spike_threshold(threshold_uv, polarity)  # type: ignore[arg-type]
+    if pol == "positive":
+        return f"threshold +{mag:g} µV (above, rising edge)"
+    return f"threshold −{mag:g} µV (below, falling edge)"
 
 
 def _resolve_channel_spike_threshold(
     *,
     mode: str,
     fixed_threshold_uv: float,
+    spike_threshold_polarity: str = "negative",
     rms_multiplier: float,
     source: AmplifierSpikeSource | None,
     channel_index: int,
 ) -> tuple[float, str]:
     """Resolve spike threshold value and caption for one channel."""
+    from intan_rhx_dsp import effective_spike_threshold_uv
+
+    pol = spike_threshold_polarity
     if str(mode).strip().lower() != "rms_multiple":
-        return float(fixed_threshold_uv), _spike_threshold_caption(float(fixed_threshold_uv))
+        eff = effective_spike_threshold_uv(fixed_threshold_uv, pol)  # type: ignore[arg-type]
+        return eff, _spike_threshold_caption(fixed_threshold_uv, pol)
     if source is None:
-        return float(fixed_threshold_uv), _spike_threshold_caption(float(fixed_threshold_uv))
+        eff = effective_spike_threshold_uv(fixed_threshold_uv, pol)  # type: ignore[arg-type]
+        return eff, _spike_threshold_caption(fixed_threshold_uv, pol)
     mean_rms_uv = source.mean_rms_for_channel(int(channel_index))
-    threshold_uv = float(rms_multiplier) * float(mean_rms_uv)
-    return threshold_uv, f"{rms_multiplier:g}x RMS mean/channel ({threshold_uv:g} µV)"
+    magnitude_uv = float(rms_multiplier) * float(mean_rms_uv)
+    eff = effective_spike_threshold_uv(magnitude_uv, pol)  # type: ignore[arg-type]
+    direction = "below" if pol == "negative" else "above"
+    return eff, (
+        f"{rms_multiplier:g}x RMS mean/channel "
+        f"({magnitude_uv:g} µV, {direction})"
+    )
 
 
 def _draw_impedance_evolution_panel(
@@ -1706,7 +1723,8 @@ def plot_channel_multi_comparison(
     means_raw: Optional[Sequence[np.ndarray]] = None,
     spike_sources: Optional[Sequence[Optional[AmplifierSpikeSource]]] = None,
     fs: Optional[float] = None,
-    spike_threshold_uv: float = -40.0,
+    spike_threshold_uv: float = 70.0,
+    spike_threshold_polarity: str = "negative",
     spike_threshold_mode: str = "fixed",
     spike_threshold_rms_multiplier: float = 4.0,
     psth_bin_window_s: float = 0.025,
@@ -2179,6 +2197,7 @@ def plot_channel_multi_comparison(
                     _resolve_channel_spike_threshold(
                         mode=spike_threshold_mode,
                         fixed_threshold_uv=spike_threshold_uv,
+                        spike_threshold_polarity=spike_threshold_polarity,
                         rms_multiplier=spike_threshold_rms_multiplier,
                         source=src,
                         channel_index=ch,
@@ -2196,7 +2215,9 @@ def plot_channel_multi_comparison(
                     ]
                     threshold_caption = " | ".join(threshold_labels)
                 else:
-                    threshold_caption = _spike_threshold_caption(spike_threshold_uv)
+                    threshold_caption = _spike_threshold_caption(
+                        spike_threshold_uv, spike_threshold_polarity
+                    )
                 threshold_entries = [
                     (labels[i], caption)
                     for i, (_thr_uv, caption) in enumerate(thresholds_and_captions)
@@ -2280,7 +2301,8 @@ def plot_channel_averages(
     windows: Optional[np.ndarray] = None,
     spike_source: Optional[AmplifierSpikeSource] = None,
     fs: Optional[float] = None,
-    spike_threshold_uv: float = -40.0,
+    spike_threshold_uv: float = 70.0,
+    spike_threshold_polarity: str = "negative",
     spike_threshold_mode: str = "fixed",
     spike_threshold_rms_multiplier: float = 4.0,
     psth_bin_window_s: float = 0.025,
@@ -2342,7 +2364,8 @@ def plot_channel_averages(
     )
     spike_note = (
         f" — spikes ({spike_pipe_detail}), mode={spike_threshold_mode}: "
-        f"{_spike_threshold_caption(spike_threshold_uv)}, PSTH time window={psth_effective_window_s:g} s"
+        f"{_spike_threshold_caption(spike_threshold_uv, spike_threshold_polarity)}, "
+        f"PSTH time window={psth_effective_window_s:g} s"
         if _has_spike_data
         else ""
     )
@@ -2720,6 +2743,7 @@ def plot_channel_averages(
                 channel_spike_threshold_uv, channel_threshold_caption = _resolve_channel_spike_threshold(
                     mode=spike_threshold_mode,
                     fixed_threshold_uv=spike_threshold_uv,
+                    spike_threshold_polarity=spike_threshold_polarity,
                     rms_multiplier=spike_threshold_rms_multiplier,
                     source=spike_source,
                     channel_index=ch,
@@ -2870,7 +2894,8 @@ def plot_channel_comparison(
     spike_source_a: Optional[AmplifierSpikeSource] = None,
     spike_source_b: Optional[AmplifierSpikeSource] = None,
     fs: Optional[float] = None,
-    spike_threshold_uv: float = -40.0,
+    spike_threshold_uv: float = 70.0,
+    spike_threshold_polarity: str = "negative",
     spike_threshold_mode: str = "fixed",
     spike_threshold_rms_multiplier: float = 4.0,
     psth_bin_window_s: float = 0.025,
@@ -3435,6 +3460,7 @@ def plot_channel_comparison(
                 threshold_a_uv, threshold_a_caption = _resolve_channel_spike_threshold(
                     mode=spike_threshold_mode,
                     fixed_threshold_uv=spike_threshold_uv,
+                    spike_threshold_polarity=spike_threshold_polarity,
                     rms_multiplier=spike_threshold_rms_multiplier,
                     source=spike_source_a,
                     channel_index=ch,
@@ -3442,6 +3468,7 @@ def plot_channel_comparison(
                 threshold_b_uv, threshold_b_caption = _resolve_channel_spike_threshold(
                     mode=spike_threshold_mode,
                     fixed_threshold_uv=spike_threshold_uv,
+                    spike_threshold_polarity=spike_threshold_polarity,
                     rms_multiplier=spike_threshold_rms_multiplier,
                     source=spike_source_b,
                     channel_index=ch,
@@ -3451,7 +3478,9 @@ def plot_channel_comparison(
                 if str(spike_threshold_mode).strip().lower() == "rms_multiple":
                     threshold_caption = f"{label_a}: {threshold_a_caption} | {label_b}: {threshold_b_caption}"
                 else:
-                    threshold_caption = _spike_threshold_caption(spike_threshold_uv)
+                    threshold_caption = _spike_threshold_caption(
+                        spike_threshold_uv, spike_threshold_polarity
+                    )
                 threshold_entries = [
                     (label_a, threshold_a_caption),
                     (label_b, threshold_b_caption),

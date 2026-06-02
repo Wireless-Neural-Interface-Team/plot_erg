@@ -7,6 +7,7 @@ from typing import Literal, Optional
 EdgeKind = Literal["falling", "rising", "none"]
 CurveFilterKind = Literal["highpass", "lowpass", "bandpass", "no filter"]
 SpikeThresholdMode = Literal["fixed", "rms_multiple"]
+SpikeThresholdPolarity = Literal["negative", "positive"]
 SpikeFilterKind = Literal["highpass", "lowpass"]
 IntanFilterType = Literal["bessel", "butterworth"]
 SectionSpecKind = Literal["count", "duration"]
@@ -36,8 +37,9 @@ class AnalysisConfig:
     save_dir: Path | None = None
     # Output PDF title / basename (.pdf added if no extension)
     pdf_title: str | None = None
-    # Spike threshold (µV) on Intan HIGH: >=0 rising, <0 falling (RHX default -70)
-    spike_threshold_uv: float = -70.0
+    # Spike threshold magnitude (µV); polarity selects above vs below (default negative = below).
+    spike_threshold_uv: float = 70.0
+    spike_threshold_polarity: SpikeThresholdPolarity = "negative"
     # Spike threshold mode:
     # - fixed: same threshold (µV) for all channels.
     # - rms_multiple: threshold = spike_threshold_rms_multiplier * mean RMS per channel.

@@ -32,7 +32,8 @@ def launch_qt_gui(
     default_curve_filter: str = "no filter",
     default_curve_filter_low_hz: float | None = None,
     default_curve_filter_high_hz: float | None = None,
-    default_spike_threshold_uv: float = -70.0,
+    default_spike_threshold_uv: float = 70.0,
+    default_spike_threshold_polarity: str = "negative",
     default_spike_threshold_mode: str = "fixed",
     default_spike_threshold_rms_multiplier: float = 4.0,
     default_psth_bin_window_s: float = 0.025,
@@ -200,11 +201,27 @@ def launch_qt_gui(
         idx_mode = spike_threshold_mode_combo.findData("fixed")
     if idx_mode >= 0:
         spike_threshold_mode_combo.setCurrentIndex(idx_mode)
-    spike_threshold_fixed_edit = QLineEdit(str(default_spike_threshold_uv))
+    spike_threshold_polarity_combo = QComboBox()
+    spike_threshold_polarity_combo.addItem(
+        "Negative — spike when signal goes below threshold", "negative"
+    )
+    spike_threshold_polarity_combo.addItem(
+        "Positive — spike when signal goes above threshold", "positive"
+    )
+    idx_pol = spike_threshold_polarity_combo.findData(default_spike_threshold_polarity)
+    if idx_pol < 0:
+        idx_pol = spike_threshold_polarity_combo.findData("negative")
+    if idx_pol >= 0:
+        spike_threshold_polarity_combo.setCurrentIndex(idx_pol)
+    spike_threshold_polarity_combo.setToolTip(
+        "Polarity of spike detection on the Intan HIGH signal. "
+        "Negative: count crossings below the threshold (default, Intan-style). "
+        "Positive: count crossings above the threshold."
+    )
+    spike_threshold_fixed_edit = QLineEdit(str(abs(default_spike_threshold_uv)))
     spike_threshold_fixed_edit.setToolTip(
-        "Fixed threshold in µV (same value for every channel). "
-        "Value >= 0: spike = rising crossing. "
-        "Value < 0: spike = falling crossing (negative peaks)."
+        "Fixed threshold magnitude in µV (same value for every channel). "
+        "Use « Threshold polarity » to choose above vs below."
     )
     spike_threshold_rms_multiplier_edit = QLineEdit(str(default_spike_threshold_rms_multiplier))
     spike_threshold_rms_multiplier_edit.setToolTip(
@@ -419,6 +436,7 @@ def launch_qt_gui(
 
     spike_form = QFormLayout()
     spike_form.addRow("Spike threshold mode — raster, PSTH and ISI:", spike_threshold_mode_combo)
+    spike_form.addRow("Threshold polarity:", spike_threshold_polarity_combo)
     spike_form.addRow("Spike threshold parameters:", spike_threshold_value_row_widget)
     spike_form.addRow("PSTH time window (s):", psth_bin_window_edit)
     spike_form.addRow("RMS window (s):", rms_window_edit)
@@ -593,7 +611,14 @@ def launch_qt_gui(
         if rms_window_s <= 0:
             raise ValueError("RMS window (s): value must be > 0.")
         spike_threshold_mode = str(spike_threshold_mode_combo.currentData() or "fixed")
-        spike_threshold_fixed_uv = float(spike_threshold_fixed_edit.text().strip())
+        spike_threshold_polarity = str(
+            spike_threshold_polarity_combo.currentData() or "negative"
+        )
+        if spike_threshold_polarity not in {"negative", "positive"}:
+            raise ValueError("Threshold polarity: choose negative or positive.")
+        spike_threshold_fixed_uv = abs(float(spike_threshold_fixed_edit.text().strip()))
+        if spike_threshold_fixed_uv <= 0:
+            raise ValueError("Fixed threshold (µV): magnitude must be > 0.")
         spike_threshold_rms_multiplier = float(
             spike_threshold_rms_multiplier_edit.text().strip()
         )
@@ -612,6 +637,7 @@ def launch_qt_gui(
             Path(save_text) if save_text else None,
             pdf_title_text if pdf_title_text else None,
             spike_threshold_fixed_uv,
+            spike_threshold_polarity,
             spike_threshold_mode,
             spike_threshold_rms_multiplier,
             float(psth_bin_window_edit.text().strip()),
@@ -781,6 +807,7 @@ def launch_qt_gui(
         curve_cutoff_high_edit.setEnabled(not running)
         threshold_edit.setEnabled(not running)
         spike_threshold_mode_combo.setEnabled(not running)
+        spike_threshold_polarity_combo.setEnabled(not running)
         spike_threshold_fixed_edit.setEnabled(not running)
         spike_threshold_rms_multiplier_edit.setEnabled(not running)
         psth_bin_window_edit.setEnabled(not running)
@@ -850,7 +877,7 @@ def launch_qt_gui(
         return unique_paths
 
     def _build_configs_from_paths(paths: list[str]) -> list[AnalysisConfig]:
-        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, spike_filter_kind, spike_filter_type, spike_filter_order, spike_filter_cutoff_hz, work_dir_path, section_count, section_duration_s, section_spec, section_trigger_start_s, section_trigger_end_s, channel_worker_count, sampling_percent = (
+        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_polarity, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, spike_filter_kind, spike_filter_type, spike_filter_order, spike_filter_cutoff_hz, work_dir_path, section_count, section_duration_s, section_spec, section_trigger_start_s, section_trigger_end_s, channel_worker_count, sampling_percent = (
             build_shared_params()
         )
         if psth_bin_window_s <= 0:
@@ -877,6 +904,7 @@ def launch_qt_gui(
                     save_dir=save_dir_path,
                     pdf_title=pdf_title,
                     spike_threshold_uv=spike_threshold_uv,
+                    spike_threshold_polarity=spike_threshold_polarity,  # type: ignore[arg-type]
                     spike_threshold_mode=spike_threshold_mode,  # type: ignore[arg-type]
                     spike_threshold_rms_multiplier=spike_threshold_rms_multiplier,
                     psth_bin_window_s=psth_bin_window_s,
