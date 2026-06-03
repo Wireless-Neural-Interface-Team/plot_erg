@@ -1,45 +1,44 @@
 # Intan Trigger Plotter
 
-Programme Python pour lire des fichiers Intan `.rhs`, detecter un **front montant ou descendant** sur `ANALOG_IN 0`, extraire des fenetres temporelles autour de chaque trigger, puis enregistrer la moyenne par canal dans **un seul PDF multi-pages** (aucune fenetre matplotlib).
+Programme Python pour lire des fichiers Intan `.rhs`, détecter un **front montant ou descendant** sur `ANALOG_IN 0`, extraire des fenêtres temporelles autour de chaque trigger, puis enregistrer la moyenne par canal dans **un seul PDF multi-pages** (aucune fenêtre matplotlib).
 
 ## Structure du projet
 
-- `src/core.py` : lecture RHS et calculs
-- `src/plotting.py` : affichage et export PDF
-- `src/gui.py` : interface graphique Qt (selection fichier + parametres)
-- `src/cli.py` : point d'entree ligne de commande
+- `src/core.py` : lecture RHS, filtrage Intan RHX, triggers, piles mmap
+- `src/plotting.py` : export PDF multi-panneaux (moyennes, RMS, raster, PSTH, ISI)
+- `src/gui.py` : interface graphique Qt (sélection fichier + paramètres)
+- `src/cli.py` : point d'entrée ligne de commande
 - `src/load_intan_rhs_format.py` : lecteur Intan RHS
 - `run_gui.py` : lanceur Python simple pour la GUI
 
-## Prerequis
+## Prérequis
 
 1. Installer Python 3.9+
-2. Installer les dependances:
+2. Installer les dépendances :
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Le lecteur Intan `load_intan_rhs_format.py` doit etre dans `src/`.
+3. Le lecteur Intan `load_intan_rhs_format.py` doit être dans `src/`.
 
 ## Utilisation
 
-### Mode GUI (selection du fichier RHS)
+### Mode GUI (sélection du fichier RHS)
 
 ```bash
 python src/cli.py --gui --save-dir "plots"
 ```
 
 L'interface comporte deux **onglets** :
-- **Analyse** : un fichier `.rhs`, moyenne par canal, PDF nomme comme le `.rhs`.
-- **Comparaison** : deux fichiers `.rhs`, memes parametres (bloc commun sous les onglets), courbes **superposees** par canal dans un PDF `{nom1}_vs_{nom2}.pdf`.
+- **Analyse** : un ou plusieurs fichiers `.rhs`, PDF par canal avec moyennes superposées.
+- **Comparaison** : plusieurs enregistrements, mêmes paramètres, courbes **superposées** par canal.
 
-Parametres communs (seuil, front, pre/post, passe-bas, dossier PDF) :
-- type de front sur ANALOG_IN 0 (descendant ou montant)
-- pre/post trigger
-- dossier de sortie du PDF (optionnel : si vide, **meme dossier que le premier .rhs** en analyse simple, ou enregistrement 1 en comparaison)
-
-En analyse simple, le PDF porte le **meme nom de base** que le fichier `.rhs` (ex. `session.rhs` → `session.pdf`).
+Paramètres communs (seuil, front, pre/post, filtre Intan RHX, dossier PDF) :
+- type de front sur ANALOG_IN 0 (descendant, montant, ou aucun pour sections fixes)
+- fenêtre pre/post trigger
+- filtre Intan pour moyennes filtrées, RMS et panneaux spike (passe-haut ou passe-bas, Bessel/Butterworth, ordre, coupure)
+- dossier de sortie du PDF (optionnel : si vide, **même dossier que le premier .rhs**)
 
 ### Mode ligne de commande
 
@@ -55,13 +54,13 @@ python run_gui.py
 
 ## Options principales
 
-- `--edge` : `falling` (descendant) ou `rising` (montant) sur ANALOG_IN 0 (defaut: `falling`)
-- `--threshold` : seuil de comparaison pour le front (defaut: `1.0`)
-- `--pre` : secondes avant trigger (defaut: `2.0`)
-- `--post` : secondes apres trigger (defaut: `10.0`)
-- `--save-dir` : dossier de sortie du PDF (defaut : dossier du fichier `.rhs`)
-- `--lowpass-hz` : frequence de coupure (Hz) d'un **passe-bas Butterworth** (ordre 4, `filtfilt`) sur les canaux amplificateur ; omis = pas de filtre
+- `--edge` : `falling`, `rising` ou `none` sur ANALOG_IN 0 (défaut : `falling`)
+- `--threshold` : seuil de détection du front (défaut : `1.0`)
+- `--pre` / `--post` : secondes avant/après trigger
+- `--save-dir` : dossier de sortie du PDF
+- `--intan-spike-filter` : `highpass` ou `lowpass` (défaut : `highpass`)
+- `--intan-filter-type` : `bessel` ou `butterworth`
+- `--intan-filter-order` : ordre du filtre Intan (1–8)
+- `--intan-filter-cutoff-hz` : fréquence de coupure (Hz)
 
-Les courbes amplificateur sont en **microvolts (µV)** (convention du lecteur Intan).
-
-Le PDF est en multi-pages (une page par canal), nomme comme le fichier RHS : `<nom_du_fichier_sans_extension>.pdf`.
+Les courbes amplificateur sont en **microvolts (µV)**. Le PDF contient, par canal : moyenne brute, moyenne filtrée Intan, premier trigger (HP et brut), RMS, raster, PSTH, taux par trial et ISI.

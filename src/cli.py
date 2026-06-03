@@ -6,6 +6,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 import gc
+import os
 import sys
 import time
 from pathlib import Path
@@ -22,7 +23,6 @@ from core import (
     get_sampling_rate,
     load_rhs_file,
     persist_amp_and_filtered_stacks,
-    resolve_curve_filter,
     resolve_recording_windows,
     resolve_work_dir,
     uses_analog_trigger,
@@ -146,12 +146,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="PDF output name/title (with or without .pdf)",
-    )
-    parser.add_argument(
-        "--lowpass-hz",
-        type=float,
-        default=defaults.lowpass_cutoff_hz,
-        help="Butterworth low-pass corner (Hz) on amplifier channels (default: no filter)",
     )
     parser.add_argument(
         "--spike-threshold-uv",
@@ -309,15 +303,12 @@ def run(config: AnalysisConfig) -> None:
     print(f"Channels compared (overlay): {stats['n_ch']}")
     if config.edge == "none":
         print("Segmentation: equal sections with imaginary trigger window")
-    curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(config, fs)
-    if curve_filter_kind == "no filter":
-        print("Butterworth curve filter: disabled")
-    elif curve_filter_kind == "bandpass":
-        print(f"Butterworth curve filter: band-pass {curve_filter_low_hz:g}-{curve_filter_high_hz:g} Hz")
-    elif curve_filter_kind == "highpass":
-        print(f"Butterworth curve filter: high-pass {curve_filter_low_hz:g} Hz")
-    else:
-        print(f"Butterworth curve filter: low-pass {curve_filter_low_hz:g} Hz")
+    print(
+        "Mean traces in PDF: raw amplifier + Intan software filter "
+        f"({config.intan_filter_type} "
+        f"{'HP' if config.intan_spike_filter_kind == 'highpass' else 'LP'} "
+        f"{config.intan_filter_cutoff_hz:g} Hz, order {config.intan_filter_order})"
+    )
     print(f"PDF written: {pdf_path}")
     print(f"Compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
     print(f"PDF render time: {stats['t_render_s']:.2f} s")
@@ -348,18 +339,12 @@ def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
     print(f"Multiprocessing workers (A/B comparison): {stats['workers']}")
     print(f"A/B compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
     print(f"A/B PDF render time: {stats['t_render_s']:.2f} s")
-    fs_a = float(stats["fs_values"][0])  # type: ignore[index]
-    curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(
-        config_a, fs_a
+    print(
+        "Mean traces in PDF: raw amplifier + Intan software filter "
+        f"({config_a.intan_filter_type} "
+        f"{'HP' if config_a.intan_spike_filter_kind == 'highpass' else 'LP'} "
+        f"{config_a.intan_filter_cutoff_hz:g} Hz, order {config_a.intan_filter_order})"
     )
-    if curve_filter_kind == "no filter":
-        print("Butterworth curve filter: disabled")
-    elif curve_filter_kind == "bandpass":
-        print(f"Butterworth curve filter: band-pass {curve_filter_low_hz:g}-{curve_filter_high_hz:g} Hz")
-    elif curve_filter_kind == "highpass":
-        print(f"Butterworth curve filter: high-pass {curve_filter_low_hz:g} Hz")
-    else:
-        print(f"Butterworth curve filter: low-pass {curve_filter_low_hz:g} Hz")
     print(f"Comparison PDF written: {pdf_path}")
     print(f"Total time (comparison + PDF): {stats['t_total_s']:.2f} s")
     return pdf_path
@@ -395,11 +380,13 @@ def _autotune_config(cfg: AnalysisConfig, n_files: int) -> AnalysisConfig:
     workers = max(1, min(int(cfg.comparison_workers), max(1, min(6, n_files))))
     channel_workers = cfg.channel_workers
     if channel_workers is None:
-        channel_workers = 8 if n_files <= 2 else 4
+        channel_workers = 8 if n_files <= 3 else 4
     if uses_analog_trigger(cfg) and cfg.pre_s + cfg.post_s > 20:
         workers = min(workers, 3)
         channel_workers = min(channel_workers, 4)
     sampling_percent = cfg.sampling_percent
+    if n_files >= 2 and sampling_percent > 50:
+        sampling_percent = 50
     if n_files >= 4 and sampling_percent > 35:
         sampling_percent = 35
     if n_files >= 6 and sampling_percent > 20:
@@ -425,6 +412,16 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
         print("Guardrail mode: large window detected, parallelism limited for memory stability.")
     if tuned[0].sampling_percent != configs[0].sampling_percent:
         print(f"Auto-tuning sampling: {configs[0].sampling_percent}% -> {tuned[0].sampling_percent}%")
+    if os.environ.get("PLOT_ERG_HIGH_QUALITY_PDF", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        print(
+            "PDF fast layout: ~38 in page height, DPI=72 "
+            "(set PLOT_ERG_HIGH_QUALITY_PDF=1 for legacy tall export @ 120 DPI)."
+        )
     payloads = []
     t_compute0 = time.perf_counter()
     if len(tuned) == 1:
@@ -507,17 +504,11 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
         t_render0 = time.perf_counter()
         pdf_path = plot_channel_multi_comparison(
             t_rel=t_ref,
-            means=[],
             channel_names=channel_names,
             output_dir=out_dir,
             labels=labels,
             pdf_title=tuned[0].pdf_title,
-            lowpass_cutoff_hz=tuned[0].lowpass_cutoff_hz,
-            curve_filter=tuned[0].curve_filter,
-            curve_filter_low_hz=tuned[0].curve_filter_low_hz,
-            curve_filter_high_hz=tuned[0].curve_filter_high_hz,
             trigger_end_rising_rel_s_list=end_markers,
-            means_raw=None,
             spike_sources=spike_sources,
             fs=float(fs_ref),
             spike_threshold_uv=tuned[0].spike_threshold_uv,
@@ -528,13 +519,12 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             rms_window_s=tuned[0].rms_window_s,
             zoom_t0_s=tuned[0].zoom_t0_s,
             zoom_t1_s=tuned[0].zoom_t1_s,
-            spike_bandpass_low_hz=tuned[0].spike_bandpass_low_hz,
-            spike_bandpass_high_hz=tuned[0].spike_bandpass_high_hz,
             sampling_percent=tuned[0].sampling_percent,
             pre_n_common=pre_n_common,
             post_n_common=post_n_common,
             impedance_sessions=imp_sessions if imp_sessions else None,
             probe_layout_json=tuned[0].probe_layout_json,
+            channel_workers=tuned[0].channel_workers,
         )
         t_render_s = time.perf_counter() - t_render0
         stats: dict[str, object] = {
@@ -566,9 +556,6 @@ def main() -> None:
             default_edge=args.edge,
             default_pre_s=args.pre,
             default_post_s=args.post,
-            default_lowpass_hz=args.lowpass_hz,
-            default_curve_filter="lowpass" if args.lowpass_hz is not None else "no filter",
-            default_curve_filter_low_hz=args.lowpass_hz,
             default_spike_threshold_uv=normalize_spike_threshold(
                 args.spike_threshold_uv, args.spike_threshold_polarity
             )[0],
@@ -604,10 +591,6 @@ def main() -> None:
         section_spec=args.section_spec,
         section_trigger_start_s=args.section_trigger_start_s,
         section_trigger_end_s=args.section_trigger_end_s,
-        lowpass_cutoff_hz=args.lowpass_hz,
-        curve_filter="lowpass" if args.lowpass_hz is not None else "no filter",
-        curve_filter_low_hz=args.lowpass_hz,
-        curve_filter_high_hz=None,
         save_dir=args.save_dir,
         pdf_title=args.pdf_title,
         spike_threshold_uv=normalize_spike_threshold(

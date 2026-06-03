@@ -1,4 +1,4 @@
-"""Core analysis: Intan RHS loading, Butterworth filters, triggers, spike windows, mmap amplifier."""
+"""Core analysis: Intan RHS loading, triggers, spike windows, mmap amplifier."""
 
 from __future__ import annotations
 
@@ -18,9 +18,8 @@ from collections.abc import Iterator
 from typing import Any
 
 import numpy as np
-from scipy.signal import butter, filtfilt
 
-from config import AnalysisConfig, CurveFilterKind, SectionSpecKind
+from config import AnalysisConfig, SectionSpecKind
 from intan_rhx_dsp import (
     effective_spike_threshold_uv,
     IntanDspSettings,
@@ -54,92 +53,6 @@ def check_analysis_cancelled() -> None:
     ev = _analysis_cancel_event.get()
     if ev is not None and ev.is_set():
         raise InterruptedError("Analysis interrupted.")
-
-
-@functools.lru_cache(maxsize=128)
-def _butter_lowpass_coeffs(fs: float, cutoff_hz: float, order: int) -> tuple[np.ndarray, np.ndarray]:
-    nyq = 0.5 * fs
-    if cutoff_hz <= 0:
-        raise ValueError("Cutoff frequency must be > 0.")
-    if cutoff_hz >= nyq:
-        raise ValueError(
-            f"Cutoff ({cutoff_hz} Hz) must be below Nyquist frequency ({nyq:.1f} Hz)."
-        )
-    wn = cutoff_hz / nyq
-    return butter(order, wn, btype="low")
-
-
-@functools.lru_cache(maxsize=128)
-def _butter_highpass_coeffs(fs: float, cutoff_hz: float, order: int) -> tuple[np.ndarray, np.ndarray]:
-    nyq = 0.5 * fs
-    if cutoff_hz <= 0:
-        raise ValueError("Cutoff frequency must be > 0.")
-    if cutoff_hz >= nyq:
-        raise ValueError(
-            f"Cutoff ({cutoff_hz} Hz) must be below Nyquist frequency ({nyq:.1f} Hz)."
-        )
-    wn = cutoff_hz / nyq
-    return butter(order, wn, btype="high")
-
-
-@functools.lru_cache(maxsize=128)
-def _butter_bandpass_coeffs(
-    fs: float, low_hz: float, high_hz: float, order: int
-) -> tuple[np.ndarray, np.ndarray]:
-    nyq = 0.5 * fs
-    if low_hz <= 0 or high_hz <= 0:
-        raise ValueError("Band-pass corner frequencies must be > 0.")
-    if low_hz >= high_hz:
-        raise ValueError("Band-pass: low frequency must be < high frequency.")
-    if high_hz >= nyq:
-        raise ValueError(
-            f"High corner ({high_hz} Hz) must be below Nyquist ({nyq:.1f} Hz)."
-        )
-    wn = (low_hz / nyq, high_hz / nyq)
-    return butter(order, wn, btype="band")
-
-
-def apply_butterworth_lowpass(
-    data: np.ndarray,
-    fs: float,
-    cutoff_hz: float,
-    order: int = 4,
-) -> np.ndarray:
-    """Butterworth low-pass, zero-phase (filtfilt), per channel (axis=1)."""
-    data = np.asarray(data, dtype=np.float64)
-    if data.ndim != 2:
-        raise RuntimeError("apply_butterworth_lowpass expects [n_channels, n_samples].")
-    b, a = _butter_lowpass_coeffs(float(fs), float(cutoff_hz), int(order))
-    return filtfilt(b, a, data, axis=1)
-
-
-def apply_butterworth_highpass(
-    data: np.ndarray,
-    fs: float,
-    cutoff_hz: float,
-    order: int = 4,
-) -> np.ndarray:
-    """Butterworth high-pass, zero-phase (filtfilt), per channel (axis=1)."""
-    data = np.asarray(data, dtype=np.float64)
-    if data.ndim != 2:
-        raise RuntimeError("apply_butterworth_highpass expects [n_channels, n_samples].")
-    b, a = _butter_highpass_coeffs(float(fs), float(cutoff_hz), int(order))
-    return filtfilt(b, a, data, axis=1)
-
-
-def apply_butterworth_bandpass(
-    data: np.ndarray,
-    fs: float,
-    low_hz: float,
-    high_hz: float,
-    order: int = 4,
-) -> np.ndarray:
-    """Butterworth band-pass, zero-phase (filtfilt), per channel (axis=1)."""
-    data = np.asarray(data, dtype=np.float64)
-    if data.ndim != 2:
-        raise RuntimeError("apply_butterworth_bandpass expects [n_channels, n_samples].")
-    b, a = _butter_bandpass_coeffs(float(fs), float(low_hz), float(high_hz), int(order))
-    return filtfilt(b, a, data, axis=1)
 
 
 def _import_intan_loader():
@@ -475,8 +388,12 @@ class AmplifierSpikeSource:
         self._closed = False
 
     def _high_row(self, ch: int) -> np.ndarray:
-        """1D mmap/view for one channel (no full-array copy)."""
-        return np.asarray(self.highpass[ch])
+        """1D mmap/view for one channel (no full-row copy)."""
+        return self.highpass[ch]
+
+    def _amp_row(self, ch: int) -> np.ndarray:
+        """1D mmap/view for one amplifier channel (no full-row copy)."""
+        return self.amplifier[ch]
 
     def high_trace_for_channel(self, ch: int) -> np.ndarray:
         return self._high_row(ch)
@@ -580,97 +497,6 @@ def resolve_channel_workers(channel_workers: int | None, n_channels: int) -> int
         return max(1, min(int(channel_workers), int(MAX_PARALLEL_CHANNELS), int(n_channels)))
     n_cpu = int(os.cpu_count() or 2)
     return max(1, min(int(n_channels), int(MAX_PARALLEL_CHANNELS), n_cpu))
-
-
-def resolve_curve_filter(config: AnalysisConfig, fs: float) -> tuple[CurveFilterKind, float | None, float | None]:
-    """Resolve and validate curve filter settings, with legacy low-pass fallback."""
-    kind = str(config.curve_filter).strip().lower()
-    if kind not in {"highpass", "lowpass", "bandpass", "no filter"}:
-        raise ValueError(
-            "Curve filter: expected one of highpass, lowpass, bandpass, no filter."
-        )
-    filter_kind: CurveFilterKind = kind  # type: ignore[assignment]
-    low_hz = config.curve_filter_low_hz
-    high_hz = config.curve_filter_high_hz
-
-    # Backward compatibility for CLI / old configs.
-    if filter_kind == "no filter" and config.lowpass_cutoff_hz is not None:
-        filter_kind = "lowpass"
-        low_hz = float(config.lowpass_cutoff_hz)
-        high_hz = None
-
-    nyq = 0.5 * float(fs)
-    if filter_kind == "no filter":
-        return filter_kind, None, None
-    if filter_kind in {"highpass", "lowpass"}:
-        if low_hz is None:
-            raise ValueError(f"Curve filter '{filter_kind}': provide one cutoff frequency (Hz).")
-        fc = float(low_hz)
-        if fc <= 0:
-            raise ValueError("Curve filter cutoff must be > 0 Hz.")
-        if fc >= nyq:
-            raise ValueError(f"Curve filter cutoff ({fc:g} Hz) must be < Nyquist ({nyq:.1f} Hz).")
-        return filter_kind, fc, None
-    if low_hz is None or high_hz is None:
-        raise ValueError("Curve filter 'bandpass': provide both low and high cutoffs (Hz).")
-    flo = float(low_hz)
-    fhi = float(high_hz)
-    if flo <= 0 or fhi <= 0:
-        raise ValueError("Curve filter bandpass: both frequencies must be > 0 Hz.")
-    if flo >= fhi:
-        raise ValueError("Curve filter bandpass: low cutoff must be < high cutoff.")
-    if fhi >= nyq:
-        raise ValueError(f"Curve filter bandpass high cutoff ({fhi:g} Hz) must be < Nyquist ({nyq:.1f} Hz).")
-    return filter_kind, flo, fhi
-
-
-def mean_filtered_channelwise(
-    amplifier_2d: np.ndarray,
-    valid_triggers: np.ndarray,
-    fs: float,
-    pre_n: int,
-    post_n: int,
-    filter_kind: CurveFilterKind,
-    low_hz: float | None,
-    high_hz: float | None,
-    channel_workers: int | None = None,
-) -> np.ndarray:
-    """Butterworth filter per channel (parallel up to MAX_PARALLEL_CHANNELS)."""
-    channel_count, _ = np.asarray(amplifier_2d).shape
-    window_length = pre_n + post_n
-    mean_windows = np.zeros((channel_count, window_length), dtype=np.float64)
-    valid_triggers = np.asarray(valid_triggers, dtype=np.int64)
-    n_trig = float(valid_triggers.size)
-
-    def _compute_one_channel(c: int) -> tuple[int, np.ndarray]:
-        check_analysis_cancelled()
-        row_2d = amplifier_2d[c : c + 1]
-        if filter_kind == "lowpass":
-            if low_hz is None:
-                raise ValueError("Curve filter low-pass requires cutoff frequency.")
-            filtered_channel = apply_butterworth_lowpass(row_2d, fs, low_hz)[0]
-        elif filter_kind == "highpass":
-            if low_hz is None:
-                raise ValueError("Curve filter high-pass requires cutoff frequency.")
-            filtered_channel = apply_butterworth_highpass(row_2d, fs, low_hz)[0]
-        elif filter_kind == "bandpass":
-            if low_hz is None or high_hz is None:
-                raise ValueError("Curve filter band-pass requires low/high frequencies.")
-            filtered_channel = apply_butterworth_bandpass(row_2d, fs, low_hz, high_hz)[0]
-        else:
-            filtered_channel = np.asarray(row_2d[0], dtype=np.float64)
-        summed_windows = np.zeros(window_length, dtype=np.float64)
-        for trigger_index in valid_triggers:
-            sample_start = int(trigger_index - pre_n)
-            sample_end = int(trigger_index + post_n)
-            summed_windows += filtered_channel[sample_start:sample_end]
-        return c, summed_windows / n_trig
-
-    worker_count = resolve_channel_workers(channel_workers, channel_count)
-    with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        for channel_index, channel_mean in pool.map(_compute_one_channel, range(channel_count)):
-            mean_windows[channel_index] = channel_mean
-    return mean_windows
 
 
 def persist_amplifier_float32(amplifier_2d: np.ndarray, path: Path) -> Path:
@@ -942,109 +768,3 @@ def get_channel_names(data: dict[str, Any], n_channels: int) -> list[str]:
             names.append(str(name))
         return names
     return [f"CH{i}" for i in range(n_channels)]
-
-
-def compute_average_per_channel(
-    config: AnalysisConfig,
-) -> tuple[
-    np.ndarray,
-    np.ndarray,
-    list[str],
-    int,
-    int,
-    float,
-    float | None,
-    AmplifierSpikeSource,
-    np.ndarray,
-]:
-    check_analysis_cancelled()
-    if not config.rhs_file.exists():
-        raise FileNotFoundError(f"File not found: {config.rhs_file}")
-
-    data = load_rhs_file(config.rhs_file)
-    check_analysis_cancelled()
-    fs = get_sampling_rate(data)
-    analog_in0 = get_analog_in0_signal(data) if uses_analog_trigger(config) else np.array([], dtype=np.float64)
-
-    amplifier_raw = np.asarray(data.get("amplifier_data"))
-    if amplifier_raw.size == 0:
-        raise RuntimeError("RHS file has no amplifier_data.")
-
-    _, n_samples = amplifier_raw.shape
-    valid_triggers, t_rel, pre_n, post_n, n_valid, n_total, end_rising_rel_s = resolve_recording_windows(
-        config=config,
-        n_samples=n_samples,
-        fs=fs,
-        analog_in0=analog_in0,
-    )
-    check_analysis_cancelled()
-
-    n_ch, n_samples = amplifier_raw.shape
-    channel_names = get_channel_names(data, n_ch)
-
-    work_dir = resolve_work_dir(config)
-    intan_dsp = build_intan_dsp_settings(data, config)
-    stack_shape = (int(amplifier_raw.shape[0]), int(amplifier_raw.shape[1]))
-
-    mean_per_channel_raw = mean_triggered_windows_channelwise(
-        amplifier_data=amplifier_raw,
-        valid_triggers=valid_triggers,
-        pre_n=pre_n,
-        post_n=post_n,
-        channel_workers=config.channel_workers,
-    )
-
-    curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(config, fs)
-    if curve_filter_kind != "no filter":
-        mean_per_channel = mean_filtered_channelwise(
-            amplifier_raw,
-            valid_triggers,
-            fs,
-            pre_n,
-            post_n,
-            curve_filter_kind,
-            curve_filter_low_hz,
-            curve_filter_high_hz,
-            config.channel_workers,
-        )
-    else:
-        mean_per_channel = mean_per_channel_raw.astype(np.float64, copy=False)
-
-    persist_amp_and_filtered_stacks(
-        work_dir,
-        intan_dsp,
-        stack_shape,
-        amplifier_2d=amplifier_raw,
-        channel_workers=config.channel_workers,
-    )
-    del amplifier_raw
-    if isinstance(data, dict):
-        data.pop("amplifier_data", None)
-    del data
-    gc.collect()
-
-    amp_path = work_dir / "amplifier_raw.npy"
-    high_path = work_dir / "high_intan.npy"
-    amp_mm = load_readonly_memmap(amp_path)
-    high_mm = load_readonly_memmap(high_path)
-    spike_source = AmplifierSpikeSource(
-        amplifier=amp_mm,
-        highpass=high_mm,
-        valid_triggers=valid_triggers,
-        pre_n=pre_n,
-        post_n=post_n,
-        work_dir=work_dir,
-        intan_dsp=intan_dsp,
-    )
-
-    return (
-        mean_per_channel,
-        t_rel,
-        channel_names,
-        n_valid,
-        n_total,
-        fs,
-        end_rising_rel_s,
-        spike_source,
-        mean_per_channel_raw,
-    )

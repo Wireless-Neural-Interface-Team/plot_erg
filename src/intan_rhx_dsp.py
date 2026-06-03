@@ -460,22 +460,25 @@ def compute_high_channel_stack(
 
 def rms_intan_at_index(high: np.ndarray, end_index: int, settings: IntanDspSettings) -> float:
     """RMS over the last `rms_window_s` ending at end_index (spikeplot.cpp)."""
-    x = np.asarray(high, dtype=np.float64).ravel()
-    if x.size == 0:
+    n = int(np.asarray(high).shape[-1]) if np.ndim(high) >= 1 else int(np.asarray(high).size)
+    if n == 0:
         return 0.0
     end = int(end_index)
     if end < 0:
         return 0.0
-    end = min(end, x.size - 1)
+    end = min(end, n - 1)
     n_win = min(settings.rms_window_samples, end + 1)
     start = end + 1 - n_win
-    seg = x[start : end + 1]
+    seg = np.asarray(high[start : end + 1], dtype=np.float64).ravel()
     return float(math.sqrt(float(np.mean(seg * seg))))
 
 
 def mean_rms_intan_channel(high: np.ndarray, settings: IntanDspSettings) -> float:
     """Channel RMS used for threshold = multiplier × RMS (last 1 s of recording)."""
-    return rms_intan_at_index(high, int(np.asarray(high).size) - 1, settings)
+    n = int(np.asarray(high).shape[-1]) if np.ndim(high) >= 1 else int(np.asarray(high).size)
+    if n == 0:
+        return 0.0
+    return rms_intan_at_index(high, n - 1, settings)
 
 
 def sliding_rms_intan_profile(high: np.ndarray, settings: IntanDspSettings) -> np.ndarray:
@@ -489,9 +492,8 @@ def sliding_rms_intan_profile_range(
     start_index: int = 0,
     end_index: int | None = None,
 ) -> np.ndarray:
-    """RMS profile on [start_index, end_index) only (reads high[:end_index] from mmap)."""
-    x = np.asarray(high, dtype=np.float64).ravel()
-    n = x.size
+    """RMS profile on [start_index, end_index) only (minimal mmap read)."""
+    n = int(np.asarray(high).shape[-1]) if np.ndim(high) >= 1 else int(np.asarray(high).size)
     if n == 0:
         return np.array([], dtype=np.float64)
     start = max(0, int(start_index))
@@ -499,12 +501,19 @@ def sliding_rms_intan_profile_range(
     if end <= start:
         return np.array([], dtype=np.float64)
     n_win = settings.rms_window_samples
-    sq = x[:end] * x[:end]
+    read_start = max(0, start + 1 - n_win)
+    read_end = end
+    x = np.asarray(high[read_start:read_end], dtype=np.float64).ravel()
+    if x.size == 0:
+        return np.array([], dtype=np.float64)
+    sq = x * x
     cs = np.concatenate(([0.0], np.cumsum(sq)))
-    idx = np.arange(start, end, dtype=np.int64)
-    seg_start = np.maximum(0, idx + 1 - n_win)
-    counts = idx + 1 - seg_start
-    return np.sqrt((cs[idx + 1] - cs[seg_start]) / counts)
+    abs_idx = np.arange(start, end, dtype=np.int64)
+    seg_start_abs = np.maximum(read_start, abs_idx + 1 - n_win)
+    cs_hi = abs_idx + 1 - read_start
+    cs_lo = seg_start_abs - read_start
+    counts = abs_idx + 1 - seg_start_abs
+    return np.sqrt((cs[cs_hi] - cs[cs_lo]) / counts)
 
 
 def detect_spikes_intan(
@@ -515,8 +524,7 @@ def detect_spikes_intan(
     end_sample: int | None = None,
 ) -> np.ndarray:
     """Spike sample indices on HIGH (simplified Intan cpuinterface, no hoops)."""
-    x = np.asarray(high, dtype=np.float64).ravel()
-    n = x.size
+    n = int(np.asarray(high).shape[-1]) if np.ndim(high) >= 1 else int(np.asarray(high).size)
     if n < 2:
         return np.array([], dtype=np.int64)
     t0 = max(0, int(start_sample))
@@ -524,14 +532,16 @@ def detect_spikes_intan(
     if t1 - t0 < settings.snippet_size + 2:
         return np.array([], dtype=np.int64)
 
+    x = np.asarray(high[t0:t1], dtype=np.float32).ravel()
+    win_len = x.size
     thr = float(settings.spike_threshold_uv)
     artifact = float(settings.artifact_threshold_uv)
     use_artifact = settings.artifact_suppression_enabled
     snippet = int(settings.snippet_size)
 
     spikes: list[int] = []
-    s = t0
-    while s < t1 - snippet:
+    s = 0
+    while s < win_len - snippet:
         surpassed = False
         if thr >= 0:
             if x[s] > thr:
@@ -541,7 +551,7 @@ def detect_spikes_intan(
         if not surpassed:
             s += 1
             continue
-        snippet_end = min(t1, s + snippet)
+        snippet_end = min(win_len, s + snippet)
         seg = x[s:snippet_end]
         if use_artifact:
             if thr >= 0 and np.any(seg >= artifact):
@@ -550,6 +560,6 @@ def detect_spikes_intan(
             if thr < 0 and np.any(seg <= -artifact):
                 s += 1
                 continue
-        spikes.append(s)
+        spikes.append(s + t0)
         s += snippet
     return np.asarray(spikes, dtype=np.int64)

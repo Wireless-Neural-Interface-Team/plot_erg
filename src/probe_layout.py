@@ -141,6 +141,8 @@ def draw_probe_layout_on_axes(
     target_ax: Any,  # matplotlib.axes.Axes
     layout: ProbeLayout,
     channel_name: str,
+    *,
+    set_mea_title: bool = True,
 ) -> None:
     """Draw the MEA layout directly on an axes (no inset), highlight active channel."""
     active_contact_index = match_contact_index(layout, channel_name)
@@ -214,5 +216,6 @@ def draw_probe_layout_on_axes(
     layout_ax.set_aspect("equal", adjustable="box")
     layout_ax.set_xticks([])
     layout_ax.set_yticks([])
-    layout_ax.set_title("MEA layout", fontsize=7, pad=2)
+    if set_mea_title:
+        layout_ax.set_title("MEA layout", fontsize=7, pad=2)
     layout_ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)

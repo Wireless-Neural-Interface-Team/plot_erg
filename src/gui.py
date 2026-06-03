@@ -28,10 +28,6 @@ def launch_qt_gui(
     default_section_spec: str = "count",
     default_section_trigger_start_s: float = 1.0,
     default_section_trigger_end_s: float = 4.0,
-    default_lowpass_hz: float | None = None,
-    default_curve_filter: str = "no filter",
-    default_curve_filter_low_hz: float | None = None,
-    default_curve_filter_high_hz: float | None = None,
     default_spike_threshold_uv: float = 70.0,
     default_spike_threshold_polarity: str = "negative",
     default_spike_threshold_mode: str = "fixed",
@@ -158,41 +154,6 @@ def launch_qt_gui(
     _section_sync_guard = False
     _cached_duration_s: float | None = None
     save_dir_edit = QLineEdit()
-    filter_combo = QComboBox()
-    filter_combo.addItem("highpass", "highpass")
-    filter_combo.addItem("lowpass", "lowpass")
-    filter_combo.addItem("bandpass", "bandpass")
-    filter_combo.addItem("no filter", "no filter")
-    curve_cutoff_low_edit = QLineEdit()
-    curve_cutoff_high_edit = QLineEdit()
-    curve_cutoff_low_edit.setPlaceholderText("Cutoff (Hz)")
-    curve_cutoff_high_edit.setPlaceholderText("High cutoff (Hz)")
-    curve_cutoff_row_widget = QWidget()
-    curve_cutoff_row = QHBoxLayout(curve_cutoff_row_widget)
-    curve_cutoff_row.setContentsMargins(0, 0, 0, 0)
-    curve_cutoff_row.setSpacing(6)
-    curve_cutoff_row.addWidget(curve_cutoff_low_edit)
-    curve_cutoff_row.addWidget(curve_cutoff_high_edit)
-
-    # Backward compatibility with old low-pass default.
-    initial_filter_kind = default_curve_filter if default_curve_filter else "no filter"
-    if (
-        initial_filter_kind == "no filter"
-        and default_curve_filter_low_hz is None
-        and default_curve_filter_high_hz is None
-        and default_lowpass_hz is not None
-    ):
-        initial_filter_kind = "lowpass"
-        default_curve_filter_low_hz = default_lowpass_hz
-    idx_filter = filter_combo.findData(initial_filter_kind)
-    if idx_filter < 0:
-        idx_filter = filter_combo.findData("no filter")
-    if idx_filter >= 0:
-        filter_combo.setCurrentIndex(idx_filter)
-    if default_curve_filter_low_hz is not None:
-        curve_cutoff_low_edit.setText(str(default_curve_filter_low_hz))
-    if default_curve_filter_high_hz is not None:
-        curve_cutoff_high_edit.setText(str(default_curve_filter_high_hz))
     spike_threshold_mode_combo = QComboBox()
     spike_threshold_mode_combo.addItem("Fixed threshold (same for all channels)", "fixed")
     spike_threshold_mode_combo.addItem("Multiplier x mean RMS per channel", "rms_multiple")
@@ -258,8 +219,8 @@ def launch_qt_gui(
     if idx_sf_kind >= 0:
         spike_filter_kind_combo.setCurrentIndex(idx_sf_kind)
     spike_filter_kind_combo.setToolTip(
-        "Intan RHX software filter type for raster, PSTH, ISI and RMS "
-        "(high-pass = Spike Scope HIGH, low-pass = LFP-style LOW)."
+        "Intan RHX software filter applied to the full recording (notch + HP or LP). "
+        "Used for the filtered mean trace, first-trigger HP panel, RMS, raster, PSTH and ISI."
     )
     spike_filter_type_combo = QComboBox()
     spike_filter_type_combo.addItem("Bessel", "bessel")
@@ -295,25 +256,6 @@ def launch_qt_gui(
     channel_workers_edit.setPlaceholderText("empty = max CPU (up to 16)")
     sampling_percent_edit = QLineEdit(str(default_sampling_percent))
     sampling_percent_edit.setPlaceholderText("1..100")
-
-    def update_curve_filter_inputs_visibility() -> None:
-        kind = str(filter_combo.currentData() or "no filter")
-        if kind in {"highpass", "lowpass"}:
-            curve_cutoff_low_edit.setVisible(True)
-            curve_cutoff_low_edit.setPlaceholderText("Cutoff (Hz)")
-            curve_cutoff_high_edit.setVisible(False)
-            curve_cutoff_high_edit.clear()
-        elif kind == "bandpass":
-            curve_cutoff_low_edit.setVisible(True)
-            curve_cutoff_low_edit.setPlaceholderText("Low cutoff (Hz)")
-            curve_cutoff_high_edit.setVisible(True)
-        else:
-            curve_cutoff_low_edit.setVisible(False)
-            curve_cutoff_high_edit.setVisible(False)
-            curve_cutoff_low_edit.clear()
-            curve_cutoff_high_edit.clear()
-    filter_combo.currentIndexChanged.connect(update_curve_filter_inputs_visibility)
-    update_curve_filter_inputs_visibility()
 
     def update_spike_threshold_inputs_visibility() -> None:
         mode = str(spike_threshold_mode_combo.currentData() or "fixed")
@@ -423,18 +365,28 @@ def launch_qt_gui(
     general_form.addRow(section_duration_label, section_duration_edit)
     general_form.addRow(section_trigger_start_label, section_trigger_start_edit)
     general_form.addRow(section_trigger_end_label, section_trigger_end_edit)
-    general_form.addRow("Filter:", filter_combo)
-    general_form.addRow("", curve_cutoff_row_widget)
+    trace_panels_info = QLabel(
+        "PDF trace panels per section: (1) raw averaged mean, "
+        "(2) Intan-filtered averaged mean, (3) first trigger Intan HP, "
+        "(4) first trigger raw, (5) RMS — then raster / PSTH / ISI."
+    )
+    trace_panels_info.setWordWrap(True)
+    trace_panels_info.setStyleSheet("color: palette(mid); font-size: 11px;")
+    general_form.addRow("", trace_panels_info)
     general_form.addRow("PDF output folder (empty = .rhs folder):", save_row)
     general_form.addRow("PDF title/name:", pdf_title_edit)
     general_form.addRow("Probe MEA (JSON probeinterface):", probe_json_row)
     general_form.addRow("Channel workers (empty = max CPU, max 16):", channel_workers_edit)
     general_form.addRow("Spike display sampling (%):", sampling_percent_edit)
 
-    general_group = QGroupBox("General settings — segmentation, amplifier averages, files")
+    general_group = QGroupBox("General settings — segmentation, files, PDF output")
     general_group.setLayout(general_form)
 
     spike_form = QFormLayout()
+    spike_form.addRow("Intan filter kind (HP/LP):", spike_filter_kind_combo)
+    spike_form.addRow("Filter type:", spike_filter_type_combo)
+    spike_form.addRow("Filter order (1–8):", spike_filter_order_edit)
+    spike_form.addRow("Cutoff frequency (Hz):", spike_filter_cutoff_edit)
     spike_form.addRow("Spike threshold mode — raster, PSTH and ISI:", spike_threshold_mode_combo)
     spike_form.addRow("Threshold polarity:", spike_threshold_polarity_combo)
     spike_form.addRow("Spike threshold parameters:", spike_threshold_value_row_widget)
@@ -442,17 +394,12 @@ def launch_qt_gui(
     spike_form.addRow("RMS window (s):", rms_window_edit)
     spike_form.addRow("Zoom window start (s, relative to trigger):", zoom_t0_edit)
     spike_form.addRow("Zoom window end (s, relative to trigger):", zoom_t1_edit)
-    spike_form.addRow("Spike signal filter (raster, PSTH, ISI):", spike_filter_kind_combo)
-    spike_form.addRow("Filter type:", spike_filter_type_combo)
-    spike_form.addRow("Filter order (1–8):", spike_filter_order_edit)
-    spike_form.addRow("Cutoff frequency (Hz):", spike_filter_cutoff_edit)
 
-    spike_group = QGroupBox("Raster, firing rate (PSTH) and ISI — amplifier PDF panels")
+    spike_group = QGroupBox("Intan RHX filter — mean traces, RMS and spike panels")
     spike_group.setLayout(spike_form)
     spike_group.setToolTip(
-        "These settings apply only to amplifier spike panels in the PDF. "
-        "Raster, PSTH (rate), and ISI share the same spike times (threshold + Intan software filter). "
-        "Zoom window is configured in this panel."
+        "Intan software filter (Bandwidth tab): filtered mean trace, first-trigger HP, "
+        "RMS evolution, and spike detection for raster / PSTH / ISI share the same HIGH (or LOW) signal."
     )
 
     params_stack = QWidget()
@@ -500,19 +447,19 @@ def launch_qt_gui(
         str,
         float,
         float,
-        str,
-        float | None,
-        float | None,
         Path | None,
         str | None,
         float,
         str,
+        str,
         float,
         float,
         float,
         float,
-        float | None,
-        float | None,
+        float,
+        str,
+        int,
+        float,
         Path | None,
         int,
         float | None,
@@ -522,35 +469,6 @@ def launch_qt_gui(
         int | None,
         int,
     ]:
-        curve_filter_kind = str(filter_combo.currentData() or "no filter")
-        cutoff_low_text = curve_cutoff_low_edit.text().strip()
-        cutoff_high_text = curve_cutoff_high_edit.text().strip()
-        curve_filter_low_hz: float | None = None
-        curve_filter_high_hz: float | None = None
-        if curve_filter_kind in {"highpass", "lowpass"}:
-            if not cutoff_low_text:
-                raise ValueError(f"Filter {curve_filter_kind}: enter cutoff (Hz).")
-            curve_filter_low_hz = float(cutoff_low_text)
-            if curve_filter_low_hz <= 0:
-                raise ValueError("Filter cutoff must be > 0 Hz.")
-            if cutoff_high_text:
-                raise ValueError(
-                    f"Filter {curve_filter_kind}: only one cutoff is required."
-                )
-        elif curve_filter_kind == "bandpass":
-            if not cutoff_low_text or not cutoff_high_text:
-                raise ValueError("Filter bandpass: enter low and high cutoffs (Hz).")
-            curve_filter_low_hz = float(cutoff_low_text)
-            curve_filter_high_hz = float(cutoff_high_text)
-            if curve_filter_low_hz <= 0 or curve_filter_high_hz <= 0:
-                raise ValueError("Filter bandpass: both frequencies must be > 0 Hz.")
-            if curve_filter_low_hz >= curve_filter_high_hz:
-                raise ValueError("Filter bandpass: low cutoff must be < high cutoff.")
-        elif curve_filter_kind == "no filter":
-            if cutoff_low_text or cutoff_high_text:
-                raise ValueError("Filter no filter: leave cutoffs empty.")
-        else:
-            raise ValueError("Filter: invalid option.")
         save_text = save_dir_edit.text().strip()
         edge = str(edge_combo.currentData() or "falling")
         if edge not in ("falling", "rising", "none"):
@@ -631,9 +549,6 @@ def launch_qt_gui(
             edge,
             float(pre_edit.text().strip()),
             float(post_edit.text().strip()),
-            curve_filter_kind,
-            curve_filter_low_hz,
-            curve_filter_high_hz,
             Path(save_text) if save_text else None,
             pdf_title_text if pdf_title_text else None,
             spike_threshold_fixed_uv,
@@ -802,9 +717,6 @@ def launch_qt_gui(
             edit.setEnabled(not running)
         browse_save_btn.setEnabled(not running)
         edge_combo.setEnabled(not running)
-        filter_combo.setEnabled(not running)
-        curve_cutoff_low_edit.setEnabled(not running)
-        curve_cutoff_high_edit.setEnabled(not running)
         threshold_edit.setEnabled(not running)
         spike_threshold_mode_combo.setEnabled(not running)
         spike_threshold_polarity_combo.setEnabled(not running)
@@ -877,7 +789,7 @@ def launch_qt_gui(
         return unique_paths
 
     def _build_configs_from_paths(paths: list[str]) -> list[AnalysisConfig]:
-        trigger_threshold, edge_mode, pre_window_s, post_window_s, curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_polarity, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, spike_filter_kind, spike_filter_type, spike_filter_order, spike_filter_cutoff_hz, work_dir_path, section_count, section_duration_s, section_spec, section_trigger_start_s, section_trigger_end_s, channel_worker_count, sampling_percent = (
+        trigger_threshold, edge_mode, pre_window_s, post_window_s, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_polarity, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, spike_filter_kind, spike_filter_type, spike_filter_order, spike_filter_cutoff_hz, work_dir_path, section_count, section_duration_s, section_spec, section_trigger_start_s, section_trigger_end_s, channel_worker_count, sampling_percent = (
             build_shared_params()
         )
         if psth_bin_window_s <= 0:
@@ -897,10 +809,6 @@ def launch_qt_gui(
                     section_spec=section_spec,  # type: ignore[arg-type]
                     section_trigger_start_s=section_trigger_start_s,
                     section_trigger_end_s=section_trigger_end_s,
-                    lowpass_cutoff_hz=curve_filter_low_hz if curve_filter_kind == "lowpass" else None,
-                    curve_filter=curve_filter_kind,  # type: ignore[arg-type]
-                    curve_filter_low_hz=curve_filter_low_hz,
-                    curve_filter_high_hz=curve_filter_high_hz,
                     save_dir=save_dir_path,
                     pdf_title=pdf_title,
                     spike_threshold_uv=spike_threshold_uv,
