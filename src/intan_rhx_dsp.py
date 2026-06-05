@@ -111,10 +111,19 @@ class IntanDspSettings:
                 f"Spike filter cutoff ({fc:g} Hz) must be below Nyquist ({nyq:g} Hz)."
             )
 
-    def filter_short_label(self) -> str:
-        tag = "HP" if self.spike_filter_kind == "highpass" else "LP"
+    def filter_pass_label(self) -> str:
+        return "high-pass" if self.spike_filter_kind == "highpass" else "low-pass"
+
+    def filter_title_label(self) -> str:
+        """Compact filter description for plot titles (type, pass band, cutoff)."""
         return (
-            f"{self.filter_type} {tag} ord.{self.filter_order} "
+            f"{self.filter_type} {self.filter_pass_label()} "
+            f"@ {self.filter_cutoff_hz:g} Hz"
+        )
+
+    def filter_short_label(self) -> str:
+        return (
+            f"{self.filter_type} {self.filter_pass_label()} ord.{self.filter_order} "
             f"@ {self.filter_cutoff_hz:g} Hz"
         )
 

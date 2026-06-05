@@ -198,6 +198,24 @@ def parse_args() -> argparse.Namespace:
         help="Zoom window end (s, relative to trigger).",
     )
     parser.add_argument(
+        "--first-trigger-hp-ylim",
+        action="store_true",
+        default=defaults.first_trigger_hp_ylim_enabled,
+        help="Fix y-axis (µV) on first-trigger high-pass PDF panels.",
+    )
+    parser.add_argument(
+        "--first-trigger-hp-ylim-min-uv",
+        type=float,
+        default=defaults.first_trigger_hp_ylim_min_uv,
+        help="Fixed y-axis minimum (µV) for first-trigger HP panels (default: -200).",
+    )
+    parser.add_argument(
+        "--first-trigger-hp-ylim-max-uv",
+        type=float,
+        default=defaults.first_trigger_hp_ylim_max_uv,
+        help="Fixed y-axis maximum (µV) for first-trigger HP panels (default: 200).",
+    )
+    parser.add_argument(
         "--rms-window-s",
         "--rms-smoothing-window-s",
         type=float,
@@ -525,6 +543,9 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             impedance_sessions=imp_sessions if imp_sessions else None,
             probe_layout_json=tuned[0].probe_layout_json,
             channel_workers=tuned[0].channel_workers,
+            first_trigger_hp_ylim_enabled=tuned[0].first_trigger_hp_ylim_enabled,
+            first_trigger_hp_ylim_min_uv=tuned[0].first_trigger_hp_ylim_min_uv,
+            first_trigger_hp_ylim_max_uv=tuned[0].first_trigger_hp_ylim_max_uv,
         )
         t_render_s = time.perf_counter() - t_render0
         stats: dict[str, object] = {
@@ -575,6 +596,9 @@ def main() -> None:
             default_channel_workers=args.channel_workers,
             default_sampling_percent=args.sampling_percent,
             default_probe_layout_json=args.probe_layout_json,
+            default_first_trigger_hp_ylim_enabled=args.first_trigger_hp_ylim,
+            default_first_trigger_hp_ylim_min_uv=args.first_trigger_hp_ylim_min_uv,
+            default_first_trigger_hp_ylim_max_uv=args.first_trigger_hp_ylim_max_uv,
         )
         if exit_code != 0:
             sys.exit(exit_code)
@@ -614,12 +638,23 @@ def main() -> None:
         channel_workers=args.channel_workers,
         sampling_percent=args.sampling_percent,
         probe_layout_json=args.probe_layout_json,
+        first_trigger_hp_ylim_enabled=args.first_trigger_hp_ylim,
+        first_trigger_hp_ylim_min_uv=args.first_trigger_hp_ylim_min_uv,
+        first_trigger_hp_ylim_max_uv=args.first_trigger_hp_ylim_max_uv,
     )
     if config.zoom_t1_s <= config.zoom_t0_s:
         print("Error: --zoom-t1-s must be strictly greater than --zoom-t0-s.", file=sys.stderr)
         sys.exit(2)
     if config.rms_window_s <= 0:
         print("Error: --rms-window-s / --rms-smoothing-window-s must be > 0.", file=sys.stderr)
+        sys.exit(2)
+    if config.first_trigger_hp_ylim_enabled and (
+        config.first_trigger_hp_ylim_max_uv <= config.first_trigger_hp_ylim_min_uv
+    ):
+        print(
+            "Error: --first-trigger-hp-ylim-max-uv must be > --first-trigger-hp-ylim-min-uv.",
+            file=sys.stderr,
+        )
         sys.exit(2)
     if config.intan_filter_order < 1 or config.intan_filter_order > 8:
         print("Error: --intan-filter-order must be between 1 and 8.", file=sys.stderr)

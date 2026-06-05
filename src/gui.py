@@ -43,11 +43,15 @@ def launch_qt_gui(
     default_channel_workers: int | None = None,
     default_sampling_percent: int = 100,
     default_probe_layout_json: Path | None = None,
+    default_first_trigger_hp_ylim_enabled: bool = False,
+    default_first_trigger_hp_ylim_min_uv: float = -200.0,
+    default_first_trigger_hp_ylim_max_uv: float = 200.0,
 ) -> int:
     try:
         from PySide6.QtCore import QThread, Signal
         from PySide6.QtWidgets import (
             QApplication,
+            QCheckBox,
             QComboBox,
             QFileDialog,
             QFormLayout,
@@ -212,6 +216,24 @@ def launch_qt_gui(
     zoom_t1_edit = QLineEdit(str(default_zoom_t1_s))
     zoom_t0_edit.setToolTip("Zoom window start (seconds relative to trigger).")
     zoom_t1_edit.setToolTip("Zoom window end (seconds relative to trigger).")
+    first_trigger_hp_ylim_check = QCheckBox("Fix y-axis on first-trigger high-pass panels (µV)")
+    first_trigger_hp_ylim_check.setChecked(bool(default_first_trigger_hp_ylim_enabled))
+    first_trigger_hp_ylim_check.setToolTip(
+        "Same fixed Potential (µV) scale on all first-trigger Intan HP panels (Parts 1–3). "
+        "When unchecked, matplotlib autoscale is used."
+    )
+    first_trigger_hp_ylim_min_edit = QLineEdit(str(default_first_trigger_hp_ylim_min_uv))
+    first_trigger_hp_ylim_max_edit = QLineEdit(str(default_first_trigger_hp_ylim_max_uv))
+    first_trigger_hp_ylim_min_edit.setToolTip("Minimum Potential (µV) for the fixed HP y-axis.")
+    first_trigger_hp_ylim_max_edit.setToolTip("Maximum Potential (µV) for the fixed HP y-axis.")
+
+    def update_first_trigger_hp_ylim_inputs() -> None:
+        enabled = first_trigger_hp_ylim_check.isChecked()
+        first_trigger_hp_ylim_min_edit.setEnabled(enabled)
+        first_trigger_hp_ylim_max_edit.setEnabled(enabled)
+
+    first_trigger_hp_ylim_check.toggled.connect(update_first_trigger_hp_ylim_inputs)
+    update_first_trigger_hp_ylim_inputs()
     spike_filter_kind_combo = QComboBox()
     spike_filter_kind_combo.addItem("High-pass", "highpass")
     spike_filter_kind_combo.addItem("Low-pass", "lowpass")
@@ -394,6 +416,9 @@ def launch_qt_gui(
     spike_form.addRow("RMS window (s):", rms_window_edit)
     spike_form.addRow("Zoom window start (s, relative to trigger):", zoom_t0_edit)
     spike_form.addRow("Zoom window end (s, relative to trigger):", zoom_t1_edit)
+    spike_form.addRow("", first_trigger_hp_ylim_check)
+    spike_form.addRow("First-trigger HP y-axis min (µV):", first_trigger_hp_ylim_min_edit)
+    spike_form.addRow("First-trigger HP y-axis max (µV):", first_trigger_hp_ylim_max_edit)
 
     spike_group = QGroupBox("Intan RHX filter — mean traces, RMS and spike panels")
     spike_group.setLayout(spike_form)
@@ -525,6 +550,13 @@ def launch_qt_gui(
         zoom_t1_s = float(zoom_t1_edit.text().strip())
         if zoom_t1_s <= zoom_t0_s:
             raise ValueError("Zoom window: end must be strictly greater than start.")
+        first_trigger_hp_ylim_enabled = first_trigger_hp_ylim_check.isChecked()
+        first_trigger_hp_ylim_min_uv = float(first_trigger_hp_ylim_min_edit.text().strip())
+        first_trigger_hp_ylim_max_uv = float(first_trigger_hp_ylim_max_edit.text().strip())
+        if first_trigger_hp_ylim_enabled and first_trigger_hp_ylim_max_uv <= first_trigger_hp_ylim_min_uv:
+            raise ValueError(
+                "First-trigger HP y-axis: maximum (µV) must be strictly greater than minimum."
+            )
         rms_window_s = float(rms_window_edit.text().strip())
         if rms_window_s <= 0:
             raise ValueError("RMS window (s): value must be > 0.")
@@ -571,6 +603,9 @@ def launch_qt_gui(
             section_trigger_end_s,
             channel_workers,
             sampling_percent,
+            first_trigger_hp_ylim_enabled,
+            first_trigger_hp_ylim_min_uv,
+            first_trigger_hp_ylim_max_uv,
         )
 
     def _suggest_pdf_title() -> str:
@@ -726,6 +761,12 @@ def launch_qt_gui(
         rms_window_edit.setEnabled(False)
         zoom_t0_edit.setEnabled(not running)
         zoom_t1_edit.setEnabled(not running)
+        first_trigger_hp_ylim_check.setEnabled(not running)
+        if not running:
+            update_first_trigger_hp_ylim_inputs()
+        else:
+            first_trigger_hp_ylim_min_edit.setEnabled(False)
+            first_trigger_hp_ylim_max_edit.setEnabled(False)
         spike_filter_kind_combo.setEnabled(not running)
         spike_filter_type_combo.setEnabled(not running)
         spike_filter_order_edit.setEnabled(not running)
@@ -789,7 +830,7 @@ def launch_qt_gui(
         return unique_paths
 
     def _build_configs_from_paths(paths: list[str]) -> list[AnalysisConfig]:
-        trigger_threshold, edge_mode, pre_window_s, post_window_s, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_polarity, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, spike_filter_kind, spike_filter_type, spike_filter_order, spike_filter_cutoff_hz, work_dir_path, section_count, section_duration_s, section_spec, section_trigger_start_s, section_trigger_end_s, channel_worker_count, sampling_percent = (
+        trigger_threshold, edge_mode, pre_window_s, post_window_s, save_dir_path, pdf_title, spike_threshold_uv, spike_threshold_polarity, spike_threshold_mode, spike_threshold_rms_multiplier, psth_bin_window_s, rms_window_s, zoom_start_s, zoom_end_s, spike_filter_kind, spike_filter_type, spike_filter_order, spike_filter_cutoff_hz, work_dir_path, section_count, section_duration_s, section_spec, section_trigger_start_s, section_trigger_end_s, channel_worker_count, sampling_percent, first_trigger_hp_ylim_enabled, first_trigger_hp_ylim_min_uv, first_trigger_hp_ylim_max_uv = (
             build_shared_params()
         )
         if psth_bin_window_s <= 0:
@@ -827,6 +868,9 @@ def launch_qt_gui(
                     channel_workers=channel_worker_count,
                     sampling_percent=sampling_percent,
                     probe_layout_json=probe_layout_path,
+                    first_trigger_hp_ylim_enabled=first_trigger_hp_ylim_enabled,
+                    first_trigger_hp_ylim_min_uv=first_trigger_hp_ylim_min_uv,
+                    first_trigger_hp_ylim_max_uv=first_trigger_hp_ylim_max_uv,
                 )
             )
         return configs

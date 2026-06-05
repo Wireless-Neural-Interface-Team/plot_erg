@@ -74,7 +74,8 @@ else:
 THREE_PART_PANEL_HEIGHT_SCALE = 1.0  # e.g. 1.25 for 25% taller panels (same width)
 THREE_PART_PAGE_HEIGHT_REF = 120.0
 THREE_PART_GRID_HSPACE = 0.52
-THREE_PART_SUBPLOT_LEFT = 0.04
+# Leave room for y-axis tick labels + vertical ylabels (e.g. "Trial # (grouped by file)").
+THREE_PART_SUBPLOT_LEFT = 0.10
 THREE_PART_SUBPLOT_RIGHT = 0.99
 THREE_PART_SUBPLOT_BOTTOM = 0.01
 THREE_PART_SUBPLOT_TOP = 0.99
@@ -82,7 +83,7 @@ SUMMARY_PAGE_WIDTH_IN = 16.0
 SUMMARY_PAGE_HEIGHT_IN = 9.0
 TRACE_PANEL_LEGEND_KWARGS = {
     "loc": "upper center",
-    "bbox_to_anchor": (0.5, -0.1),
+    "bbox_to_anchor": (0.5, -0.15),
     "fontsize": LEGEND_FONT_SIZE,
     "framealpha": None,
 }
@@ -123,8 +124,8 @@ THREE_PART_ROW_HEIGHTS = [
 THREE_PART1_PANEL_KEYS = [
     "ax_full",
     "ax_full_filt",
-    "ax_first_trigger_hp",
     "ax_first_trigger",
+    "ax_first_trigger_hp",
     "ax_full_rms",
     "ax_raster_f",
     "ax_fr_f",
@@ -135,8 +136,8 @@ THREE_PART2_PANEL_KEYS = [
     "ax_hdr2",
     "ax_zoom",
     "ax_zoom_filt",
-    "ax_zoom_first_hp",
     "ax_zoom_first",
+    "ax_zoom_first_hp",
     "ax_zoom_rms",
     "ax_raster_z",
     "ax_fr_z",
@@ -148,8 +149,8 @@ THREE_PART3_PANEL_KEYS = [
     "ax_hdr3",
     "ax_zoom_end",
     "ax_zoom_end_filt",
-    "ax_zoom_end_first_hp",
     "ax_zoom_end_first",
+    "ax_zoom_end_first_hp",
     "ax_zoom_end_rms",
     "ax_raster_ze",
     "ax_fr_ze",
@@ -287,6 +288,8 @@ def _apply_compact_axis_fonts(fig: Any) -> None:
             ax.xaxis.label.set_fontsize(AXIS_LABEL_FONT_SIZE)
         if ax.get_ylabel():
             ax.yaxis.label.set_fontsize(AXIS_LABEL_FONT_SIZE)
+            # Keep vertical titles inside the widened left margin.
+            ax.yaxis.label.set_clip_on(False)
         ax.tick_params(axis="both", labelsize=TICK_LABEL_FONT_SIZE)
 
 
@@ -332,8 +335,8 @@ def _build_three_part_page_axes(
             )
     ax_full = fig.add_subplot(gs[1, 0])
     ax_full_filt = fig.add_subplot(gs[2, 0], sharex=ax_full)
-    ax_first_trigger_hp = fig.add_subplot(gs[3, 0], sharex=ax_full)
-    ax_first_trigger = fig.add_subplot(gs[4, 0], sharex=ax_full)
+    ax_first_trigger = fig.add_subplot(gs[3, 0], sharex=ax_full)
+    ax_first_trigger_hp = fig.add_subplot(gs[4, 0], sharex=ax_full)
     ax_full_rms = fig.add_subplot(gs[5, 0], sharex=ax_full)
     ax_raster_f = fig.add_subplot(gs[6, 0], sharex=ax_full)
     ax_fr_f = fig.add_subplot(gs[7, 0], sharex=ax_full)
@@ -353,8 +356,8 @@ def _build_three_part_page_axes(
     )
     ax_zoom = fig.add_subplot(gs[11, 0])
     ax_zoom_filt = fig.add_subplot(gs[12, 0], sharex=ax_zoom)
-    ax_zoom_first_hp = fig.add_subplot(gs[13, 0], sharex=ax_zoom)
-    ax_zoom_first = fig.add_subplot(gs[14, 0], sharex=ax_zoom)
+    ax_zoom_first = fig.add_subplot(gs[13, 0], sharex=ax_zoom)
+    ax_zoom_first_hp = fig.add_subplot(gs[14, 0], sharex=ax_zoom)
     ax_zoom_rms = fig.add_subplot(gs[15, 0])
     ax_raster_z = fig.add_subplot(gs[16, 0], sharex=ax_zoom)
     ax_fr_z = fig.add_subplot(gs[17, 0], sharex=ax_zoom)
@@ -374,8 +377,8 @@ def _build_three_part_page_axes(
     )
     ax_zoom_end = fig.add_subplot(gs[21, 0])
     ax_zoom_end_filt = fig.add_subplot(gs[22, 0], sharex=ax_zoom_end)
-    ax_zoom_end_first_hp = fig.add_subplot(gs[23, 0], sharex=ax_zoom_end)
-    ax_zoom_end_first = fig.add_subplot(gs[24, 0], sharex=ax_zoom_end)
+    ax_zoom_end_first = fig.add_subplot(gs[23, 0], sharex=ax_zoom_end)
+    ax_zoom_end_first_hp = fig.add_subplot(gs[24, 0], sharex=ax_zoom_end)
     ax_zoom_end_rms = fig.add_subplot(gs[25, 0])
     ax_raster_ze = fig.add_subplot(gs[26, 0], sharex=ax_zoom_end)
     ax_fr_ze = fig.add_subplot(gs[27, 0], sharex=ax_zoom_end)
@@ -385,8 +388,8 @@ def _build_three_part_page_axes(
         "ax_top": ax_top,
         "ax_full": ax_full,
         "ax_full_filt": ax_full_filt,
-        "ax_first_trigger_hp": ax_first_trigger_hp,
         "ax_first_trigger": ax_first_trigger,
+        "ax_first_trigger_hp": ax_first_trigger_hp,
         "ax_full_rms": ax_full_rms,
         "ax_raster_f": ax_raster_f,
         "ax_fr_f": ax_fr_f,
@@ -395,8 +398,8 @@ def _build_three_part_page_axes(
         "ax_hdr2": ax_hdr2,
         "ax_zoom": ax_zoom,
         "ax_zoom_filt": ax_zoom_filt,
-        "ax_zoom_first_hp": ax_zoom_first_hp,
         "ax_zoom_first": ax_zoom_first,
+        "ax_zoom_first_hp": ax_zoom_first_hp,
         "ax_zoom_rms": ax_zoom_rms,
         "ax_raster_z": ax_raster_z,
         "ax_fr_z": ax_fr_z,
@@ -405,8 +408,8 @@ def _build_three_part_page_axes(
         "ax_hdr3": ax_hdr3,
         "ax_zoom_end": ax_zoom_end,
         "ax_zoom_end_filt": ax_zoom_end_filt,
-        "ax_zoom_end_first_hp": ax_zoom_end_first_hp,
         "ax_zoom_end_first": ax_zoom_end_first,
+        "ax_zoom_end_first_hp": ax_zoom_end_first_hp,
         "ax_zoom_end_rms": ax_zoom_end_rms,
         "ax_raster_ze": ax_raster_ze,
         "ax_fr_ze": ax_fr_ze,
@@ -554,12 +557,12 @@ def _finalize_and_save_three_part_page(
     )
     gap_legend = max(
         0.0025,
-        (0.001 + 0.002 * float(recording_count - 1)) * max(1.0, page_height_scale),
+        (0.006 + 0.003 * float(recording_count - 1)) * max(1.0, page_height_scale),
     )
     gap_legend_hp = gap_legend * 0.55
     gap_4_5 = max(
         0.006,
-        (0.005 + 0.002 * float(recording_count - 1)) * max(1.0, page_height_scale),
+        (0.010 + 0.003 * float(recording_count - 1)) * max(1.0, page_height_scale),
     )
     # Fixed minimum gaps between Part 1/2/3 (do not shrink on compact PDF pages).
     gap_section = 0.026 + 0.006 * float(recording_count - 1)
@@ -571,25 +574,26 @@ def _finalize_and_save_three_part_page(
         if "ax_imp" in axes:
             axis_order.append("ax_imp")
 
+    # First-trigger raw is above HP on the page; match legend-shift order to panel stack.
     part1_legend_shifts = (
         ("ax_full", gap_legend),
         ("ax_full_filt", gap_legend),
-        ("ax_first_trigger_hp", gap_legend),
-        ("ax_first_trigger", gap_legend_hp),
+        ("ax_first_trigger", gap_legend),
+        ("ax_first_trigger_hp", gap_legend_hp),
         ("ax_fr_f", gap_4_5),
     )
     part2_legend_shifts = (
         ("ax_zoom", gap_legend),
         ("ax_zoom_filt", gap_legend),
-        ("ax_zoom_first_hp", gap_legend),
-        ("ax_zoom_first", gap_legend_hp),
+        ("ax_zoom_first", gap_legend),
+        ("ax_zoom_first_hp", gap_legend_hp),
         ("ax_fr_z", gap_4_5),
     )
     part3_legend_shifts = (
         ("ax_zoom_end", gap_legend),
         ("ax_zoom_end_filt", gap_legend),
-        ("ax_zoom_end_first_hp", gap_legend),
-        ("ax_zoom_end_first", gap_legend_hp),
+        ("ax_zoom_end_first", gap_legend),
+        ("ax_zoom_end_first_hp", gap_legend_hp),
         ("ax_fr_ze", gap_4_5),
     )
     for start_key, gap in part1_legend_shifts:
@@ -737,17 +741,27 @@ def _trial_mean_firing_rate_hz(
     return out
 
 
+def _default_filter_short_label() -> str:
+    return "bessel high-pass ord.2 @ 250 Hz"
+
+
+def _default_filter_title_label() -> str:
+    return "bessel high-pass @ 250 Hz"
+
+
 def _spike_pipeline_captions(
     intan_dsp: IntanDspSettings | None = None,
 ) -> Tuple[str, str]:
     """(short for subtitles, detailed for footer note)"""
     if intan_dsp is None:
-        return "Intan filtered", "Intan RHX software filter (default high-pass)"
-    short = f"Intan {intan_dsp.filter_short_label()}"
-    hp_lp = "HP" if intan_dsp.spike_filter_kind == "highpass" else "LP"
+        short = _default_filter_short_label()
+        return short, (
+            f"{_default_filter_title_label()}, order 2; "
+            "RMS window 1 s; spike detection on filtered signal"
+        )
+    short = intan_dsp.filter_short_label()
     detail = (
-        f"Intan RHX: notch→{hp_lp} ({intan_dsp.filter_type} {hp_lp} "
-        f"{intan_dsp.filter_cutoff_hz:g} Hz, order {intan_dsp.filter_order}); "
+        f"{intan_dsp.filter_title_label()}, order {intan_dsp.filter_order}; "
         f"RMS window {intan_dsp.rms_window_s:g} s; "
         f"spike thr. {intan_dsp.spike_threshold_uv:g} µV"
     )
@@ -757,29 +771,16 @@ def _spike_pipeline_captions(
 
 
 def _intan_hp_mean_filter_captions(intan_dsp: IntanDspSettings | None) -> tuple[str, str]:
-    """Return (title suffix, compact legend spec) for Intan-filtered mean traces."""
+    """Return (title suffix, compact legend spec) for software-filtered mean traces."""
     if intan_dsp is None:
-        return " — mean trace: Intan high-pass", "high-pass (Intan)"
+        short = _default_filter_short_label()
+        return f" — mean trace: {short}", short
     short = intan_dsp.filter_short_label()
-    return f" — mean trace: Intan {short}", short
+    return f" — mean trace: {short}", short
 
 
 def _intan_hp_mean_trace_label(name: str, intan_hp_legend: str) -> str:
-    return f"{name} mean (Intan {intan_hp_legend})"
-
-
-def _annotate_intan_hp_mean_axis(ax: Any, intan_hp_legend: str) -> None:
-    ax.text(
-        0.01,
-        0.99,
-        f"Mean: Intan {intan_hp_legend}",
-        transform=ax.transAxes,
-        ha="left",
-        va="top",
-        fontsize=7,
-        color="0.25",
-        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.85, "edgecolor": "0.75"},
-    )
+    return f"{name} mean ({intan_hp_legend})"
 
 
 def _mean_triggered_average_row(
@@ -926,9 +927,9 @@ def _plot_mean_section_trace_panels(
     legend_cols: int,
     aux_legend_label: Optional[str] = None,
     end_line_specs: Optional[Sequence[tuple[float, str]]] = None,
-    annotate_filter_on_filt: bool = True,
     show_reference_on_first_raw: bool = True,
     show_reference_on_first_hp: bool = False,
+    first_trigger_hp_ylim: tuple[float, float] | None = None,
     base_lw: float = 1.2,
     main_lw: float = 1.35,
     first_lw: float = 1.1,
@@ -951,7 +952,11 @@ def _plot_mean_section_trace_panels(
         )
         raw_label = f"{labels[i]} mean (raw)" if len(labels) > 1 else "Mean (raw)"
         ax_raw.plot(t_plot, _slice(y_raw), linewidth=base_lw, color=line_color, label=raw_label)
-        hp_legend = intan_hp_legends[i] if i < len(intan_hp_legends) else "high-pass (Intan)"
+        hp_legend = (
+            intan_hp_legends[i]
+            if i < len(intan_hp_legends)
+            else _default_filter_short_label()
+        )
         filt_label = _intan_hp_mean_trace_label(labels[i], hp_legend)
         ax_filt.plot(t_plot, _slice(y_filt), linewidth=main_lw, color=line_color, label=filt_label)
 
@@ -981,10 +986,6 @@ def _plot_mean_section_trace_panels(
     ax_filt.set_ylabel("Potential (µV)")
     ax_filt.set_xlabel(TIME_REL_XLABEL)
     ax_filt.grid(True, alpha=0.3)
-    if annotate_filter_on_filt and intan_hp_legends:
-        unique_legends = list(dict.fromkeys(intan_hp_legends))
-        legend_note = unique_legends[0] if len(unique_legends) == 1 else "see legend"
-        _annotate_intan_hp_mean_axis(ax_filt, legend_note)
     ax_filt.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
 
     if any(curve is not None for curve in first_trigger_hp):
@@ -992,10 +993,15 @@ def _plot_mean_section_trace_panels(
             if curve is None:
                 continue
             line_color = colors[i % len(colors)]
+            hp_legend = (
+                intan_hp_legends[i]
+                if i < len(intan_hp_legends)
+                else _default_filter_short_label()
+            )
             hp_label = (
-                f"{labels[i]} first trigger HP (Intan)"
+                f"{labels[i]} first trigger ({hp_legend})"
                 if len(labels) > 1
-                else "First trigger HP (Intan)"
+                else f"First trigger ({hp_legend})"
             )
             ax_first_hp.plot(t_plot, _slice(curve), linewidth=first_lw, color=line_color, label=hp_label)
         if show_reference_on_first_hp:
@@ -1019,8 +1025,13 @@ def _plot_mean_section_trace_panels(
         ax_first_hp.set_ylabel("Potential (µV)")
         ax_first_hp.set_xlabel(TIME_REL_XLABEL)
         ax_first_hp.grid(True, alpha=0.3)
+        if first_trigger_hp_ylim is not None:
+            ax_first_hp.set_ylim(
+                float(first_trigger_hp_ylim[0]),
+                float(first_trigger_hp_ylim[1]),
+            )
     else:
-        _mark_unavailable_axis(ax_first_hp, "First trigger high-pass signal unavailable")
+        _mark_unavailable_axis(ax_first_hp, "First trigger filtered signal unavailable")
 
     if any(curve is not None for curve in first_trigger_raw):
         for i, curve in enumerate(first_trigger_raw):
@@ -1163,7 +1174,7 @@ def _add_raster_threshold_legend(
     ncol = 1
     rows = max(1, entry_count)
     # Extra vertical offset when many stacked legend rows (single column).
-    legend_y = -0.08 - 0.035 * max(0, rows - 1)
+    legend_y = -0.22 - 0.035 * max(0, rows - 1)
     legend = ax_raster.legend(
         unique_handles,
         unique_labels,
@@ -1927,8 +1938,11 @@ def _append_mean_rms_evolution_page(
     pdf: PdfPages,
     rms_series: Sequence[tuple[str, np.ndarray, np.ndarray]],
     rms_window_s: float,
+    *,
+    filter_title: str | None = None,
 ) -> None:
     """Append one summary page: mean RMS profile on analysis timebase."""
+    title_filter = filter_title or _default_filter_title_label()
     check_analysis_cancelled()
     fig, ax = plt.subplots(figsize=(SUMMARY_PAGE_WIDTH_IN, SUMMARY_PAGE_HEIGHT_IN))
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
@@ -1945,7 +1959,7 @@ def _append_mean_rms_evolution_page(
             label=label,
         )
     if has_data:
-        ax.set_title("Mean RMS profile (Intan HIGH, RMS window = 1 s)")
+        ax.set_title(f"Mean RMS profile ({title_filter}, RMS window = 1 s)")
         ax.set_xlabel(TIME_REL_XLABEL)
         ax.set_ylabel("Mean RMS across channels (µV)")
         ax.set_ylim(0.0, 10.0)
@@ -1990,6 +2004,9 @@ def plot_channel_multi_comparison(
     probe_layout_json: Optional[Path] = None,
     impedance_sessions: Optional[Sequence[ImpedanceSession]] = None,
     channel_workers: int | None = None,
+    first_trigger_hp_ylim_enabled: bool = False,
+    first_trigger_hp_ylim_min_uv: float = -200.0,
+    first_trigger_hp_ylim_max_uv: float = 200.0,
 ) -> Path:
     """Multi-page PDF: overlay of N recordings (same aligned channels)."""
     _profile_before = _profile_snapshot()
@@ -2011,10 +2028,23 @@ def plot_channel_multi_comparison(
     pdf_path = output_dir / pdf_name
 
     zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
-    intan_hp_filt_note, _ = _intan_hp_mean_filter_captions(
-        spike_sources[0].intan_dsp if spike_sources else None
+    first_trigger_hp_ylim: tuple[float, float] | None = None
+    if first_trigger_hp_ylim_enabled:
+        y_lo = float(first_trigger_hp_ylim_min_uv)
+        y_hi = float(first_trigger_hp_ylim_max_uv)
+        if y_hi <= y_lo:
+            raise ValueError(
+                "First-trigger HP y-axis: maximum (µV) must be strictly greater than minimum."
+            )
+        first_trigger_hp_ylim = (y_lo, y_hi)
+    main_intan_dsp = spike_sources[0].intan_dsp if spike_sources else None
+    filter_title = (
+        main_intan_dsp.filter_title_label()
+        if main_intan_dsp is not None
+        else _default_filter_title_label()
     )
-    both_note = " — raw and Intan-filtered means on separate panels"
+    intan_hp_filt_note, _ = _intan_hp_mean_filter_captions(main_intan_dsp)
+    both_note = " — raw and filtered means on separate panels"
     zoom_title = f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){intan_hp_filt_note}{both_note}"
     n_channels = min(src.amplifier.shape[0] for src in spike_sources)
     zmask = (t_rel >= zoom_t0) & (t_rel <= zoom_t1)
@@ -2069,7 +2099,7 @@ def plot_channel_multi_comparison(
                 zoom_t0=zoom_t0,
                 zoom_t1=zoom_t1,
                 n_recordings=n_records,
-                first_row_height_ratio=1.5,
+                first_row_height_ratio=2.2,
                 first_row_text=None,
                 first_row_mea_channel_name=channel_name,
                 probe_layout=probe_layout_loaded,
@@ -2107,7 +2137,7 @@ def plot_channel_multi_comparison(
                 ax_imp = _axes["ax_imp"]
                 _draw_impedance_evolution_panel(ax_imp, channel_name, impedance_sessions)
 
-            legend_cols = 2 if len(means_ch) > 4 else min(4, max(1, len(means_ch)))
+            legend_cols = 1
             rms_series_full_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
             rms_series_zoom_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
             rms_series_zoom_end_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
@@ -2166,14 +2196,15 @@ def plot_channel_multi_comparison(
                 intan_hp_legends=intan_hp_legends,
                 title_raw=f"Multi-comparison — {channel_name} — mean (raw, averaged){both_note}",
                 title_filt=f"Multi-comparison — {channel_name} (full view){intan_hp_filt_note}{both_note}",
-                title_first_hp="Part 1 — First trigger high-pass (Intan)",
+                title_first_hp=f"Part 1 — First trigger ({filter_title})",
                 title_first_raw="Part 1 — First trigger raw (no averaging)",
                 legend_cols=legend_cols,
+                first_trigger_hp_ylim=first_trigger_hp_ylim,
             )
             _plot_rms_series(
                 ax_full_rms,
                 rms_series_full_multi,
-                f"Part 1 — RMS evolution (Intan HIGH, RMS window = 1 s)",
+                f"Part 1 — RMS evolution ({filter_title}, RMS window = 1 s)",
                 x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
             )
 
@@ -2197,16 +2228,17 @@ def plot_channel_multi_comparison(
                 intan_hp_legends=intan_hp_legends,
                 title_raw=f"Part 2 — Zoom mean (raw, averaged){both_note}",
                 title_filt=zoom_title,
-                title_first_hp="Part 2 — First trigger high-pass (Intan)",
+                title_first_hp=f"Part 2 — First trigger ({filter_title})",
                 title_first_raw="Part 2 — First trigger raw (separate view)",
                 legend_cols=legend_cols,
                 show_reference_on_first_raw=False,
                 show_reference_on_first_hp=False,
+                first_trigger_hp_ylim=first_trigger_hp_ylim,
             )
             _plot_rms_series(
                 ax_zoom_rms,
                 rms_series_zoom_multi,
-                f"Part 2 — RMS evolution (Intan HIGH, RMS window = 1 s)",
+                f"Part 2 — RMS evolution ({filter_title}, RMS window = 1 s)",
                 x_limits=(zoom_t0, zoom_t1),
             )
 
@@ -2239,23 +2271,24 @@ def plot_channel_multi_comparison(
                         f"Trigger-end zoom: {end_zoom_t0:.2f} to {end_zoom_t1:.2f} s "
                         f"(relative to trigger){intan_hp_filt_note}{both_note}"
                     ),
-                    title_first_hp="Part 3 — First trigger high-pass (Intan)",
+                    title_first_hp=f"Part 3 — First trigger ({filter_title})",
                     title_first_raw="Part 3 — First trigger raw (separate view)",
                     legend_cols=legend_cols,
                     show_reference_on_first_raw=False,
                     show_reference_on_first_hp=False,
+                    first_trigger_hp_ylim=first_trigger_hp_ylim,
                 )
                 _plot_rms_series(
                     ax_zoom_end_rms,
                     rms_series_zoom_end_multi,
-                    f"Part 3 — RMS evolution (Intan HIGH, RMS window = 1 s)",
+                    f"Part 3 — RMS evolution ({filter_title}, RMS window = 1 s)",
                     x_limits=(end_zoom_t0, end_zoom_t1),
                 )
             else:
                 for ax, msg in (
                     (ax_zoom_end, "Trigger-end zoom unavailable\n(no rising edge after trigger)"),
                     (ax_zoom_end_filt, "Trigger-end zoom unavailable\n(no rising edge after trigger)"),
-                    (ax_zoom_end_first_hp, "First trigger high-pass signal unavailable"),
+                    (ax_zoom_end_first_hp, "First trigger filtered signal unavailable"),
                     (ax_zoom_end_first, "First trigger raw signal unavailable"),
                     (ax_zoom_end_rms, "RMS evolution unavailable"),
                 ):
@@ -2346,7 +2379,9 @@ def plot_channel_multi_comparison(
             label = labels[i] if i < len(labels) else f"Recording {i + 1}"
             rms_series.append((label, tx_rms, rms_vals))
         if rms_series:
-            _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s)
+            _append_mean_rms_evolution_page(
+                pdf, rms_series, rms_window_s, filter_title=filter_title
+            )
 
         if impedance_sessions:
             _append_mean_impedance_summary_page(pdf, impedance_sessions)

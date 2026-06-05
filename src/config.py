@@ -43,6 +43,10 @@ class AnalysisConfig:
     # PDF zoom-panel window (s, time relative to trigger)
     zoom_t0_s: float = -0.1
     zoom_t1_s: float = 0.4
+    # First-trigger high-pass panels (Parts 1–3): fixed Potential (µV) y-axis when enabled.
+    first_trigger_hp_ylim_enabled: bool = False
+    first_trigger_hp_ylim_min_uv: float = -200.0
+    first_trigger_hp_ylim_max_uv: float = 200.0
     # RMS window (s): fixed to 1.0 in Intan Spike Scope (kept for CLI/GUI compatibility)
     rms_window_s: float = 1.0
     # Intan RHX software filter: mean traces (HIGH/LP), RMS, raster / PSTH / ISI
