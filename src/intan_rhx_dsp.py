@@ -123,7 +123,7 @@ class IntanDspSettings:
 
     def filter_short_label(self) -> str:
         return (
-            f"{self.filter_type} {self.filter_pass_label()} ord.{self.filter_order} "
+            f"{self.filter_type} {self.filter_pass_label()} order {self.filter_order} "
             f"@ {self.filter_cutoff_hz:g} Hz"
         )
 
@@ -139,6 +139,7 @@ class IntanDspSettings:
         filter_cutoff_hz: float = 250.0,
         artifact_threshold_uv: float = 2500.0,
         artifact_suppression_enabled: bool = True,
+        rms_window_s: float = INTAN_RMS_WINDOW_S,
     ) -> IntanDspSettings:
         freq = data.get("frequency_parameters") or {}
         fs = float(freq.get("amplifier_sample_rate") or data.get("sample_rate") or 0.0)
@@ -158,6 +159,7 @@ class IntanDspSettings:
             spike_threshold_uv=float(spike_threshold_uv),
             artifact_threshold_uv=float(artifact_threshold_uv),
             artifact_suppression_enabled=bool(artifact_suppression_enabled),
+            rms_window_s=float(rms_window_s),
         )
         settings.validate_filter()
         return settings
@@ -169,14 +171,6 @@ class IntanDspSettings:
     @classmethod
     def load_json(cls, path: Path) -> IntanDspSettings:
         raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-        if "filter_cutoff_hz" not in raw:
-            raw.setdefault("spike_filter_kind", "highpass")
-            if "high_order" in raw:
-                raw["filter_order"] = raw.pop("high_order")
-            if "high_type" in raw:
-                raw["filter_type"] = raw.pop("high_type")
-            if "high_cutoff_hz" in raw:
-                raw["filter_cutoff_hz"] = raw.pop("high_cutoff_hz")
         field_names = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         filtered = {k: v for k, v in raw.items() if k in field_names}
         settings = cls(**filtered)
@@ -415,56 +409,6 @@ def write_filtered_stack_channelwise(
     finally:
         del out
     return path
-
-
-def compute_filtered_channel_stack(
-    amplifier_2d: np.ndarray,
-    settings: IntanDspSettings,
-    channel_workers: int | None = None,
-    cancel_check: Any | None = None,
-) -> np.ndarray:
-    """In-RAM filtered stack (legacy); prefer write_filtered_stack_channelwise for large files."""
-    import os
-    from concurrent.futures import ThreadPoolExecutor
-
-    n_ch, n_samp = np.asarray(amplifier_2d).shape
-    if channel_workers is not None:
-        workers = max(1, min(int(channel_workers), 16, n_ch))
-    else:
-        workers = max(1, min(n_ch, 16, int(os.cpu_count() or 2)))
-    out = np.empty((n_ch, n_samp), dtype=np.float32)
-    notch_sos, filter_sos = build_intan_filter_sos(settings)
-
-    def _one(ch: int) -> tuple[int, np.ndarray]:
-        if cancel_check is not None:
-            cancel_check()
-        row = np.asarray(
-            filter_wideband_with_sos(np.asarray(amplifier_2d[ch], dtype=np.float64), notch_sos, filter_sos),
-            dtype=np.float32,
-        )
-        return ch, row
-
-    if workers <= 1 or n_ch == 1:
-        for ch in range(n_ch):
-            _, row = _one(ch)
-            out[ch] = row
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for ch, row in pool.map(_one, range(n_ch)):
-                out[ch] = row
-    return out
-
-
-def compute_high_channel_stack(
-    amplifier_2d: np.ndarray,
-    settings: IntanDspSettings,
-    channel_workers: int | None = None,
-    cancel_check: Any | None = None,
-) -> np.ndarray:
-    """Backward-compatible alias for compute_filtered_channel_stack."""
-    return compute_filtered_channel_stack(
-        amplifier_2d, settings, channel_workers=channel_workers, cancel_check=cancel_check
-    )
 
 
 def rms_intan_at_index(high: np.ndarray, end_index: int, settings: IntanDspSettings) -> float:

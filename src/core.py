@@ -156,16 +156,16 @@ def validate_section_trigger_window(
     """Raise if the imaginary trigger window falls outside a segment."""
     if trigger_start_s < 0:
         raise ValueError(
-            f"Imaginary trigger start ({trigger_start_s:g} s) must be >= 0 within each segment."
+            f"Imaginary stimulation start ({trigger_start_s:g} s) must be >= 0 within each segment."
         )
     if trigger_end_s > section_duration_s:
         raise ValueError(
-            f"Imaginary trigger end ({trigger_end_s:g} s) exceeds segment duration "
+            f"Imaginary stimulation end ({trigger_end_s:g} s) exceeds segment duration "
             f"({section_duration_s:g} s)."
         )
     if trigger_start_s >= trigger_end_s:
         raise ValueError(
-            f"Imaginary trigger start ({trigger_start_s:g} s) must be strictly before "
+            f"Imaginary stimulation start ({trigger_start_s:g} s) must be strictly before "
             f"end ({trigger_end_s:g} s)."
         )
 
@@ -209,12 +209,12 @@ def no_trigger_sections_and_timebase(
     end_n = max(start_n + 1, min(end_n, section_len))
     window_n = end_n - start_n
     if window_n < 2:
-        raise RuntimeError("Imaginary trigger window too short (< 2 samples).")
+        raise RuntimeError("Imaginary stimulation window too short (< 2 samples).")
     starts = np.arange(n_sections, dtype=np.int64) * section_len
     triggers = starts + start_n
     if np.any(triggers + window_n > n_samples):
         raise RuntimeError(
-            "Imaginary trigger window extends beyond the recording for at least one section."
+            "Imaginary stimulation window extends beyond the recording for at least one section."
         )
     pre_n = 0
     post_n = window_n
@@ -326,16 +326,6 @@ def detect_spikes_at_threshold(
         if c - kept[-1] >= min_dist:
             kept.append(int(c))
     return np.asarray(kept, dtype=np.int64)
-
-
-def detect_spikes_threshold_rising(
-    trace: np.ndarray,
-    fs: float,
-    threshold: float,
-    refractory_s: float = 0.001,
-) -> np.ndarray:
-    """Backward compatibility: delegates to detect_spikes_at_threshold (negative threshold supported)."""
-    return detect_spikes_at_threshold(trace, fs, threshold, refractory_s=refractory_s)
 
 
 def resolve_work_dir(config: AnalysisConfig) -> Path:
@@ -484,7 +474,7 @@ def valid_triggers_and_timebase(
     valid_mask = (start_idx >= 0) & (end_idx <= n_samples)
     valid_triggers = trigger_indices[valid_mask]
     if valid_triggers.size == 0:
-        raise RuntimeError("No valid window around triggers.")
+        raise RuntimeError("No valid window around stimulations.")
     t_rel = np.arange(-pre_n, post_n, dtype=np.float64) / fs
     return valid_triggers, t_rel, pre_n, post_n
 
@@ -613,6 +603,7 @@ def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> In
         filter_cutoff_hz=float(config.intan_filter_cutoff_hz),
         artifact_threshold_uv=float(config.intan_artifact_threshold_uv),
         artifact_suppression_enabled=bool(config.intan_artifact_suppression_enabled),
+        rms_window_s=float(config.rms_window_s),
     )
 
 
@@ -696,7 +687,7 @@ def extract_triggered_windows(
     valid_triggers = trigger_indices[valid_mask]
 
     if valid_triggers.size == 0:
-        raise RuntimeError("No valid window around triggers.")
+        raise RuntimeError("No valid window around stimulations.")
 
     n_trials = int(valid_triggers.size)
     n_channels = int(amplifier_data.shape[0])
@@ -734,7 +725,7 @@ def mean_triggered_windows_channelwise(
         raise RuntimeError("Invalid time window.")
     valid_triggers = np.asarray(valid_triggers, dtype=np.int64)
     if valid_triggers.size == 0:
-        raise RuntimeError("No valid window around triggers.")
+        raise RuntimeError("No valid window around stimulations.")
 
     out = np.zeros((n_ch, win_len), dtype=np.float32)
     n_trig = float(valid_triggers.size)

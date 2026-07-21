@@ -3,50 +3,32 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
-import gc
-import os
 import sys
-import time
 from pathlib import Path
 
-import numpy as np
-
 from config import AnalysisConfig
-from intan_rhx_dsp import normalize_spike_threshold
-from core import (
-    AmplifierSpikeSource,
-    build_intan_dsp_settings,
-    get_analog_in0_signal,
-    get_channel_names,
-    get_sampling_rate,
-    load_rhs_file,
-    persist_amp_and_filtered_stacks,
-    resolve_recording_windows,
-    resolve_work_dir,
-    uses_analog_trigger,
-)
-from memmap_io import load_readonly_memmap
-from gui import launch_qt_gui
-from impedance_tracking import collect_impedance_sessions
-from plotting import plot_channel_multi_comparison
-from probe_layout import load_probe_layout_json
+from display_config import resolve_display_label
 
 
-def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple[
-    np.ndarray,
-    list[str],
-    int,
-    int,
-    float,
-    float | None,
-    np.ndarray,
-    int,
-    int,
-    str,
-]:
+def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple:
     """Lightweight payload for multi-recording streaming (no global means)."""
+    import gc
+
+    import numpy as np
+
+    from core import (
+        build_intan_dsp_settings,
+        get_analog_in0_signal,
+        get_channel_names,
+        get_sampling_rate,
+        load_rhs_file,
+        persist_amp_and_filtered_stacks,
+        resolve_recording_windows,
+        resolve_work_dir,
+        uses_analog_trigger,
+    )
+
     if not config.rhs_file.exists():
         raise FileNotFoundError(f"File not found: {config.rhs_file}")
     data = load_rhs_file(config.rhs_file)
@@ -108,37 +90,37 @@ def parse_args() -> argparse.Namespace:
         help="ANALOG_IN 0 edge (falling/rising) or none for fixed equal sections",
     )
     parser.add_argument("--threshold", type=float, default=defaults.threshold, help="Detection threshold (default: 1.0)")
-    parser.add_argument("--pre", type=float, default=defaults.pre_s, help="Time before trigger (seconds)")
-    parser.add_argument("--post", type=float, default=defaults.post_s, help="Time after trigger (seconds)")
+    parser.add_argument("--pre", type=float, default=defaults.pre_s, help="Time before stimulation (seconds)")
+    parser.add_argument("--post", type=float, default=defaults.post_s, help="Time after stimulation (seconds)")
     parser.add_argument(
         "--section-count",
         type=int,
         default=defaults.section_count,
-        help="No-trigger mode: number of equal sections per recording (default: 10)",
+        help="No-stimulation mode: number of equal sections per recording (default: 10)",
     )
     parser.add_argument(
         "--section-duration-s",
         type=float,
         default=None,
-        help="No-trigger mode: section duration (s); sets section count from recording length",
+        help="No-stimulation mode: section duration (s); sets section count from recording length",
     )
     parser.add_argument(
         "--section-spec",
         choices=("count", "duration"),
         default=defaults.section_spec,
-        help="No-trigger mode: whether --section-count or --section-duration-s is authoritative",
+        help="No-stimulation mode: whether --section-count or --section-duration-s is authoritative",
     )
     parser.add_argument(
         "--section-trigger-start-s",
         type=float,
         default=defaults.section_trigger_start_s,
-        help="No-trigger mode: imaginary trigger start within each segment (s, default: 1.0)",
+        help="No-stimulation mode: imaginary stimulation start within each segment (s, default: 1.0)",
     )
     parser.add_argument(
         "--section-trigger-end-s",
         type=float,
         default=defaults.section_trigger_end_s,
-        help="No-trigger mode: imaginary trigger end within each segment (s, default: 4.0)",
+        help="No-stimulation mode: imaginary stimulation end within each segment (s, default: 4.0)",
     )
     parser.add_argument("--save-dir", type=Path, default=None, help="Folder for the output PDF")
     parser.add_argument(
@@ -179,45 +161,61 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--psth-bin-window-s",
-        "--firing-rate-window-s",
         dest="psth_bin_window_s",
         type=float,
         default=defaults.psth_bin_window_s,
-        help="PSTH time window (s) used for each PSTH point (default: from config)",
+        help="PSTH time window (s) used for each PSTH point.",
     )
     parser.add_argument(
-        "--zoom-t0-s",
-        type=float,
-        default=defaults.zoom_t0_s,
-        help="Zoom window start (s, relative to trigger).",
+        "--zoom-mode",
+        choices=("none", "onset", "trigger_end", "both"),
+        default=defaults.zoom_mode,
+        help="PDF zoom sections: none, onset, trigger_end, or both.",
     )
     parser.add_argument(
-        "--zoom-t1-s",
+        "--zoom-onset-t0-s",
         type=float,
-        default=defaults.zoom_t1_s,
-        help="Zoom window end (s, relative to trigger).",
+        default=defaults.zoom_onset_t0_s,
+        help="Onset zoom window start (s, relative to stimulation).",
+    )
+    parser.add_argument(
+        "--zoom-onset-t1-s",
+        type=float,
+        default=defaults.zoom_onset_t1_s,
+        help="Onset zoom window end (s, relative to stimulation).",
+    )
+    parser.add_argument(
+        "--zoom-end-t0-s",
+        type=float,
+        default=defaults.zoom_end_t0_s,
+        help="Stimulation-end zoom window start (s, relative to stimulation end).",
+    )
+    parser.add_argument(
+        "--zoom-end-t1-s",
+        type=float,
+        default=defaults.zoom_end_t1_s,
+        help="Stimulation-end zoom window end (s, relative to stimulation end).",
     )
     parser.add_argument(
         "--first-trigger-hp-ylim",
         action="store_true",
         default=defaults.first_trigger_hp_ylim_enabled,
-        help="Fix y-axis (µV) on first-trigger high-pass PDF panels.",
+        help="Fix y-axis (µV) on first-stimulation high-pass PDF panels.",
     )
     parser.add_argument(
         "--first-trigger-hp-ylim-min-uv",
         type=float,
         default=defaults.first_trigger_hp_ylim_min_uv,
-        help="Fixed y-axis minimum (µV) for first-trigger HP panels (default: -200).",
+        help="Fixed y-axis minimum (µV) for first-stimulation HP panels (default: -200).",
     )
     parser.add_argument(
         "--first-trigger-hp-ylim-max-uv",
         type=float,
         default=defaults.first_trigger_hp_ylim_max_uv,
-        help="Fixed y-axis maximum (µV) for first-trigger HP panels (default: 200).",
+        help="Fixed y-axis maximum (µV) for first-stimulation HP panels (default: 200).",
     )
     parser.add_argument(
         "--rms-window-s",
-        "--rms-smoothing-window-s",
         type=float,
         default=defaults.rms_window_s,
         help="RMS computation window (s) for moving-RMS profile.",
@@ -280,6 +278,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def run(config: AnalysisConfig) -> None:
+    from probe_layout import load_probe_layout_json
+
     if config.probe_layout_json is not None:
         probe_json_path = config.probe_layout_json
         if not probe_json_path.exists():
@@ -294,7 +294,7 @@ def run(config: AnalysisConfig) -> None:
 
     print(f"Sample rate: {fs:.2f} Hz")
     if config.edge == "none":
-        print("--- Sections (no ANALOG_IN trigger) ---")
+        print("--- Sections (no ANALOG_IN stimulation) ---")
         print(f"Section spec: {config.section_spec}")
         if config.section_spec == "duration" and config.section_duration_s is not None:
             print(f"Target section duration: {config.section_duration_s:g} s")
@@ -302,25 +302,25 @@ def run(config: AnalysisConfig) -> None:
             print(f"Target section count: {config.section_count}")
         print(f"Sections used for average: {n_valid}")
         print(
-            f"Imaginary trigger window per segment: "
+            f"Imaginary stimulation window per segment: "
             f"{config.section_trigger_start_s:g}–{config.section_trigger_end_s:g} s "
             f"(t=0 at segment start + {config.section_trigger_start_s:g} s)"
         )
     else:
-        print("--- Triggers (ANALOG_IN 0) ---")
-        print(f"Total triggers detected: {n_total}")
-        print(f"Triggers used for average: {n_valid}")
+        print("--- Stimulations (ANALOG_IN 0) ---")
+        print(f"Total stimulations detected: {n_total}")
+        print(f"Stimulations used for average: {n_valid}")
         if n_total > n_valid:
-            print(f"  ({n_total - n_valid} trigger(s) excluded: [-pre,+post] window outside signal)")
+            print(f"  ({n_total - n_valid} stimulation(s) excluded: [-pre,+post] window outside signal)")
         print(f"Time window: [-{config.pre_s:.3f}s, +{config.post_s:.3f}s]")
         print(f"ANALOG_IN 0 edge: {config.edge}")
         if end_marker is not None:
-            print(f"Mean delay to trigger end (rising): {float(end_marker)*1e3:.3f} ms")
+            print(f"Mean delay to stimulation end (rising): {float(end_marker)*1e3:.3f} ms")
         else:
-            print("Next rising edge at threshold: not computed (no rising edge after triggers).")
+            print("Next rising edge at threshold: not computed (no rising edge after stimulations).")
     print(f"Channels compared (overlay): {stats['n_ch']}")
     if config.edge == "none":
-        print("Segmentation: equal sections with imaginary trigger window")
+        print("Segmentation: equal sections with imaginary stimulation window")
     print(
         "Mean traces in PDF: raw amplifier + Intan software filter "
         f"({config.intan_filter_type} "
@@ -338,21 +338,21 @@ def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
     pdf_path, stats = _run_streaming_comparison([config_a, config_b], "A/B comparison")
     print(f"Sample rate A: {stats['fs_values'][0]:.2f} Hz | B: {stats['fs_values'][1]:.2f} Hz")
     if config_a.edge == "none":
-        print("--- Sections per recording (no ANALOG_IN trigger) ---")
+        print("--- Sections per recording (no ANALOG_IN stimulation) ---")
         for i, cfg in enumerate((config_a, config_b)):
             label = "A" if i == 0 else "B"
             print(f"  Recording {label}: sections used={stats['n_valids'][i]}")
     else:
         print("--- Recording A ---")
-        print(f"  Triggers detected: {stats['n_totals'][0]} | used: {stats['n_valids'][0]}")
+        print(f"  Stimulations detected: {stats['n_totals'][0]} | used: {stats['n_valids'][0]}")
         print("--- Recording B ---")
-        print(f"  Triggers detected: {stats['n_totals'][1]} | used: {stats['n_valids'][1]}")
+        print(f"  Stimulations detected: {stats['n_totals'][1]} | used: {stats['n_valids'][1]}")
         print(f"Time window: [-{config_a.pre_s:.3f}s, +{config_a.post_s:.3f}s]")
         print(f"ANALOG_IN 0 edge: {config_a.edge}")
         if stats["end_markers"][0] is not None:
-            print(f"Mean delay to trigger end (rising) — A: {stats['end_markers'][0]*1e3:.3f} ms")
+            print(f"Mean delay to stimulation end (rising) — A: {stats['end_markers'][0]*1e3:.3f} ms")
         if stats["end_markers"][1] is not None:
-            print(f"Mean delay to trigger end (rising) — B: {stats['end_markers'][1]*1e3:.3f} ms")
+            print(f"Mean delay to stimulation end (rising) — B: {stats['end_markers'][1]*1e3:.3f} ms")
     print(f"Channels compared (overlay): {stats['n_ch']}")
     print(f"Multiprocessing workers (A/B comparison): {stats['workers']}")
     print(f"A/B compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
@@ -372,11 +372,11 @@ def run_multi_comparison(configs: list[AnalysisConfig]) -> None:
     """Process N recordings on a unified multi-trace plotting pipeline."""
     pdf_path, stats = _run_streaming_comparison(configs, "multi comparison")
     if configs[0].edge == "none":
-        print("--- Sections per recording (no ANALOG_IN trigger) ---")
+        print("--- Sections per recording (no ANALOG_IN stimulation) ---")
         for i, cfg in enumerate(configs):
             print(f"{cfg.rhs_file.name}: sections used={stats['n_valids'][i]}")
     else:
-        print("--- Triggers per recording ---")
+        print("--- Stimulations per recording ---")
         for i, cfg in enumerate(configs):
             print(f"{cfg.rhs_file.name}: detected={stats['n_totals'][i]} | used={stats['n_valids'][i]}")
     print(f"Channels compared (overlay): {stats['n_ch']}")
@@ -384,7 +384,7 @@ def run_multi_comparison(configs: list[AnalysisConfig]) -> None:
     print(f"Multi compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
     print(f"Multi PDF render time: {stats['t_render_s']:.2f} s")
     if configs[0].edge == "none":
-        print("Segmentation: no trigger — equal contiguous sections")
+        print("Segmentation: no stimulation — equal contiguous sections")
     else:
         print(f"ANALOG_IN 0 edge: {configs[0].edge}")
     print(f"Comparison PDF written: {pdf_path}")
@@ -393,6 +393,8 @@ def run_multi_comparison(configs: list[AnalysisConfig]) -> None:
 
 def _autotune_config(cfg: AnalysisConfig, n_files: int) -> AnalysisConfig:
     """Auto-tuning policy biased toward stable throughput."""
+    from core import uses_analog_trigger
+
     if n_files <= 1:
         return replace(cfg, comparison_workers=1)
     workers = max(1, min(int(cfg.comparison_workers), max(1, min(6, n_files))))
@@ -418,12 +420,27 @@ def _autotune_config(cfg: AnalysisConfig, n_files: int) -> AnalysisConfig:
 
 
 def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tuple[Path, dict[str, object]]:
+    import os
+    import time
+    from concurrent.futures import ProcessPoolExecutor
+
+    import numpy as np
+
+    from core import AmplifierSpikeSource, uses_analog_trigger
+    from impedance_tracking import collect_impedance_sessions
+    from memmap_io import load_readonly_memmap
+    from plotting import plot_channel_multi_comparison
+
     if len(configs) < 1:
         raise ValueError("At least 1 recording is required.")
     t0 = time.perf_counter()
     tuned = [_autotune_config(cfg, len(configs)) for cfg in configs]
     workers = max(1, int(tuned[0].comparison_workers))
-    labels = [cfg.rhs_file.stem for cfg in tuned]
+    labels = [
+        resolve_display_label(cfg.rhs_file.stem, cfg.recording_label) for cfg in tuned
+    ]
+    recording_styles = [cfg.recording_style for cfg in tuned]
+    plot_display = tuned[0].plot_display
     print(f"{label.capitalize()}: {len(tuned)} file(s).")
     print("Files: " + " | ".join(cfg.rhs_file.name for cfg in tuned))
     if uses_analog_trigger(tuned[0]) and tuned[0].pre_s + tuned[0].post_s > 20:
@@ -535,8 +552,11 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             spike_threshold_rms_multiplier=tuned[0].spike_threshold_rms_multiplier,
             psth_bin_window_s=tuned[0].psth_bin_window_s,
             rms_window_s=tuned[0].rms_window_s,
-            zoom_t0_s=tuned[0].zoom_t0_s,
-            zoom_t1_s=tuned[0].zoom_t1_s,
+            zoom_mode=tuned[0].zoom_mode,
+            zoom_onset_t0_s=tuned[0].zoom_onset_t0_s,
+            zoom_onset_t1_s=tuned[0].zoom_onset_t1_s,
+            zoom_end_t0_s=tuned[0].zoom_end_t0_s,
+            zoom_end_t1_s=tuned[0].zoom_end_t1_s,
             sampling_percent=tuned[0].sampling_percent,
             pre_n_common=pre_n_common,
             post_n_common=post_n_common,
@@ -546,6 +566,8 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             first_trigger_hp_ylim_enabled=tuned[0].first_trigger_hp_ylim_enabled,
             first_trigger_hp_ylim_min_uv=tuned[0].first_trigger_hp_ylim_min_uv,
             first_trigger_hp_ylim_max_uv=tuned[0].first_trigger_hp_ylim_max_uv,
+            plot_display=plot_display,
+            recording_styles=recording_styles,
         )
         t_render_s = time.perf_counter() - t_render0
         stats: dict[str, object] = {
@@ -569,40 +591,14 @@ def main() -> None:
     args = parse_args()
     rhs_path = args.rhs_file
     if args.gui or rhs_path is None:
-        exit_code = launch_qt_gui(
-            run_callback=run,
-            run_comparison_callback=run_comparison,
-            run_multi_comparison_callback=run_multi_comparison,
-            default_threshold=args.threshold,
-            default_edge=args.edge,
-            default_pre_s=args.pre,
-            default_post_s=args.post,
-            default_spike_threshold_uv=normalize_spike_threshold(
-                args.spike_threshold_uv, args.spike_threshold_polarity
-            )[0],
-            default_spike_threshold_polarity=normalize_spike_threshold(
-                args.spike_threshold_uv, args.spike_threshold_polarity
-            )[1],
-            default_spike_threshold_mode=args.spike_threshold_mode,
-            default_spike_threshold_rms_multiplier=args.spike_threshold_rms_multiplier,
-            default_psth_bin_window_s=args.psth_bin_window_s,
-            default_rms_window_s=args.rms_window_s,
-            default_zoom_t0_s=args.zoom_t0_s,
-            default_zoom_t1_s=args.zoom_t1_s,
-            default_intan_spike_filter_kind=args.intan_spike_filter,
-            default_intan_filter_order=args.intan_filter_order,
-            default_intan_filter_type=args.intan_filter_type,
-            default_intan_filter_cutoff_hz=args.intan_filter_cutoff_hz,
-            default_channel_workers=args.channel_workers,
-            default_sampling_percent=args.sampling_percent,
-            default_probe_layout_json=args.probe_layout_json,
-            default_first_trigger_hp_ylim_enabled=args.first_trigger_hp_ylim,
-            default_first_trigger_hp_ylim_min_uv=args.first_trigger_hp_ylim_min_uv,
-            default_first_trigger_hp_ylim_max_uv=args.first_trigger_hp_ylim_max_uv,
-        )
+        from gui.launcher import launch_gui_from_args
+
+        exit_code = launch_gui_from_args(args)
         if exit_code != 0:
             sys.exit(exit_code)
         return
+
+    from intan_rhx_dsp import normalize_spike_threshold
 
     config = AnalysisConfig(
         rhs_file=rhs_path,
@@ -627,8 +623,11 @@ def main() -> None:
         spike_threshold_rms_multiplier=args.spike_threshold_rms_multiplier,
         psth_bin_window_s=args.psth_bin_window_s,
         rms_window_s=args.rms_window_s,
-        zoom_t0_s=args.zoom_t0_s,
-        zoom_t1_s=args.zoom_t1_s,
+        zoom_mode=args.zoom_mode,
+        zoom_onset_t0_s=args.zoom_onset_t0_s,
+        zoom_onset_t1_s=args.zoom_onset_t1_s,
+        zoom_end_t0_s=args.zoom_end_t0_s,
+        zoom_end_t1_s=args.zoom_end_t1_s,
         intan_spike_filter_kind=args.intan_spike_filter,
         intan_filter_order=args.intan_filter_order,
         intan_filter_type=args.intan_filter_type,
@@ -642,11 +641,20 @@ def main() -> None:
         first_trigger_hp_ylim_min_uv=args.first_trigger_hp_ylim_min_uv,
         first_trigger_hp_ylim_max_uv=args.first_trigger_hp_ylim_max_uv,
     )
-    if config.zoom_t1_s <= config.zoom_t0_s:
-        print("Error: --zoom-t1-s must be strictly greater than --zoom-t0-s.", file=sys.stderr)
+    if config.zoom_mode in ("onset", "both") and config.zoom_onset_t1_s <= config.zoom_onset_t0_s:
+        print(
+            "Error: --zoom-onset-t1-s must be strictly greater than --zoom-onset-t0-s.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if config.zoom_mode in ("trigger_end", "both") and config.zoom_end_t1_s <= config.zoom_end_t0_s:
+        print(
+            "Error: --zoom-end-t1-s must be strictly greater than --zoom-end-t0-s.",
+            file=sys.stderr,
+        )
         sys.exit(2)
     if config.rms_window_s <= 0:
-        print("Error: --rms-window-s / --rms-smoothing-window-s must be > 0.", file=sys.stderr)
+        print("Error: --rms-window-s must be > 0.", file=sys.stderr)
         sys.exit(2)
     if config.first_trigger_hp_ylim_enabled and (
         config.first_trigger_hp_ylim_max_uv <= config.first_trigger_hp_ylim_min_uv

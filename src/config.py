@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, Optional
+
+from display_config import PlotDisplaySettings, RecordingStyle, ZoomMode
 
 EdgeKind = Literal["falling", "rising", "none"]
 SpikeThresholdMode = Literal["fixed", "rms_multiple"]
@@ -16,53 +18,43 @@ SectionSpecKind = Literal["count", "duration"]
 class AnalysisConfig:
     rhs_file: Path
     threshold: float = 1.0
-    edge: EdgeKind = "falling"  # falling / rising on ANALOG_IN 0, or none (fixed sections)
+    edge: EdgeKind = "falling"
     pre_s: float = 1.0
     post_s: float = 10.0
-    # No-trigger mode: split each recording into equal sections for averaging.
     section_count: int = 10
     section_duration_s: float | None = None
-    section_spec: SectionSpecKind = "count"  # which GUI field drives the other
-    # No-trigger mode: imaginary trigger window inside each section (seconds from segment start).
+    section_spec: SectionSpecKind = "count"
     section_trigger_start_s: float = 1.0
     section_trigger_end_s: float = 4.0
     save_dir: Path | None = None
-    # Output PDF title / basename (.pdf added if no extension)
     pdf_title: str | None = None
-    # Spike threshold magnitude (µV); polarity selects above vs below (default negative = below).
     spike_threshold_uv: float = 70.0
     spike_threshold_polarity: SpikeThresholdPolarity = "negative"
-    # Spike threshold mode:
-    # - fixed: same threshold (µV) for all channels.
-    # - rms_multiple: threshold = spike_threshold_rms_multiplier * mean RMS per channel.
     spike_threshold_mode: SpikeThresholdMode = "fixed"
-    # Multiplier used when spike_threshold_mode == "rms_multiple"
     spike_threshold_rms_multiplier: float = 4.0
-    # PSTH time window (s) used for each PSTH point
     psth_bin_window_s: float = 0.050
-    # PDF zoom-panel window (s, time relative to trigger)
-    zoom_t0_s: float = -0.1
-    zoom_t1_s: float = 0.4
-    # First-trigger high-pass panels (Parts 1–3): fixed Potential (µV) y-axis when enabled.
+    # Zoom: mode selects which temporal sections are rendered in the PDF.
+    zoom_mode: ZoomMode = "both"
+    zoom_onset_t0_s: float = -0.1
+    zoom_onset_t1_s: float = 0.4
+    zoom_end_t0_s: float = -0.1
+    zoom_end_t1_s: float = 0.4
     first_trigger_hp_ylim_enabled: bool = False
     first_trigger_hp_ylim_min_uv: float = -200.0
     first_trigger_hp_ylim_max_uv: float = 200.0
-    # RMS window (s): fixed to 1.0 in Intan Spike Scope (kept for CLI/GUI compatibility)
     rms_window_s: float = 1.0
-    # Intan RHX software filter: mean traces (HIGH/LP), RMS, raster / PSTH / ISI
     intan_spike_filter_kind: SpikeFilterKind = "highpass"
     intan_filter_order: int = 2
     intan_filter_type: IntanFilterType = "bessel"
     intan_filter_cutoff_hz: float = 250.0
     intan_artifact_threshold_uv: float = 2500.0
     intan_artifact_suppression_enabled: bool = True
-    # None = auto: (save_dir or .rhs folder) / ".plot_erg" / <stem>
     work_dir: Path | None = None
-    # Process workers for A/B comparison (>=1)
     comparison_workers: int = 32
-    # Channel worker threads (None = all CPU cores up to 16; explicit value capped at 16)
     channel_workers: int | None = None
-    # Fraction of spike-plot points to keep (1..100)
     sampling_percent: int = 100
-    # probeinterface JSON (MEA map inset in PDF when channel maps)
     probe_layout_json: Path | None = None
+    # Custom legend label (falls back to .rhs stem when empty).
+    recording_label: str | None = None
+    recording_style: RecordingStyle = field(default_factory=RecordingStyle.visible)
+    plot_display: PlotDisplaySettings = field(default_factory=PlotDisplaySettings.all_on)
