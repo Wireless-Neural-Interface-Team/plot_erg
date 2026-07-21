@@ -17,15 +17,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.lines import Line2D
-from scipy.ndimage import uniform_filter1d
+
+from concurrent.futures import ThreadPoolExecutor
 
 from core import (
     AmplifierSpikeSource,
-    apply_butterworth_bandpass,
-    apply_butterworth_highpass,
-    apply_butterworth_lowpass,
     check_analysis_cancelled,
     detect_spikes_at_threshold,
+    mean_triggered_windows_channelwise,
+    resolve_channel_workers,
+)
+from intan_rhx_dsp import (
+    IntanDspSettings,
+    detect_spikes_intan,
+    sliding_rms_intan_profile,
+    sliding_rms_intan_profile_range,
 )
 from impedance_tracking import ImpedanceSession
 from plot_utils import downsample_points, shift_axes_down, shorten_filename_for_windows
@@ -48,74 +54,113 @@ TICK_LABEL_FONT_SIZE = 7
 #   1. THREE_PART_PAGE_HEIGHT_*  — total page height
 #   2. THREE_PART_PANEL_HEIGHT_SCALE — global multiplier on panel height
 #   3. THREE_PART_GRID_HSPACE — lower = more height for plots, less for row gaps
+# Default layout targets screen/PDF review (~38 in page height at 72 DPI).
+# Set env PLOT_ERG_HIGH_QUALITY_PDF=1 to restore the older very tall export (128 in @ 120 DPI).
+_HIGH_QUALITY_PDF = os.environ.get("PLOT_ERG_HIGH_QUALITY_PDF", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 THREE_PART_PAGE_WIDTH_IN = 12.0
-THREE_PART_PAGE_HEIGHT_NO_IMP = (110.0, 2.0)  # base height, +per extra recording
-THREE_PART_PAGE_HEIGHT_IMP = (120.0, 2.5)
+if _HIGH_QUALITY_PDF:
+    THREE_PART_PAGE_HEIGHT_NO_IMP = (128.0, 2.2)
+    THREE_PART_PAGE_HEIGHT_IMP = (138.0, 2.7)
+    PDF_DPI = 120
+else:
+    THREE_PART_PAGE_HEIGHT_NO_IMP = (100.0, 0.9)
+    THREE_PART_PAGE_HEIGHT_IMP = (110.0, 1.0)
+    PDF_DPI = 72
 THREE_PART_PANEL_HEIGHT_SCALE = 1.0  # e.g. 1.25 for 25% taller panels (same width)
 THREE_PART_PAGE_HEIGHT_REF = 120.0
-THREE_PART_GRID_HSPACE = 0.4
-THREE_PART_SUBPLOT_LEFT = 0.04
+THREE_PART_GRID_HSPACE = 0.52
+# Leave room for y-axis tick labels + vertical ylabels (e.g. "Trial # (grouped by file)").
+THREE_PART_SUBPLOT_LEFT = 0.10
 THREE_PART_SUBPLOT_RIGHT = 0.99
-PDF_DPI = 120
+THREE_PART_SUBPLOT_BOTTOM = 0.01
+THREE_PART_SUBPLOT_TOP = 0.99
 SUMMARY_PAGE_WIDTH_IN = 16.0
 SUMMARY_PAGE_HEIGHT_IN = 9.0
 TRACE_PANEL_LEGEND_KWARGS = {
     "loc": "upper center",
-    "bbox_to_anchor": (0.5, -0.1),
+    "bbox_to_anchor": (0.5, -0.15),
     "fontsize": LEGEND_FONT_SIZE,
     "framealpha": None,
 }
 THREE_PART_ROW_HEIGHTS = [
+    # Part 1 — full view (9 panels)
     1.70,
     1.60,
+    1.35,
+    1.25,
     1.30,
     1.20,
     1.45,
     1.05,
     1.15,
-    0.06,
+    0.08,  # Part 2 title band (gs[10])
+    # Part 2 — zoom (9 panels)
     1.70,
-    1.50,
-    1.20,
+    1.60,
+    1.35,
+    1.25,
     1.30,
+    1.20,
     1.45,
     1.05,
     1.15,
-    0.06,
+    0.08,  # Part 3 title band (gs[20])
+    # Part 3 — trigger-end zoom (9 panels)
     1.70,
-    1.50,
-    1.20,
+    1.60,
+    1.35,
+    1.25,
     1.30,
+    1.20,
     1.45,
     1.05,
     1.15,
 ]
-THREE_PART_AXIS_ORDER = [
+THREE_PART1_PANEL_KEYS = [
+    "ax_full",
+    "ax_full_filt",
     "ax_first_trigger",
+    "ax_first_trigger_hp",
     "ax_full_rms",
     "ax_raster_f",
     "ax_fr_f",
     "ax_trial_fr_f",
     "ax_isi_f",
+]
+THREE_PART2_PANEL_KEYS = [
     "ax_hdr2",
     "ax_zoom",
+    "ax_zoom_filt",
     "ax_zoom_first",
+    "ax_zoom_first_hp",
     "ax_zoom_rms",
     "ax_raster_z",
     "ax_fr_z",
     "ax_trial_fr_z",
     "ax_isi_z",
+]
+THREE_PART2_CURVE_KEYS = [k for k in THREE_PART2_PANEL_KEYS if not k.startswith("ax_hdr")]
+THREE_PART3_PANEL_KEYS = [
     "ax_hdr3",
     "ax_zoom_end",
+    "ax_zoom_end_filt",
     "ax_zoom_end_first",
+    "ax_zoom_end_first_hp",
     "ax_zoom_end_rms",
     "ax_raster_ze",
     "ax_fr_ze",
     "ax_trial_fr_ze",
     "ax_isi_ze",
 ]
-RMS_INTAN_LIKE_BANDPASS_LOW_HZ = 300.0
-RMS_INTAN_LIKE_BANDPASS_HIGH_HZ = 7500.0
+THREE_PART3_CURVE_KEYS = [k for k in THREE_PART3_PANEL_KEYS if not k.startswith("ax_hdr")]
+THREE_PART_AXIS_ORDER = (
+    THREE_PART1_PANEL_KEYS + THREE_PART2_PANEL_KEYS + THREE_PART3_PANEL_KEYS
+)
 _PROFILE_ENABLED = os.environ.get("PLOT_ERG_PROFILE", "1").strip().lower() in {
     "1",
     "true",
@@ -187,16 +232,16 @@ def _draw_mea_layout_panel(
             transform=ax.transAxes,
         )
         return
-    draw_probe_layout_on_axes(ax, probe_layout, channel_name)
-    ax.set_title(f"MEA layout — highlighted channel: {channel_name}", fontsize=10)
+    draw_probe_layout_on_axes(ax, probe_layout, channel_name, set_mea_title=False)
+    ax.set_title(f"MEA layout — highlighted channel: {channel_name}", fontsize=10, pad=4)
 
 
 def _soften_figure_linewidths(
     fig: Any,
-    scale: float = 0.75,
-    min_width: float = 0.5,
-    marker_scale: float = 0.8,
-    scatter_scale: float = 0.7,
+    scale: float = 0.3,
+    min_width: float = 0.3,
+    marker_scale: float = 0.3,
+    scatter_scale: float = 0.3,
 ) -> None:
     """Reduce line/marker thickness globally for a figure."""
     for ax in fig.axes:
@@ -243,6 +288,8 @@ def _apply_compact_axis_fonts(fig: Any) -> None:
             ax.xaxis.label.set_fontsize(AXIS_LABEL_FONT_SIZE)
         if ax.get_ylabel():
             ax.yaxis.label.set_fontsize(AXIS_LABEL_FONT_SIZE)
+            # Keep vertical titles inside the widened left margin.
+            ax.yaxis.label.set_clip_on(False)
         ax.tick_params(axis="both", labelsize=TICK_LABEL_FONT_SIZE)
 
 
@@ -262,7 +309,7 @@ def _build_three_part_page_axes(
     page_width_in = THREE_PART_PAGE_WIDTH_IN
     height_ratios = [first_row_height_ratio, *THREE_PART_ROW_HEIGHTS]
     if include_impedance_panel:
-        height_ratios = [*height_ratios, 0.05, 0.95]
+        height_ratios = [*height_ratios, 0.08, 0.92]
     fig = plt.figure(figsize=(page_width_in, page_height_in))
     gs = fig.add_gridspec(
         len(height_ratios),
@@ -287,54 +334,62 @@ def _build_three_part_page_axes(
                 transform=ax_top.transAxes,
             )
     ax_full = fig.add_subplot(gs[1, 0])
-    ax_first_trigger = fig.add_subplot(gs[2, 0], sharex=ax_full)
-    ax_full_rms = fig.add_subplot(gs[3, 0], sharex=ax_full)
-    ax_raster_f = fig.add_subplot(gs[4, 0], sharex=ax_full)
-    ax_fr_f = fig.add_subplot(gs[5, 0], sharex=ax_full)
-    ax_trial_fr_f = fig.add_subplot(gs[6, 0])
-    ax_isi_f = fig.add_subplot(gs[7, 0])
-    ax_hdr2 = fig.add_subplot(gs[8, 0])
+    ax_full_filt = fig.add_subplot(gs[2, 0], sharex=ax_full)
+    ax_first_trigger = fig.add_subplot(gs[3, 0], sharex=ax_full)
+    ax_first_trigger_hp = fig.add_subplot(gs[4, 0], sharex=ax_full)
+    ax_full_rms = fig.add_subplot(gs[5, 0], sharex=ax_full)
+    ax_raster_f = fig.add_subplot(gs[6, 0], sharex=ax_full)
+    ax_fr_f = fig.add_subplot(gs[7, 0], sharex=ax_full)
+    ax_trial_fr_f = fig.add_subplot(gs[8, 0])
+    ax_isi_f = fig.add_subplot(gs[9, 0])
+    ax_hdr2 = fig.add_subplot(gs[10, 0])
     ax_hdr2.axis("off")
     ax_hdr2.text(
         0.02,
-        0.5,
+        0.04,
         f"Part 2 — Zoomed view [{zoom_t0:.2f}, {zoom_t1:.2f}] s (relative to trigger)",
         ha="left",
-        va="center",
+        va="bottom",
         fontsize=11,
         fontweight="bold",
         transform=ax_hdr2.transAxes,
     )
-    ax_zoom = fig.add_subplot(gs[9, 0])
-    ax_zoom_first = fig.add_subplot(gs[10, 0], sharex=ax_zoom)
-    ax_zoom_rms = fig.add_subplot(gs[11, 0])
-    ax_raster_z = fig.add_subplot(gs[12, 0], sharex=ax_zoom)
-    ax_fr_z = fig.add_subplot(gs[13, 0], sharex=ax_zoom)
-    ax_trial_fr_z = fig.add_subplot(gs[14, 0])
-    ax_isi_z = fig.add_subplot(gs[15, 0])
-    ax_hdr3 = fig.add_subplot(gs[16, 0])
+    ax_zoom = fig.add_subplot(gs[11, 0])
+    ax_zoom_filt = fig.add_subplot(gs[12, 0], sharex=ax_zoom)
+    ax_zoom_first = fig.add_subplot(gs[13, 0], sharex=ax_zoom)
+    ax_zoom_first_hp = fig.add_subplot(gs[14, 0], sharex=ax_zoom)
+    ax_zoom_rms = fig.add_subplot(gs[15, 0])
+    ax_raster_z = fig.add_subplot(gs[16, 0], sharex=ax_zoom)
+    ax_fr_z = fig.add_subplot(gs[17, 0], sharex=ax_zoom)
+    ax_trial_fr_z = fig.add_subplot(gs[18, 0])
+    ax_isi_z = fig.add_subplot(gs[19, 0])
+    ax_hdr3 = fig.add_subplot(gs[20, 0])
     ax_hdr3.axis("off")
     ax_hdr3.text(
         0.02,
-        0.5,
+        0.04,
         "Part 3 — Trigger-end zoom (rising edge)",
         ha="left",
-        va="center",
+        va="bottom",
         fontsize=11,
         fontweight="bold",
         transform=ax_hdr3.transAxes,
     )
-    ax_zoom_end = fig.add_subplot(gs[17, 0])
-    ax_zoom_end_first = fig.add_subplot(gs[18, 0], sharex=ax_zoom_end)
-    ax_zoom_end_rms = fig.add_subplot(gs[19, 0])
-    ax_raster_ze = fig.add_subplot(gs[20, 0], sharex=ax_zoom_end)
-    ax_fr_ze = fig.add_subplot(gs[21, 0], sharex=ax_zoom_end)
-    ax_trial_fr_ze = fig.add_subplot(gs[22, 0])
-    ax_isi_ze = fig.add_subplot(gs[23, 0])
+    ax_zoom_end = fig.add_subplot(gs[21, 0])
+    ax_zoom_end_filt = fig.add_subplot(gs[22, 0], sharex=ax_zoom_end)
+    ax_zoom_end_first = fig.add_subplot(gs[23, 0], sharex=ax_zoom_end)
+    ax_zoom_end_first_hp = fig.add_subplot(gs[24, 0], sharex=ax_zoom_end)
+    ax_zoom_end_rms = fig.add_subplot(gs[25, 0])
+    ax_raster_ze = fig.add_subplot(gs[26, 0], sharex=ax_zoom_end)
+    ax_fr_ze = fig.add_subplot(gs[27, 0], sharex=ax_zoom_end)
+    ax_trial_fr_ze = fig.add_subplot(gs[28, 0])
+    ax_isi_ze = fig.add_subplot(gs[29, 0])
     axes: dict[str, Any] = {
         "ax_top": ax_top,
         "ax_full": ax_full,
+        "ax_full_filt": ax_full_filt,
         "ax_first_trigger": ax_first_trigger,
+        "ax_first_trigger_hp": ax_first_trigger_hp,
         "ax_full_rms": ax_full_rms,
         "ax_raster_f": ax_raster_f,
         "ax_fr_f": ax_fr_f,
@@ -342,7 +397,9 @@ def _build_three_part_page_axes(
         "ax_isi_f": ax_isi_f,
         "ax_hdr2": ax_hdr2,
         "ax_zoom": ax_zoom,
+        "ax_zoom_filt": ax_zoom_filt,
         "ax_zoom_first": ax_zoom_first,
+        "ax_zoom_first_hp": ax_zoom_first_hp,
         "ax_zoom_rms": ax_zoom_rms,
         "ax_raster_z": ax_raster_z,
         "ax_fr_z": ax_fr_z,
@@ -350,7 +407,9 @@ def _build_three_part_page_axes(
         "ax_isi_z": ax_isi_z,
         "ax_hdr3": ax_hdr3,
         "ax_zoom_end": ax_zoom_end,
+        "ax_zoom_end_filt": ax_zoom_end_filt,
         "ax_zoom_end_first": ax_zoom_end_first,
+        "ax_zoom_end_first_hp": ax_zoom_end_first_hp,
         "ax_zoom_end_rms": ax_zoom_end_rms,
         "ax_raster_ze": ax_raster_ze,
         "ax_fr_ze": ax_fr_ze,
@@ -358,23 +417,91 @@ def _build_three_part_page_axes(
         "ax_isi_ze": ax_isi_ze,
     }
     if include_impedance_panel:
-        ax_imp_hdr = fig.add_subplot(gs[24, 0])
+        ax_imp_hdr = fig.add_subplot(gs[30, 0])
         ax_imp_hdr.axis("off")
         ax_imp_hdr.text(
             0.02,
-            0.25,
+            0.04,
             "Part 4 — Impedance |Z| @ 1 kHz vs session",
             ha="left",
-            va="center",
+            va="bottom",
             fontsize=11,
             fontweight="bold",
             transform=ax_imp_hdr.transAxes,
         )
         axes["ax_imp_hdr"] = ax_imp_hdr
-        axes["ax_imp"] = fig.add_subplot(gs[25, 0])
+        axes["ax_imp"] = fig.add_subplot(gs[31, 0])
     return fig, axes
 
 
+def _shift_panel_group_down(
+    axes: dict[str, Any],
+    panel_keys: Sequence[str],
+    start_key: str,
+    delta: float,
+) -> None:
+    """Shift a contiguous panel group downward (figure coordinates)."""
+    if start_key not in panel_keys or start_key not in axes:
+        return
+    start_idx = panel_keys.index(start_key)
+    shift_axes_down(
+        [axes[key] for key in panel_keys[start_idx:] if key in axes],
+        float(delta),
+    )
+
+
+def _fit_axes_vertical_to_figure(
+    axes: dict[str, Any],
+    *,
+    bottom: float = THREE_PART_SUBPLOT_BOTTOM,
+    top: float = THREE_PART_SUBPLOT_TOP,
+) -> None:
+    """Remap stacked axes into [bottom, top] when legend/section shifts push content off-page."""
+    if not axes:
+        return
+    y_min = min(float(ax.get_position().y0) for ax in axes.values())
+    y_max = max(float(ax.get_position().y1) for ax in axes.values())
+    content_h = y_max - y_min
+    avail_h = float(top) - float(bottom)
+    if content_h <= 1e-9 or avail_h <= 1e-9:
+        return
+    if y_min >= bottom - 1e-6 and y_max <= top + 1e-6:
+        return
+    for ax in axes.values():
+        pos = ax.get_position()
+        rel_bottom = (float(pos.y0) - y_min) / content_h
+        rel_height = float(pos.height) / content_h
+        ax.set_position(
+            [pos.x0, bottom + rel_bottom * avail_h, pos.width, rel_height * avail_h]
+        )
+
+
+def _enforce_min_vertical_gap(
+    axes: dict[str, Any],
+    axis_order: Sequence[str],
+    below_start_key: str,
+    min_gap: float,
+) -> None:
+    """Ensure a minimum figure-coordinate gap between the row above a section header and that header."""
+    if below_start_key not in axes or below_start_key not in axis_order:
+        return
+    start_idx = axis_order.index(below_start_key)
+    if start_idx <= 0:
+        return
+    above_key = axis_order[start_idx - 1]
+    if above_key not in axes:
+        return
+    below_axes = [axes[key] for key in axis_order[start_idx:] if key in axes]
+    if not below_axes:
+        return
+    pos_above = axes[above_key].get_position()
+    pos_below = below_axes[0].get_position()
+    delta = float(min_gap) - float(pos_above.y0 - pos_below.y1)
+    if delta > 0:
+        shift_axes_down(below_axes, delta)
+
+
+@_profiled("pdf_savefig_channel_page")
 def _finalize_and_save_three_part_page(
     *,
     fig: Any,
@@ -384,9 +511,13 @@ def _finalize_and_save_three_part_page(
 ) -> None:
     tick_keys = [
         "ax_full",
+        "ax_full_filt",
+        "ax_first_trigger_hp",
         "ax_first_trigger",
         "ax_full_rms",
         "ax_zoom",
+        "ax_zoom_filt",
+        "ax_zoom_first_hp",
         "ax_zoom_first",
         "ax_zoom_rms",
         "ax_raster_f",
@@ -402,6 +533,8 @@ def _finalize_and_save_three_part_page(
         "ax_trial_fr_ze",
         "ax_isi_ze",
         "ax_zoom_end",
+        "ax_zoom_end_filt",
+        "ax_zoom_end_first_hp",
         "ax_zoom_end_first",
         "ax_zoom_end_rms",
     ]
@@ -409,15 +542,30 @@ def _finalize_and_save_three_part_page(
         tick_keys.append("ax_imp")
     for key in tick_keys:
         axes[key].tick_params(axis="x", labelbottom=True)
-    fig.tight_layout()
+    fig.subplots_adjust(
+        left=THREE_PART_SUBPLOT_LEFT,
+        right=THREE_PART_SUBPLOT_RIGHT,
+        top=THREE_PART_SUBPLOT_TOP,
+        bottom=THREE_PART_SUBPLOT_BOTTOM,
+        hspace=THREE_PART_GRID_HSPACE,
+    )
     recording_count = max(1, int(n_recordings))
     include_imp = "ax_imp" in axes
     page_height_scale = max(
         1.0,
         _three_part_page_height(recording_count, include_imp=include_imp) / THREE_PART_PAGE_HEIGHT_REF,
     )
-    gap_1_2 = (0.001 + 0.001 * float(recording_count - 1)) * page_height_scale
-    gap_4_5 = (0.001 + 0.001 * float(recording_count - 1)) * page_height_scale
+    gap_legend = max(
+        0.0025,
+        (0.006 + 0.003 * float(recording_count - 1)) * max(1.0, page_height_scale),
+    )
+    gap_legend_hp = gap_legend * 0.55
+    gap_4_5 = max(
+        0.006,
+        (0.010 + 0.003 * float(recording_count - 1)) * max(1.0, page_height_scale),
+    )
+    # Fixed minimum gaps between Part 1/2/3 (do not shrink on compact PDF pages).
+    gap_section = 0.026 + 0.006 * float(recording_count - 1)
 
     axis_order = list(THREE_PART_AXIS_ORDER)
     if include_imp:
@@ -425,27 +573,57 @@ def _finalize_and_save_three_part_page(
             axis_order.append("ax_imp_hdr")
         if "ax_imp" in axes:
             axis_order.append("ax_imp")
-    for start_key, gap in (
-        ("ax_first_trigger", gap_1_2),
-        ("ax_zoom_first", gap_1_2),
-        ("ax_zoom_end_first", gap_1_2),
+
+    # First-trigger raw is above HP on the page; match legend-shift order to panel stack.
+    part1_legend_shifts = (
+        ("ax_full", gap_legend),
+        ("ax_full_filt", gap_legend),
+        ("ax_first_trigger", gap_legend),
+        ("ax_first_trigger_hp", gap_legend_hp),
         ("ax_fr_f", gap_4_5),
+    )
+    part2_legend_shifts = (
+        ("ax_zoom", gap_legend),
+        ("ax_zoom_filt", gap_legend),
+        ("ax_zoom_first", gap_legend),
+        ("ax_zoom_first_hp", gap_legend_hp),
         ("ax_fr_z", gap_4_5),
+    )
+    part3_legend_shifts = (
+        ("ax_zoom_end", gap_legend),
+        ("ax_zoom_end_filt", gap_legend),
+        ("ax_zoom_end_first", gap_legend),
+        ("ax_zoom_end_first_hp", gap_legend_hp),
         ("ax_fr_ze", gap_4_5),
-    ):
-        start_idx = axis_order.index(start_key)
-        shift_axes_down(
-            [axes[key] for key in axis_order[start_idx:] if key in axes],
-            delta=gap,
-        )
+    )
+    for start_key, gap in part1_legend_shifts:
+        _shift_panel_group_down(axes, THREE_PART1_PANEL_KEYS, start_key, gap)
+    for start_key, gap in part2_legend_shifts:
+        # Keep Part 2 section title glued to the first curve panel (legend clearance).
+        if start_key == "ax_zoom":
+            _shift_panel_group_down(axes, THREE_PART2_PANEL_KEYS, "ax_hdr2", gap)
+        else:
+            _shift_panel_group_down(axes, THREE_PART2_CURVE_KEYS, start_key, gap)
+    for start_key, gap in part3_legend_shifts:
+        if start_key == "ax_zoom_end":
+            _shift_panel_group_down(axes, THREE_PART3_PANEL_KEYS, "ax_hdr3", gap)
+        else:
+            _shift_panel_group_down(axes, THREE_PART3_CURVE_KEYS, start_key, gap)
+
+    _enforce_min_vertical_gap(axes, axis_order, "ax_hdr2", gap_section)
+    _enforce_min_vertical_gap(axes, axis_order, "ax_hdr3", gap_section)
+    if include_imp and "ax_imp_hdr" in axes:
+        _enforce_min_vertical_gap(axes, axis_order, "ax_imp_hdr", gap_section)
 
     panel_width = THREE_PART_SUBPLOT_RIGHT - THREE_PART_SUBPLOT_LEFT
     for ax in axes.values():
         pos = ax.get_position()
         ax.set_position([THREE_PART_SUBPLOT_LEFT, pos.y0, panel_width, pos.height])
+    _fit_axes_vertical_to_figure(axes)
     _soften_figure_linewidths(fig)
     _apply_compact_axis_fonts(fig)
-    pdf.savefig(fig, bbox_inches="tight", pad_inches=0.2, dpi=PDF_DPI)
+    # Avoid bbox_inches="tight" on huge multi-panel figures (very slow).
+    pdf.savefig(fig, dpi=PDF_DPI, pad_inches=0.15)
     plt.close(fig)
 
 
@@ -454,12 +632,24 @@ def _spike_times_per_trial(
     t_rel: np.ndarray,
     fs: float,
     threshold: float,
+    intan_dsp: IntanDspSettings | None = None,
 ) -> list[np.ndarray]:
     """For one channel: list of spike-time arrays (s rel. trigger), one per trial."""
+    from dataclasses import replace
+
     n_trials = int(windows_ch.shape[0])
     out: list[np.ndarray] = []
     for i in range(n_trials):
-        idx = detect_spikes_at_threshold(windows_ch[i], fs, threshold)
+        if intan_dsp is not None:
+            dsp = replace(intan_dsp, spike_threshold_uv=float(threshold))
+            idx = detect_spikes_intan(
+                windows_ch[i],
+                dsp,
+                start_sample=0,
+                end_sample=int(windows_ch.shape[1]),
+            )
+        else:
+            idx = detect_spikes_at_threshold(windows_ch[i], fs, threshold)
         out.append(np.asarray(t_rel[idx], dtype=np.float64))
     return out
 
@@ -551,88 +741,336 @@ def _trial_mean_firing_rate_hz(
     return out
 
 
+def _default_filter_short_label() -> str:
+    return "bessel high-pass ord.2 @ 250 Hz"
+
+
+def _default_filter_title_label() -> str:
+    return "bessel high-pass @ 250 Hz"
+
+
 def _spike_pipeline_captions(
-    spike_bandpass_low_hz: Optional[float],
-    spike_bandpass_high_hz: Optional[float],
+    intan_dsp: IntanDspSettings | None = None,
 ) -> Tuple[str, str]:
     """(short for subtitles, detailed for footer note)"""
-    if spike_bandpass_low_hz is not None and spike_bandpass_high_hz is not None:
-        flo = float(spike_bandpass_low_hz)
-        fhi = float(spike_bandpass_high_hz)
-        short = f"band-pass {flo:g}–{fhi:g} Hz"
-        detail = f"Butterworth band-pass {flo:g}–{fhi:g} Hz (order 4, filtfilt)"
-        return short, detail
-    return "raw", "raw mmap signal (no spike band-pass)"
-
-
-def _curve_filter_captions(
-    curve_filter: str = "no filter",
-    curve_filter_low_hz: Optional[float] = None,
-    curve_filter_high_hz: Optional[float] = None,
-    lowpass_cutoff_hz: Optional[float] = None,
-) -> tuple[bool, str, str]:
-    """Return (enabled, short title note, legend label)."""
-    kind = (curve_filter or "no filter").strip().lower()
-    lo = curve_filter_low_hz
-    hi = curve_filter_high_hz
-    # Backward compatibility with older low-pass-only calls.
-    if kind == "no filter" and lowpass_cutoff_hz is not None:
-        kind = "lowpass"
-        lo = float(lowpass_cutoff_hz)
-    if kind == "no filter":
-        return False, "", ""
-    if kind == "lowpass":
-        if lo is None:
-            raise ValueError("Curve filter lowpass requires one cutoff frequency (Hz).")
-        return True, f" — Butterworth low-pass {lo:g} Hz", f"low-pass {lo:g} Hz"
-    if kind == "highpass":
-        if lo is None:
-            raise ValueError("Curve filter highpass requires one cutoff frequency (Hz).")
-        return True, f" — Butterworth high-pass {lo:g} Hz", f"high-pass {lo:g} Hz"
-    if kind == "bandpass":
-        if lo is None or hi is None:
-            raise ValueError("Curve filter bandpass requires low/high cutoffs (Hz).")
-        return True, f" — Butterworth band-pass {lo:g}–{hi:g} Hz", f"band-pass {lo:g}–{hi:g} Hz"
-    raise ValueError("Curve filter must be highpass, lowpass, bandpass, or no filter.")
-
-
-def _apply_curve_filter_to_row(
-    row: np.ndarray,
-    fs: float,
-    curve_filter: str = "no filter",
-    curve_filter_low_hz: Optional[float] = None,
-    curve_filter_high_hz: Optional[float] = None,
-    lowpass_cutoff_hz: Optional[float] = None,
-) -> np.ndarray:
-    """Apply configured Butterworth filter to one 1D curve."""
-    enabled, _, _ = _curve_filter_captions(
-        curve_filter=curve_filter,
-        curve_filter_low_hz=curve_filter_low_hz,
-        curve_filter_high_hz=curve_filter_high_hz,
-        lowpass_cutoff_hz=lowpass_cutoff_hz,
+    if intan_dsp is None:
+        short = _default_filter_short_label()
+        return short, (
+            f"{_default_filter_title_label()}, order 2; "
+            "RMS window 1 s; spike detection on filtered signal"
+        )
+    short = intan_dsp.filter_short_label()
+    detail = (
+        f"{intan_dsp.filter_title_label()}, order {intan_dsp.filter_order}; "
+        f"RMS window {intan_dsp.rms_window_s:g} s; "
+        f"spike thr. {intan_dsp.spike_threshold_uv:g} µV"
     )
-    if not enabled:
-        return np.asarray(row, dtype=np.float64)
-    kind = (curve_filter or "no filter").strip().lower()
-    lo = curve_filter_low_hz
-    hi = curve_filter_high_hz
-    if kind == "no filter" and lowpass_cutoff_hz is not None:
-        kind = "lowpass"
-        lo = float(lowpass_cutoff_hz)
-    row_2d = np.asarray(row, dtype=np.float64).reshape(1, -1)
-    if kind == "lowpass":
-        if lo is None:
-            raise ValueError("Curve filter lowpass requires cutoff.")
-        return apply_butterworth_lowpass(row_2d, fs, float(lo))[0]
-    if kind == "highpass":
-        if lo is None:
-            raise ValueError("Curve filter highpass requires cutoff.")
-        return apply_butterworth_highpass(row_2d, fs, float(lo))[0]
-    if kind == "bandpass":
-        if lo is None or hi is None:
-            raise ValueError("Curve filter bandpass requires low/high cutoffs.")
-        return apply_butterworth_bandpass(row_2d, fs, float(lo), float(hi))[0]
-    return np.asarray(row, dtype=np.float64)
+    if intan_dsp.artifact_suppression_enabled:
+        detail += f"; artifact {intan_dsp.artifact_threshold_uv:g} µV"
+    return short, detail
+
+
+def _intan_hp_mean_filter_captions(intan_dsp: IntanDspSettings | None) -> tuple[str, str]:
+    """Return (title suffix, compact legend spec) for software-filtered mean traces."""
+    if intan_dsp is None:
+        short = _default_filter_short_label()
+        return f" — mean trace: {short}", short
+    short = intan_dsp.filter_short_label()
+    return f" — mean trace: {short}", short
+
+
+def _intan_hp_mean_trace_label(name: str, intan_hp_legend: str) -> str:
+    return f"{name} mean ({intan_hp_legend})"
+
+
+def _mean_triggered_average_row(
+    row: np.ndarray,
+    valid_triggers: np.ndarray,
+    pre_n: int,
+    post_n: int,
+    n_expected: int,
+) -> np.ndarray:
+    """Average triggered windows from one 1D channel row (mmap view: only window slices are read)."""
+    win_len = int(pre_n) + int(post_n)
+    acc = np.zeros(win_len, dtype=np.float64)
+    triggers = np.asarray(valid_triggers, dtype=np.int64)
+    for trig in triggers:
+        start = int(trig - pre_n)
+        end = int(trig + post_n)
+        acc += np.asarray(row[start:end], dtype=np.float64)
+    y = acc / float(max(triggers.size, 1))
+    if y.shape[0] != n_expected:
+        y = np.asarray(y[:n_expected], dtype=np.float64)
+    return y
+
+
+def _first_trigger_window(
+    source: AmplifierSpikeSource,
+    ch: int,
+    n_expected: int,
+    *,
+    highpass: bool = False,
+) -> Optional[np.ndarray]:
+    """Extract the first-trigger window (raw amplifier or Intan high-pass)."""
+    if source.valid_triggers.size == 0:
+        return None
+    first_trig = int(source.valid_triggers[0])
+    start = int(first_trig - source.pre_n)
+    end = int(first_trig + source.post_n)
+    data = source.highpass if highpass else source.amplifier
+    curve = np.asarray(data[ch, start:end], dtype=np.float64)
+    if curve.shape[0] != n_expected:
+        return None
+    return curve
+
+
+def _collect_first_trigger_windows(
+    spike_sources: Sequence[AmplifierSpikeSource],
+    ch: int,
+    n_expected: int,
+) -> tuple[list[Optional[np.ndarray]], list[Optional[np.ndarray]]]:
+    raw_curves: list[Optional[np.ndarray]] = []
+    hp_curves: list[Optional[np.ndarray]] = []
+    for src in spike_sources:
+        raw_curves.append(_first_trigger_window(src, ch, n_expected, highpass=False))
+        hp_curves.append(_first_trigger_window(src, ch, n_expected, highpass=True))
+    return raw_curves, hp_curves
+
+
+def _trigger_end_zoom_bounds(
+    end_markers: Sequence[float],
+    zoom_t0: float,
+    zoom_t1: float,
+) -> tuple[float, float] | None:
+    if not end_markers:
+        return None
+    return float(min(end_markers) + zoom_t0), float(max(end_markers) + zoom_t1)
+
+
+def _mark_unavailable_axis(ax: Any, message: str) -> None:
+    ax.text(0.5, 0.5, message, ha="center", va="center", transform=ax.transAxes)
+    ax.set_axis_off()
+
+
+def _add_trace_reference_overlays(
+    ax: Any,
+    *,
+    zoom_t0: float,
+    zoom_t1: float,
+    end_markers: Sequence[float],
+    onset_label: str = "Trigger (onset)",
+    end_line_specs: Optional[Sequence[tuple[float, str]]] = None,
+    show_zoom_span: bool = True,
+    show_end_zoom_span: bool = True,
+    aux_legend_label: Optional[str] = None,
+) -> None:
+    ax.axvline(
+        0.0,
+        linestyle="--",
+        linewidth=1.0,
+        color="red",
+        label=onset_label if aux_legend_label is None else aux_legend_label,
+    )
+    if end_line_specs:
+        for value, label in end_line_specs:
+            ax.axvline(value, linestyle=":", linewidth=0.9, color="0.45", label=label)
+    else:
+        for value in end_markers:
+            ax.axvline(value, linestyle=":", linewidth=0.9, color="0.45")
+    if show_zoom_span:
+        ax.axvspan(
+            zoom_t0,
+            zoom_t1,
+            alpha=0.12,
+            color="green",
+            label=("Zoom region" if aux_legend_label is None else aux_legend_label),
+        )
+    if show_end_zoom_span:
+        end_bounds = _trigger_end_zoom_bounds(end_markers, zoom_t0, zoom_t1)
+        if end_bounds is not None:
+            ax.axvspan(
+                end_bounds[0],
+                end_bounds[1],
+                alpha=0.10,
+                color="gold",
+                label=(
+                    "Trigger-end zoom region"
+                    if aux_legend_label is None
+                    else aux_legend_label
+                ),
+            )
+
+
+def _plot_mean_section_trace_panels(
+    *,
+    ax_raw: Any,
+    ax_filt: Any,
+    ax_first_hp: Any,
+    ax_first_raw: Any,
+    t_rel: np.ndarray,
+    time_mask: Optional[np.ndarray],
+    x_limits: Optional[tuple[float, float]],
+    labels: Sequence[str],
+    mean_filtered: Sequence[np.ndarray],
+    mean_raw: Optional[Sequence[np.ndarray]],
+    first_trigger_raw: Sequence[Optional[np.ndarray]],
+    first_trigger_hp: Sequence[Optional[np.ndarray]],
+    colors: Sequence[Any],
+    zoom_t0: float,
+    zoom_t1: float,
+    end_markers: Sequence[float],
+    intan_hp_legends: Sequence[str],
+    title_raw: str,
+    title_filt: str,
+    title_first_hp: str,
+    title_first_raw: str,
+    legend_cols: int,
+    aux_legend_label: Optional[str] = None,
+    end_line_specs: Optional[Sequence[tuple[float, str]]] = None,
+    show_reference_on_first_raw: bool = True,
+    show_reference_on_first_hp: bool = False,
+    first_trigger_hp_ylim: tuple[float, float] | None = None,
+    base_lw: float = 1.2,
+    main_lw: float = 1.35,
+    first_lw: float = 1.1,
+) -> None:
+    """Plot the four mean-trace panels shared by each three-part section."""
+    if time_mask is not None:
+        t_plot = t_rel[time_mask]
+    else:
+        t_plot = t_rel
+
+    def _slice(y: np.ndarray) -> np.ndarray:
+        return y[time_mask] if time_mask is not None else y
+
+    for i, y_filt in enumerate(mean_filtered):
+        line_color = colors[i % len(colors)]
+        y_raw = (
+            np.asarray(mean_raw[i], dtype=np.float64)
+            if mean_raw is not None and i < len(mean_raw)
+            else np.asarray(y_filt, dtype=np.float64)
+        )
+        raw_label = f"{labels[i]} mean (raw)" if len(labels) > 1 else "Mean (raw)"
+        ax_raw.plot(t_plot, _slice(y_raw), linewidth=base_lw, color=line_color, label=raw_label)
+        hp_legend = (
+            intan_hp_legends[i]
+            if i < len(intan_hp_legends)
+            else _default_filter_short_label()
+        )
+        filt_label = _intan_hp_mean_trace_label(labels[i], hp_legend)
+        ax_filt.plot(t_plot, _slice(y_filt), linewidth=main_lw, color=line_color, label=filt_label)
+
+    _add_trace_reference_overlays(
+        ax_raw,
+        zoom_t0=zoom_t0,
+        zoom_t1=zoom_t1,
+        end_markers=end_markers,
+        end_line_specs=end_line_specs,
+        aux_legend_label=aux_legend_label,
+    )
+    ax_raw.set_title(title_raw)
+    ax_raw.set_ylabel("Potential (µV)")
+    ax_raw.set_xlabel(TIME_REL_XLABEL)
+    ax_raw.grid(True, alpha=0.3)
+    ax_raw.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
+
+    _add_trace_reference_overlays(
+        ax_filt,
+        zoom_t0=zoom_t0,
+        zoom_t1=zoom_t1,
+        end_markers=end_markers,
+        end_line_specs=end_line_specs,
+        aux_legend_label=aux_legend_label,
+    )
+    ax_filt.set_title(title_filt)
+    ax_filt.set_ylabel("Potential (µV)")
+    ax_filt.set_xlabel(TIME_REL_XLABEL)
+    ax_filt.grid(True, alpha=0.3)
+    ax_filt.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
+
+    if any(curve is not None for curve in first_trigger_hp):
+        for i, curve in enumerate(first_trigger_hp):
+            if curve is None:
+                continue
+            line_color = colors[i % len(colors)]
+            hp_legend = (
+                intan_hp_legends[i]
+                if i < len(intan_hp_legends)
+                else _default_filter_short_label()
+            )
+            hp_label = (
+                f"{labels[i]} first trigger ({hp_legend})"
+                if len(labels) > 1
+                else f"First trigger ({hp_legend})"
+            )
+            ax_first_hp.plot(t_plot, _slice(curve), linewidth=first_lw, color=line_color, label=hp_label)
+        if show_reference_on_first_hp:
+            _add_trace_reference_overlays(
+                ax_first_hp,
+                zoom_t0=zoom_t0,
+                zoom_t1=zoom_t1,
+                end_markers=end_markers,
+                end_line_specs=end_line_specs,
+                aux_legend_label=aux_legend_label,
+            )
+        else:
+            ax_first_hp.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
+            if end_line_specs:
+                for value, _label in end_line_specs:
+                    ax_first_hp.axvline(value, linestyle=":", linewidth=0.9, color="0.45")
+            else:
+                for value in end_markers:
+                    ax_first_hp.axvline(value, linestyle=":", linewidth=0.9, color="0.45")
+        ax_first_hp.set_title(title_first_hp)
+        ax_first_hp.set_ylabel("Potential (µV)")
+        ax_first_hp.set_xlabel(TIME_REL_XLABEL)
+        ax_first_hp.grid(True, alpha=0.3)
+        if first_trigger_hp_ylim is not None:
+            ax_first_hp.set_ylim(
+                float(first_trigger_hp_ylim[0]),
+                float(first_trigger_hp_ylim[1]),
+            )
+    else:
+        _mark_unavailable_axis(ax_first_hp, "First trigger filtered signal unavailable")
+
+    if any(curve is not None for curve in first_trigger_raw):
+        for i, curve in enumerate(first_trigger_raw):
+            if curve is None:
+                continue
+            line_color = colors[i % len(colors)]
+            raw_label = (
+                f"{labels[i]} first trigger raw"
+                if len(labels) > 1
+                else "First trigger (raw, no averaging)"
+            )
+            ax_first_raw.plot(t_plot, _slice(curve), linewidth=first_lw, color=line_color, label=raw_label)
+        if show_reference_on_first_raw:
+            _add_trace_reference_overlays(
+                ax_first_raw,
+                zoom_t0=zoom_t0,
+                zoom_t1=zoom_t1,
+                end_markers=end_markers,
+                end_line_specs=end_line_specs,
+                aux_legend_label=aux_legend_label,
+            )
+        else:
+            ax_first_raw.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
+            if end_line_specs:
+                for value, _label in end_line_specs:
+                    ax_first_raw.axvline(value, linestyle=":", linewidth=0.9, color="0.45")
+            else:
+                for value in end_markers:
+                    ax_first_raw.axvline(value, linestyle=":", linewidth=0.9, color="0.45")
+        ax_first_raw.set_title(title_first_raw)
+        ax_first_raw.set_ylabel("Potential (µV)")
+        ax_first_raw.set_xlabel(TIME_REL_XLABEL)
+        ax_first_raw.grid(True, alpha=0.3)
+    else:
+        _mark_unavailable_axis(ax_first_raw, "First trigger raw signal unavailable")
+
+    if x_limits is not None:
+        for ax in (ax_raw, ax_filt, ax_first_hp, ax_first_raw):
+            ax.set_xlim(float(x_limits[0]), float(x_limits[1]))
 
 
 def _isi_time_and_values_s(
@@ -733,16 +1171,10 @@ def _add_raster_threshold_legend(
         unique_handles = [Line2D([0], [0], color="0.25", linestyle="--", linewidth=1.0)]
         unique_labels = [f"Threshold: {threshold_caption}"]
     entry_count = len(unique_labels)
-    # Keep the legend compact with many recordings, and avoid letting it drive
-    # global subplot compression in tight_layout().
-    if entry_count <= 4:
-        ncol = 1
-    elif entry_count <= 10:
-        ncol = 2
-    else:
-        ncol = 3
-    rows = max(1, int(math.ceil(entry_count / float(ncol))))
-    legend_y = -0.1
+    ncol = 1
+    rows = max(1, entry_count)
+    # Extra vertical offset when many stacked legend rows (single column).
+    legend_y = -0.22 - 0.035 * max(0, rows - 1)
     legend = ax_raster.legend(
         unique_handles,
         unique_labels,
@@ -759,331 +1191,6 @@ def _add_raster_threshold_legend(
         legend.set_in_layout(False)
 
 
-def _draw_spike_panels_single_channel(
-    ax_raster: Any,
-    ax_fr: Any,
-    ax_trial_fr: Any,
-    ax_isi: Any,
-    w_ch: Optional[np.ndarray],
-    t_rel: np.ndarray,
-    fs: float,
-    spike_threshold_uv: float,
-    psth_bin_window_s: float,
-    spike_bandpass_low_hz: Optional[float] = None,
-    spike_bandpass_high_hz: Optional[float] = None,
-    *,
-    t_range_s: Optional[Tuple[float, float]] = None,
-    section_title: str = "",
-    st_per_tr: Optional[list[np.ndarray]] = None,
-    sampling_percent: int = 100,
-    threshold_caption: str | None = None,
-    threshold_entries: Sequence[tuple[str, str]] | None = None,
-) -> None:
-    """Raster, PSTH / firing rate, ISI (time rel. trigger x duration) for one channel."""
-    short, _ = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
-    if st_per_tr is None:
-        if w_ch is None:
-            raise ValueError("w_ch is required when st_per_tr is not provided.")
-        st_per_tr = _spike_times_per_trial(w_ch, t_rel, fs, spike_threshold_uv)
-    n_tr = int(len(st_per_tr))
-    if t_range_s is None:
-        t_xlim_lo, t_xlim_hi = float(t_rel[0]), float(t_rel[-1])
-        psth_t_range: Optional[Tuple[float, float]] = None
-        isi_window: Optional[Tuple[float, float]] = None
-        isi_caption = f"spikes within ±{ISI_HALF_WINDOW_S:g} s of trigger, within-trial"
-        isi_empty_hint = (
-            "fewer than 2 spikes within ±"
-            f"{ISI_HALF_WINDOW_S:g} s of trigger, per trial"
-        )
-    else:
-        t_xlim_lo, t_xlim_hi = float(t_range_s[0]), float(t_range_s[1])
-        psth_t_range = (t_xlim_lo, t_xlim_hi)
-        isi_window = (t_xlim_lo, t_xlim_hi)
-        isi_caption = f"spikes in [{t_xlim_lo:g}, {t_xlim_hi:g}] s relative to trigger, within-trial"
-        isi_empty_hint = (
-            f"fewer than 2 spikes in [{t_xlim_lo:g}, {t_xlim_hi:g}] s, per trial"
-        )
-
-    sec = f"{section_title} — " if section_title else ""
-    for tri, st in enumerate(st_per_tr):
-        st_plot = st
-        if t_range_s is not None:
-            st_plot = st[(st >= t_xlim_lo) & (st <= t_xlim_hi)]
-        if st_plot.size:
-            y_pts = np.full(st_plot.shape, tri)
-            st_ds, y_ds = downsample_points(st_plot, y_pts, sampling_percent)
-            ax_raster.scatter(
-                st_ds,
-                y_ds,
-                s=4,
-                c="k",
-                alpha=0.75,
-                linewidths=0,
-            )
-    ax_raster.set_ylabel("Trial #")
-    if threshold_caption is not None:
-        cap = threshold_caption
-    else:
-        cap = (
-            f"crossing below {spike_threshold_uv:g} µV (falling edge)"
-            if spike_threshold_uv < 0
-            else f"crossing above {spike_threshold_uv:g} µV (rising edge)"
-        )
-    ax_raster.set_title(f"{sec}Raster — {short}")
-    ax_raster.grid(True, alpha=0.25, axis="x")
-    ax_raster.set_ylim(-0.5, max(n_tr - 0.5, 0.5))
-    ax_raster.set_xlim(t_xlim_lo, t_xlim_hi)
-    _add_raster_threshold_legend(
-        ax_raster,
-        f"{cap}, 1 ms refractory",
-        threshold_entries=threshold_entries,
-    )
-
-    # Sliding PSTH time window; values are evaluated at sampling cadence in _psth_mean_hz().
-    bin_w = max(float(psth_bin_window_s), 1.0 / fs)
-    tc, rate_hz = _psth_mean_hz(
-        st_per_tr,
-        t_rel,
-        n_tr,
-        bin_w,
-        t_range_s=psth_t_range,
-    )
-    if tc.size:
-        ax_fr.plot(tc, rate_hz, linewidth=1.3, color="darkred", label="PSTH (Hz)")
-    ax_fr.set_ylabel("Rate (Hz)")
-    ax_fr.set_title(
-        f"{sec}Mean firing rate — {short} (PSTH time window = {bin_w:g} s)"
-    )
-    ax_fr.grid(True, alpha=0.3)
-    ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
-    ax_raster.set_xlabel(TIME_REL_XLABEL)
-    ax_fr.set_xlabel(TIME_REL_XLABEL)
-    fr_trials = _trial_mean_firing_rate_hz(st_per_tr, (t_xlim_lo, t_xlim_hi))
-    x_trials = np.arange(1, len(fr_trials) + 1)
-    if fr_trials.size:
-        ax_trial_fr.plot(x_trials, fr_trials, color="teal", linewidth=1.1, marker="o", markersize=2.6)
-    ax_trial_fr.set_title(f"{sec}Mean firing rate per trial — shown window")
-    ax_trial_fr.set_xlabel("Trial index")
-    ax_trial_fr.set_ylabel("Firing rate (Hz)")
-    ax_trial_fr.grid(True, alpha=0.25)
-
-    t_isi, isi_vals_s = _isi_time_and_values_s(st_per_tr, isi_window_s=isi_window)
-    if t_isi.size:
-        t_isi, isi_vals_s = downsample_points(t_isi, isi_vals_s, sampling_percent)
-        ax_isi.scatter(
-            t_isi,
-            isi_vals_s * 1e3,
-            s=10,
-            c="steelblue",
-            alpha=0.35,
-            linewidths=0,
-            rasterized=True,
-        )
-        ax_isi.set_ylabel("ISI (ms)")
-        ax_isi.set_title(
-            f"{sec}ISI — {short} ({isi_caption} ; x-axis = time of 2nd spike in pair)"
-        )
-        ax_isi.grid(True, alpha=0.25)
-        _set_adaptive_x_limits(ax_isi, t_isi, fallback_limits=(t_xlim_lo, t_xlim_hi))
-        ax_isi.set_xlabel(TIME_REL_XLABEL)
-    else:
-        ax_isi.text(
-            0.5,
-            0.5,
-            "Not enough spikes for ISI\n(" + isi_empty_hint + ")",
-            ha="center",
-            va="center",
-            transform=ax_isi.transAxes,
-        )
-        ax_isi.set_axis_off()
-
-
-def _draw_spike_panels_dual_channel(
-    ax_raster: Any,
-    ax_fr: Any,
-    ax_trial_fr: Any,
-    ax_isi: Any,
-    w_a: Optional[np.ndarray],
-    w_b: Optional[np.ndarray],
-    t_rel: np.ndarray,
-    fs: float,
-    spike_threshold_uv: float,
-    psth_bin_window_s: float,
-    label_a: str,
-    label_b: str,
-    spike_bandpass_low_hz: Optional[float] = None,
-    spike_bandpass_high_hz: Optional[float] = None,
-    *,
-    t_range_s: Optional[Tuple[float, float]] = None,
-    section_title: str = "",
-    sta: Optional[list[np.ndarray]] = None,
-    stb: Optional[list[np.ndarray]] = None,
-    sampling_percent: int = 100,
-    threshold_caption: str | None = None,
-    threshold_entries: Sequence[tuple[str, str]] | None = None,
-) -> None:
-    """Overlaid raster / PSTH / ISI for two recordings (same channel, same time axis)."""
-    short, _ = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
-    if sta is None:
-        if w_a is None:
-            raise ValueError("w_a is required when sta is not provided.")
-        sta = _spike_times_per_trial(w_a, t_rel, fs, spike_threshold_uv)
-    if stb is None:
-        if w_b is None:
-            raise ValueError("w_b is required when stb is not provided.")
-        stb = _spike_times_per_trial(w_b, t_rel, fs, spike_threshold_uv)
-    n_a = int(len(sta))
-    n_b = int(len(stb))
-
-    if t_range_s is None:
-        t_xlim_lo, t_xlim_hi = float(t_rel[0]), float(t_rel[-1])
-        psth_t_range = None
-        isi_window = None
-        isi_caption = f"±{ISI_HALF_WINDOW_S:g} s of trigger, within-trial"
-        isi_empty_hint = f"±{ISI_HALF_WINDOW_S:g} s of trigger"
-    else:
-        t_xlim_lo, t_xlim_hi = float(t_range_s[0]), float(t_range_s[1])
-        psth_t_range = (t_xlim_lo, t_xlim_hi)
-        isi_window = (t_xlim_lo, t_xlim_hi)
-        isi_caption = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s rel. trigger, within-trial"
-        isi_empty_hint = f"[{t_xlim_lo:g}, {t_xlim_hi:g}] s of trigger"
-
-    sec = f"{section_title} — " if section_title else ""
-    for tri, st in enumerate(sta):
-        st_plot = st
-        if t_range_s is not None:
-            st_plot = st[(st >= t_xlim_lo) & (st <= t_xlim_hi)]
-        if st_plot.size:
-            y_pts = np.full(st_plot.shape, tri)
-            st_ds, y_ds = downsample_points(st_plot, y_pts, sampling_percent)
-            ax_raster.scatter(
-                st_ds,
-                y_ds,
-                s=4,
-                c="C0",
-                alpha=0.75,
-                linewidths=0,
-                label=label_a if tri == 0 else "",
-            )
-    offset = n_a
-    for tri, st in enumerate(stb):
-        st_plot = st
-        if t_range_s is not None:
-            st_plot = st[(st >= t_xlim_lo) & (st <= t_xlim_hi)]
-        if st_plot.size:
-            y_pts = np.full(st_plot.shape, offset + tri)
-            st_ds, y_ds = downsample_points(st_plot, y_pts, sampling_percent)
-            ax_raster.scatter(
-                st_ds,
-                y_ds,
-                s=4,
-                c="C1",
-                alpha=0.75,
-                linewidths=0,
-                label=label_b if tri == 0 else "",
-            )
-    ax_raster.set_ylabel("Trial # (A then B stacked)")
-    if threshold_caption is not None:
-        cap = threshold_caption
-    else:
-        cap = (
-            f"threshold {spike_threshold_uv:g} µV (falling)"
-            if spike_threshold_uv < 0
-            else f"threshold {spike_threshold_uv:g} µV (rising)"
-        )
-    ax_raster.set_title(f"{sec}Raster — {short}")
-    ax_raster.grid(True, alpha=0.25, axis="x")
-    ax_raster.set_ylim(-0.5, max(offset + n_b - 0.5, 0.5))
-    ax_raster.set_xlim(t_xlim_lo, t_xlim_hi)
-    ax_raster.axhline(offset - 0.5, color="0.5", linestyle="--", linewidth=0.8, alpha=0.7)
-    _add_raster_threshold_legend(
-        ax_raster,
-        cap,
-        threshold_entries=threshold_entries,
-    )
-
-    # Sliding PSTH time window; values are evaluated at sampling cadence in _psth_mean_hz().
-    bin_w = max(float(psth_bin_window_s), 1.0 / fs)
-    tc_a, rate_a = _psth_mean_hz(
-        sta, t_rel, n_a, bin_w, t_range_s=psth_t_range
-    )
-    tc_b, rate_b = _psth_mean_hz(
-        stb, t_rel, n_b, bin_w, t_range_s=psth_t_range
-    )
-    if tc_a.size:
-        ax_fr.plot(tc_a, rate_a, linewidth=1.3, color="C0", label=label_a)
-    if tc_b.size:
-        ax_fr.plot(tc_b, rate_b, linewidth=1.3, color="C1", label=label_b)
-    ax_fr.set_ylabel("Rate (Hz)")
-    ax_fr.set_title(
-        f"{sec}Firing rate (PSTH time window = {bin_w:g} s) — {short}"
-    )
-    ax_fr.grid(True, alpha=0.3)
-    ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
-    ax_raster.set_xlabel(TIME_REL_XLABEL)
-    ax_fr.set_xlabel(TIME_REL_XLABEL)
-    fr_a = _trial_mean_firing_rate_hz(sta, (t_xlim_lo, t_xlim_hi))
-    fr_b = _trial_mean_firing_rate_hz(stb, (t_xlim_lo, t_xlim_hi))
-    xa = np.arange(1, len(fr_a) + 1)
-    xb = np.arange(1, len(fr_b) + 1)
-    if fr_a.size:
-        ax_trial_fr.plot(xa, fr_a, color="C0", linewidth=1.1, marker="o", markersize=2.4, label=label_a)
-    if fr_b.size:
-        ax_trial_fr.plot(xb, fr_b, color="C1", linewidth=1.1, marker="o", markersize=2.4, label=label_b)
-    ax_trial_fr.set_title(f"{sec}Mean firing rate per trial — shown window")
-    ax_trial_fr.set_xlabel("Trial index")
-    ax_trial_fr.set_ylabel("Firing rate (Hz)")
-    ax_trial_fr.grid(True, alpha=0.25)
-
-    t_a, isi_a_s = _isi_time_and_values_s(sta, isi_window_s=isi_window)
-    t_b, isi_b_s = _isi_time_and_values_s(stb, isi_window_s=isi_window)
-    if t_a.size or t_b.size:
-        if t_a.size:
-            t_a, isi_a_s = downsample_points(t_a, isi_a_s, sampling_percent)
-        if t_b.size:
-            t_b, isi_b_s = downsample_points(t_b, isi_b_s, sampling_percent)
-        if t_a.size:
-            ax_isi.scatter(
-                t_a,
-                isi_a_s * 1e3,
-                s=10,
-                c="C0",
-                alpha=0.35,
-                linewidths=0,
-                label=label_a,
-                rasterized=True,
-            )
-        if t_b.size:
-            ax_isi.scatter(
-                t_b,
-                isi_b_s * 1e3,
-                s=10,
-                c="C1",
-                alpha=0.35,
-                linewidths=0,
-                label=label_b,
-                rasterized=True,
-            )
-        ax_isi.set_ylabel("ISI (ms)")
-        ax_isi.set_title(
-            f"{sec}ISI — {short} ({isi_caption} ; x-axis = time of 2nd spike in pair)"
-        )
-        ax_isi.grid(True, alpha=0.25)
-        isi_time_union = np.concatenate([t_a, t_b]) if (t_a.size and t_b.size) else (t_a if t_a.size else t_b)
-        _set_adaptive_x_limits(ax_isi, isi_time_union, fallback_limits=(t_xlim_lo, t_xlim_hi))
-        ax_isi.set_xlabel(TIME_REL_XLABEL)
-    else:
-        ax_isi.text(
-            0.5,
-            0.5,
-            f"Not enough spikes for ISI\n({isi_empty_hint})",
-            ha="center",
-            va="center",
-            transform=ax_isi.transAxes,
-        )
-        ax_isi.set_axis_off()
-
-
 def _draw_spike_panels_multi_channel(
     ax_raster: Any,
     ax_fr: Any,
@@ -1095,9 +1202,8 @@ def _draw_spike_panels_multi_channel(
     spike_threshold_uv: float,
     psth_bin_window_s: float,
     labels: Sequence[str],
-    spike_bandpass_low_hz: Optional[float] = None,
-    spike_bandpass_high_hz: Optional[float] = None,
     *,
+    intan_dsp: IntanDspSettings | None = None,
     t_range_s: Optional[Tuple[float, float]] = None,
     section_title: str = "",
     spikes_per_recording: Optional[list[list[np.ndarray]]] = None,
@@ -1106,7 +1212,7 @@ def _draw_spike_panels_multi_channel(
     threshold_entries: Sequence[tuple[str, str]] | None = None,
 ) -> None:
     """Overlaid raster / PSTH / ISI for N recordings."""
-    short, _ = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
+    short, _ = _spike_pipeline_captions(intan_dsp=intan_dsp)
     if spikes_per_recording is None:
         if windows_list is None:
             raise ValueError("windows_list is required when spikes_per_recording is not provided.")
@@ -1260,28 +1366,309 @@ def _draw_spike_panels_multi_channel(
         ax_isi.set_axis_off()
 
 
-def _spike_threshold_caption(threshold_uv: float) -> str:
-    if threshold_uv >= 0:
-        return f"threshold {threshold_uv:g} µV (rising edge)"
-    return f"threshold {threshold_uv:g} µV (falling edge, negative spike)"
+def _spike_threshold_caption(
+    threshold_uv: float,
+    polarity: str | None = None,
+) -> str:
+    from intan_rhx_dsp import normalize_spike_threshold
+
+    mag, pol = normalize_spike_threshold(threshold_uv, polarity)  # type: ignore[arg-type]
+    if pol == "positive":
+        return f"threshold +{mag:g} µV (above, rising edge)"
+    return f"threshold −{mag:g} µV (below, falling edge)"
 
 
 def _resolve_channel_spike_threshold(
     *,
     mode: str,
     fixed_threshold_uv: float,
+    spike_threshold_polarity: str = "negative",
     rms_multiplier: float,
     source: AmplifierSpikeSource | None,
     channel_index: int,
+    mean_rms_uv: float | None = None,
 ) -> tuple[float, str]:
     """Resolve spike threshold value and caption for one channel."""
+    from intan_rhx_dsp import effective_spike_threshold_uv
+
+    pol = spike_threshold_polarity
     if str(mode).strip().lower() != "rms_multiple":
-        return float(fixed_threshold_uv), _spike_threshold_caption(float(fixed_threshold_uv))
-    if source is None:
-        return float(fixed_threshold_uv), _spike_threshold_caption(float(fixed_threshold_uv))
-    mean_rms_uv = source.mean_rms_for_channel(int(channel_index))
-    threshold_uv = float(rms_multiplier) * float(mean_rms_uv)
-    return threshold_uv, f"{rms_multiplier:g}x RMS mean/channel ({threshold_uv:g} µV)"
+        eff = effective_spike_threshold_uv(fixed_threshold_uv, pol)  # type: ignore[arg-type]
+        return eff, _spike_threshold_caption(fixed_threshold_uv, pol)
+    if mean_rms_uv is None:
+        if source is None:
+            eff = effective_spike_threshold_uv(fixed_threshold_uv, pol)  # type: ignore[arg-type]
+            return eff, _spike_threshold_caption(fixed_threshold_uv, pol)
+        mean_rms_uv = source.mean_rms_for_channel(int(channel_index))
+    magnitude_uv = float(rms_multiplier) * float(mean_rms_uv)
+    eff = effective_spike_threshold_uv(magnitude_uv, pol)  # type: ignore[arg-type]
+    direction = "below" if pol == "negative" else "above"
+    return eff, (
+        f"{rms_multiplier:g}x RMS mean/channel "
+        f"({magnitude_uv:g} µV, {direction})"
+    )
+
+
+class _PlotRenderCache:
+    """Caches per-channel means, RMS profiles, spike times and thresholds during PDF render."""
+
+    def __init__(
+        self,
+        t_rel: np.ndarray,
+        pre_n: int,
+        post_n: int,
+        t0_rms: float,
+        t1_rms: float,
+        rms_window_s: float,
+    ) -> None:
+        self.t_rel = t_rel
+        self.pre_n = int(pre_n)
+        self.post_n = int(post_n)
+        self.t0_rms = float(t0_rms)
+        self.t1_rms = float(t1_rms)
+        self.rms_window_s = float(rms_window_s)
+        self.n_expected = int(t_rel.shape[0])
+        self._mean_raw: dict[tuple[int, int], np.ndarray] = {}
+        self._mean_hp: dict[tuple[int, int], np.ndarray] = {}
+        self._rms: dict[tuple[int, int | None], tuple[np.ndarray, np.ndarray]] = {}
+        self._spikes: dict[tuple[int, int, float], list[np.ndarray]] = {}
+        self._channel_rms_uv: dict[tuple[int, int], float] = {}
+        self._threshold: dict[tuple[int, int], tuple[float, str]] = {}
+
+    @staticmethod
+    def _normalize_mean_row(row: np.ndarray, n_expected: int) -> np.ndarray:
+        y = np.asarray(row, dtype=np.float64)
+        if y.shape[0] != n_expected:
+            y = np.asarray(y[:n_expected], dtype=np.float64)
+        return y
+
+    def prefill_means(
+        self,
+        spike_sources: Sequence[AmplifierSpikeSource],
+        n_channels: int,
+        channel_workers: int | None = None,
+    ) -> None:
+        """Pre-compute all channel means in parallel (mmap-friendly, one pass per stack)."""
+        for src_idx, src in enumerate(spike_sources):
+            n_ch = min(int(n_channels), int(src.amplifier.shape[0]))
+            if n_ch <= 0:
+                continue
+            workers = resolve_channel_workers(channel_workers, n_ch)
+            check_analysis_cancelled()
+            raw_all = mean_triggered_windows_channelwise(
+                src.amplifier,
+                src.valid_triggers,
+                self.pre_n,
+                self.post_n,
+                channel_workers=workers,
+            )
+            check_analysis_cancelled()
+            hp_all = mean_triggered_windows_channelwise(
+                src.highpass,
+                src.valid_triggers,
+                self.pre_n,
+                self.post_n,
+                channel_workers=workers,
+            )
+            for ch in range(n_ch):
+                self._mean_raw[(src_idx, ch)] = self._normalize_mean_row(
+                    raw_all[ch], self.n_expected
+                )
+                self._mean_hp[(src_idx, ch)] = self._normalize_mean_row(
+                    hp_all[ch], self.n_expected
+                )
+
+    def mean_raw(self, src_idx: int, source: AmplifierSpikeSource, ch: int) -> np.ndarray:
+        key = (src_idx, ch)
+        cached = self._mean_raw.get(key)
+        if cached is not None:
+            return cached
+        mean = _mean_triggered_average_row(
+            source._amp_row(ch),
+            source.valid_triggers,
+            self.pre_n,
+            self.post_n,
+            self.n_expected,
+        )
+        self._mean_raw[key] = mean
+        return mean
+
+    def mean_hp(self, src_idx: int, source: AmplifierSpikeSource, ch: int) -> np.ndarray:
+        key = (src_idx, ch)
+        cached = self._mean_hp.get(key)
+        if cached is not None:
+            return cached
+        mean = _mean_triggered_average_row(
+            source._high_row(ch),
+            source.valid_triggers,
+            self.pre_n,
+            self.post_n,
+            self.n_expected,
+        )
+        self._mean_hp[key] = mean
+        return mean
+
+    def rms_profile(
+        self,
+        src_idx: int,
+        source: AmplifierSpikeSource,
+        channel_index: int | None = None,
+        *,
+        n_channels: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if channel_index is None:
+            if n_channels is None:
+                n_channels = int(source.highpass.shape[0])
+            return self.rms_profile_recording_mean(src_idx, int(n_channels))
+        key = (src_idx, channel_index)
+        cached = self._rms.get(key)
+        if cached is not None:
+            return cached
+        profile = _mean_rms_profile_from_source_window(
+            source,
+            self.t0_rms,
+            self.t1_rms,
+            self.rms_window_s,
+            channel_index=channel_index,
+        )
+        self._rms[key] = profile
+        return profile
+
+    def rms_profile_recording_mean(
+        self,
+        src_idx: int,
+        n_channels: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Mean RMS across channels from already-cached per-channel profiles."""
+        key = (src_idx, None)
+        cached = self._rms.get(key)
+        if cached is not None:
+            return cached
+        tx_ref: np.ndarray | None = None
+        acc: np.ndarray | None = None
+        n_ok = 0
+        for ch in range(int(n_channels)):
+            per_ch = self._rms.get((src_idx, ch))
+            if per_ch is None:
+                continue
+            tx, vals = per_ch
+            if vals.size == 0 or tx.size == 0:
+                continue
+            if acc is None:
+                tx_ref = np.asarray(tx, dtype=np.float64)
+                acc = np.asarray(vals, dtype=np.float64)
+                n_ok = 1
+            elif tx_ref is not None and tx.shape == tx_ref.shape and np.array_equal(tx, tx_ref):
+                acc += np.asarray(vals, dtype=np.float64)
+                n_ok += 1
+        if acc is None or tx_ref is None or n_ok == 0:
+            empty = np.array([], dtype=np.float64)
+            profile = (empty, empty)
+        else:
+            profile = (tx_ref, acc / float(n_ok))
+        self._rms[key] = profile
+        return profile
+
+    def prefill_channel_metrics(
+        self,
+        spike_sources: Sequence[AmplifierSpikeSource],
+        n_channels: int,
+        channel_workers: int | None,
+        *,
+        spike_threshold_mode: str,
+        spike_threshold_uv: float,
+        spike_threshold_polarity: str,
+        spike_threshold_rms_multiplier: float,
+    ) -> None:
+        """Pre-compute per-channel RMS and spike times in parallel before PDF pages."""
+        n_src = len(spike_sources)
+        n_ch = int(n_channels)
+        jobs = [(si, ch) for si in range(n_src) for ch in range(n_ch)]
+
+        def _one(job: tuple[int, int]) -> None:
+            si, ch = job
+            src = spike_sources[si]
+            check_analysis_cancelled()
+            self.rms_profile(si, src, ch)
+            thr_uv, _ = self.resolve_threshold(
+                si,
+                mode=spike_threshold_mode,
+                fixed_threshold_uv=spike_threshold_uv,
+                spike_threshold_polarity=spike_threshold_polarity,
+                rms_multiplier=spike_threshold_rms_multiplier,
+                source=src,
+                channel_index=ch,
+            )
+            self.spike_times_per_trial(si, src, ch, thr_uv)
+
+        workers = resolve_channel_workers(channel_workers, len(jobs))
+        if workers <= 1 or len(jobs) <= 1:
+            for job in jobs:
+                _one(job)
+            return
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_one, jobs, chunksize=max(1, len(jobs) // (workers * 4))))
+
+    def channel_rms_uv(self, src_idx: int, source: AmplifierSpikeSource, ch: int) -> float:
+        key = (src_idx, ch)
+        cached = self._channel_rms_uv.get(key)
+        if cached is not None:
+            return cached
+        value = float(source.mean_rms_for_channel(ch))
+        self._channel_rms_uv[key] = value
+        return value
+
+    def resolve_threshold(
+        self,
+        src_idx: int,
+        *,
+        mode: str,
+        fixed_threshold_uv: float,
+        spike_threshold_polarity: str,
+        rms_multiplier: float,
+        source: AmplifierSpikeSource,
+        channel_index: int,
+    ) -> tuple[float, str]:
+        key = (src_idx, channel_index)
+        cached = self._threshold.get(key)
+        if cached is not None:
+            return cached
+        if str(mode).strip().lower() != "rms_multiple":
+            resolved = _resolve_channel_spike_threshold(
+                mode=mode,
+                fixed_threshold_uv=fixed_threshold_uv,
+                spike_threshold_polarity=spike_threshold_polarity,
+                rms_multiplier=rms_multiplier,
+                source=source,
+                channel_index=channel_index,
+            )
+        else:
+            resolved = _resolve_channel_spike_threshold(
+                mode=mode,
+                fixed_threshold_uv=fixed_threshold_uv,
+                spike_threshold_polarity=spike_threshold_polarity,
+                rms_multiplier=rms_multiplier,
+                source=source,
+                channel_index=channel_index,
+                mean_rms_uv=self.channel_rms_uv(src_idx, source, channel_index),
+            )
+        self._threshold[key] = resolved
+        return resolved
+
+    def spike_times_per_trial(
+        self,
+        src_idx: int,
+        source: AmplifierSpikeSource,
+        ch: int,
+        threshold_uv: float,
+    ) -> list[np.ndarray]:
+        key = (src_idx, ch, float(threshold_uv))
+        cached = self._spikes.get(key)
+        if cached is not None:
+            return cached
+        spikes = source.spike_times_per_trial_for_channel(ch, self.t_rel, threshold_uv)
+        self._spikes[key] = spikes
+        return spikes
 
 
 def _draw_impedance_evolution_panel(
@@ -1441,10 +1828,8 @@ def _mean_rms_profile_from_source_window(
     rms_window_s: float,
     channel_index: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Mean RMS profile in window [t0_s, t1_s], averaged over triggers.
-
-    Intan-like preprocessing: per-channel DC removal + AP-like band-pass.
-    """
+    """Mean RMS profile in [t0_s, t1_s], averaged over triggers (Intan Spike Scope, 1 s on HIGH)."""
+    del rms_window_s  # Intan uses source.intan_dsp.rms_window_s (1 s).
     if source.valid_triggers.size == 0 or t1_s <= t0_s:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     fs = float(source.fs)
@@ -1452,25 +1837,12 @@ def _mean_rms_profile_from_source_window(
     end_off = int(round(float(t1_s) * fs))
     if end_off <= start_off:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-    bp_low = (
-        float(source.bandpass_low_hz)
-        if source.bandpass_low_hz is not None
-        else RMS_INTAN_LIKE_BANDPASS_LOW_HZ
-    )
-    bp_high = (
-        float(source.bandpass_high_hz)
-        if source.bandpass_high_hz is not None
-        else RMS_INTAN_LIKE_BANDPASS_HIGH_HZ
-    )
-    nyq = 0.5 * fs
-    use_bandpass = bp_low > 0 and bp_high > bp_low and bp_high < nyq
-    n_channels = int(source.amplifier.shape[0])
-    n_samples = int(source.amplifier.shape[1])
+    n_channels = int(source.highpass.shape[0])
+    n_samples = int(source.highpass.shape[1])
     ch_idx = int(channel_index) if channel_index is not None else None
     if ch_idx is not None and (ch_idx < 0 or ch_idx >= n_channels):
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     n_win = int(end_off - start_off)
-    rms_n = max(1, int(round(float(rms_window_s) * fs)))
     t_axis = np.arange(start_off, end_off, dtype=np.float64) / fs
 
     valid_trigs: list[int] = []
@@ -1483,104 +1855,27 @@ def _mean_rms_profile_from_source_window(
     if not valid_trigs:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
 
-    if ch_idx is not None:
-        # Fast path: stack all trigger windows for one channel, then filter in batch.
-        seg_stack = np.empty((len(valid_trigs), n_win), dtype=np.float64)
-        for i, trig in enumerate(valid_trigs):
-            start = int(trig + start_off)
-            end = int(trig + end_off)
-            seg_stack[i, :] = np.asarray(source.amplifier[ch_idx, start:end], dtype=np.float64)
-        seg_stack = seg_stack - np.mean(seg_stack, axis=1, keepdims=True)
-        if use_bandpass and n_win >= 32:
-            try:
-                seg_stack = apply_butterworth_bandpass(seg_stack, fs, bp_low, bp_high)
-            except Exception:
-                pass
-        sq = seg_stack * seg_stack
-        rms_trials = np.sqrt(uniform_filter1d(sq, size=rms_n, axis=1, mode="constant", cval=0.0))
-        return t_axis, np.mean(rms_trials, axis=0)
-
+    channel_indices = [ch_idx] if ch_idx is not None else list(range(n_channels))
+    pad = source.intan_dsp.rms_window_samples
     acc = np.zeros(n_win, dtype=np.float64)
     n_ok = 0
     for trig in valid_trigs:
-        start = int(trig + start_off)
-        end = int(trig + end_off)
-        seg = np.asarray(source.amplifier[:, start:end], dtype=np.float64)
-        if seg.size == 0 or seg.shape[1] != n_win:
-            continue
-        seg = seg - np.mean(seg, axis=1, keepdims=True)
-        if use_bandpass and seg.shape[1] >= 32:
-            try:
-                seg = apply_butterworth_bandpass(seg, fs, bp_low, bp_high)
-            except Exception:
-                pass
-        sq = seg * seg
-        ch_rms = np.sqrt(uniform_filter1d(sq, size=rms_n, axis=1, mode="constant", cval=0.0))
-        acc += np.mean(ch_rms, axis=0)
+        seg_stack = np.empty((len(channel_indices), n_win), dtype=np.float64)
+        for i, ch in enumerate(channel_indices):
+            row = source.highpass[ch]
+            seg_start = int(trig + start_off)
+            seg_end = int(trig + end_off)
+            r0 = max(0, seg_start - pad)
+            rms_seg = sliding_rms_intan_profile_range(
+                row, source.intan_dsp, r0, seg_end
+            )
+            seg_stack[i, :] = rms_seg[seg_start - r0 : seg_end - r0]
+        acc += np.mean(seg_stack, axis=0)
         n_ok += 1
     if n_ok == 0:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     return t_axis, acc / float(n_ok)
 
-
-@_profiled("rms_from_windows_window")
-def _mean_rms_profile_from_windows_window(
-    windows: np.ndarray,
-    t_rel: np.ndarray,
-    t0_s: float,
-    t1_s: float,
-    rms_window_s: float,
-    channel_index: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Mean RMS profile in window [t0_s, t1_s], averaged over trials.
-
-    Intan-like preprocessing: per-channel DC removal + AP-like band-pass.
-    """
-    if windows is None or windows.ndim != 3 or windows.shape[0] == 0 or t1_s <= t0_s:
-        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-    start_idx = int(np.searchsorted(t_rel, float(t0_s), side="left"))
-    end_idx = int(np.searchsorted(t_rel, float(t1_s), side="left"))
-    start_idx = max(0, min(start_idx, int(windows.shape[2])))
-    end_idx = max(0, min(end_idx, int(windows.shape[2])))
-    if end_idx <= start_idx:
-        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-    seg = np.asarray(windows[:, :, start_idx:end_idx], dtype=np.float64)
-    if seg.size == 0:
-        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-    ch_idx = int(channel_index) if channel_index is not None else None
-    if ch_idx is not None:
-        if ch_idx < 0 or ch_idx >= seg.shape[1]:
-            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-        # Performance: in per-channel mode, process only one channel.
-        seg = seg[:, ch_idx : ch_idx + 1, :]
-    seg = seg - np.mean(seg, axis=2, keepdims=True)
-    dt = float(np.median(np.diff(t_rel)))
-    fs = 1.0 / dt if dt > 0 else 0.0
-    rms_n = max(1, int(round(float(rms_window_s) * fs))) if fs > 0 else 1
-    nyq = 0.5 * fs if fs > 0 else 0.0
-    use_bandpass = (
-        fs > 0
-        and RMS_INTAN_LIKE_BANDPASS_LOW_HZ > 0
-        and RMS_INTAN_LIKE_BANDPASS_HIGH_HZ > RMS_INTAN_LIKE_BANDPASS_LOW_HZ
-        and RMS_INTAN_LIKE_BANDPASS_HIGH_HZ < nyq
-        and seg.shape[2] >= 32
-    )
-    if use_bandpass:
-        try:
-            flat = seg.reshape(seg.shape[0] * seg.shape[1], seg.shape[2])
-            flat = apply_butterworth_bandpass(
-                flat, fs, RMS_INTAN_LIKE_BANDPASS_LOW_HZ, RMS_INTAN_LIKE_BANDPASS_HIGH_HZ
-            )
-            seg = flat.reshape(seg.shape[0], seg.shape[1], seg.shape[2])
-        except Exception:
-            pass
-    sq = seg * seg
-    rms_all = np.sqrt(uniform_filter1d(sq, size=rms_n, axis=2, mode="constant", cval=0.0))
-    if ch_idx is not None:
-        profile = np.mean(rms_all[:, 0, :], axis=0)
-    else:
-        profile = np.mean(np.mean(rms_all, axis=1), axis=0)
-    return np.asarray(t_rel[start_idx:end_idx], dtype=np.float64), np.asarray(profile, dtype=np.float64)
 
 
 def _slice_rms_profile_window(
@@ -1622,7 +1917,7 @@ def _plot_rms_series(
         ax.set_title(title)
         ax.set_xlabel(TIME_REL_XLABEL)
         ax.set_ylabel("Mean RMS (µV)")
-        ax.set_ylim(0.0, 10.0)
+        ax.set_ylim(0.0, 20.0)
         if x_limits is not None:
             ax.set_xlim(float(x_limits[0]), float(x_limits[1]))
         ax.grid(True, alpha=0.3)
@@ -1643,8 +1938,11 @@ def _append_mean_rms_evolution_page(
     pdf: PdfPages,
     rms_series: Sequence[tuple[str, np.ndarray, np.ndarray]],
     rms_window_s: float,
+    *,
+    filter_title: str | None = None,
 ) -> None:
     """Append one summary page: mean RMS profile on analysis timebase."""
+    title_filter = filter_title or _default_filter_title_label()
     check_analysis_cancelled()
     fig, ax = plt.subplots(figsize=(SUMMARY_PAGE_WIDTH_IN, SUMMARY_PAGE_HEIGHT_IN))
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
@@ -1661,7 +1959,7 @@ def _append_mean_rms_evolution_page(
             label=label,
         )
     if has_data:
-        ax.set_title(f"Mean RMS profile (RMS window = {rms_window_s:g} s)")
+        ax.set_title(f"Mean RMS profile ({title_filter}, RMS window = 1 s)")
         ax.set_xlabel(TIME_REL_XLABEL)
         ax.set_ylabel("Mean RMS across channels (µV)")
         ax.set_ylim(0.0, 10.0)
@@ -1685,58 +1983,39 @@ def _append_mean_rms_evolution_page(
 
 def plot_channel_multi_comparison(
     t_rel: np.ndarray,
-    means: Sequence[np.ndarray],
     channel_names: Sequence[str],
     output_dir: Path,
     labels: Sequence[str],
+    spike_sources: Sequence[AmplifierSpikeSource],
+    pre_n_common: int,
+    post_n_common: int,
     pdf_title: Optional[str] = None,
-    lowpass_cutoff_hz: Optional[float] = None,
-    curve_filter: str = "no filter",
-    curve_filter_low_hz: Optional[float] = None,
-    curve_filter_high_hz: Optional[float] = None,
     trigger_end_rising_rel_s_list: Optional[Sequence[Optional[float]]] = None,
-    means_raw: Optional[Sequence[np.ndarray]] = None,
-    spike_sources: Optional[Sequence[Optional[AmplifierSpikeSource]]] = None,
     fs: Optional[float] = None,
-    spike_threshold_uv: float = -40.0,
+    spike_threshold_uv: float = 70.0,
+    spike_threshold_polarity: str = "negative",
     spike_threshold_mode: str = "fixed",
     spike_threshold_rms_multiplier: float = 4.0,
     psth_bin_window_s: float = 0.025,
     rms_window_s: float = 0.050,
     zoom_t0_s: float = ZOOM_T0,
     zoom_t1_s: float = ZOOM_T1,
-    spike_bandpass_low_hz: Optional[float] = None,
-    spike_bandpass_high_hz: Optional[float] = None,
     sampling_percent: int = 100,
     probe_layout_json: Optional[Path] = None,
-    streaming_mode: bool = False,
-    pre_n_common: Optional[int] = None,
-    post_n_common: Optional[int] = None,
     impedance_sessions: Optional[Sequence[ImpedanceSession]] = None,
+    channel_workers: int | None = None,
+    first_trigger_hp_ylim_enabled: bool = False,
+    first_trigger_hp_ylim_min_uv: float = -200.0,
+    first_trigger_hp_ylim_max_uv: float = 200.0,
 ) -> Path:
-    """Multi-page PDF: overlay of N recordings (same aligned channels).
-
-    This renderer now uses a single source-based pipeline (AmplifierSpikeSource)
-    for all multi-comparison runs so display structure remains homogeneous and
-    options only control which curves are shown.
-
-    Deprecated compatibility parameters:
-    - `means`: ignored by the renderer.
-    - `means_raw`: ignored by the renderer.
-    - `streaming_mode`: ignored by the renderer.
-    Prefer passing `spike_sources` + (`pre_n_common`, `post_n_common`).
-    """
+    """Multi-page PDF: overlay of N recordings (same aligned channels)."""
     _profile_before = _profile_snapshot()
     _profile_t0 = time.perf_counter()
-    # Legacy args (`means`, `means_raw`, `streaming_mode`) are intentionally kept
-    # for API compatibility. Rendering always uses the source-based pipeline.
     n_records = len(labels)
     if n_records < 1:
         raise ValueError("plot_channel_multi_comparison requires at least 1 aligned recording.")
-    if spike_sources is None or len(spike_sources) != n_records:
+    if len(spike_sources) != n_records:
         raise ValueError("`spike_sources` must contain N recordings.")
-    if pre_n_common is None or post_n_common is None:
-        raise ValueError("`pre_n_common` and `post_n_common` are required.")
     if any(src is None for src in spike_sources):
         raise ValueError("All entries in `spike_sources` must be non-null.")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1749,14 +2028,24 @@ def plot_channel_multi_comparison(
     pdf_path = output_dir / pdf_name
 
     zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
-    curve_filter_enabled, filt_note, curve_filter_legend = _curve_filter_captions(
-        curve_filter=curve_filter,
-        curve_filter_low_hz=curve_filter_low_hz,
-        curve_filter_high_hz=curve_filter_high_hz,
-        lowpass_cutoff_hz=lowpass_cutoff_hz,
+    first_trigger_hp_ylim: tuple[float, float] | None = None
+    if first_trigger_hp_ylim_enabled:
+        y_lo = float(first_trigger_hp_ylim_min_uv)
+        y_hi = float(first_trigger_hp_ylim_max_uv)
+        if y_hi <= y_lo:
+            raise ValueError(
+                "First-trigger HP y-axis: maximum (µV) must be strictly greater than minimum."
+            )
+        first_trigger_hp_ylim = (y_lo, y_hi)
+    main_intan_dsp = spike_sources[0].intan_dsp if spike_sources else None
+    filter_title = (
+        main_intan_dsp.filter_title_label()
+        if main_intan_dsp is not None
+        else _default_filter_title_label()
     )
-    both_note = " — raw signal overlaid (filtered curve emphasized)" if curve_filter_enabled else ""
-    zoom_title = f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){filt_note}{both_note}"
+    intan_hp_filt_note, _ = _intan_hp_mean_filter_captions(main_intan_dsp)
+    both_note = " — raw and filtered means on separate panels"
+    zoom_title = f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){intan_hp_filt_note}{both_note}"
     n_channels = min(src.amplifier.shape[0] for src in spike_sources)
     zmask = (t_rel >= zoom_t0) & (t_rel <= zoom_t1)
     end_markers = [v for v in (trigger_end_rising_rel_s_list or []) if v is not None]
@@ -1764,63 +2053,61 @@ def plot_channel_multi_comparison(
         fs is not None
         and len(spike_sources) == n_records
     )
-    _, spike_cmp_pipe = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
+    _, spike_cmp_pipe = _spike_pipeline_captions(intan_dsp=spike_sources[0].intan_dsp)
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
 
     probe_layout_loaded = None
     if probe_layout_json is not None:
         probe_layout_loaded = load_probe_layout_json(Path(probe_layout_json))
+    t0_rms = float(t_rel[0]) if t_rel.size else 0.0
+    t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
+    render_cache = _PlotRenderCache(
+        t_rel,
+        int(pre_n_common),
+        int(post_n_common),
+        t0_rms,
+        t1_rms,
+        rms_window_s,
+    )
+    render_cache.prefill_means(spike_sources, n_channels, channel_workers=channel_workers)
+    print(
+        f"Pre-computing RMS and spikes for {n_channels} channel(s) × {n_records} recording(s)..."
+    )
+    render_cache.prefill_channel_metrics(
+        spike_sources,
+        n_channels,
+        channel_workers,
+        spike_threshold_mode=spike_threshold_mode,
+        spike_threshold_uv=spike_threshold_uv,
+        spike_threshold_polarity=spike_threshold_polarity,
+        spike_threshold_rms_multiplier=spike_threshold_rms_multiplier,
+    )
     with PdfPages(pdf_path) as pdf:
         for ch in range(n_channels):
             check_analysis_cancelled()
             channel_name = str(channel_names[ch])
             means_ch: list[np.ndarray] = []
-            means_raw_ch: list[np.ndarray] | None = [] if curve_filter_enabled else None
-            win_len = int(pre_n_common) + int(post_n_common)
-            for src in spike_sources:
-                row = np.asarray(src.amplifier[ch], dtype=np.float64)
-                acc_raw = np.zeros(win_len, dtype=np.float64)
-                for trig in src.valid_triggers:
-                    start = int(trig - int(pre_n_common))
-                    end = int(trig + int(post_n_common))
-                    acc_raw += row[start:end]
-                y_raw = acc_raw / float(max(len(src.valid_triggers), 1))
-                if len(y_raw) != len(t_rel):
-                    y_raw = np.asarray(y_raw[: len(t_rel)])
-                if curve_filter_enabled:
-                    row_f = _apply_curve_filter_to_row(
-                        row,
-                        float(fs or src.fs),
-                        curve_filter=curve_filter,
-                        curve_filter_low_hz=curve_filter_low_hz,
-                        curve_filter_high_hz=curve_filter_high_hz,
-                        lowpass_cutoff_hz=lowpass_cutoff_hz,
-                    )
-                    acc_f = np.zeros(win_len, dtype=np.float64)
-                    for trig in src.valid_triggers:
-                        start = int(trig - int(pre_n_common))
-                        end = int(trig + int(post_n_common))
-                        acc_f += row_f[start:end]
-                    y_f = acc_f / float(max(len(src.valid_triggers), 1))
-                    if len(y_f) != len(t_rel):
-                        y_f = np.asarray(y_f[: len(t_rel)])
-                    means_ch.append(np.asarray(y_f))
-                    assert means_raw_ch is not None
-                    means_raw_ch.append(np.asarray(y_raw))
-                else:
-                    means_ch.append(np.asarray(y_raw))
+            means_raw_ch: list[np.ndarray] = []
+            intan_hp_legends: list[str] = []
+            for src_idx, src in enumerate(spike_sources):
+                means_raw_ch.append(render_cache.mean_raw(src_idx, src, ch))
+                means_ch.append(render_cache.mean_hp(src_idx, src, ch))
+                _hp_note, hp_legend = _intan_hp_mean_filter_captions(src.intan_dsp)
+                intan_hp_legends.append(hp_legend)
 
             fig, _axes = _build_three_part_page_axes(
                 zoom_t0=zoom_t0,
                 zoom_t1=zoom_t1,
                 n_recordings=n_records,
-                first_row_height_ratio=2.0,
+                first_row_height_ratio=2.2,
                 first_row_text=None,
                 first_row_mea_channel_name=channel_name,
                 probe_layout=probe_layout_loaded,
                 include_impedance_panel=bool(impedance_sessions),
             )
             ax_full = _axes["ax_full"]
+            ax_full_filt = _axes["ax_full_filt"]
+            ax_first_trigger_hp = _axes["ax_first_trigger_hp"]
             ax_first_trigger = _axes["ax_first_trigger"]
             ax_full_rms = _axes["ax_full_rms"]
             ax_raster_f = _axes["ax_raster_f"]
@@ -1828,6 +2115,8 @@ def plot_channel_multi_comparison(
             ax_trial_fr_f = _axes["ax_trial_fr_f"]
             ax_isi_f = _axes["ax_isi_f"]
             ax_zoom = _axes["ax_zoom"]
+            ax_zoom_filt = _axes["ax_zoom_filt"]
+            ax_zoom_first_hp = _axes["ax_zoom_first_hp"]
             ax_zoom_first = _axes["ax_zoom_first"]
             ax_zoom_rms = _axes["ax_zoom_rms"]
             ax_raster_z = _axes["ax_raster_z"]
@@ -1835,6 +2124,8 @@ def plot_channel_multi_comparison(
             ax_trial_fr_z = _axes["ax_trial_fr_z"]
             ax_isi_z = _axes["ax_isi_z"]
             ax_zoom_end = _axes["ax_zoom_end"]
+            ax_zoom_end_filt = _axes["ax_zoom_end_filt"]
+            ax_zoom_end_first_hp = _axes["ax_zoom_end_first_hp"]
             ax_zoom_end_first = _axes["ax_zoom_end_first"]
             ax_zoom_end_rms = _axes["ax_zoom_end_rms"]
             ax_raster_ze = _axes["ax_raster_ze"]
@@ -1846,37 +2137,13 @@ def plot_channel_multi_comparison(
                 ax_imp = _axes["ax_imp"]
                 _draw_impedance_evolution_panel(ax_imp, channel_name, impedance_sessions)
 
-            show_filtered_and_raw = (
-                curve_filter_enabled
-                and means_raw_ch is not None
-                and len(means_raw_ch) == len(means_ch)
-                and any(
-                    not np.allclose(np.asarray(means_ch[i]), np.asarray(means_raw_ch[i]), rtol=0.0, atol=1e-9)
-                    for i in range(len(means_ch))
-                )
-            )
-            main_lw = 1.35
-            base_lw = 1.2
-            raw_lw = 1.0
-            raw_alpha = 0.35
-            first_lw = 1.1
-            legend_cols = 2 if len(means_ch) > 4 else min(4, max(1, len(means_ch)))
-            legend_font = LEGEND_FONT_SIZE
-            aux_legend_label = None
+            legend_cols = 1
             rms_series_full_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
             rms_series_zoom_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
             rms_series_zoom_end_multi: list[tuple[str, np.ndarray, np.ndarray]] = []
-            t0_rms = float(t_rel[0]) if t_rel.size else 0.0
-            t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
             for i, src in enumerate(spike_sources):
                 label = labels[i] if i < len(labels) else f"Recording {i + 1}"
-                tx_full, rms_full_vals = _mean_rms_profile_from_source_window(
-                    src,
-                    t0_rms,
-                    t1_rms,
-                    rms_window_s,
-                    channel_index=ch,
-                )
+                tx_full, rms_full_vals = render_cache.rms_profile(i, src, channel_index=ch)
                 rms_series_full_multi.append((label, tx_full, rms_full_vals))
                 tx_zoom, rms_zoom_vals = _slice_rms_profile_window(
                     tx_full,
@@ -1900,166 +2167,78 @@ def plot_channel_multi_comparison(
                         float(marker_i + zoom_t1),
                     )
                     rms_series_zoom_end_multi.append((label, tx_end, rms_zoom_end_vals))
-            first_trigger_curves: list[Optional[np.ndarray]] = []
-            for src in spike_sources:
-                if src.valid_triggers.size == 0:
-                    first_trigger_curves.append(None)
-                    continue
-                first_trig = int(src.valid_triggers[0])
-                start = int(first_trig - src.pre_n)
-                end = int(first_trig + src.post_n)
-                first_curve = np.asarray(src.amplifier[ch, start:end], dtype=np.float64)
-                if first_curve.shape[0] != t_rel.shape[0]:
-                    first_trigger_curves.append(None)
-                    continue
-                first_trigger_curves.append(first_curve)
-            for recording_index, recording_curve in enumerate(means_ch):
-                line_color = colors[recording_index % len(colors)]
-                if show_filtered_and_raw and means_raw_ch is not None:
-                    raw_curve = np.asarray(means_raw_ch[recording_index])
-                    ax_full.plot(t_rel, raw_curve, linewidth=raw_lw, color=line_color, alpha=raw_alpha, label="_nolegend_")
-                    ax_full.plot(
-                        t_rel,
-                        recording_curve,
-                        linewidth=main_lw,
-                        color=line_color,
-                        label=f"{labels[recording_index]} (filtered {curve_filter_legend})",
-                    )
-                    ax_zoom.plot(t_rel[zmask], raw_curve[zmask], linewidth=raw_lw, color=line_color, alpha=raw_alpha, label="_nolegend_")
-                    ax_zoom.plot(
-                        t_rel[zmask],
-                        recording_curve[zmask],
-                        linewidth=main_lw,
-                        color=line_color,
-                        label=f"{labels[recording_index]} (filtered {curve_filter_legend})",
-                    )
-                else:
-                    ax_full.plot(t_rel, recording_curve, linewidth=base_lw, color=line_color, label=labels[recording_index])
-                    ax_zoom.plot(t_rel[zmask], recording_curve[zmask], linewidth=main_lw, color=line_color, label=labels[recording_index])
-            ax_full.axvline(
-                0.0,
-                linestyle="--",
-                linewidth=1.0,
-                color="red",
-                label=("Trigger (onset)" if aux_legend_label is None else aux_legend_label),
+            first_trigger_raw, first_trigger_hp = _collect_first_trigger_windows(
+                spike_sources,
+                ch,
+                int(t_rel.shape[0]),
             )
-            for v in end_markers:
-                ax_full.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
-                ax_zoom.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
-            ax_full.axvspan(
-                zoom_t0,
-                zoom_t1,
-                alpha=0.12,
-                color="green",
-                label=("Zoom region" if aux_legend_label is None else aux_legend_label),
+            record_labels = [
+                labels[i] if i < len(labels) else f"Recording {i + 1}"
+                for i in range(len(means_ch))
+            ]
+            _plot_mean_section_trace_panels(
+                ax_raw=ax_full,
+                ax_filt=ax_full_filt,
+                ax_first_hp=ax_first_trigger_hp,
+                ax_first_raw=ax_first_trigger,
+                t_rel=t_rel,
+                time_mask=None,
+                x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
+                labels=record_labels,
+                mean_filtered=means_ch,
+                mean_raw=means_raw_ch,
+                first_trigger_raw=first_trigger_raw,
+                first_trigger_hp=first_trigger_hp,
+                colors=colors,
+                zoom_t0=zoom_t0,
+                zoom_t1=zoom_t1,
+                end_markers=end_markers,
+                intan_hp_legends=intan_hp_legends,
+                title_raw=f"Multi-comparison — {channel_name} — mean (raw, averaged){both_note}",
+                title_filt=f"Multi-comparison — {channel_name} (full view){intan_hp_filt_note}{both_note}",
+                title_first_hp=f"Part 1 — First trigger ({filter_title})",
+                title_first_raw="Part 1 — First trigger raw (no averaging)",
+                legend_cols=legend_cols,
+                first_trigger_hp_ylim=first_trigger_hp_ylim,
             )
-            if end_markers:
-                end_zoom_t0 = float(min(end_markers) + zoom_t0)
-                end_zoom_t1 = float(max(end_markers) + zoom_t1)
-                ax_full.axvspan(
-                    end_zoom_t0,
-                    end_zoom_t1,
-                    alpha=0.10,
-                    color="gold",
-                    label=(
-                        "Trigger-end zoom region"
-                        if aux_legend_label is None
-                        else aux_legend_label
-                    ),
-                )
-            ax_full.set_title(f"Multi-comparison — {channel_name} (full view){filt_note}{both_note}")
-            ax_full.set_ylabel("Potential (µV)")
-            ax_full.set_xlabel(TIME_REL_XLABEL)
-            ax_full.grid(True, alpha=0.3)
-            ax_full.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
-
-            if any(curve is not None for curve in first_trigger_curves):
-                for recording_index, first_curve in enumerate(first_trigger_curves):
-                    if first_curve is None:
-                        continue
-                    line_color = colors[recording_index % len(colors)]
-                    ax_first_trigger.plot(
-                        t_rel,
-                        first_curve,
-                        linewidth=first_lw,
-                        color=line_color,
-                        label=f"{labels[recording_index]} first trigger raw",
-                    )
-                ax_first_trigger.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
-                for v in end_markers:
-                    ax_first_trigger.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
-                ax_first_trigger.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
-                if end_markers:
-                    end_zoom_t0 = float(min(end_markers) + zoom_t0)
-                    end_zoom_t1 = float(max(end_markers) + zoom_t1)
-                    ax_first_trigger.axvspan(
-                        end_zoom_t0,
-                        end_zoom_t1,
-                        alpha=0.10,
-                        color="gold",
-                        label="Trigger-end zoom region",
-                    )
-                ax_first_trigger.set_title("First trigger — raw signal (no averaging)")
-                ax_first_trigger.set_ylabel("Potential (µV)")
-                ax_first_trigger.set_xlabel(TIME_REL_XLABEL)
-                ax_first_trigger.grid(True, alpha=0.3)
-            else:
-                ax_first_trigger.text(
-                    0.5,
-                    0.5,
-                    "First trigger raw signal unavailable",
-                    ha="center",
-                    va="center",
-                    transform=ax_first_trigger.transAxes,
-                )
-                ax_first_trigger.set_axis_off()
             _plot_rms_series(
                 ax_full_rms,
                 rms_series_full_multi,
-                f"Part 1 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                f"Part 1 — RMS evolution ({filter_title}, RMS window = 1 s)",
                 x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
             )
 
-            ax_zoom.axvline(
-                0.0,
-                linestyle="--",
-                linewidth=1.0,
-                color="red",
-                label=("Trigger (onset)" if aux_legend_label is None else aux_legend_label),
+            _plot_mean_section_trace_panels(
+                ax_raw=ax_zoom,
+                ax_filt=ax_zoom_filt,
+                ax_first_hp=ax_zoom_first_hp,
+                ax_first_raw=ax_zoom_first,
+                t_rel=t_rel,
+                time_mask=zmask,
+                x_limits=(zoom_t0, zoom_t1),
+                labels=record_labels,
+                mean_filtered=means_ch,
+                mean_raw=means_raw_ch,
+                first_trigger_raw=first_trigger_raw,
+                first_trigger_hp=first_trigger_hp,
+                colors=colors,
+                zoom_t0=zoom_t0,
+                zoom_t1=zoom_t1,
+                end_markers=end_markers,
+                intan_hp_legends=intan_hp_legends,
+                title_raw=f"Part 2 — Zoom mean (raw, averaged){both_note}",
+                title_filt=zoom_title,
+                title_first_hp=f"Part 2 — First trigger ({filter_title})",
+                title_first_raw="Part 2 — First trigger raw (separate view)",
+                legend_cols=legend_cols,
+                show_reference_on_first_raw=False,
+                show_reference_on_first_hp=False,
+                first_trigger_hp_ylim=first_trigger_hp_ylim,
             )
-            ax_zoom.set_xlim(zoom_t0, zoom_t1)
-            ax_zoom.set_title(zoom_title)
-            ax_zoom.set_ylabel("Potential (µV)")
-            ax_zoom.set_xlabel(TIME_REL_XLABEL)
-            ax_zoom.grid(True, alpha=0.3)
-            ax_zoom.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
-            if any(curve is not None for curve in first_trigger_curves):
-                for recording_index, first_curve in enumerate(first_trigger_curves):
-                    if first_curve is None:
-                        continue
-                    line_color = colors[recording_index % len(colors)]
-                    ax_zoom_first.plot(
-                        t_rel[zmask],
-                        first_curve[zmask],
-                        linewidth=first_lw,
-                        color=line_color,
-                        label=f"{labels[recording_index]} first trigger raw",
-                    )
-                ax_zoom_first.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
-                for v in end_markers:
-                    ax_zoom_first.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
-                ax_zoom_first.set_xlim(zoom_t0, zoom_t1)
-                ax_zoom_first.set_title("Part 2 — First trigger raw (separate view)")
-                ax_zoom_first.set_ylabel("Potential (µV)")
-                ax_zoom_first.set_xlabel(TIME_REL_XLABEL)
-                ax_zoom_first.grid(True, alpha=0.3)
-            else:
-                ax_zoom_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_first.transAxes)
-                ax_zoom_first.set_axis_off()
             _plot_rms_series(
                 ax_zoom_rms,
                 rms_series_zoom_multi,
-                f"Part 2 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                f"Part 2 — RMS evolution ({filter_title}, RMS window = 1 s)",
                 x_limits=(zoom_t0, zoom_t1),
             )
 
@@ -2069,87 +2248,70 @@ def plot_channel_multi_comparison(
                 end_zoom_t1 = float(max(end_markers) + zoom_t1)
                 end_zoom_range = (end_zoom_t0, end_zoom_t1)
                 end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
-                for recording_index, recording_curve in enumerate(means_ch):
-                    line_color = colors[recording_index % len(colors)]
-                    if show_filtered_and_raw and means_raw_ch is not None:
-                        raw_curve = np.asarray(means_raw_ch[recording_index])
-                        ax_zoom_end.plot(t_rel[end_mask], raw_curve[end_mask], linewidth=raw_lw, color=line_color, alpha=raw_alpha, label="_nolegend_")
-                        ax_zoom_end.plot(
-                            t_rel[end_mask],
-                            recording_curve[end_mask],
-                            linewidth=main_lw,
-                            color=line_color,
-                            label=f"{labels[recording_index]} (filtered {curve_filter_legend})",
-                        )
-                    else:
-                        ax_zoom_end.plot(t_rel[end_mask], recording_curve[end_mask], linewidth=main_lw, color=line_color, label=labels[recording_index])
-                ax_zoom_end.axvline(
-                    0.0,
-                    linestyle="--",
-                    linewidth=1.0,
-                    color="red",
-                    label=("Trigger (onset)" if aux_legend_label is None else aux_legend_label),
+                _plot_mean_section_trace_panels(
+                    ax_raw=ax_zoom_end,
+                    ax_filt=ax_zoom_end_filt,
+                    ax_first_hp=ax_zoom_end_first_hp,
+                    ax_first_raw=ax_zoom_end_first,
+                    t_rel=t_rel,
+                    time_mask=end_mask,
+                    x_limits=(end_zoom_t0, end_zoom_t1),
+                    labels=record_labels,
+                    mean_filtered=means_ch,
+                    mean_raw=means_raw_ch,
+                    first_trigger_raw=first_trigger_raw,
+                    first_trigger_hp=first_trigger_hp,
+                    colors=colors,
+                    zoom_t0=zoom_t0,
+                    zoom_t1=zoom_t1,
+                    end_markers=end_markers,
+                    intan_hp_legends=intan_hp_legends,
+                    title_raw=f"Part 3 — Trigger-end zoom mean (raw, averaged){both_note}",
+                    title_filt=(
+                        f"Trigger-end zoom: {end_zoom_t0:.2f} to {end_zoom_t1:.2f} s "
+                        f"(relative to trigger){intan_hp_filt_note}{both_note}"
+                    ),
+                    title_first_hp=f"Part 3 — First trigger ({filter_title})",
+                    title_first_raw="Part 3 — First trigger raw (separate view)",
+                    legend_cols=legend_cols,
+                    show_reference_on_first_raw=False,
+                    show_reference_on_first_hp=False,
+                    first_trigger_hp_ylim=first_trigger_hp_ylim,
                 )
-                for v in end_markers:
-                    ax_zoom_end.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
-                ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
-                ax_zoom_end.set_title(f"Trigger-end zoom: {end_zoom_t0:.2f} to {end_zoom_t1:.2f} s (relative to trigger){filt_note}{both_note}")
-                ax_zoom_end.set_ylabel("Potential (µV)")
-                ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
-                ax_zoom_end.grid(True, alpha=0.3)
-                ax_zoom_end.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
-                if any(curve is not None for curve in first_trigger_curves):
-                    for recording_index, first_curve in enumerate(first_trigger_curves):
-                        if first_curve is None:
-                            continue
-                        line_color = colors[recording_index % len(colors)]
-                        ax_zoom_end_first.plot(
-                            t_rel[end_mask],
-                            first_curve[end_mask],
-                            linewidth=first_lw,
-                            color=line_color,
-                            label=f"{labels[recording_index]} first trigger raw",
-                        )
-                    for v in end_markers:
-                        ax_zoom_end_first.axvline(v, linestyle=":", linewidth=0.9, color="0.45")
-                    ax_zoom_end_first.set_xlim(end_zoom_t0, end_zoom_t1)
-                    ax_zoom_end_first.set_title("Part 3 — First trigger raw (separate view)")
-                    ax_zoom_end_first.set_ylabel("Potential (µV)")
-                    ax_zoom_end_first.set_xlabel(TIME_REL_XLABEL)
-                    ax_zoom_end_first.grid(True, alpha=0.3)
-                else:
-                    ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
-                    ax_zoom_end_first.set_axis_off()
                 _plot_rms_series(
                     ax_zoom_end_rms,
                     rms_series_zoom_end_multi,
-                    f"Part 3 — RMS evolution (RMS time window = {rms_window_s:g} s)",
+                    f"Part 3 — RMS evolution ({filter_title}, RMS window = 1 s)",
                     x_limits=(end_zoom_t0, end_zoom_t1),
                 )
             else:
-                ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
-                ax_zoom_end.set_axis_off()
-                ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
-                ax_zoom_end_first.set_axis_off()
-                ax_zoom_end_rms.text(0.5, 0.5, "RMS evolution unavailable", ha="center", va="center", transform=ax_zoom_end_rms.transAxes)
-                ax_zoom_end_rms.set_axis_off()
+                for ax, msg in (
+                    (ax_zoom_end, "Trigger-end zoom unavailable\n(no rising edge after trigger)"),
+                    (ax_zoom_end_filt, "Trigger-end zoom unavailable\n(no rising edge after trigger)"),
+                    (ax_zoom_end_first_hp, "First trigger filtered signal unavailable"),
+                    (ax_zoom_end_first, "First trigger raw signal unavailable"),
+                    (ax_zoom_end_rms, "RMS evolution unavailable"),
+                ):
+                    _mark_unavailable_axis(ax, msg)
 
             if _has_spike_cmp:
-                # Spike detection is computed once per channel/file,
-                # then reused for full / zoom / trigger-end zoom.
                 thresholds_and_captions = [
-                    _resolve_channel_spike_threshold(
+                    render_cache.resolve_threshold(
+                        src_idx,
                         mode=spike_threshold_mode,
                         fixed_threshold_uv=spike_threshold_uv,
+                        spike_threshold_polarity=spike_threshold_polarity,
                         rms_multiplier=spike_threshold_rms_multiplier,
                         source=src,
                         channel_index=ch,
                     )
-                    for src in spike_sources
+                    for src_idx, src in enumerate(spike_sources)
                 ]
                 st_list = [
-                    src.spike_times_per_trial_for_channel(ch, t_rel, thr_uv)
-                    for src, (thr_uv, _caption) in zip(spike_sources, thresholds_and_captions)
+                    render_cache.spike_times_per_trial(src_idx, src, ch, thr_uv)
+                    for src_idx, (src, (thr_uv, _caption)) in enumerate(
+                        zip(spike_sources, thresholds_and_captions)
+                    )
                 ]
                 if str(spike_threshold_mode).strip().lower() == "rms_multiple":
                     threshold_labels = [
@@ -2158,21 +2320,25 @@ def plot_channel_multi_comparison(
                     ]
                     threshold_caption = " | ".join(threshold_labels)
                 else:
-                    threshold_caption = _spike_threshold_caption(spike_threshold_uv)
+                    threshold_caption = _spike_threshold_caption(
+                        spike_threshold_uv, spike_threshold_polarity
+                    )
                 threshold_entries = [
                     (labels[i], caption)
                     for i, (_thr_uv, caption) in enumerate(thresholds_and_captions)
                 ]
                 _draw_spike_panels_multi_channel(
                     ax_raster_f, ax_fr_f, ax_trial_fr_f, ax_isi_f, None, t_rel, float(fs), spike_threshold_uv,
-                    psth_bin_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
+                    psth_bin_window_s, labels,
+                    intan_dsp=spike_sources[0].intan_dsp,
                     t_range_s=None, spikes_per_recording=st_list, sampling_percent=sampling_percent,
                     threshold_caption=threshold_caption,
                     threshold_entries=threshold_entries,
                 )
                 _draw_spike_panels_multi_channel(
                     ax_raster_z, ax_fr_z, ax_trial_fr_z, ax_isi_z, None, t_rel, float(fs), spike_threshold_uv,
-                    psth_bin_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
+                    psth_bin_window_s, labels,
+                    intan_dsp=spike_sources[0].intan_dsp,
                     t_range_s=(zoom_t0, zoom_t1), spikes_per_recording=st_list, sampling_percent=sampling_percent,
                     threshold_caption=threshold_caption,
                     threshold_entries=threshold_entries,
@@ -2180,7 +2346,8 @@ def plot_channel_multi_comparison(
                 if end_zoom_range is not None:
                     _draw_spike_panels_multi_channel(
                         ax_raster_ze, ax_fr_ze, ax_trial_fr_ze, ax_isi_ze, None, t_rel, float(fs), spike_threshold_uv,
-                        psth_bin_window_s, labels, spike_bandpass_low_hz, spike_bandpass_high_hz,
+                        psth_bin_window_s, labels,
+                        intan_dsp=spike_sources[0].intan_dsp,
                         t_range_s=end_zoom_range, section_title="Trigger-end zoom", spikes_per_recording=st_list, sampling_percent=sampling_percent,
                         threshold_caption=threshold_caption,
                         threshold_entries=threshold_entries,
@@ -2207,14 +2374,14 @@ def plot_channel_multi_comparison(
             )
 
         rms_series: list[tuple[str, np.ndarray, np.ndarray]] = []
-        t0_rms = float(t_rel[0]) if t_rel.size else 0.0
-        t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
         for i, src in enumerate(spike_sources):
-            tx_rms, rms_vals = _mean_rms_profile_from_source_window(src, t0_rms, t1_rms, rms_window_s)
+            tx_rms, rms_vals = render_cache.rms_profile_recording_mean(i, n_channels)
             label = labels[i] if i < len(labels) else f"Recording {i + 1}"
             rms_series.append((label, tx_rms, rms_vals))
         if rms_series:
-            _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s)
+            _append_mean_rms_evolution_page(
+                pdf, rms_series, rms_window_s, filter_title=filter_title
+            )
 
         if impedance_sessions:
             _append_mean_impedance_summary_page(pdf, impedance_sessions)
@@ -2227,1189 +2394,3 @@ def plot_channel_multi_comparison(
     return pdf_path
 
 
-def plot_channel_averages(
-    t_rel: np.ndarray,
-    mean_per_channel: np.ndarray,
-    channel_names: Sequence[str],
-    output_dir: Path,
-    rhs_file: Path,
-    pdf_title: Optional[str] = None,
-    lowpass_cutoff_hz: Optional[float] = None,
-    curve_filter: str = "no filter",
-    curve_filter_low_hz: Optional[float] = None,
-    curve_filter_high_hz: Optional[float] = None,
-    trigger_end_rising_rel_s: Optional[float] = None,
-    windows: Optional[np.ndarray] = None,
-    spike_source: Optional[AmplifierSpikeSource] = None,
-    fs: Optional[float] = None,
-    spike_threshold_uv: float = -40.0,
-    spike_threshold_mode: str = "fixed",
-    spike_threshold_rms_multiplier: float = 4.0,
-    psth_bin_window_s: float = 0.025,
-    rms_window_s: float = 0.050,
-    zoom_t0_s: float = ZOOM_T0,
-    zoom_t1_s: float = ZOOM_T1,
-    mean_per_channel_raw: Optional[np.ndarray] = None,
-    spike_bandpass_low_hz: Optional[float] = None,
-    spike_bandpass_high_hz: Optional[float] = None,
-    sampling_percent: int = 100,
-    probe_layout_json: Optional[Path] = None,
-) -> Path:
-    """Single multi-page PDF (one page per channel), without GUI window.
-
-    Intan amplifier values are displayed in microvolts (uV), as
-    provided by load_intan_rhs_format (amplifier_data).
-
-    Deprecated compatibility parameters:
-    - `windows`: ignored by the renderer.
-    Prefer passing `spike_source` for a single source-based pipeline.
-    """
-    _profile_before = _profile_snapshot()
-    _profile_t0 = time.perf_counter()
-    n_channels = mean_per_channel.shape[0]
-    output_dir.mkdir(parents=True, exist_ok=True)
-    if pdf_title is not None and pdf_title.strip():
-        safe_title = "".join(c if c.isalnum() or c in "._- " else "_" for c in pdf_title.strip())
-        pdf_stem = safe_title.removesuffix(".pdf")
-    else:
-        pdf_stem = rhs_file.stem
-    pdf_name = shorten_filename_for_windows(output_dir, f"{pdf_stem}.pdf")
-    pdf_path = output_dir / pdf_name
-
-    zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
-    curve_filter_enabled, filt_note, curve_filter_legend = _curve_filter_captions(
-        curve_filter=curve_filter,
-        curve_filter_low_hz=curve_filter_low_hz,
-        curve_filter_high_hz=curve_filter_high_hz,
-        lowpass_cutoff_hz=lowpass_cutoff_hz,
-    )
-    both_note = (
-        " — raw signal overlaid (filtered curve emphasized)"
-        if curve_filter_enabled
-        else ""
-    )
-    zoom_title = (
-        f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){filt_note}{both_note}"
-    )
-
-    # Legacy arg `windows` is kept for API compatibility.
-    # Rendering always uses the source-based pipeline when available.
-    _has_spike_data = fs is not None and spike_source is not None
-    _, spike_pipe_detail = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
-    psth_effective_window_s = (
-        max(float(psth_bin_window_s), 1.0 / float(fs))
-        if fs is not None and float(fs) > 0
-        else float(psth_bin_window_s)
-    )
-    spike_note = (
-        f" — spikes ({spike_pipe_detail}), mode={spike_threshold_mode}: "
-        f"{_spike_threshold_caption(spike_threshold_uv)}, PSTH time window={psth_effective_window_s:g} s"
-        if _has_spike_data
-        else ""
-    )
-    probe_layout_loaded = None
-    if probe_layout_json is not None:
-        probe_layout_loaded = load_probe_layout_json(Path(probe_layout_json))
-
-    with PdfPages(pdf_path) as pdf:
-        for ch in range(n_channels):
-            check_analysis_cancelled()
-            channel_name = str(channel_names[ch])
-            channel_mean = mean_per_channel[ch]
-            rms_series_full: list[tuple[str, np.ndarray, np.ndarray]] = []
-            rms_series_zoom: list[tuple[str, np.ndarray, np.ndarray]] = []
-            rms_series_zoom_end: list[tuple[str, np.ndarray, np.ndarray]] = []
-            t0_rms = float(t_rel[0]) if t_rel.size else 0.0
-            t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
-            if spike_source is not None:
-                tx_full, rms_full_vals = _mean_rms_profile_from_source_window(
-                    spike_source,
-                    t0_rms,
-                    t1_rms,
-                    rms_window_s,
-                    channel_index=ch,
-                )
-                rms_series_full = [("RMS", tx_full, rms_full_vals)]
-                tx_zoom, rms_zoom_vals = _slice_rms_profile_window(tx_full, rms_full_vals, zoom_t0, zoom_t1)
-                rms_series_zoom = [("RMS", tx_zoom, rms_zoom_vals)]
-                if trigger_end_rising_rel_s is not None:
-                    tx_end, rms_zoom_end_vals = _slice_rms_profile_window(
-                        tx_full,
-                        rms_full_vals,
-                        float(trigger_end_rising_rel_s + zoom_t0),
-                        float(trigger_end_rising_rel_s + zoom_t1),
-                    )
-                    rms_series_zoom_end = [("RMS", tx_end, rms_zoom_end_vals)]
-            fig, _axes = _build_three_part_page_axes(
-                zoom_t0=zoom_t0,
-                zoom_t1=zoom_t1,
-                n_recordings=1,
-                first_row_height_ratio=1.60,
-                first_row_text=None,
-                first_row_mea_channel_name=channel_name,
-                probe_layout=probe_layout_loaded,
-                include_impedance_panel=False,
-            )
-            ax_full = _axes["ax_full"]
-            ax_first_trigger = _axes["ax_first_trigger"]
-            ax_full_rms = _axes["ax_full_rms"]
-            ax_raster_f = _axes["ax_raster_f"]
-            ax_fr_f = _axes["ax_fr_f"]
-            ax_trial_fr_f = _axes["ax_trial_fr_f"]
-            ax_isi_f = _axes["ax_isi_f"]
-            ax_zoom = _axes["ax_zoom"]
-            ax_zoom_first = _axes["ax_zoom_first"]
-            ax_zoom_rms = _axes["ax_zoom_rms"]
-            ax_raster_z = _axes["ax_raster_z"]
-            ax_fr_z = _axes["ax_fr_z"]
-            ax_trial_fr_z = _axes["ax_trial_fr_z"]
-            ax_isi_z = _axes["ax_isi_z"]
-            ax_zoom_end = _axes["ax_zoom_end"]
-            ax_zoom_end_first = _axes["ax_zoom_end_first"]
-            ax_zoom_end_rms = _axes["ax_zoom_end_rms"]
-            ax_raster_ze = _axes["ax_raster_ze"]
-            ax_fr_ze = _axes["ax_fr_ze"]
-            ax_trial_fr_ze = _axes["ax_trial_fr_ze"]
-            ax_isi_ze = _axes["ax_isi_ze"]
-
-            channel_mean_raw = (
-                mean_per_channel_raw[ch]
-                if mean_per_channel_raw is not None
-                else None
-            )
-            channel_first_trigger_raw: Optional[np.ndarray] = None
-            if spike_source is not None and spike_source.valid_triggers.size > 0:
-                first_trigger_index = int(spike_source.valid_triggers[0])
-                sample_start = int(first_trigger_index - spike_source.pre_n)
-                sample_end = int(first_trigger_index + spike_source.post_n)
-                channel_first_trigger_raw = np.asarray(
-                    spike_source.amplifier[ch, sample_start:sample_end],
-                    dtype=np.float64,
-                )
-                if channel_first_trigger_raw.shape[0] != t_rel.shape[0]:
-                    channel_first_trigger_raw = None
-            show_filtered_and_raw = (
-                curve_filter_enabled
-                and mean_per_channel_raw is not None
-                and channel_mean_raw is not None
-                and not np.allclose(channel_mean, channel_mean_raw, rtol=0.0, atol=1e-9)
-            )
-            if show_filtered_and_raw:
-                ax_full.plot(
-                    t_rel,
-                    channel_mean_raw,
-                    linewidth=1.05,
-                    color="0.35",
-                    alpha=0.85,
-                    label="Mean (raw)",
-                    zorder=1,
-                )
-                ax_full.plot(
-                    t_rel,
-                    channel_mean,
-                    linewidth=1.35,
-                    color="C0",
-                    label=f"Mean (filtered, {curve_filter_legend})",
-                    zorder=2,
-                )
-            else:
-                ax_full.plot(t_rel, channel_mean, linewidth=1.2, color="C0", label="Mean")
-            ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
-            if trigger_end_rising_rel_s is not None:
-                ax_full.axvline(
-                    trigger_end_rising_rel_s,
-                    linestyle=":",
-                    linewidth=1.0,
-                    color="darkorange",
-                    label="Trigger end (rising)",
-                )
-            ax_full.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
-            if trigger_end_rising_rel_s is not None:
-                end_zoom_t0 = float(trigger_end_rising_rel_s + zoom_t0)
-                end_zoom_t1 = float(trigger_end_rising_rel_s + zoom_t1)
-                ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom region")
-            ax_full.set_title(
-                f"Trigger mean — {channel_name} (full view){filt_note}{both_note}{spike_note}"
-            )
-            ax_full.set_ylabel("Potential (µV)")
-            ax_full.set_xlabel(TIME_REL_XLABEL)
-            ax_full.grid(True, alpha=0.3)
-            ax_full.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
-
-            if channel_first_trigger_raw is not None:
-                ax_first_trigger.plot(
-                    t_rel,
-                    channel_first_trigger_raw,
-                    linewidth=1.1,
-                    color="C3",
-                    label="First trigger (raw, no averaging)",
-                )
-                ax_first_trigger.axvline(
-                    0.0,
-                    linestyle="--",
-                    linewidth=1.0,
-                    color="red",
-                    label="Trigger (onset)",
-                )
-                if trigger_end_rising_rel_s is not None:
-                    ax_first_trigger.axvline(
-                        trigger_end_rising_rel_s,
-                        linestyle=":",
-                        linewidth=1.0,
-                        color="darkorange",
-                        label="Trigger end (rising)",
-                    )
-                ax_first_trigger.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
-                if trigger_end_rising_rel_s is not None:
-                    end_zoom_t0 = float(trigger_end_rising_rel_s + zoom_t0)
-                    end_zoom_t1 = float(trigger_end_rising_rel_s + zoom_t1)
-                    ax_first_trigger.axvspan(
-                        end_zoom_t0,
-                        end_zoom_t1,
-                        alpha=0.10,
-                        color="gold",
-                        label="Trigger-end zoom region",
-                    )
-                ax_first_trigger.set_title("First trigger — raw signal (no averaging)")
-                ax_first_trigger.set_ylabel("Potential (µV)")
-                ax_first_trigger.set_xlabel(TIME_REL_XLABEL)
-                ax_first_trigger.grid(True, alpha=0.3)
-            else:
-                ax_first_trigger.text(
-                    0.5,
-                    0.5,
-                    "First trigger raw signal unavailable",
-                    ha="center",
-                    va="center",
-                    transform=ax_first_trigger.transAxes,
-                )
-                ax_first_trigger.set_axis_off()
-
-            _plot_rms_series(
-                ax_full_rms,
-                rms_series_full,
-                f"Part 1 — RMS evolution (RMS time window = {rms_window_s:g} s)",
-                x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
-            )
-
-            zmask = (t_rel >= zoom_t0) & (t_rel <= zoom_t1)
-            if show_filtered_and_raw and channel_mean_raw is not None:
-                ax_zoom.plot(
-                    t_rel[zmask],
-                    channel_mean_raw[zmask],
-                    linewidth=1.15,
-                    color="0.35",
-                    alpha=0.85,
-                    label="Raw",
-                )
-                ax_zoom.plot(
-                    t_rel[zmask],
-                    channel_mean[zmask],
-                    linewidth=1.45,
-                    color="C0",
-                    label=f"Filtered ({curve_filter_legend})",
-                )
-            else:
-                ax_zoom.plot(t_rel[zmask], channel_mean[zmask], linewidth=1.4, color="C0", label="Mean")
-            ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
-            if trigger_end_rising_rel_s is not None:
-                ax_zoom.axvline(
-                    trigger_end_rising_rel_s,
-                    linestyle=":",
-                    linewidth=1.0,
-                    color="darkorange",
-                    label="Trigger end (rising)",
-                )
-            ax_zoom.set_xlim(zoom_t0, zoom_t1)
-            ax_zoom.set_title(zoom_title)
-            ax_zoom.set_ylabel("Potential (µV)")
-            ax_zoom.set_xlabel(TIME_REL_XLABEL)
-            ax_zoom.grid(True, alpha=0.3)
-            ax_zoom.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
-            if channel_first_trigger_raw is not None:
-                ax_zoom_first.plot(
-                    t_rel[zmask],
-                    channel_first_trigger_raw[zmask],
-                    linewidth=1.2,
-                    color="C3",
-                    label="First trigger raw (no averaging)",
-                )
-                ax_zoom_first.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
-                if trigger_end_rising_rel_s is not None:
-                    ax_zoom_first.axvline(
-                        trigger_end_rising_rel_s,
-                        linestyle=":",
-                        linewidth=1.0,
-                        color="darkorange",
-                    )
-                ax_zoom_first.set_xlim(zoom_t0, zoom_t1)
-                ax_zoom_first.set_title("Part 2 — First trigger raw (separate view)")
-                ax_zoom_first.set_ylabel("Potential (µV)")
-                ax_zoom_first.set_xlabel(TIME_REL_XLABEL)
-                ax_zoom_first.grid(True, alpha=0.3)
-            else:
-                ax_zoom_first.text(
-                    0.5,
-                    0.5,
-                    "First trigger raw signal unavailable",
-                    ha="center",
-                    va="center",
-                    transform=ax_zoom_first.transAxes,
-                )
-                ax_zoom_first.set_axis_off()
-            _plot_rms_series(
-                ax_zoom_rms,
-                rms_series_zoom,
-                f"Part 2 — RMS evolution (RMS time window = {rms_window_s:g} s)",
-                x_limits=(zoom_t0, zoom_t1),
-            )
-            end_zoom_range: tuple[float, float] | None = None
-            if trigger_end_rising_rel_s is not None:
-                end_zoom_t0 = float(trigger_end_rising_rel_s + zoom_t0)
-                end_zoom_t1 = float(trigger_end_rising_rel_s + zoom_t1)
-                end_zoom_range = (end_zoom_t0, end_zoom_t1)
-                end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
-                if show_filtered_and_raw and channel_mean_raw is not None:
-                    ax_zoom_end.plot(t_rel[end_mask], channel_mean_raw[end_mask], linewidth=1.15, color="0.35", alpha=0.85, label="Unfiltered")
-                    ax_zoom_end.plot(
-                        t_rel[end_mask],
-                        channel_mean[end_mask],
-                        linewidth=1.45,
-                        color="C0",
-                        label=f"Filtered ({curve_filter_legend})",
-                    )
-                else:
-                    ax_zoom_end.plot(t_rel[end_mask], channel_mean[end_mask], linewidth=1.4, color="C0", label="Mean")
-                ax_zoom_end.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
-                ax_zoom_end.axvline(
-                    trigger_end_rising_rel_s,
-                    linestyle="--",
-                    linewidth=1.0,
-                    color="darkorange",
-                    label="Trigger end (rising)",
-                )
-                ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
-                ax_zoom_end.set_title(f"Part 3 — Trigger-end zoom [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
-                ax_zoom_end.set_ylabel("Potential (µV)")
-                ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
-                ax_zoom_end.grid(True, alpha=0.3)
-                ax_zoom_end.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
-                if channel_first_trigger_raw is not None:
-                    ax_zoom_end_first.plot(
-                        t_rel[end_mask],
-                        channel_first_trigger_raw[end_mask],
-                        linewidth=1.2,
-                        color="C3",
-                        label="First trigger raw (no averaging)",
-                    )
-                    ax_zoom_end_first.axvline(trigger_end_rising_rel_s, linestyle="--", linewidth=1.0, color="darkorange")
-                    ax_zoom_end_first.set_xlim(end_zoom_t0, end_zoom_t1)
-                    ax_zoom_end_first.set_title("Part 3 — First trigger raw (separate view)")
-                    ax_zoom_end_first.set_ylabel("Potential (µV)")
-                    ax_zoom_end_first.set_xlabel(TIME_REL_XLABEL)
-                    ax_zoom_end_first.grid(True, alpha=0.3)
-                else:
-                    ax_zoom_end_first.text(
-                        0.5,
-                        0.5,
-                        "First trigger raw signal unavailable",
-                        ha="center",
-                        va="center",
-                        transform=ax_zoom_end_first.transAxes,
-                    )
-                    ax_zoom_end_first.set_axis_off()
-                _plot_rms_series(
-                    ax_zoom_end_rms,
-                    rms_series_zoom_end,
-                    f"Part 3 — RMS evolution (RMS time window = {rms_window_s:g} s)",
-                    x_limits=(end_zoom_t0, end_zoom_t1),
-                )
-            else:
-                ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
-                ax_zoom_end.set_axis_off()
-                ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
-                ax_zoom_end_first.set_axis_off()
-                ax_zoom_end_rms.text(0.5, 0.5, "RMS evolution unavailable", ha="center", va="center", transform=ax_zoom_end_rms.transAxes)
-                ax_zoom_end_rms.set_axis_off()
-
-            if _has_spike_data and spike_source is not None:
-                channel_spike_threshold_uv, channel_threshold_caption = _resolve_channel_spike_threshold(
-                    mode=spike_threshold_mode,
-                    fixed_threshold_uv=spike_threshold_uv,
-                    rms_multiplier=spike_threshold_rms_multiplier,
-                    source=spike_source,
-                    channel_index=ch,
-                )
-                st_per_tr = spike_source.spike_times_per_trial_for_channel(
-                    ch, t_rel, channel_spike_threshold_uv
-                )
-                _draw_spike_panels_single_channel(
-                    ax_raster_f,
-                    ax_fr_f,
-                    ax_trial_fr_f,
-                    ax_isi_f,
-                    None,
-                    t_rel,
-                    float(fs),
-                    channel_spike_threshold_uv,
-                    psth_bin_window_s,
-                    spike_bandpass_low_hz,
-                    spike_bandpass_high_hz,
-                    t_range_s=None,
-                    st_per_tr=st_per_tr,
-                    sampling_percent=sampling_percent,
-                    threshold_caption=channel_threshold_caption,
-                )
-                _draw_spike_panels_single_channel(
-                    ax_raster_z,
-                    ax_fr_z,
-                    ax_trial_fr_z,
-                    ax_isi_z,
-                    None,
-                    t_rel,
-                    float(fs),
-                    channel_spike_threshold_uv,
-                    psth_bin_window_s,
-                    spike_bandpass_low_hz,
-                    spike_bandpass_high_hz,
-                    t_range_s=(zoom_t0, zoom_t1),
-                    st_per_tr=st_per_tr,
-                    sampling_percent=sampling_percent,
-                    threshold_caption=channel_threshold_caption,
-                )
-                if end_zoom_range is not None:
-                    _draw_spike_panels_single_channel(
-                        ax_raster_ze,
-                        ax_fr_ze,
-                        ax_trial_fr_ze,
-                        ax_isi_ze,
-                        None,
-                        t_rel,
-                        float(fs),
-                        channel_spike_threshold_uv,
-                        psth_bin_window_s,
-                        spike_bandpass_low_hz,
-                        spike_bandpass_high_hz,
-                        t_range_s=end_zoom_range,
-                        st_per_tr=st_per_tr,
-                        section_title="Trigger-end zoom",
-                        threshold_caption=channel_threshold_caption,
-                    )
-                else:
-                    for ax in (ax_raster_ze, ax_fr_ze, ax_trial_fr_ze):
-                        ax.text(
-                            0.5,
-                            0.5,
-                            "Trigger-end zoom unavailable\n(no rising edge after trigger)",
-                            ha="center",
-                            va="center",
-                            transform=ax.transAxes,
-                        )
-                        ax.set_axis_off()
-                    ax_isi_ze.text(
-                        0.5,
-                        0.5,
-                        "ISI unavailable",
-                        ha="center",
-                        va="center",
-                        transform=ax_isi_ze.transAxes,
-                    )
-                    ax_isi_ze.set_axis_off()
-            elif not _has_spike_data:
-                for ax in (ax_raster_f, ax_fr_f, ax_trial_fr_f, ax_raster_z, ax_fr_z, ax_trial_fr_z, ax_raster_ze, ax_fr_ze, ax_trial_fr_ze):
-                    ax.text(
-                        0.5,
-                        0.5,
-                        "Raw trial data unavailable",
-                        ha="center",
-                        va="center",
-                        transform=ax.transAxes,
-                    )
-                    ax.set_axis_off()
-                for ax in (ax_isi_f, ax_isi_z, ax_isi_ze):
-                    ax.text(
-                        0.5,
-                        0.5,
-                        "ISI unavailable",
-                        ha="center",
-                        va="center",
-                        transform=ax.transAxes,
-                    )
-                    ax.set_axis_off()
-
-            _finalize_and_save_three_part_page(
-                fig=fig,
-                pdf=pdf,
-                axes=_axes,
-                n_recordings=1,
-            )
-
-        rms_tx = np.array([], dtype=np.float64)
-        rms_values = np.array([], dtype=np.float64)
-        t0_rms = float(t_rel[0]) if t_rel.size else 0.0
-        t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
-        if spike_source is not None:
-            rms_tx, rms_values = _mean_rms_profile_from_source_window(
-                spike_source, t0_rms, t1_rms, rms_window_s
-            )
-        _append_mean_rms_evolution_page(
-            pdf,
-            [("Mean RMS", rms_tx, rms_values)],
-            rms_window_s,
-        )
-
-    _profile_print_delta(
-        "plot_channel_averages",
-        _profile_before,
-        time.perf_counter() - _profile_t0,
-    )
-    return pdf_path
-
-
-def plot_channel_comparison(
-    t_rel: np.ndarray,
-    mean_a: np.ndarray,
-    mean_b: np.ndarray,
-    channel_names: Sequence[str],
-    output_dir: Path,
-    label_a: str,
-    label_b: str,
-    pdf_title: Optional[str] = None,
-    lowpass_cutoff_hz: Optional[float] = None,
-    curve_filter: str = "no filter",
-    curve_filter_low_hz: Optional[float] = None,
-    curve_filter_high_hz: Optional[float] = None,
-    trigger_end_rising_rel_s_a: Optional[float] = None,
-    trigger_end_rising_rel_s_b: Optional[float] = None,
-    mean_a_raw: Optional[np.ndarray] = None,
-    mean_b_raw: Optional[np.ndarray] = None,
-    spike_source_a: Optional[AmplifierSpikeSource] = None,
-    spike_source_b: Optional[AmplifierSpikeSource] = None,
-    fs: Optional[float] = None,
-    spike_threshold_uv: float = -40.0,
-    spike_threshold_mode: str = "fixed",
-    spike_threshold_rms_multiplier: float = 4.0,
-    psth_bin_window_s: float = 0.025,
-    rms_window_s: float = 0.050,
-    zoom_t0_s: float = ZOOM_T0,
-    zoom_t1_s: float = ZOOM_T1,
-    spike_bandpass_low_hz: Optional[float] = None,
-    spike_bandpass_high_hz: Optional[float] = None,
-    sampling_percent: int = 100,
-) -> Path:
-    """Multi-page PDF: per channel, means + zoom + raster / PSTH / ISI (two overlaid recordings)."""
-    _profile_before = _profile_snapshot()
-    _profile_t0 = time.perf_counter()
-    output_dir.mkdir(parents=True, exist_ok=True)
-    safe_a = "".join(c if c.isalnum() or c in "._-" else "_" for c in label_a)[:80]
-    safe_b = "".join(c if c.isalnum() or c in "._-" else "_" for c in label_b)[:80]
-    if pdf_title is not None and pdf_title.strip():
-        safe_title = "".join(c if c.isalnum() or c in "._- " else "_" for c in pdf_title.strip())
-        pdf_stem = safe_title.removesuffix(".pdf")
-    else:
-        pdf_stem = f"{safe_a}_vs_{safe_b}"
-    pdf_name = shorten_filename_for_windows(output_dir, f"{pdf_stem}.pdf")
-    pdf_path = output_dir / pdf_name
-
-    zoom_t0, zoom_t1 = float(zoom_t0_s), float(zoom_t1_s)
-    curve_filter_enabled, filt_note, curve_filter_legend = _curve_filter_captions(
-        curve_filter=curve_filter,
-        curve_filter_low_hz=curve_filter_low_hz,
-        curve_filter_high_hz=curve_filter_high_hz,
-        lowpass_cutoff_hz=lowpass_cutoff_hz,
-    )
-    both_note = (
-        " — raw signal overlaid (filtered curve emphasized)"
-        if curve_filter_enabled
-        else ""
-    )
-    zoom_title = f"Zoom: {zoom_t0:.1f} to {zoom_t1:.1f} s (relative to trigger){filt_note}{both_note}"
-    n_channels = mean_a.shape[0]
-    zmask = (t_rel >= zoom_t0) & (t_rel <= zoom_t1)
-    _has_spike_cmp = (
-        fs is not None
-        and spike_source_a is not None
-        and spike_source_b is not None
-    )
-    _, spike_cmp_pipe = _spike_pipeline_captions(spike_bandpass_low_hz, spike_bandpass_high_hz)
-    with PdfPages(pdf_path) as pdf:
-        for ch in range(n_channels):
-            check_analysis_cancelled()
-            channel_name = str(channel_names[ch])
-            channel_mean_a = mean_a[ch]
-            channel_mean_b = mean_b[ch]
-            t0_rms = float(t_rel[0]) if t_rel.size else 0.0
-            t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
-            rms_full_a = (
-                _mean_rms_profile_from_source_window(
-                    spike_source_a,
-                    t0_rms,
-                    t1_rms,
-                    rms_window_s,
-                    channel_index=ch,
-                )
-                if spike_source_a is not None
-                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
-            )
-            rms_full_b = (
-                _mean_rms_profile_from_source_window(
-                    spike_source_b,
-                    t0_rms,
-                    t1_rms,
-                    rms_window_s,
-                    channel_index=ch,
-                )
-                if spike_source_b is not None
-                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
-            )
-            rms_zoom_a = _slice_rms_profile_window(rms_full_a[0], rms_full_a[1], zoom_t0, zoom_t1)
-            rms_zoom_b = _slice_rms_profile_window(rms_full_b[0], rms_full_b[1], zoom_t0, zoom_t1)
-            rms_end_a = (
-                _slice_rms_profile_window(
-                    rms_full_a[0],
-                    rms_full_a[1],
-                    float(trigger_end_rising_rel_s_a + zoom_t0),
-                    float(trigger_end_rising_rel_s_a + zoom_t1),
-                )
-                if trigger_end_rising_rel_s_a is not None
-                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
-            )
-            rms_end_b = (
-                _slice_rms_profile_window(
-                    rms_full_b[0],
-                    rms_full_b[1],
-                    float(trigger_end_rising_rel_s_b + zoom_t0),
-                    float(trigger_end_rising_rel_s_b + zoom_t1),
-                )
-                if trigger_end_rising_rel_s_b is not None
-                else (np.array([], dtype=np.float64), np.array([], dtype=np.float64))
-            )
-            channel_mean_a_raw = mean_a_raw[ch] if mean_a_raw is not None else None
-            channel_mean_b_raw = mean_b_raw[ch] if mean_b_raw is not None else None
-            show_filtered_and_raw = (
-                curve_filter_enabled
-                and channel_mean_a_raw is not None
-                and channel_mean_b_raw is not None
-                and (
-                    not np.allclose(channel_mean_a, channel_mean_a_raw, rtol=0.0, atol=1e-9)
-                    or not np.allclose(channel_mean_b, channel_mean_b_raw, rtol=0.0, atol=1e-9)
-                )
-            )
-            first_trigger_a_raw: Optional[np.ndarray] = None
-            first_trigger_b_raw: Optional[np.ndarray] = None
-            if spike_source_a is not None and spike_source_a.valid_triggers.size > 0:
-                trig_a0 = int(spike_source_a.valid_triggers[0])
-                s0_a = int(trig_a0 - spike_source_a.pre_n)
-                s1_a = int(trig_a0 + spike_source_a.post_n)
-                first_trigger_a_raw = np.asarray(spike_source_a.amplifier[ch, s0_a:s1_a], dtype=np.float64)
-                if first_trigger_a_raw.shape[0] != t_rel.shape[0]:
-                    first_trigger_a_raw = None
-            if spike_source_b is not None and spike_source_b.valid_triggers.size > 0:
-                trig_b0 = int(spike_source_b.valid_triggers[0])
-                s0_b = int(trig_b0 - spike_source_b.pre_n)
-                s1_b = int(trig_b0 + spike_source_b.post_n)
-                first_trigger_b_raw = np.asarray(spike_source_b.amplifier[ch, s0_b:s1_b], dtype=np.float64)
-                if first_trigger_b_raw.shape[0] != t_rel.shape[0]:
-                    first_trigger_b_raw = None
-            fig, _axes = _build_three_part_page_axes(
-                zoom_t0=zoom_t0,
-                zoom_t1=zoom_t1,
-                n_recordings=2,
-                first_row_height_ratio=0.06,
-                first_row_text="Part 1 — Full view (entire pre/post-trigger window)",
-                first_row_mea_channel_name=None,
-                probe_layout=None,
-                include_impedance_panel=False,
-            )
-            ax_full = _axes["ax_full"]
-            ax_first_trigger = _axes["ax_first_trigger"]
-            ax_full_rms = _axes["ax_full_rms"]
-            ax_raster_f = _axes["ax_raster_f"]
-            ax_fr_f = _axes["ax_fr_f"]
-            ax_trial_fr_f = _axes["ax_trial_fr_f"]
-            ax_isi_f = _axes["ax_isi_f"]
-            ax_zoom = _axes["ax_zoom"]
-            ax_zoom_first = _axes["ax_zoom_first"]
-            ax_zoom_rms = _axes["ax_zoom_rms"]
-            ax_raster_z = _axes["ax_raster_z"]
-            ax_fr_z = _axes["ax_fr_z"]
-            ax_trial_fr_z = _axes["ax_trial_fr_z"]
-            ax_isi_z = _axes["ax_isi_z"]
-            ax_zoom_end = _axes["ax_zoom_end"]
-            ax_zoom_end_first = _axes["ax_zoom_end_first"]
-            ax_zoom_end_rms = _axes["ax_zoom_end_rms"]
-            ax_raster_ze = _axes["ax_raster_ze"]
-            ax_fr_ze = _axes["ax_fr_ze"]
-            ax_trial_fr_ze = _axes["ax_trial_fr_ze"]
-            ax_isi_ze = _axes["ax_isi_ze"]
-            if show_filtered_and_raw:
-                ax_full.plot(
-                    t_rel,
-                    channel_mean_a_raw,
-                    linewidth=1.0,
-                    color="C0",
-                    alpha=0.4,
-                    label="_nolegend_",
-                )
-                ax_full.plot(
-                    t_rel,
-                    channel_mean_b_raw,
-                    linewidth=1.0,
-                    color="C1",
-                    alpha=0.4,
-                    label="_nolegend_",
-                )
-                ax_full.plot(
-                    t_rel,
-                    channel_mean_a,
-                    linewidth=1.35,
-                    color="C0",
-                    label=f"{label_a} (filtered {curve_filter_legend})",
-                )
-                ax_full.plot(
-                    t_rel,
-                    channel_mean_b,
-                    linewidth=1.35,
-                    color="C1",
-                    label=f"{label_b} (filtered {curve_filter_legend})",
-                )
-            else:
-                ax_full.plot(t_rel, channel_mean_a, linewidth=1.2, color="C0", label=label_a)
-                ax_full.plot(t_rel, channel_mean_b, linewidth=1.2, color="C1", label=label_b)
-            ax_full.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
-            if trigger_end_rising_rel_s_a is not None:
-                ax_full.axvline(
-                    trigger_end_rising_rel_s_a,
-                    linestyle=":",
-                    linewidth=1.0,
-                    color="darkorange",
-                    label=f"End (rising) {label_a}",
-                )
-            if trigger_end_rising_rel_s_b is not None:
-                ax_full.axvline(
-                    trigger_end_rising_rel_s_b,
-                    linestyle=":",
-                    linewidth=1.0,
-                    color="purple",
-                    label=f"End (rising) {label_b}",
-                )
-            ax_full.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
-            end_markers = [v for v in (trigger_end_rising_rel_s_a, trigger_end_rising_rel_s_b) if v is not None]
-            if end_markers:
-                end_zoom_t0 = float(min(end_markers) + zoom_t0)
-                end_zoom_t1 = float(max(end_markers) + zoom_t1)
-                ax_full.axvspan(end_zoom_t0, end_zoom_t1, alpha=0.10, color="gold", label="Trigger-end zoom region")
-            spike_cmp_note = (
-                f" — + raster / rate / ISI ({spike_cmp_pipe})"
-                if _has_spike_cmp
-                else ""
-            )
-            ax_full.set_title(
-                f"Comparison — {channel_name} (full view){filt_note}{both_note}{spike_cmp_note}"
-            )
-            ax_full.set_ylabel("Potential (µV)")
-            ax_full.set_xlabel(TIME_REL_XLABEL)
-            ax_full.grid(True, alpha=0.3)
-            ax_full.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
-            if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
-                if first_trigger_a_raw is not None:
-                    ax_first_trigger.plot(
-                        t_rel,
-                        first_trigger_a_raw,
-                        linewidth=1.1,
-                        color="C0",
-                        label=f"{label_a} first trigger raw",
-                    )
-                if first_trigger_b_raw is not None:
-                    ax_first_trigger.plot(
-                        t_rel,
-                        first_trigger_b_raw,
-                        linewidth=1.1,
-                        color="C1",
-                        label=f"{label_b} first trigger raw",
-                    )
-                ax_first_trigger.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
-                if trigger_end_rising_rel_s_a is not None:
-                    ax_first_trigger.axvline(
-                        trigger_end_rising_rel_s_a,
-                        linestyle=":",
-                        linewidth=1.0,
-                        color="darkorange",
-                        label=f"End (rising) {label_a}",
-                    )
-                if trigger_end_rising_rel_s_b is not None:
-                    ax_first_trigger.axvline(
-                        trigger_end_rising_rel_s_b,
-                        linestyle=":",
-                        linewidth=1.0,
-                        color="purple",
-                        label=f"End (rising) {label_b}",
-                    )
-                ax_first_trigger.axvspan(zoom_t0, zoom_t1, alpha=0.12, color="green", label="Zoom region")
-                end_markers_first = [
-                    v for v in (trigger_end_rising_rel_s_a, trigger_end_rising_rel_s_b) if v is not None
-                ]
-                if end_markers_first:
-                    end_zoom_t0 = float(min(end_markers_first) + zoom_t0)
-                    end_zoom_t1 = float(max(end_markers_first) + zoom_t1)
-                    ax_first_trigger.axvspan(
-                        end_zoom_t0,
-                        end_zoom_t1,
-                        alpha=0.10,
-                        color="gold",
-                        label="Trigger-end zoom region",
-                    )
-                ax_first_trigger.set_title("First trigger — raw signal (no averaging)")
-                ax_first_trigger.set_ylabel("Potential (µV)")
-                ax_first_trigger.set_xlabel(TIME_REL_XLABEL)
-                ax_first_trigger.grid(True, alpha=0.3)
-            else:
-                ax_first_trigger.text(
-                    0.5,
-                    0.5,
-                    "First trigger raw signal unavailable",
-                    ha="center",
-                    va="center",
-                    transform=ax_first_trigger.transAxes,
-                )
-                ax_first_trigger.set_axis_off()
-            _plot_rms_series(
-                ax_full_rms,
-                [(label_a, rms_full_a[0], rms_full_a[1]), (label_b, rms_full_b[0], rms_full_b[1])],
-                f"Part 1 — RMS evolution (RMS time window = {rms_window_s:g} s)",
-                x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
-            )
-
-            if show_filtered_and_raw and channel_mean_a_raw is not None and channel_mean_b_raw is not None:
-                ax_zoom.plot(
-                    t_rel[zmask],
-                    channel_mean_a_raw[zmask],
-                    linewidth=1.1,
-                    color="C0",
-                    alpha=0.45,
-                    label=f"{label_a} raw",
-                )
-                ax_zoom.plot(
-                    t_rel[zmask],
-                    channel_mean_b_raw[zmask],
-                    linewidth=1.1,
-                    color="C1",
-                    alpha=0.45,
-                    label=f"{label_b} raw",
-                )
-                ax_zoom.plot(
-                    t_rel[zmask],
-                    channel_mean_a[zmask],
-                    linewidth=1.45,
-                    color="C0",
-                    label=f"{label_a} filtered",
-                )
-                ax_zoom.plot(
-                    t_rel[zmask],
-                    channel_mean_b[zmask],
-                    linewidth=1.45,
-                    color="C1",
-                    label=f"{label_b} filtered",
-                )
-            else:
-                ax_zoom.plot(t_rel[zmask], channel_mean_a[zmask], linewidth=1.4, color="C0", label=label_a)
-                ax_zoom.plot(t_rel[zmask], channel_mean_b[zmask], linewidth=1.4, color="C1", label=label_b)
-            ax_zoom.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
-            if trigger_end_rising_rel_s_a is not None:
-                ax_zoom.axvline(
-                    trigger_end_rising_rel_s_a,
-                    linestyle=":",
-                    linewidth=1.0,
-                    color="darkorange",
-                    label=f"End (rising) {label_a}",
-                )
-            if trigger_end_rising_rel_s_b is not None:
-                ax_zoom.axvline(
-                    trigger_end_rising_rel_s_b,
-                    linestyle=":",
-                    linewidth=1.0,
-                    color="purple",
-                    label=f"End (rising) {label_b}",
-                )
-            ax_zoom.set_xlim(zoom_t0, zoom_t1)
-            ax_zoom.set_title(zoom_title)
-            ax_zoom.set_ylabel("Potential (µV)")
-            ax_zoom.set_xlabel(TIME_REL_XLABEL)
-            ax_zoom.grid(True, alpha=0.3)
-            ax_zoom.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
-            if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
-                if first_trigger_a_raw is not None:
-                    ax_zoom_first.plot(
-                        t_rel[zmask],
-                        first_trigger_a_raw[zmask],
-                        linewidth=1.2,
-                        color="C0",
-                        label=f"{label_a} first trigger raw",
-                    )
-                if first_trigger_b_raw is not None:
-                    ax_zoom_first.plot(
-                        t_rel[zmask],
-                        first_trigger_b_raw[zmask],
-                        linewidth=1.2,
-                        color="C1",
-                        label=f"{label_b} first trigger raw",
-                    )
-                ax_zoom_first.axvline(0.0, linestyle="--", linewidth=1.0, color="red")
-                if trigger_end_rising_rel_s_a is not None:
-                    ax_zoom_first.axvline(trigger_end_rising_rel_s_a, linestyle=":", linewidth=1.0, color="darkorange")
-                if trigger_end_rising_rel_s_b is not None:
-                    ax_zoom_first.axvline(trigger_end_rising_rel_s_b, linestyle=":", linewidth=1.0, color="purple")
-                ax_zoom_first.set_xlim(zoom_t0, zoom_t1)
-                ax_zoom_first.set_title("Part 2 — First trigger raw (separate view)")
-                ax_zoom_first.set_ylabel("Potential (µV)")
-                ax_zoom_first.set_xlabel(TIME_REL_XLABEL)
-                ax_zoom_first.grid(True, alpha=0.3)
-            else:
-                ax_zoom_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_first.transAxes)
-                ax_zoom_first.set_axis_off()
-            _plot_rms_series(
-                ax_zoom_rms,
-                    [(label_a, rms_zoom_a[0], rms_zoom_a[1]), (label_b, rms_zoom_b[0], rms_zoom_b[1])],
-                f"Part 2 — RMS evolution (RMS time window = {rms_window_s:g} s)",
-                x_limits=(zoom_t0, zoom_t1),
-            )
-            end_zoom_range: tuple[float, float] | None = None
-            end_markers = [v for v in (trigger_end_rising_rel_s_a, trigger_end_rising_rel_s_b) if v is not None]
-            if end_markers:
-                end_zoom_t0 = float(min(end_markers) + zoom_t0)
-                end_zoom_t1 = float(max(end_markers) + zoom_t1)
-                end_zoom_range = (end_zoom_t0, end_zoom_t1)
-                end_mask = (t_rel >= end_zoom_t0) & (t_rel <= end_zoom_t1)
-                ax_zoom_end.plot(t_rel[end_mask], channel_mean_a[end_mask], linewidth=1.35, color="C0", label=label_a)
-                ax_zoom_end.plot(t_rel[end_mask], channel_mean_b[end_mask], linewidth=1.35, color="C1", label=label_b)
-                ax_zoom_end.axvline(0.0, linestyle="--", linewidth=1.0, color="red", label="Trigger (onset)")
-                if trigger_end_rising_rel_s_a is not None:
-                    ax_zoom_end.axvline(
-                        trigger_end_rising_rel_s_a,
-                        linestyle=":",
-                        linewidth=1.0,
-                        color="darkorange",
-                        label=f"End (rising) {label_a}",
-                    )
-                if trigger_end_rising_rel_s_b is not None:
-                    ax_zoom_end.axvline(
-                        trigger_end_rising_rel_s_b,
-                        linestyle=":",
-                        linewidth=1.0,
-                        color="purple",
-                        label=f"End (rising) {label_b}",
-                    )
-                ax_zoom_end.set_xlim(end_zoom_t0, end_zoom_t1)
-                ax_zoom_end.set_title(f"Part 3 — Trigger-end zoom [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s")
-                ax_zoom_end.set_ylabel("Potential (µV)")
-                ax_zoom_end.set_xlabel(TIME_REL_XLABEL)
-                ax_zoom_end.grid(True, alpha=0.3)
-                ax_zoom_end.legend(ncol=3, **TRACE_PANEL_LEGEND_KWARGS)
-                if first_trigger_a_raw is not None or first_trigger_b_raw is not None:
-                    if first_trigger_a_raw is not None:
-                        ax_zoom_end_first.plot(
-                            t_rel[end_mask],
-                            first_trigger_a_raw[end_mask],
-                            linewidth=1.2,
-                            color="C0",
-                            label=f"{label_a} first trigger raw",
-                        )
-                    if first_trigger_b_raw is not None:
-                        ax_zoom_end_first.plot(
-                            t_rel[end_mask],
-                            first_trigger_b_raw[end_mask],
-                            linewidth=1.2,
-                            color="C1",
-                            label=f"{label_b} first trigger raw",
-                        )
-                    if trigger_end_rising_rel_s_a is not None:
-                        ax_zoom_end_first.axvline(trigger_end_rising_rel_s_a, linestyle=":", linewidth=1.0, color="darkorange")
-                    if trigger_end_rising_rel_s_b is not None:
-                        ax_zoom_end_first.axvline(trigger_end_rising_rel_s_b, linestyle=":", linewidth=1.0, color="purple")
-                    ax_zoom_end_first.set_xlim(end_zoom_t0, end_zoom_t1)
-                    ax_zoom_end_first.set_title("Part 3 — First trigger raw (separate view)")
-                    ax_zoom_end_first.set_ylabel("Potential (µV)")
-                    ax_zoom_end_first.set_xlabel(TIME_REL_XLABEL)
-                    ax_zoom_end_first.grid(True, alpha=0.3)
-                else:
-                    ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
-                    ax_zoom_end_first.set_axis_off()
-                _plot_rms_series(
-                    ax_zoom_end_rms,
-                    [(label_a, rms_end_a[0], rms_end_a[1]), (label_b, rms_end_b[0], rms_end_b[1])],
-                    f"Part 3 — RMS evolution (RMS time window = {rms_window_s:g} s)",
-                    x_limits=(end_zoom_t0, end_zoom_t1),
-                )
-            else:
-                ax_zoom_end.text(0.5, 0.5, "Trigger-end zoom unavailable\n(no rising edge after trigger)", ha="center", va="center", transform=ax_zoom_end.transAxes)
-                ax_zoom_end.set_axis_off()
-                ax_zoom_end_first.text(0.5, 0.5, "First trigger raw signal unavailable", ha="center", va="center", transform=ax_zoom_end_first.transAxes)
-                ax_zoom_end_first.set_axis_off()
-                ax_zoom_end_rms.text(0.5, 0.5, "RMS evolution unavailable", ha="center", va="center", transform=ax_zoom_end_rms.transAxes)
-                ax_zoom_end_rms.set_axis_off()
-
-            if _has_spike_cmp:
-                # Spike detection is computed once per channel (A/B),
-                # then reused for full / zoom / trigger-end zoom.
-                threshold_a_uv, threshold_a_caption = _resolve_channel_spike_threshold(
-                    mode=spike_threshold_mode,
-                    fixed_threshold_uv=spike_threshold_uv,
-                    rms_multiplier=spike_threshold_rms_multiplier,
-                    source=spike_source_a,
-                    channel_index=ch,
-                )
-                threshold_b_uv, threshold_b_caption = _resolve_channel_spike_threshold(
-                    mode=spike_threshold_mode,
-                    fixed_threshold_uv=spike_threshold_uv,
-                    rms_multiplier=spike_threshold_rms_multiplier,
-                    source=spike_source_b,
-                    channel_index=ch,
-                )
-                sta = spike_source_a.spike_times_per_trial_for_channel(ch, t_rel, threshold_a_uv)
-                stb = spike_source_b.spike_times_per_trial_for_channel(ch, t_rel, threshold_b_uv)
-                if str(spike_threshold_mode).strip().lower() == "rms_multiple":
-                    threshold_caption = f"{label_a}: {threshold_a_caption} | {label_b}: {threshold_b_caption}"
-                else:
-                    threshold_caption = _spike_threshold_caption(spike_threshold_uv)
-                threshold_entries = [
-                    (label_a, threshold_a_caption),
-                    (label_b, threshold_b_caption),
-                ]
-                _draw_spike_panels_dual_channel(
-                    ax_raster_f,
-                    ax_fr_f,
-                    ax_trial_fr_f,
-                    ax_isi_f,
-                    None,
-                    None,
-                    t_rel,
-                    float(fs),
-                    spike_threshold_uv,
-                    psth_bin_window_s,
-                    label_a,
-                    label_b,
-                    spike_bandpass_low_hz,
-                    spike_bandpass_high_hz,
-                    t_range_s=None,
-                    sta=sta,
-                    stb=stb,
-                    sampling_percent=sampling_percent,
-                    threshold_caption=threshold_caption,
-                    threshold_entries=threshold_entries,
-                )
-                _draw_spike_panels_dual_channel(
-                    ax_raster_z,
-                    ax_fr_z,
-                    ax_trial_fr_z,
-                    ax_isi_z,
-                    None,
-                    None,
-                    t_rel,
-                    float(fs),
-                    spike_threshold_uv,
-                    psth_bin_window_s,
-                    label_a,
-                    label_b,
-                    spike_bandpass_low_hz,
-                    spike_bandpass_high_hz,
-                    t_range_s=(zoom_t0, zoom_t1),
-                    sta=sta,
-                    stb=stb,
-                    sampling_percent=sampling_percent,
-                    threshold_caption=threshold_caption,
-                    threshold_entries=threshold_entries,
-                )
-                if end_zoom_range is not None:
-                    _draw_spike_panels_dual_channel(
-                        ax_raster_ze,
-                        ax_fr_ze,
-                        ax_trial_fr_ze,
-                        ax_isi_ze,
-                        None,
-                        None,
-                        t_rel,
-                        float(fs),
-                        spike_threshold_uv,
-                        psth_bin_window_s,
-                        label_a,
-                        label_b,
-                        spike_bandpass_low_hz,
-                        spike_bandpass_high_hz,
-                        t_range_s=end_zoom_range,
-                        sta=sta,
-                        stb=stb,
-                        section_title="Trigger-end zoom",
-                        threshold_caption=threshold_caption,
-                        threshold_entries=threshold_entries,
-                    )
-                else:
-                    for ax in (ax_raster_ze, ax_fr_ze, ax_trial_fr_ze):
-                        ax.text(
-                            0.5,
-                            0.5,
-                            "Trigger-end zoom unavailable\n(no rising edge after trigger)",
-                            ha="center",
-                            va="center",
-                            transform=ax.transAxes,
-                            fontsize=9,
-                        )
-                        ax.set_axis_off()
-                    ax_isi_ze.text(
-                        0.5,
-                        0.5,
-                        "ISI unavailable",
-                        ha="center",
-                        va="center",
-                        transform=ax_isi_ze.transAxes,
-                    )
-                    ax_isi_ze.set_axis_off()
-            else:
-                for ax in (ax_raster_f, ax_fr_f, ax_trial_fr_f, ax_raster_z, ax_fr_z, ax_trial_fr_z, ax_raster_ze, ax_fr_ze, ax_trial_fr_ze):
-                    ax.text(
-                        0.5,
-                        0.5,
-                        "Raster / PSTH / ISI unavailable\n(missing mmap sources)",
-                        ha="center",
-                        va="center",
-                        transform=ax.transAxes,
-                        fontsize=9,
-                    )
-                    ax.set_axis_off()
-                for ax in (ax_isi_f, ax_isi_z, ax_isi_ze):
-                    ax.text(
-                        0.5,
-                        0.5,
-                        "ISI unavailable",
-                        ha="center",
-                        va="center",
-                        transform=ax.transAxes,
-                    )
-                    ax.set_axis_off()
-
-            _finalize_and_save_three_part_page(
-                fig=fig,
-                pdf=pdf,
-                axes=_axes,
-                n_recordings=2,
-            )
-
-        rms_series: list[tuple[str, np.ndarray, np.ndarray]] = []
-        t0_rms = float(t_rel[0]) if t_rel.size else 0.0
-        t1_rms = float(t_rel[-1]) if t_rel.size else 0.0
-        if spike_source_a is not None:
-            rms_series.append(
-                (label_a, *_mean_rms_profile_from_source_window(spike_source_a, t0_rms, t1_rms, rms_window_s))
-            )
-        if spike_source_b is not None:
-            rms_series.append(
-                (label_b, *_mean_rms_profile_from_source_window(spike_source_b, t0_rms, t1_rms, rms_window_s))
-            )
-        if rms_series:
-            _append_mean_rms_evolution_page(pdf, rms_series, rms_window_s)
-
-    _profile_print_delta(
-        "plot_channel_comparison",
-        _profile_before,
-        time.perf_counter() - _profile_t0,
-    )
-    return pdf_path

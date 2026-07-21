@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
+import gc
+import os
 import sys
 import time
 from pathlib import Path
@@ -12,18 +14,20 @@ from pathlib import Path
 import numpy as np
 
 from config import AnalysisConfig
+from intan_rhx_dsp import normalize_spike_threshold
 from core import (
     AmplifierSpikeSource,
+    build_intan_dsp_settings,
     get_analog_in0_signal,
     get_channel_names,
     get_sampling_rate,
     load_rhs_file,
-    persist_amplifier_float32,
-    resolve_curve_filter,
+    persist_amp_and_filtered_stacks,
     resolve_recording_windows,
     resolve_work_dir,
     uses_analog_trigger,
 )
+from memmap_io import load_readonly_memmap
 from gui import launch_qt_gui
 from impedance_tracking import collect_impedance_sessions
 from plotting import plot_channel_multi_comparison
@@ -60,8 +64,19 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple[
     )
     channel_names = get_channel_names(data, amplifier_raw.shape[0])
     work_dir = resolve_work_dir(config)
-    amp_path = work_dir / "amplifier_raw.npy"
-    persist_amplifier_float32(amplifier_raw, amp_path)
+    intan_dsp = build_intan_dsp_settings(data, config)
+    stack_shape = (int(amplifier_raw.shape[0]), int(amplifier_raw.shape[1]))
+    amp_path, _ = persist_amp_and_filtered_stacks(
+        work_dir,
+        intan_dsp,
+        stack_shape,
+        amplifier_2d=amplifier_raw,
+        channel_workers=config.channel_workers,
+    )
+    del amplifier_raw
+    if isinstance(data, dict):
+        data.pop("amplifier_data", None)
+    gc.collect()
     return (
         t_rel,
         channel_names,
@@ -133,18 +148,21 @@ def parse_args() -> argparse.Namespace:
         help="PDF output name/title (with or without .pdf)",
     )
     parser.add_argument(
-        "--lowpass-hz",
-        type=float,
-        default=defaults.lowpass_cutoff_hz,
-        help="Butterworth low-pass corner (Hz) on amplifier channels (default: no filter)",
-    )
-    parser.add_argument(
         "--spike-threshold-uv",
         type=float,
         default=defaults.spike_threshold_uv,
         help=(
-            "Spike threshold (µV) on amplifier: >=0 = upward crossing; "
-            "<0 = downward crossing (negative peaks, default from config)"
+            "Spike threshold magnitude (µV). Use --spike-threshold-polarity for above vs below "
+            "(legacy: negative value implies negative polarity)."
+        ),
+    )
+    parser.add_argument(
+        "--spike-threshold-polarity",
+        choices=("negative", "positive"),
+        default=defaults.spike_threshold_polarity,
+        help=(
+            "Spike detection polarity: negative = below threshold (default), "
+            "positive = above threshold."
         ),
     )
     parser.add_argument(
@@ -180,6 +198,24 @@ def parse_args() -> argparse.Namespace:
         help="Zoom window end (s, relative to trigger).",
     )
     parser.add_argument(
+        "--first-trigger-hp-ylim",
+        action="store_true",
+        default=defaults.first_trigger_hp_ylim_enabled,
+        help="Fix y-axis (µV) on first-trigger high-pass PDF panels.",
+    )
+    parser.add_argument(
+        "--first-trigger-hp-ylim-min-uv",
+        type=float,
+        default=defaults.first_trigger_hp_ylim_min_uv,
+        help="Fixed y-axis minimum (µV) for first-trigger HP panels (default: -200).",
+    )
+    parser.add_argument(
+        "--first-trigger-hp-ylim-max-uv",
+        type=float,
+        default=defaults.first_trigger_hp_ylim_max_uv,
+        help="Fixed y-axis maximum (µV) for first-trigger HP panels (default: 200).",
+    )
+    parser.add_argument(
         "--rms-window-s",
         "--rms-smoothing-window-s",
         type=float,
@@ -187,22 +223,28 @@ def parse_args() -> argparse.Namespace:
         help="RMS computation window (s) for moving-RMS profile.",
     )
     parser.add_argument(
-        "--spike-bandpass-low-hz",
-        type=float,
-        default=defaults.spike_bandpass_low_hz,
-        help=(
-            "Spike band-pass low corner (Hz) on amplifier for raster / PSTH / ISI "
-            "(use with --spike-bandpass-high-hz; default: disabled = raw mmap)"
-        ),
+        "--intan-spike-filter",
+        choices=("highpass", "lowpass"),
+        default=defaults.intan_spike_filter_kind,
+        help="Intan software filter for raster/PSTH/ISI (default: highpass).",
     )
     parser.add_argument(
-        "--spike-bandpass-high-hz",
+        "--intan-filter-order",
+        type=int,
+        default=defaults.intan_filter_order,
+        help="Intan software filter order 1–8 (default: 2).",
+    )
+    parser.add_argument(
+        "--intan-filter-type",
+        choices=("bessel", "butterworth"),
+        default=defaults.intan_filter_type,
+        help="Intan filter prototype: bessel or butterworth (default: bessel).",
+    )
+    parser.add_argument(
+        "--intan-filter-cutoff-hz",
         type=float,
-        default=defaults.spike_bandpass_high_hz,
-        help=(
-            "Spike band-pass high corner (Hz) "
-            "(use with --spike-bandpass-low-hz; default: disabled = raw mmap)"
-        ),
+        default=defaults.intan_filter_cutoff_hz,
+        help="Intan software filter cutoff in Hz (default: 250).",
     )
     parser.add_argument(
         "--work-dir",
@@ -279,15 +321,12 @@ def run(config: AnalysisConfig) -> None:
     print(f"Channels compared (overlay): {stats['n_ch']}")
     if config.edge == "none":
         print("Segmentation: equal sections with imaginary trigger window")
-    curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(config, fs)
-    if curve_filter_kind == "no filter":
-        print("Butterworth curve filter: disabled")
-    elif curve_filter_kind == "bandpass":
-        print(f"Butterworth curve filter: band-pass {curve_filter_low_hz:g}-{curve_filter_high_hz:g} Hz")
-    elif curve_filter_kind == "highpass":
-        print(f"Butterworth curve filter: high-pass {curve_filter_low_hz:g} Hz")
-    else:
-        print(f"Butterworth curve filter: low-pass {curve_filter_low_hz:g} Hz")
+    print(
+        "Mean traces in PDF: raw amplifier + Intan software filter "
+        f"({config.intan_filter_type} "
+        f"{'HP' if config.intan_spike_filter_kind == 'highpass' else 'LP'} "
+        f"{config.intan_filter_cutoff_hz:g} Hz, order {config.intan_filter_order})"
+    )
     print(f"PDF written: {pdf_path}")
     print(f"Compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
     print(f"PDF render time: {stats['t_render_s']:.2f} s")
@@ -318,18 +357,12 @@ def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
     print(f"Multiprocessing workers (A/B comparison): {stats['workers']}")
     print(f"A/B compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
     print(f"A/B PDF render time: {stats['t_render_s']:.2f} s")
-    fs_a = float(stats["fs_values"][0])  # type: ignore[index]
-    curve_filter_kind, curve_filter_low_hz, curve_filter_high_hz = resolve_curve_filter(
-        config_a, fs_a
+    print(
+        "Mean traces in PDF: raw amplifier + Intan software filter "
+        f"({config_a.intan_filter_type} "
+        f"{'HP' if config_a.intan_spike_filter_kind == 'highpass' else 'LP'} "
+        f"{config_a.intan_filter_cutoff_hz:g} Hz, order {config_a.intan_filter_order})"
     )
-    if curve_filter_kind == "no filter":
-        print("Butterworth curve filter: disabled")
-    elif curve_filter_kind == "bandpass":
-        print(f"Butterworth curve filter: band-pass {curve_filter_low_hz:g}-{curve_filter_high_hz:g} Hz")
-    elif curve_filter_kind == "highpass":
-        print(f"Butterworth curve filter: high-pass {curve_filter_low_hz:g} Hz")
-    else:
-        print(f"Butterworth curve filter: low-pass {curve_filter_low_hz:g} Hz")
     print(f"Comparison PDF written: {pdf_path}")
     print(f"Total time (comparison + PDF): {stats['t_total_s']:.2f} s")
     return pdf_path
@@ -365,11 +398,13 @@ def _autotune_config(cfg: AnalysisConfig, n_files: int) -> AnalysisConfig:
     workers = max(1, min(int(cfg.comparison_workers), max(1, min(6, n_files))))
     channel_workers = cfg.channel_workers
     if channel_workers is None:
-        channel_workers = 8 if n_files <= 2 else 4
+        channel_workers = 8 if n_files <= 3 else 4
     if uses_analog_trigger(cfg) and cfg.pre_s + cfg.post_s > 20:
         workers = min(workers, 3)
         channel_workers = min(channel_workers, 4)
     sampling_percent = cfg.sampling_percent
+    if n_files >= 2 and sampling_percent > 50:
+        sampling_percent = 50
     if n_files >= 4 and sampling_percent > 35:
         sampling_percent = 35
     if n_files >= 6 and sampling_percent > 20:
@@ -395,6 +430,16 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
         print("Guardrail mode: large window detected, parallelism limited for memory stability.")
     if tuned[0].sampling_percent != configs[0].sampling_percent:
         print(f"Auto-tuning sampling: {configs[0].sampling_percent}% -> {tuned[0].sampling_percent}%")
+    if os.environ.get("PLOT_ERG_HIGH_QUALITY_PDF", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        print(
+            "PDF fast layout: ~38 in page height, DPI=72 "
+            "(set PLOT_ERG_HIGH_QUALITY_PDF=1 for legacy tall export @ 120 DPI)."
+        )
     payloads = []
     t_compute0 = time.perf_counter()
     if len(tuned) == 1:
@@ -430,17 +475,21 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
                 post_n,
                 amp_path,
             ) = payload
-            amp_mm = np.load(Path(amp_path), mmap_mode="r")
+            work = Path(amp_path).parent
+            amp_mm = load_readonly_memmap(Path(amp_path))
+            high_mm = load_readonly_memmap(work / "high_intan.npy")
+            from intan_rhx_dsp import IntanDspSettings
+
+            intan_dsp = IntanDspSettings.load_json(work / "intan_dsp.json")
             spike_sources.append(
                 AmplifierSpikeSource(
                     amplifier=amp_mm,
+                    highpass=high_mm,
                     valid_triggers=valid_triggers,
                     pre_n=int(pre_n),
                     post_n=int(post_n),
-                    work_dir=Path(amp_path).parent,
-                    fs=float(fs),
-                    bandpass_low_hz=cfg.spike_bandpass_low_hz,
-                    bandpass_high_hz=cfg.spike_bandpass_high_hz,
+                    work_dir=work,
+                    intan_dsp=intan_dsp,
                 )
             )
             t_arrays.append(np.asarray(t_rel))
@@ -473,33 +522,30 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
         t_render0 = time.perf_counter()
         pdf_path = plot_channel_multi_comparison(
             t_rel=t_ref,
-            means=[],
             channel_names=channel_names,
             output_dir=out_dir,
             labels=labels,
             pdf_title=tuned[0].pdf_title,
-            lowpass_cutoff_hz=tuned[0].lowpass_cutoff_hz,
-            curve_filter=tuned[0].curve_filter,
-            curve_filter_low_hz=tuned[0].curve_filter_low_hz,
-            curve_filter_high_hz=tuned[0].curve_filter_high_hz,
             trigger_end_rising_rel_s_list=end_markers,
-            means_raw=None,
             spike_sources=spike_sources,
             fs=float(fs_ref),
             spike_threshold_uv=tuned[0].spike_threshold_uv,
+            spike_threshold_polarity=tuned[0].spike_threshold_polarity,
             spike_threshold_mode=tuned[0].spike_threshold_mode,
             spike_threshold_rms_multiplier=tuned[0].spike_threshold_rms_multiplier,
             psth_bin_window_s=tuned[0].psth_bin_window_s,
             rms_window_s=tuned[0].rms_window_s,
             zoom_t0_s=tuned[0].zoom_t0_s,
             zoom_t1_s=tuned[0].zoom_t1_s,
-            spike_bandpass_low_hz=tuned[0].spike_bandpass_low_hz,
-            spike_bandpass_high_hz=tuned[0].spike_bandpass_high_hz,
             sampling_percent=tuned[0].sampling_percent,
             pre_n_common=pre_n_common,
             post_n_common=post_n_common,
             impedance_sessions=imp_sessions if imp_sessions else None,
             probe_layout_json=tuned[0].probe_layout_json,
+            channel_workers=tuned[0].channel_workers,
+            first_trigger_hp_ylim_enabled=tuned[0].first_trigger_hp_ylim_enabled,
+            first_trigger_hp_ylim_min_uv=tuned[0].first_trigger_hp_ylim_min_uv,
+            first_trigger_hp_ylim_max_uv=tuned[0].first_trigger_hp_ylim_max_uv,
         )
         t_render_s = time.perf_counter() - t_render0
         stats: dict[str, object] = {
@@ -531,21 +577,28 @@ def main() -> None:
             default_edge=args.edge,
             default_pre_s=args.pre,
             default_post_s=args.post,
-            default_lowpass_hz=args.lowpass_hz,
-            default_curve_filter="lowpass" if args.lowpass_hz is not None else "no filter",
-            default_curve_filter_low_hz=args.lowpass_hz,
-            default_spike_threshold_uv=args.spike_threshold_uv,
+            default_spike_threshold_uv=normalize_spike_threshold(
+                args.spike_threshold_uv, args.spike_threshold_polarity
+            )[0],
+            default_spike_threshold_polarity=normalize_spike_threshold(
+                args.spike_threshold_uv, args.spike_threshold_polarity
+            )[1],
             default_spike_threshold_mode=args.spike_threshold_mode,
             default_spike_threshold_rms_multiplier=args.spike_threshold_rms_multiplier,
             default_psth_bin_window_s=args.psth_bin_window_s,
             default_rms_window_s=args.rms_window_s,
             default_zoom_t0_s=args.zoom_t0_s,
             default_zoom_t1_s=args.zoom_t1_s,
-            default_spike_bandpass_low_hz=args.spike_bandpass_low_hz,
-            default_spike_bandpass_high_hz=args.spike_bandpass_high_hz,
+            default_intan_spike_filter_kind=args.intan_spike_filter,
+            default_intan_filter_order=args.intan_filter_order,
+            default_intan_filter_type=args.intan_filter_type,
+            default_intan_filter_cutoff_hz=args.intan_filter_cutoff_hz,
             default_channel_workers=args.channel_workers,
             default_sampling_percent=args.sampling_percent,
             default_probe_layout_json=args.probe_layout_json,
+            default_first_trigger_hp_ylim_enabled=args.first_trigger_hp_ylim,
+            default_first_trigger_hp_ylim_min_uv=args.first_trigger_hp_ylim_min_uv,
+            default_first_trigger_hp_ylim_max_uv=args.first_trigger_hp_ylim_max_uv,
         )
         if exit_code != 0:
             sys.exit(exit_code)
@@ -562,32 +615,52 @@ def main() -> None:
         section_spec=args.section_spec,
         section_trigger_start_s=args.section_trigger_start_s,
         section_trigger_end_s=args.section_trigger_end_s,
-        lowpass_cutoff_hz=args.lowpass_hz,
-        curve_filter="lowpass" if args.lowpass_hz is not None else "no filter",
-        curve_filter_low_hz=args.lowpass_hz,
-        curve_filter_high_hz=None,
         save_dir=args.save_dir,
         pdf_title=args.pdf_title,
-        spike_threshold_uv=args.spike_threshold_uv,
+        spike_threshold_uv=normalize_spike_threshold(
+            args.spike_threshold_uv, args.spike_threshold_polarity
+        )[0],
+        spike_threshold_polarity=normalize_spike_threshold(
+            args.spike_threshold_uv, args.spike_threshold_polarity
+        )[1],
         spike_threshold_mode=args.spike_threshold_mode,
         spike_threshold_rms_multiplier=args.spike_threshold_rms_multiplier,
         psth_bin_window_s=args.psth_bin_window_s,
         rms_window_s=args.rms_window_s,
         zoom_t0_s=args.zoom_t0_s,
         zoom_t1_s=args.zoom_t1_s,
-        spike_bandpass_low_hz=args.spike_bandpass_low_hz,
-        spike_bandpass_high_hz=args.spike_bandpass_high_hz,
+        intan_spike_filter_kind=args.intan_spike_filter,
+        intan_filter_order=args.intan_filter_order,
+        intan_filter_type=args.intan_filter_type,
+        intan_filter_cutoff_hz=args.intan_filter_cutoff_hz,
         work_dir=args.work_dir,
         comparison_workers=args.workers,
         channel_workers=args.channel_workers,
         sampling_percent=args.sampling_percent,
         probe_layout_json=args.probe_layout_json,
+        first_trigger_hp_ylim_enabled=args.first_trigger_hp_ylim,
+        first_trigger_hp_ylim_min_uv=args.first_trigger_hp_ylim_min_uv,
+        first_trigger_hp_ylim_max_uv=args.first_trigger_hp_ylim_max_uv,
     )
     if config.zoom_t1_s <= config.zoom_t0_s:
         print("Error: --zoom-t1-s must be strictly greater than --zoom-t0-s.", file=sys.stderr)
         sys.exit(2)
     if config.rms_window_s <= 0:
         print("Error: --rms-window-s / --rms-smoothing-window-s must be > 0.", file=sys.stderr)
+        sys.exit(2)
+    if config.first_trigger_hp_ylim_enabled and (
+        config.first_trigger_hp_ylim_max_uv <= config.first_trigger_hp_ylim_min_uv
+    ):
+        print(
+            "Error: --first-trigger-hp-ylim-max-uv must be > --first-trigger-hp-ylim-min-uv.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if config.intan_filter_order < 1 or config.intan_filter_order > 8:
+        print("Error: --intan-filter-order must be between 1 and 8.", file=sys.stderr)
+        sys.exit(2)
+    if config.intan_filter_cutoff_hz <= 0:
+        print("Error: --intan-filter-cutoff-hz must be > 0.", file=sys.stderr)
         sys.exit(2)
     if config.spike_threshold_mode == "rms_multiple" and config.spike_threshold_rms_multiplier <= 0:
         print(
