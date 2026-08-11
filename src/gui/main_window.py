@@ -9,6 +9,7 @@ from typing import Callable
 
 from config import AnalysisConfig
 from display_config import (
+    PANEL_DEFAULT_OFF,
     PANEL_FIELD_NAMES,
     PANEL_LABELS,
     PlotDisplaySettings,
@@ -418,11 +419,13 @@ def launch_qt_gui(
             self.end_group = end_group
             layout.addWidget(end_group)
 
-            hp_group = QGroupBox("Y axis — first filtered stimulation")
+            hp_group = QGroupBox("Y axis — first/second filtered stimulation")
             hp_form = QFormLayout(hp_group)
             hp_form.setSpacing(10)
             hp_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.hp_ylim_check = QCheckBox("Fix Y axis (µV) on first filtered stimulation panels")
+            self.hp_ylim_check = QCheckBox(
+                "Fix Y axis (µV) on first/second filtered stimulation panels"
+            )
             self.hp_ylim_check.toggled.connect(self._update_hp_ylim_visibility)
             self.hp_ylim_min_spin = _spin(defaults.get("default_first_trigger_hp_ylim_min_uv", -200.0))
             self.hp_ylim_max_spin = _spin(defaults.get("default_first_trigger_hp_ylim_max_uv", 200.0))
@@ -481,7 +484,7 @@ def launch_qt_gui(
                 self._display_cell_wrappers[panel_key] = {}
                 for col, section_key in enumerate(section_keys, start=1):
                     cb = QCheckBox()
-                    cb.setChecked(True)
+                    cb.setChecked(panel_key not in PANEL_DEFAULT_OFF)
                     wrapper = QWidget()
                     wl = QHBoxLayout(wrapper)
                     wl.addWidget(cb)

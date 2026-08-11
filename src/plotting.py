@@ -100,6 +100,8 @@ PANEL_ROW_SPEC: list[tuple[str, float]] = [
     ("mean_filtered", 1.60),
     ("first_trigger_raw", 1.35),
     ("first_trigger_hp", 1.25),
+    ("second_trigger_raw", 1.35),
+    ("second_trigger_hp", 1.25),
     ("rms", 1.30),
     ("raster", 1.20),
     ("psth", 1.45),
@@ -110,7 +112,7 @@ SECTION_HEADER_HEIGHT = 0.08
 MEA_ROW_HEIGHT = 2.2
 IMPEDANCE_HEADER_HEIGHT = 0.08
 IMPEDANCE_PANEL_HEIGHT = 0.92
-# Legacy full layout height units (MEA + 3×9 panels + 2 headers) for scaling.
+# Legacy full layout height units (MEA + 3× panels + 2 headers) for scaling.
 THREE_PART_ROW_HEIGHTS = [
     *[h for _k, h in PANEL_ROW_SPEC],
     SECTION_HEADER_HEIGHT,
@@ -125,6 +127,8 @@ THREE_PART1_PANEL_KEYS = [
     "ax_full_filt",
     "ax_first_trigger",
     "ax_first_trigger_hp",
+    "ax_second_trigger",
+    "ax_second_trigger_hp",
     "ax_full_rms",
     "ax_raster_f",
     "ax_fr_f",
@@ -137,6 +141,8 @@ THREE_PART2_PANEL_KEYS = [
     "ax_zoom_filt",
     "ax_zoom_first",
     "ax_zoom_first_hp",
+    "ax_zoom_second",
+    "ax_zoom_second_hp",
     "ax_zoom_rms",
     "ax_raster_z",
     "ax_fr_z",
@@ -150,6 +156,8 @@ THREE_PART3_PANEL_KEYS = [
     "ax_zoom_end_filt",
     "ax_zoom_end_first",
     "ax_zoom_end_first_hp",
+    "ax_zoom_end_second",
+    "ax_zoom_end_second_hp",
     "ax_zoom_end_rms",
     "ax_raster_ze",
     "ax_fr_ze",
@@ -166,6 +174,8 @@ _FULL_PANEL_TO_AXIS: dict[str, str] = {
     "mean_filtered": "ax_full_filt",
     "first_trigger_raw": "ax_first_trigger",
     "first_trigger_hp": "ax_first_trigger_hp",
+    "second_trigger_raw": "ax_second_trigger",
+    "second_trigger_hp": "ax_second_trigger_hp",
     "rms": "ax_full_rms",
     "raster": "ax_raster_f",
     "psth": "ax_fr_f",
@@ -178,6 +188,8 @@ _ZOOM_ONSET_PANEL_TO_AXIS: dict[str, str] = {
     "mean_filtered": "ax_zoom_filt",
     "first_trigger_raw": "ax_zoom_first",
     "first_trigger_hp": "ax_zoom_first_hp",
+    "second_trigger_raw": "ax_zoom_second",
+    "second_trigger_hp": "ax_zoom_second_hp",
     "rms": "ax_zoom_rms",
     "raster": "ax_raster_z",
     "psth": "ax_fr_z",
@@ -190,6 +202,8 @@ _ZOOM_END_PANEL_TO_AXIS: dict[str, str] = {
     "mean_filtered": "ax_zoom_end_filt",
     "first_trigger_raw": "ax_zoom_end_first",
     "first_trigger_hp": "ax_zoom_end_first_hp",
+    "second_trigger_raw": "ax_zoom_end_second",
+    "second_trigger_hp": "ax_zoom_end_second_hp",
     "rms": "ax_zoom_end_rms",
     "raster": "ax_raster_ze",
     "psth": "ax_fr_ze",
@@ -235,7 +249,14 @@ def _profile_print_delta(title: str, before: dict[str, tuple[float, int]], total
 def _trace_panels_enabled(panels: SectionPanels) -> bool:
     return any(
         getattr(panels, key)
-        for key in ("mean_raw", "mean_filtered", "first_trigger_raw", "first_trigger_hp")
+        for key in (
+            "mean_raw",
+            "mean_filtered",
+            "first_trigger_raw",
+            "first_trigger_hp",
+            "second_trigger_raw",
+            "second_trigger_hp",
+        )
     )
 
 
@@ -504,6 +525,8 @@ def _build_three_part_page_axes(
         "ax_full_filt",
         "ax_first_trigger",
         "ax_first_trigger_hp",
+        "ax_second_trigger",
+        "ax_second_trigger_hp",
         "ax_full_rms",
         "ax_raster_f",
         "ax_fr_f",
@@ -511,12 +534,16 @@ def _build_three_part_page_axes(
         "ax_zoom_filt",
         "ax_zoom_first",
         "ax_zoom_first_hp",
+        "ax_zoom_second",
+        "ax_zoom_second_hp",
         "ax_raster_z",
         "ax_fr_z",
         "ax_zoom_end",
         "ax_zoom_end_filt",
         "ax_zoom_end_first",
         "ax_zoom_end_first_hp",
+        "ax_zoom_end_second",
+        "ax_zoom_end_second_hp",
         "ax_raster_ze",
         "ax_fr_ze",
     }
@@ -640,11 +667,15 @@ def _finalize_and_save_three_part_page(
         "ax_full_filt",
         "ax_first_trigger_hp",
         "ax_first_trigger",
+        "ax_second_trigger_hp",
+        "ax_second_trigger",
         "ax_full_rms",
         "ax_zoom",
         "ax_zoom_filt",
         "ax_zoom_first_hp",
         "ax_zoom_first",
+        "ax_zoom_second_hp",
+        "ax_zoom_second",
         "ax_zoom_rms",
         "ax_raster_f",
         "ax_fr_f",
@@ -662,6 +693,8 @@ def _finalize_and_save_three_part_page(
         "ax_zoom_end_filt",
         "ax_zoom_end_first_hp",
         "ax_zoom_end_first",
+        "ax_zoom_end_second_hp",
+        "ax_zoom_end_second",
         "ax_zoom_end_rms",
     ]
     if "ax_imp" in axes:
@@ -710,6 +743,8 @@ def _finalize_and_save_three_part_page(
         ("ax_full_filt", gap_legend),
         ("ax_first_trigger", gap_legend),
         ("ax_first_trigger_hp", gap_legend_hp),
+        ("ax_second_trigger", gap_legend),
+        ("ax_second_trigger_hp", gap_legend_hp),
         ("ax_fr_f", gap_4_5),
     )
     part2_legend_shifts = (
@@ -717,6 +752,8 @@ def _finalize_and_save_three_part_page(
         ("ax_zoom_filt", gap_legend),
         ("ax_zoom_first", gap_legend),
         ("ax_zoom_first_hp", gap_legend_hp),
+        ("ax_zoom_second", gap_legend),
+        ("ax_zoom_second_hp", gap_legend_hp),
         ("ax_fr_z", gap_4_5),
     )
     part3_legend_shifts = (
@@ -724,6 +761,8 @@ def _finalize_and_save_three_part_page(
         ("ax_zoom_end_filt", gap_legend),
         ("ax_zoom_end_first", gap_legend),
         ("ax_zoom_end_first_hp", gap_legend_hp),
+        ("ax_zoom_end_second", gap_legend),
+        ("ax_zoom_end_second_hp", gap_legend_hp),
         ("ax_fr_ze", gap_4_5),
     )
     for start_key, gap in part1_legend_shifts:
@@ -909,6 +948,16 @@ def _intan_hp_mean_filter_captions(intan_dsp: IntanDspSettings | None) -> tuple[
     return f" — mean trace: {short}", short
 
 
+def _mean_n_samples_title_suffix(n_samples_per_recording: Sequence[int]) -> str:
+    """Suffix for mean-trace titles: number of trials/sections used in the average."""
+    counts = [int(n) for n in n_samples_per_recording]
+    if not counts:
+        return ""
+    if len(counts) == 1 or len(set(counts)) == 1:
+        return f" (n={counts[0]})"
+    return f" (n={', '.join(str(n) for n in counts)})"
+
+
 def _mean_triggered_average_row(
     row: np.ndarray,
     valid_triggers: np.ndarray,
@@ -930,19 +979,21 @@ def _mean_triggered_average_row(
     return y
 
 
-def _first_trigger_window(
+def _nth_trigger_window(
     source: AmplifierSpikeSource,
     ch: int,
     n_expected: int,
     *,
+    trigger_index: int,
     highpass: bool = False,
 ) -> Optional[np.ndarray]:
-    """Extract the first-trigger window (raw amplifier or Intan high-pass)."""
-    if source.valid_triggers.size == 0:
+    """Extract the Nth valid-stimulation window (raw amplifier or Intan filtered)."""
+    triggers = np.asarray(source.valid_triggers, dtype=np.int64)
+    if triggers.size <= int(trigger_index):
         return None
-    first_trig = int(source.valid_triggers[0])
-    start = int(first_trig - source.pre_n)
-    end = int(first_trig + source.post_n)
+    trig = int(triggers[int(trigger_index)])
+    start = int(trig - source.pre_n)
+    end = int(trig + source.post_n)
     data = source.highpass if highpass else source.amplifier
     curve = np.asarray(data[ch, start:end], dtype=np.float64)
     if curve.shape[0] != n_expected:
@@ -950,17 +1001,50 @@ def _first_trigger_window(
     return curve
 
 
+def _first_trigger_window(
+    source: AmplifierSpikeSource,
+    ch: int,
+    n_expected: int,
+    *,
+    highpass: bool = False,
+) -> Optional[np.ndarray]:
+    """Extract the first-stimulation window (raw amplifier or Intan filtered)."""
+    return _nth_trigger_window(
+        source, ch, n_expected, trigger_index=0, highpass=highpass
+    )
+
+
+def _collect_nth_trigger_windows(
+    spike_sources: Sequence[AmplifierSpikeSource],
+    ch: int,
+    n_expected: int,
+    *,
+    trigger_index: int,
+) -> tuple[list[Optional[np.ndarray]], list[Optional[np.ndarray]]]:
+    raw_curves: list[Optional[np.ndarray]] = []
+    hp_curves: list[Optional[np.ndarray]] = []
+    for src in spike_sources:
+        raw_curves.append(
+            _nth_trigger_window(
+                src, ch, n_expected, trigger_index=trigger_index, highpass=False
+            )
+        )
+        hp_curves.append(
+            _nth_trigger_window(
+                src, ch, n_expected, trigger_index=trigger_index, highpass=True
+            )
+        )
+    return raw_curves, hp_curves
+
+
 def _collect_first_trigger_windows(
     spike_sources: Sequence[AmplifierSpikeSource],
     ch: int,
     n_expected: int,
 ) -> tuple[list[Optional[np.ndarray]], list[Optional[np.ndarray]]]:
-    raw_curves: list[Optional[np.ndarray]] = []
-    hp_curves: list[Optional[np.ndarray]] = []
-    for src in spike_sources:
-        raw_curves.append(_first_trigger_window(src, ch, n_expected, highpass=False))
-        hp_curves.append(_first_trigger_window(src, ch, n_expected, highpass=True))
-    return raw_curves, hp_curves
+    return _collect_nth_trigger_windows(
+        spike_sources, ch, n_expected, trigger_index=0
+    )
 
 
 def _trigger_end_zoom_bounds(
@@ -1091,6 +1175,78 @@ def _draw_onset_offset_lines(
         labeled = True
 
 
+def _plot_stim_event_panel(
+    ax: Any,
+    *,
+    curves: Sequence[Optional[np.ndarray]],
+    t_plot: np.ndarray,
+    slice_fn,
+    labels: Sequence[str],
+    colors: Sequence[Any],
+    intan_hp_legends: Sequence[str],
+    legend_visible: Sequence[bool] | None,
+    title: str,
+    legend_suffix: str,
+    single_legend: str,
+    unavailable_message: str,
+    first_lw: float,
+    overlay_kwargs: dict[str, Any],
+    end_markers: Sequence[float],
+    end_line_specs: Optional[Sequence[tuple[float, str]]],
+    show_reference: bool,
+    ylim: tuple[float, float] | None = None,
+    filtered: bool = False,
+) -> None:
+    if ax is None:
+        return
+    if not any(curve is not None for curve in curves):
+        _mark_unavailable_axis(ax, unavailable_message)
+        return
+    for i, curve in enumerate(curves):
+        if curve is None:
+            continue
+        line_color = colors[i % len(colors)]
+        show_leg = True if legend_visible is None else bool(legend_visible[i])
+        if filtered:
+            hp_legend = (
+                intan_hp_legends[i]
+                if i < len(intan_hp_legends)
+                else _default_filter_short_label()
+            )
+            label = _legend_label(
+                labels[i],
+                f"{legend_suffix} ({hp_legend})",
+                multi=len(labels) > 1,
+                show_legend=show_leg,
+            )
+            if len(labels) <= 1 and show_leg:
+                label = f"{single_legend} ({hp_legend})"
+        else:
+            label = _legend_label(
+                labels[i],
+                legend_suffix,
+                multi=len(labels) > 1,
+                show_legend=show_leg,
+            )
+            if len(labels) <= 1 and show_leg:
+                label = single_legend
+        ax.plot(t_plot, slice_fn(curve), linewidth=first_lw, color=line_color, label=label)
+    if show_reference:
+        _add_trace_reference_overlays(ax, **overlay_kwargs)
+    else:
+        _draw_onset_offset_lines(
+            ax,
+            end_markers=end_markers,
+            end_line_specs=end_line_specs,
+        )
+    ax.set_title(title)
+    ax.set_ylabel("Potential (µV)")
+    ax.set_xlabel(TIME_REL_XLABEL)
+    ax.grid(True, alpha=0.3)
+    if ylim is not None:
+        ax.set_ylim(float(ylim[0]), float(ylim[1]))
+
+
 def _plot_mean_section_trace_panels(
     *,
     ax_raw: Any,
@@ -1125,11 +1281,19 @@ def _plot_mean_section_trace_panels(
     end_zoom_t0: float | None = None,
     end_zoom_t1: float | None = None,
     first_trigger_hp_ylim: tuple[float, float] | None = None,
+    ax_second_hp: Any = None,
+    ax_second_raw: Any = None,
+    second_trigger_raw: Sequence[Optional[np.ndarray]] | None = None,
+    second_trigger_hp: Sequence[Optional[np.ndarray]] | None = None,
+    title_second_hp: str = "Second stimulation — filtered",
+    title_second_raw: str = "Second stimulation — raw",
+    show_reference_on_second_raw: bool = True,
+    show_reference_on_second_hp: bool = False,
     base_lw: float = 1.2,
     main_lw: float = 1.35,
     first_lw: float = 1.1,
 ) -> None:
-    """Plot the four mean-trace panels shared by each three-part section."""
+    """Plot mean-trace and per-stimulation panels shared by each section."""
     if time_mask is not None:
         t_plot = t_rel[time_mask]
     else:
@@ -1202,82 +1366,98 @@ def _plot_mean_section_trace_panels(
         ax_filt.grid(True, alpha=0.3)
         ax_filt.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
 
-    if ax_first_hp is not None:
-        if any(curve is not None for curve in first_trigger_hp):
-            for i, curve in enumerate(first_trigger_hp):
-                if curve is None:
-                    continue
-                line_color = colors[i % len(colors)]
-                hp_legend = (
-                    intan_hp_legends[i]
-                    if i < len(intan_hp_legends)
-                    else _default_filter_short_label()
-                )
-                hp_label = _legend_label(
-                    labels[i],
-                    f"first stimulation ({hp_legend})",
-                    multi=len(labels) > 1,
-                    show_legend=True if legend_visible is None else bool(legend_visible[i]),
-                )
-                if len(labels) <= 1 and (legend_visible is None or legend_visible[i]):
-                    hp_label = f"First stimulation ({hp_legend})"
-                ax_first_hp.plot(
-                    t_plot, _slice(curve), linewidth=first_lw, color=line_color, label=hp_label
-                )
-            if show_reference_on_first_hp:
-                _add_trace_reference_overlays(ax_first_hp, **overlay_kwargs)
-            else:
-                _draw_onset_offset_lines(
-                    ax_first_hp,
-                    end_markers=end_markers,
-                    end_line_specs=end_line_specs,
-                )
-            ax_first_hp.set_title(title_first_hp)
-            ax_first_hp.set_ylabel("Potential (µV)")
-            ax_first_hp.set_xlabel(TIME_REL_XLABEL)
-            ax_first_hp.grid(True, alpha=0.3)
-            if first_trigger_hp_ylim is not None:
-                ax_first_hp.set_ylim(
-                    float(first_trigger_hp_ylim[0]),
-                    float(first_trigger_hp_ylim[1]),
-                )
-        else:
-            _mark_unavailable_axis(ax_first_hp, "First stimulation filtered signal unavailable")
-
-    if ax_first_raw is not None:
-        if any(curve is not None for curve in first_trigger_raw):
-            for i, curve in enumerate(first_trigger_raw):
-                if curve is None:
-                    continue
-                line_color = colors[i % len(colors)]
-                raw_label = _legend_label(
-                    labels[i],
-                    "first stimulation raw",
-                    multi=len(labels) > 1,
-                    show_legend=True if legend_visible is None else bool(legend_visible[i]),
-                )
-                if len(labels) <= 1 and (legend_visible is None or legend_visible[i]):
-                    raw_label = "First stimulation raw"
-                ax_first_raw.plot(
-                    t_plot, _slice(curve), linewidth=first_lw, color=line_color, label=raw_label
-                )
-            if show_reference_on_first_raw:
-                _add_trace_reference_overlays(ax_first_raw, **overlay_kwargs)
-            else:
-                _draw_onset_offset_lines(
-                    ax_first_raw,
-                    end_markers=end_markers,
-                    end_line_specs=end_line_specs,
-                )
-            ax_first_raw.set_title(title_first_raw)
-            ax_first_raw.set_ylabel("Potential (µV)")
-            ax_first_raw.set_xlabel(TIME_REL_XLABEL)
-            ax_first_raw.grid(True, alpha=0.3)
-        else:
-            _mark_unavailable_axis(ax_first_raw, "First stimulation raw signal unavailable")
+    _plot_stim_event_panel(
+        ax_first_hp,
+        curves=first_trigger_hp,
+        t_plot=t_plot,
+        slice_fn=_slice,
+        labels=labels,
+        colors=colors,
+        intan_hp_legends=intan_hp_legends,
+        legend_visible=legend_visible,
+        title=title_first_hp,
+        legend_suffix="first stimulation",
+        single_legend="First stimulation",
+        unavailable_message="First stimulation filtered signal unavailable",
+        first_lw=first_lw,
+        overlay_kwargs=overlay_kwargs,
+        end_markers=end_markers,
+        end_line_specs=end_line_specs,
+        show_reference=show_reference_on_first_hp,
+        ylim=first_trigger_hp_ylim,
+        filtered=True,
+    )
+    _plot_stim_event_panel(
+        ax_first_raw,
+        curves=first_trigger_raw,
+        t_plot=t_plot,
+        slice_fn=_slice,
+        labels=labels,
+        colors=colors,
+        intan_hp_legends=intan_hp_legends,
+        legend_visible=legend_visible,
+        title=title_first_raw,
+        legend_suffix="first stimulation raw",
+        single_legend="First stimulation raw",
+        unavailable_message="First stimulation raw signal unavailable",
+        first_lw=first_lw,
+        overlay_kwargs=overlay_kwargs,
+        end_markers=end_markers,
+        end_line_specs=end_line_specs,
+        show_reference=show_reference_on_first_raw,
+    )
+    second_raw = second_trigger_raw or []
+    second_hp = second_trigger_hp or []
+    _plot_stim_event_panel(
+        ax_second_hp,
+        curves=second_hp,
+        t_plot=t_plot,
+        slice_fn=_slice,
+        labels=labels,
+        colors=colors,
+        intan_hp_legends=intan_hp_legends,
+        legend_visible=legend_visible,
+        title=title_second_hp,
+        legend_suffix="second stimulation",
+        single_legend="Second stimulation",
+        unavailable_message="Second stimulation filtered signal unavailable",
+        first_lw=first_lw,
+        overlay_kwargs=overlay_kwargs,
+        end_markers=end_markers,
+        end_line_specs=end_line_specs,
+        show_reference=show_reference_on_second_hp,
+        ylim=first_trigger_hp_ylim,
+        filtered=True,
+    )
+    _plot_stim_event_panel(
+        ax_second_raw,
+        curves=second_raw,
+        t_plot=t_plot,
+        slice_fn=_slice,
+        labels=labels,
+        colors=colors,
+        intan_hp_legends=intan_hp_legends,
+        legend_visible=legend_visible,
+        title=title_second_raw,
+        legend_suffix="second stimulation raw",
+        single_legend="Second stimulation raw",
+        unavailable_message="Second stimulation raw signal unavailable",
+        first_lw=first_lw,
+        overlay_kwargs=overlay_kwargs,
+        end_markers=end_markers,
+        end_line_specs=end_line_specs,
+        show_reference=show_reference_on_second_raw,
+    )
 
     if x_limits is not None:
-        for ax in (ax_raw, ax_filt, ax_first_hp, ax_first_raw):
+        for ax in (
+            ax_raw,
+            ax_filt,
+            ax_first_hp,
+            ax_first_raw,
+            ax_second_hp,
+            ax_second_raw,
+        ):
             if ax is not None:
                 ax.set_xlim(float(x_limits[0]), float(x_limits[1]))
 
@@ -2376,6 +2556,8 @@ def plot_channel_multi_comparison(
             ax_full_filt = _axes.get("ax_full_filt")
             ax_first_trigger_hp = _axes.get("ax_first_trigger_hp")
             ax_first_trigger = _axes.get("ax_first_trigger")
+            ax_second_trigger_hp = _axes.get("ax_second_trigger_hp")
+            ax_second_trigger = _axes.get("ax_second_trigger")
             ax_full_rms = _axes.get("ax_full_rms")
             ax_raster_f = _axes.get("ax_raster_f")
             ax_fr_f = _axes.get("ax_fr_f")
@@ -2385,6 +2567,8 @@ def plot_channel_multi_comparison(
             ax_zoom_filt = _axes.get("ax_zoom_filt")
             ax_zoom_first_hp = _axes.get("ax_zoom_first_hp")
             ax_zoom_first = _axes.get("ax_zoom_first")
+            ax_zoom_second_hp = _axes.get("ax_zoom_second_hp")
+            ax_zoom_second = _axes.get("ax_zoom_second")
             ax_zoom_rms = _axes.get("ax_zoom_rms")
             ax_raster_z = _axes.get("ax_raster_z")
             ax_fr_z = _axes.get("ax_fr_z")
@@ -2394,6 +2578,8 @@ def plot_channel_multi_comparison(
             ax_zoom_end_filt = _axes.get("ax_zoom_end_filt")
             ax_zoom_end_first_hp = _axes.get("ax_zoom_end_first_hp")
             ax_zoom_end_first = _axes.get("ax_zoom_end_first")
+            ax_zoom_end_second_hp = _axes.get("ax_zoom_end_second_hp")
+            ax_zoom_end_second = _axes.get("ax_zoom_end_second")
             ax_zoom_end_rms = _axes.get("ax_zoom_end_rms")
             ax_raster_ze = _axes.get("ax_raster_ze")
             ax_fr_ze = _axes.get("ax_fr_ze")
@@ -2438,17 +2624,29 @@ def plot_channel_multi_comparison(
                         float(marker_i + zoom_end_t1),
                     )
                     rms_series_zoom_end_multi.append((label, tx_end, rms_zoom_end_vals))
-            first_trigger_raw_all, first_trigger_hp_all = _collect_first_trigger_windows(
+            first_trigger_raw_all, first_trigger_hp_all = _collect_nth_trigger_windows(
                 spike_sources,
                 ch,
                 int(t_rel.shape[0]),
+                trigger_index=0,
+            )
+            second_trigger_raw_all, second_trigger_hp_all = _collect_nth_trigger_windows(
+                spike_sources,
+                ch,
+                int(t_rel.shape[0]),
+                trigger_index=1,
             )
             first_trigger_raw = [first_trigger_raw_all[i] for i in plot_indices]
             first_trigger_hp = [first_trigger_hp_all[i] for i in plot_indices]
+            second_trigger_raw = [second_trigger_raw_all[i] for i in plot_indices]
+            second_trigger_hp = [second_trigger_hp_all[i] for i in plot_indices]
             record_labels = [
                 labels[i] if i < len(labels) else f"Recording {i + 1}"
                 for i in plot_indices
             ]
+            mean_n_suffix = _mean_n_samples_title_suffix(
+                [int(spike_sources[i].valid_triggers.size) for i in plot_indices]
+            )
             plot_colors = [colors[k % len(colors)] for k in range(len(plot_indices))]
             full_panels = display.full_view
             onset_panels = display.zoom_onset
@@ -2461,6 +2659,8 @@ def plot_channel_multi_comparison(
                     ax_filt=ax_full_filt,
                     ax_first_hp=ax_first_trigger_hp,
                     ax_first_raw=ax_first_trigger,
+                    ax_second_hp=ax_second_trigger_hp,
+                    ax_second_raw=ax_second_trigger,
                     t_rel=t_rel,
                     time_mask=None,
                     x_limits=(float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None,
@@ -2469,15 +2669,19 @@ def plot_channel_multi_comparison(
                     mean_raw=means_raw_ch,
                     first_trigger_raw=first_trigger_raw,
                     first_trigger_hp=first_trigger_hp,
+                    second_trigger_raw=second_trigger_raw,
+                    second_trigger_hp=second_trigger_hp,
                     colors=plot_colors,
                     zoom_t0=zoom_onset_t0,
                     zoom_t1=zoom_onset_t1,
                     end_markers=end_markers,
                     intan_hp_legends=intan_hp_legends,
-                    title_raw=f"{channel_name} — Raw mean (full view)",
-                    title_filt=f"{channel_name} — Filtered mean ({filter_short})",
+                    title_raw=f"{channel_name} — Raw mean (full view){mean_n_suffix}",
+                    title_filt=f"{channel_name} — Filtered mean ({filter_short}){mean_n_suffix}",
                     title_first_hp=f"First stimulation — filtered ({filter_title})",
                     title_first_raw="First stimulation — raw",
+                    title_second_hp=f"Second stimulation — filtered ({filter_title})",
+                    title_second_raw="Second stimulation — raw",
                     legend_cols=legend_cols,
                     legend_visible=legend_flags,
                     first_trigger_hp_ylim=first_trigger_hp_ylim,
@@ -2502,6 +2706,8 @@ def plot_channel_multi_comparison(
                     ax_filt=ax_zoom_filt,
                     ax_first_hp=ax_zoom_first_hp,
                     ax_first_raw=ax_zoom_first,
+                    ax_second_hp=ax_zoom_second_hp,
+                    ax_second_raw=ax_zoom_second,
                     t_rel=t_rel,
                     time_mask=zmask,
                     x_limits=(zoom_onset_t0, zoom_onset_t1),
@@ -2510,19 +2716,25 @@ def plot_channel_multi_comparison(
                     mean_raw=means_raw_ch,
                     first_trigger_raw=first_trigger_raw,
                     first_trigger_hp=first_trigger_hp,
+                    second_trigger_raw=second_trigger_raw,
+                    second_trigger_hp=second_trigger_hp,
                     colors=plot_colors,
                     zoom_t0=zoom_onset_t0,
                     zoom_t1=zoom_onset_t1,
                     end_markers=end_markers,
                     intan_hp_legends=intan_hp_legends,
-                    title_raw=f"{channel_name} — Raw mean (onset zoom [{zoom_onset_t0:g}, {zoom_onset_t1:g}] s)",
-                    title_filt=f"{channel_name} — Filtered mean — onset zoom ({filter_short})",
+                    title_raw=f"{channel_name} — Raw mean (onset zoom [{zoom_onset_t0:g}, {zoom_onset_t1:g}] s){mean_n_suffix}",
+                    title_filt=f"{channel_name} — Filtered mean — onset zoom ({filter_short}){mean_n_suffix}",
                     title_first_hp=f"First stimulation — filtered, onset zoom ({filter_title})",
                     title_first_raw="First stimulation — raw (onset zoom)",
+                    title_second_hp=f"Second stimulation — filtered, onset zoom ({filter_title})",
+                    title_second_raw="Second stimulation — raw (onset zoom)",
                     legend_cols=legend_cols,
                     legend_visible=legend_flags,
                     show_reference_on_first_raw=False,
                     show_reference_on_first_hp=False,
+                    show_reference_on_second_raw=False,
+                    show_reference_on_second_hp=False,
                     first_trigger_hp_ylim=first_trigger_hp_ylim,
                     show_zoom_span=False,
                     show_end_zoom_span=False,
@@ -2548,6 +2760,8 @@ def plot_channel_multi_comparison(
                         ax_filt=ax_zoom_end_filt,
                         ax_first_hp=ax_zoom_end_first_hp,
                         ax_first_raw=ax_zoom_end_first,
+                        ax_second_hp=ax_zoom_end_second_hp,
+                        ax_second_raw=ax_zoom_end_second,
                         t_rel=t_rel,
                         time_mask=end_mask,
                         x_limits=(end_zoom_t0, end_zoom_t1),
@@ -2556,19 +2770,25 @@ def plot_channel_multi_comparison(
                         mean_raw=means_raw_ch,
                         first_trigger_raw=first_trigger_raw,
                         first_trigger_hp=first_trigger_hp,
+                        second_trigger_raw=second_trigger_raw,
+                        second_trigger_hp=second_trigger_hp,
                         colors=plot_colors,
                         zoom_t0=zoom_end_t0,
                         zoom_t1=zoom_end_t1,
                         end_markers=end_markers,
                         intan_hp_legends=intan_hp_legends,
-                        title_raw=f"{channel_name} — Raw mean (end zoom [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s)",
-                        title_filt=f"{channel_name} — Filtered mean — end zoom ({filter_short})",
+                        title_raw=f"{channel_name} — Raw mean (end zoom [{end_zoom_t0:.2f}, {end_zoom_t1:.2f}] s){mean_n_suffix}",
+                        title_filt=f"{channel_name} — Filtered mean — end zoom ({filter_short}){mean_n_suffix}",
                         title_first_hp=f"First stimulation — filtered, end zoom ({filter_title})",
                         title_first_raw="First stimulation — raw (end zoom)",
+                        title_second_hp=f"Second stimulation — filtered, end zoom ({filter_title})",
+                        title_second_raw="Second stimulation — raw (end zoom)",
                         legend_cols=legend_cols,
                         legend_visible=legend_flags,
                         show_reference_on_first_raw=False,
                         show_reference_on_first_hp=False,
+                        show_reference_on_second_raw=False,
+                        show_reference_on_second_hp=False,
                         first_trigger_hp_ylim=first_trigger_hp_ylim,
                         show_zoom_span=False,
                         show_end_zoom_span=False,
@@ -2586,6 +2806,8 @@ def plot_channel_multi_comparison(
                     (ax_zoom_end_filt, "End zoom unavailable\n(no rising edge after stimulation)"),
                     (ax_zoom_end_first_hp, "First filtered stimulation unavailable"),
                     (ax_zoom_end_first, "First raw stimulation unavailable"),
+                    (ax_zoom_end_second_hp, "Second filtered stimulation unavailable"),
+                    (ax_zoom_end_second, "Second raw stimulation unavailable"),
                     (ax_zoom_end_rms, "RMS unavailable"),
                 ):
                     if ax is not None and ax.get_visible():

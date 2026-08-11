@@ -12,6 +12,8 @@ PANEL_FIELD_NAMES: tuple[str, ...] = (
     "mean_filtered",
     "first_trigger_raw",
     "first_trigger_hp",
+    "second_trigger_raw",
+    "second_trigger_hp",
     "rms",
     "raster",
     "psth",
@@ -24,12 +26,19 @@ PANEL_LABELS: dict[str, str] = {
     "mean_filtered": "Filtered mean",
     "first_trigger_raw": "First stimulation (raw)",
     "first_trigger_hp": "First stimulation (filtered)",
+    "second_trigger_raw": "Second stimulation (raw)",
+    "second_trigger_hp": "Second stimulation (filtered)",
     "rms": "RMS evolution",
     "raster": "Raster",
     "psth": "PSTH / firing rate",
     "trial_rate": "Rate per trial",
     "isi": "ISI",
 }
+
+# Panels that stay unchecked by default in the Display table.
+PANEL_DEFAULT_OFF: frozenset[str] = frozenset(
+    {"second_trigger_raw", "second_trigger_hp"}
+)
 
 
 @dataclass(frozen=True)
@@ -40,6 +49,8 @@ class SectionPanels:
     mean_filtered: bool = True
     first_trigger_raw: bool = True
     first_trigger_hp: bool = True
+    second_trigger_raw: bool = False
+    second_trigger_hp: bool = False
     rms: bool = True
     raster: bool = True
     psth: bool = True
