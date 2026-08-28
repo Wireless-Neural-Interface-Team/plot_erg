@@ -16,11 +16,16 @@ from typing import Any, Literal
 import numpy as np
 from scipy.signal import sosfilt
 
-# systemstate.h
+# systemstate.h / spikeplot.cpp
 INTAN_SNIPPET_SIZE = 50
 INTAN_FRAMES_PER_BLOCK = 128
 INTAN_NOTCH_BANDWIDTH_HZ = 10.0
 INTAN_RMS_WINDOW_S = 1.0
+# Spike Scope waveform buffer around the detection sample (spikeplot.cpp).
+INTAN_SPIKE_PRE_DETECT_SAMPLES = 300
+INTAN_SPIKE_POST_DETECT_SAMPLES = 600
+INTAN_SPIKE_SCOPE_TSCALES_MS: tuple[float, ...] = (2.0, 4.0, 6.0, 10.0, 16.0, 20.0)
+INTAN_SPIKE_SCOPE_YSCALES_UV: tuple[float, ...] = (50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0)
 
 FilterType = Literal["bessel", "butterworth"]
 SpikeFilterKind = Literal["highpass", "lowpass"]
@@ -476,7 +481,13 @@ def detect_spikes_intan(
     start_sample: int = 0,
     end_sample: int | None = None,
 ) -> np.ndarray:
-    """Spike sample indices on HIGH (simplified Intan cpuinterface, no hoops)."""
+    """Spike sample indices on HIGH (cpuinterface.cpp, no hoops).
+
+    Threshold crossing on the first sample that exceeds the signed threshold.
+    After a hit, search skips ``snippet_size`` samples (Intan refractory).
+    Artifact snippets (any sample past spikeMax) are not counted as spikes
+    but still consume the same refractory window.
+    """
     n = int(np.asarray(high).shape[-1]) if np.ndim(high) >= 1 else int(np.asarray(high).size)
     if n < 2:
         return np.array([], dtype=np.int64)
@@ -507,11 +518,14 @@ def detect_spikes_intan(
         snippet_end = min(win_len, s + snippet)
         seg = x[s:snippet_end]
         if use_artifact:
+            is_artifact = False
             if thr >= 0 and np.any(seg >= artifact):
-                s += 1
-                continue
-            if thr < 0 and np.any(seg <= -artifact):
-                s += 1
+                is_artifact = True
+            elif thr < 0 and np.any(seg <= -artifact):
+                is_artifact = True
+            if is_artifact:
+                # cpuinterface.cpp: artifacts still occupy SnippetSize (not counted as spikes).
+                s += snippet
                 continue
         spikes.append(s + t0)
         s += snippet

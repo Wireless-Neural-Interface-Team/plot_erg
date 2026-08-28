@@ -19,6 +19,7 @@ PANEL_FIELD_NAMES: tuple[str, ...] = (
     "psth",
     "trial_rate",
     "isi",
+    "spike_overlay",
 )
 
 PANEL_LABELS: dict[str, str] = {
@@ -33,6 +34,7 @@ PANEL_LABELS: dict[str, str] = {
     "psth": "PSTH / firing rate",
     "trial_rate": "Rate per trial",
     "isi": "ISI",
+    "spike_overlay": "Spike overlay (after first/second raw)",
 }
 
 # Panels that stay unchecked by default in the Display table.
@@ -56,9 +58,12 @@ class SectionPanels:
     psth: bool = True
     trial_rate: bool = True
     isi: bool = True
+    spike_overlay: bool = True
 
     def any_enabled(self) -> bool:
-        return any(getattr(self, name) for name in PANEL_FIELD_NAMES)
+        return any(
+            getattr(self, name) for name in PANEL_FIELD_NAMES if name != "spike_overlay"
+        )
 
 
 @dataclass(frozen=True)

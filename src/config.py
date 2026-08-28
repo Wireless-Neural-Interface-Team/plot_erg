@@ -33,6 +33,8 @@ class AnalysisConfig:
     spike_threshold_mode: SpikeThresholdMode = "fixed"
     spike_threshold_rms_multiplier: float = 4.0
     psth_bin_window_s: float = 0.050
+    # Intan Spike Scope time scale T (ms): display window is [-T/2, +T] around detection.
+    spike_scope_tscale_ms: float = 4.0
     # Zoom: mode selects which temporal sections are rendered in the PDF.
     zoom_mode: ZoomMode = "both"
     zoom_onset_t0_s: float = -0.1

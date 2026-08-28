@@ -137,12 +137,76 @@ def draw_probe_inset_on_axes(
     draw_probe_layout_on_axes(inset_axes, layout, channel_name)
 
 
+def _cluster_count(values: np.ndarray) -> tuple[int, float]:
+    """Number of distinct columns/rows and typical pitch (same units as ``values``)."""
+    vals = np.asarray(values, dtype=np.float64)
+    if vals.size == 0:
+        return 1, 1.0
+    uniq = np.unique(np.round(vals, 8))
+    if uniq.size <= 1:
+        return 1, 1.0
+    diffs = np.diff(uniq)
+    diffs = diffs[diffs > 0]
+    pitch = float(np.median(diffs)) if diffs.size else 1.0
+    count = 1
+    anchor = float(uniq[0])
+    for raw in uniq[1:]:
+        value = float(raw)
+        if value - anchor > pitch * 0.4:
+            count += 1
+            anchor = value
+    return max(1, count), max(pitch, 1e-6)
+
+
+def mea_panel_size_in(
+    layout: ProbeLayout,
+    *,
+    max_width_in: float,
+    max_height_in: float = 10.5,
+    font_min: float = 8.0,
+    font_max: float = 14.0,
+    font_scale: float = 120.0,
+) -> tuple[float, float]:
+    """Width/height in inches so contact labels fit (equal aspect when possible)."""
+    positions = np.asarray(layout.positions_um, dtype=np.float64)
+    n_cols, pitch_x = _cluster_count(positions[:, 0])
+    n_rows, pitch_y = _cluster_count(positions[:, 1])
+    labels = [str(cid).strip() for cid in layout.contact_ids if not _is_nc_contact(str(cid))]
+    max_chars = max((len(lab) for lab in labels), default=5)
+    contact_count = max(len(layout.contact_ids), 1)
+    font = max(float(font_min), min(float(font_max), float(font_scale) / max(float(contact_count) ** 0.48, 1.0)))
+    char_w_in = font * 0.58 / 72.0
+    cell_w_in = max(char_w_in * (max_chars + 0.9), font * 1.15 / 72.0)
+    cell_h_in = font * 1.65 / 72.0
+    min_width_in = n_cols * cell_w_in + 0.28
+    min_height_in = n_rows * cell_h_in + 0.28
+    span_x = max(float(np.ptp(positions[:, 0])), pitch_x * max(n_cols - 1, 1), 1e-6)
+    span_y = max(float(np.ptp(positions[:, 1])), pitch_y * max(n_rows - 1, 1), 1e-6)
+    aspect = span_x / span_y
+
+    width_in = min(float(max_width_in), max(min_width_in, min_height_in * aspect))
+    height_in = width_in / aspect
+    if height_in < min_height_in:
+        height_in = min_height_in
+        width_in = min(float(max_width_in), max(min_width_in, height_in * aspect))
+    if height_in > float(max_height_in):
+        height_in = float(max_height_in)
+        width_in = min(float(max_width_in), max(min_width_in, height_in * aspect))
+    width_in = min(float(max_width_in), max(min_width_in, width_in))
+    height_in = max(min_height_in, min(float(max_height_in), height_in))
+    return float(width_in), float(height_in)
+
+
 def draw_probe_layout_on_axes(
     target_ax: Any,  # matplotlib.axes.Axes
     layout: ProbeLayout,
     channel_name: str,
     *,
     set_mea_title: bool = True,
+    title_fontsize: float = 26,
+    contact_label_font_min: float = 10.0,
+    contact_label_font_max: float = 18.0,
+    contact_label_font_scale: float = 1620.0,
 ) -> None:
     """Draw the MEA layout directly on an axes (no inset), highlight active channel."""
     active_contact_index = match_contact_index(layout, channel_name)
@@ -150,17 +214,15 @@ def draw_probe_layout_on_axes(
         return
     contact_count = len(layout.contact_ids)
     contact_positions_um = layout.positions_um
-    span_x_um = float(np.ptp(contact_positions_um[:, 0])) + 1e-6
-    span_y_um = float(np.ptp(contact_positions_um[:, 1])) + 1e-6
-    outer_padding_um = 0.06 * max(span_x_um, span_y_um)
-    x_min_um = float(np.min(contact_positions_um[:, 0]) - outer_padding_um)
-    x_max_um = float(np.max(contact_positions_um[:, 0]) + outer_padding_um)
-    # Asymmetric vertical padding: more space above pushes the MEA cloud lower
-    # in its own subplot without moving any other graph.
-    y_padding_bottom_um = outer_padding_um * 0.55
-    y_padding_top_um = outer_padding_um * 2.20
-    y_min_um = float(np.min(contact_positions_um[:, 1]) - y_padding_bottom_um)
-    y_max_um = float(np.max(contact_positions_um[:, 1]) + y_padding_top_um)
+    n_cols, pitch_x = _cluster_count(contact_positions_um[:, 0])
+    n_rows, pitch_y = _cluster_count(contact_positions_um[:, 1])
+    span_x_um = max(float(np.ptp(contact_positions_um[:, 0])), pitch_x, 1e-6)
+    span_y_um = max(float(np.ptp(contact_positions_um[:, 1])), pitch_y, 1e-6)
+    pad_um = 0.55 * max(pitch_x, pitch_y)
+    x_min_um = float(np.min(contact_positions_um[:, 0]) - pad_um)
+    x_max_um = float(np.max(contact_positions_um[:, 0]) + pad_um)
+    y_min_um = float(np.min(contact_positions_um[:, 1]) - pad_um)
+    y_max_um = float(np.max(contact_positions_um[:, 1]) + pad_um)
 
     layout_ax = target_ax
     layout_ax.set_facecolor((1.0, 1.0, 1.0, 0.88))
@@ -168,33 +230,57 @@ def draw_probe_layout_on_axes(
         spine.set_linewidth(0.6)
         spine.set_edgecolor("0.45")
 
-    point_size = max(5, min(18, int(780 // max(contact_count, 1))))
+    layout_ax.set_xlim(x_min_um, x_max_um)
+    layout_ax.set_ylim(y_min_um, y_max_um)
+    data_aspect = (x_max_um - x_min_um) / max(y_max_um - y_min_um, 1e-6)
+    fig = layout_ax.figure
+    pos = layout_ax.get_position()
+    box_aspect = (pos.width * float(fig.get_figwidth())) / max(pos.height * float(fig.get_figheight()), 1e-6)
+    # Keep physical proportions only when the allocated box is close; otherwise fill the box
+    # so labels stay readable instead of collapsing into a thin strip.
+    if 0.72 <= (box_aspect / data_aspect) <= 1.35:
+        layout_ax.set_aspect("equal", adjustable="box")
+    else:
+        layout_ax.set_aspect("auto")
+
+    axes_w_in = max(pos.width * float(fig.get_figwidth()), 0.4)
+    axes_h_in = max(pos.height * float(fig.get_figheight()), 0.4)
+    labels = [str(cid).strip() for cid in layout.contact_ids if not _is_nc_contact(str(cid))]
+    max_chars = max((len(lab) for lab in labels), default=5)
+    fs_from_width = (axes_w_in / max(n_cols, 1)) * 72.0 / (max_chars * 0.62)
+    fs_from_height = (axes_h_in / max(n_rows, 1)) * 72.0 / 1.70
+    fs_from_count = float(contact_label_font_scale) / max(float(contact_count) ** 0.48, 1.0)
+    label_font_size = max(
+        float(contact_label_font_min),
+        min(float(contact_label_font_max), fs_from_width, fs_from_height, fs_from_count),
+    )
+    text_stroke_width = max(1.6, min(3.0, label_font_size * 0.40))
+
+    point_size = max(8.0, min(36.0, (axes_w_in / max(n_cols, 1)) * 72.0 * 0.45))
     layout_ax.scatter(
         contact_positions_um[:, 0],
         contact_positions_um[:, 1],
         s=point_size,
-        c="0.55",
+        c="0.78",
         edgecolors="0.35",
-        linewidths=0.2,
+        linewidths=0.4,
         zorder=1,
     )
 
     active_x_um = float(contact_positions_um[active_contact_index, 0])
     active_y_um = float(contact_positions_um[active_contact_index, 1])
-    highlight_radius_um = 0.035 * max(span_x_um, span_y_um)
+    highlight_radius_um = 0.42 * min(pitch_x, pitch_y)
     layout_ax.add_patch(
         Circle(
             (active_x_um, active_y_um),
             radius=highlight_radius_um,
             facecolor="none",
             edgecolor="crimson",
-            linewidth=2.0,
+            linewidth=1.6,
             zorder=4,
         )
     )
 
-    label_font_size = max(2.6, min(4.6, 420.0 / max(float(contact_count) ** 0.48, 1.0)))
-    text_stroke_width = max(1.8, min(2.8, label_font_size * 0.55))
     for contact_index in range(contact_count):
         contact_id = str(layout.contact_ids[contact_index]).strip()
         if _is_nc_contact(contact_id):
@@ -205,17 +291,15 @@ def draw_probe_layout_on_axes(
             ha="center",
             va="center",
             fontsize=label_font_size,
-            color="0.12",
+            color="0.10",
             fontweight="normal",
             zorder=5,
+            clip_on=True,
         )
         text_artist.set_path_effects([pe.withStroke(linewidth=text_stroke_width, foreground="white")])
 
-    layout_ax.set_xlim(x_min_um, x_max_um)
-    layout_ax.set_ylim(y_min_um, y_max_um)
-    layout_ax.set_aspect("equal", adjustable="box")
     layout_ax.set_xticks([])
     layout_ax.set_yticks([])
     if set_mea_title:
-        layout_ax.set_title("MEA layout", fontsize=7, pad=2)
+        layout_ax.set_title("MEA layout", fontsize=title_fontsize, pad=2)
     layout_ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)

@@ -167,6 +167,15 @@ def parse_args() -> argparse.Namespace:
         help="PSTH time window (s) used for each PSTH point.",
     )
     parser.add_argument(
+        "--spike-scope-tscale-ms",
+        type=float,
+        default=defaults.spike_scope_tscale_ms,
+        help=(
+            "Intan Spike Scope time scale T in ms (2, 4, 6, 10, 16, or 20). "
+            "Overlay window is [-T/2, +T] around detection (default: 4 → −2 to +4 ms)."
+        ),
+    )
+    parser.add_argument(
         "--zoom-mode",
         choices=("none", "onset", "trigger_end", "both"),
         default=defaults.zoom_mode,
@@ -302,9 +311,9 @@ def run(config: AnalysisConfig) -> None:
             print(f"Target section count: {config.section_count}")
         print(f"Sections used for average: {n_valid}")
         print(
-            f"Imaginary stimulation window per segment: "
+            f"Imaginary stimulation markers per segment: "
             f"{config.section_trigger_start_s:g}–{config.section_trigger_end_s:g} s "
-            f"(t=0 at segment start + {config.section_trigger_start_s:g} s)"
+            f"(PDF shows the full section; t=0 at segment start + {config.section_trigger_start_s:g} s)"
         )
     else:
         print("--- Stimulations (ANALOG_IN 0) ---")
@@ -550,6 +559,7 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             spike_threshold_polarity=tuned[0].spike_threshold_polarity,
             spike_threshold_mode=tuned[0].spike_threshold_mode,
             spike_threshold_rms_multiplier=tuned[0].spike_threshold_rms_multiplier,
+            spike_scope_tscale_ms=tuned[0].spike_scope_tscale_ms,
             psth_bin_window_s=tuned[0].psth_bin_window_s,
             rms_window_s=tuned[0].rms_window_s,
             zoom_mode=tuned[0].zoom_mode,
@@ -622,6 +632,7 @@ def main() -> None:
         spike_threshold_mode=args.spike_threshold_mode,
         spike_threshold_rms_multiplier=args.spike_threshold_rms_multiplier,
         psth_bin_window_s=args.psth_bin_window_s,
+        spike_scope_tscale_ms=args.spike_scope_tscale_ms,
         rms_window_s=args.rms_window_s,
         zoom_mode=args.zoom_mode,
         zoom_onset_t0_s=args.zoom_onset_t0_s,
@@ -673,6 +684,12 @@ def main() -> None:
     if config.spike_threshold_mode == "rms_multiple" and config.spike_threshold_rms_multiplier <= 0:
         print(
             "Error: --spike-threshold-rms-multiplier must be > 0 when --spike-threshold-mode=rms_multiple.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if float(config.spike_scope_tscale_ms) not in (2.0, 4.0, 6.0, 10.0, 16.0, 20.0):
+        print(
+            "Error: --spike-scope-tscale-ms must be one of 2, 4, 6, 10, 16, 20.",
             file=sys.stderr,
         )
         sys.exit(2)

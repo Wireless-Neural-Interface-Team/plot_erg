@@ -284,9 +284,6 @@ QTableWidget::item:disabled {{
     color: #94a3b8;
     background-color: #e2e8f0;
 }}
-QWidget#displayColumnDisabled {{
-    background-color: #d8dee8;
-}}
 QHeaderView::section {{
     background-color: #334155;
     color: #f8fafc;

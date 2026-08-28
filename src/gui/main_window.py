@@ -29,7 +29,7 @@ def launch_qt_gui(
 ) -> int:
     try:
         from PySide6.QtCore import Qt
-        from PySide6.QtGui import QBrush, QColor
+        from PySide6.QtGui import QFont
         from PySide6.QtWidgets import (
             QApplication,
             QCheckBox,
@@ -63,6 +63,7 @@ def launch_qt_gui(
 
     AnalysisThread = create_analysis_thread_class()
     app = QApplication.instance() or QApplication([])
+    app.setFont(QFont("Segoe UI", 15))
     app.setStyleSheet(APP_STYLESHEET)
 
     # ------------------------------------------------------------------ helpers
@@ -87,6 +88,23 @@ def launch_qt_gui(
         w.setValue(int(value))
         return w
 
+    def _set_form_row_visible(
+        form: QFormLayout, field: QWidget, label: QWidget, visible: bool
+    ) -> None:
+        """Show or hide a QFormLayout row (Qt 6.4+ setRowVisible, with fallback)."""
+        row = -1
+        getter = getattr(form, "getWidgetPosition", None)
+        if callable(getter):
+            pos = getter(field)
+            if pos is not None:
+                row = int(pos[0])
+        setter = getattr(form, "setRowVisible", None)
+        if row >= 0 and callable(setter):
+            setter(row, visible)
+            return
+        label.setVisible(visible)
+        field.setVisible(visible)
+
   # ===========================================================================
     class MainWindow(QMainWindow):
         def __init__(self) -> None:
@@ -97,12 +115,13 @@ def launch_qt_gui(
             self._run_comparison_callback = run_comparison_callback
             self._run_multi_callback = run_multi_comparison_callback
             self._analysis_thread = None
-            self._section_spec = "count"
+            spec = str(defaults.get("default_section_spec") or "count")
+            self._section_spec = spec if spec in ("count", "duration") else "count"
             self._cached_duration_s: float | None = None
             self._section_sync_guard = False
+            self._trigger_form: QFormLayout | None = None
             self._file_rows: list[MainWindow.FileEntryRow] = []
             self._display_checkboxes: dict[str, dict[str, QCheckBox]] = {}
-            self._display_cell_wrappers: dict[str, dict[str, QWidget]] = {}
             self._last_auto_pdf_title: str = ""
             self._build_ui()
             self._apply_defaults(defaults)
@@ -262,6 +281,7 @@ def launch_qt_gui(
             form.setContentsMargins(16, 16, 16, 16)
             form.setSpacing(12)
             form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self._trigger_form = form
             self.edge_combo = QComboBox()
             self.edge_combo.addItem("Falling edge", "falling")
             self.edge_combo.addItem("Rising edge", "rising")
@@ -271,15 +291,19 @@ def launch_qt_gui(
             self.pre_spin = _spin(defaults.get("default_pre_s", 2.0), minimum=0.0)
             self.post_spin = _spin(defaults.get("default_post_s", 10.0), minimum=0.0)
             self.section_count_spin = _int_spin(defaults.get("default_section_count", 10), minimum=1)
-            self.section_duration_spin = _spin(
-                defaults.get("default_section_duration_s") or 1.0, minimum=0.001
-            )
+            trigger_end_default = float(defaults.get("default_section_trigger_end_s", 4.0) or 4.0)
+            raw_section_duration = defaults.get("default_section_duration_s")
+            if raw_section_duration is None or float(raw_section_duration) <= 0:
+                section_duration_default = max(trigger_end_default + 1.0, 5.0)
+            else:
+                section_duration_default = float(raw_section_duration)
+            self.section_duration_spin = _spin(section_duration_default, minimum=0.001)
             self.section_trigger_start_spin = _spin(
                 defaults.get("default_section_trigger_start_s", 1.0), minimum=0.0
             )
-            self.section_trigger_end_spin = _spin(
-                defaults.get("default_section_trigger_end_s", 4.0), minimum=0.0
-            )
+            self.section_trigger_end_spin = _spin(trigger_end_default, minimum=0.0)
+            self.section_count_spin.setKeyboardTracking(False)
+            self.section_duration_spin.setKeyboardTracking(False)
             self.threshold_label = QLabel("ANALOG_IN 0 threshold:")
             self.pre_label = QLabel("Pre-stimulation (s):")
             self.post_label = QLabel("Post-stimulation (s):")
@@ -287,6 +311,15 @@ def launch_qt_gui(
             self.section_duration_label = QLabel("Section duration (s):")
             self.section_trigger_start_label = QLabel("Imaginary stimulation start (s):")
             self.section_trigger_end_label = QLabel("Imaginary stimulation end (s):")
+            self.section_duration_spin.setToolTip(
+                "Length of each recording split. The PDF time axis covers this full duration."
+            )
+            self.section_trigger_start_spin.setToolTip(
+                "Places t=0 inside each section. Does not crop the PDF."
+            )
+            self.section_trigger_end_spin.setToolTip(
+                "Stimulation-end marker inside each section. Does not crop the PDF."
+            )
             form.addRow("Stimulation mode:", self.edge_combo)
             form.addRow(self.threshold_label, self.threshold_spin)
             form.addRow(self.pre_label, self.pre_spin)
@@ -295,8 +328,17 @@ def launch_qt_gui(
             form.addRow(self.section_duration_label, self.section_duration_spin)
             form.addRow(self.section_trigger_start_label, self.section_trigger_start_spin)
             form.addRow(self.section_trigger_end_label, self.section_trigger_end_spin)
+            self.section_hint = QLabel(
+                "The PDF shows the full section. Imaginary start/end only set t=0 and the end marker."
+            )
+            self.section_hint.setObjectName("hintLabel")
+            self.section_hint.setWordWrap(True)
+            form.addRow(self.section_hint)
             self.section_count_spin.valueChanged.connect(lambda _v: self._sync_sections("count"))
             self.section_duration_spin.valueChanged.connect(lambda _v: self._sync_sections("duration"))
+            self.section_trigger_end_spin.valueChanged.connect(
+                lambda _v: self._sync_sections(self._section_spec)
+            )
             return w
 
         def _build_output_tab(self) -> QWidget:
@@ -379,6 +421,29 @@ def launch_qt_gui(
             form.addRow(self.spike_rms_label, self.spike_rms_mult_spin)
             form.addRow("PSTH window (s):", self.psth_bin_spin)
             form.addRow("RMS window (s):", self.rms_window_spin)
+            self.spike_scope_tscale_combo = QComboBox()
+            default_tscale = int(round(float(defaults.get("default_spike_scope_tscale_ms", 4.0))))
+            for ms in (2, 4, 6, 10, 16, 20):
+                tmin = -ms / 2.0
+                self.spike_scope_tscale_combo.addItem(
+                    f"{ms} ms  (−{abs(tmin):g} to +{ms:g} ms around detection)",
+                    ms,
+                )
+            tscale_idx = self.spike_scope_tscale_combo.findData(default_tscale)
+            if tscale_idx >= 0:
+                self.spike_scope_tscale_combo.setCurrentIndex(tscale_idx)
+            self.spike_scope_tscale_combo.setToolTip(
+                "Intan RHX Spike Scope time scale T: the overlay window is "
+                "[−T/2, +T] ms around the threshold crossing."
+            )
+            form.addRow("Spike Scope time scale:", self.spike_scope_tscale_combo)
+            overlay_hint = QLabel(
+                "Show or hide superimposed waveforms per section in the Display tab "
+                "(row “Spike overlay”, under First/Second stimulation raw)."
+            )
+            overlay_hint.setObjectName("hintLabel")
+            overlay_hint.setWordWrap(True)
+            form.addRow(overlay_hint)
             return w
 
         def _build_zoom_tab(self) -> QWidget:
@@ -386,16 +451,13 @@ def launch_qt_gui(
             layout = QVBoxLayout(w)
             layout.setContentsMargins(16, 16, 16, 16)
             layout.setSpacing(12)
-            form = QFormLayout()
-            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.zoom_mode_combo = QComboBox()
-            self.zoom_mode_combo.addItem("No zoom", "none")
-            self.zoom_mode_combo.addItem("Zoom at stimulation onset", "onset")
-            self.zoom_mode_combo.addItem("Zoom at stimulation end", "trigger_end")
-            self.zoom_mode_combo.addItem("Both zooms", "both")
-            self.zoom_mode_combo.currentIndexChanged.connect(self._update_zoom_visibility)
-            form.addRow("Zoom mode:", self.zoom_mode_combo)
-            layout.addLayout(form)
+            hint = QLabel(
+                "Time windows only. Enable or disable onset/end sections with the "
+                "Display tab columns (uncheck every box in a column to omit it)."
+            )
+            hint.setObjectName("hintLabel")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
 
             onset_group = QGroupBox("Stimulation onset zoom")
             onset_form = QFormLayout(onset_group)
@@ -405,7 +467,6 @@ def launch_qt_gui(
             self.zoom_onset_t1_spin = _spin(defaults.get("default_zoom_onset_t1_s", 0.2))
             onset_form.addRow("Start (s rel. stimulation):", self.zoom_onset_t0_spin)
             onset_form.addRow("End (s rel. stimulation):", self.zoom_onset_t1_spin)
-            self.onset_group = onset_group
             layout.addWidget(onset_group)
 
             end_group = QGroupBox("Stimulation end zoom (next rising edge)")
@@ -416,23 +477,7 @@ def launch_qt_gui(
             self.zoom_end_t1_spin = _spin(defaults.get("default_zoom_end_t1_s", 0.2))
             end_form.addRow("Start (s rel. stimulation end):", self.zoom_end_t0_spin)
             end_form.addRow("End (s rel. stimulation end):", self.zoom_end_t1_spin)
-            self.end_group = end_group
             layout.addWidget(end_group)
-
-            hp_group = QGroupBox("Y axis — first/second filtered stimulation")
-            hp_form = QFormLayout(hp_group)
-            hp_form.setSpacing(10)
-            hp_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.hp_ylim_check = QCheckBox(
-                "Fix Y axis (µV) on first/second filtered stimulation panels"
-            )
-            self.hp_ylim_check.toggled.connect(self._update_hp_ylim_visibility)
-            self.hp_ylim_min_spin = _spin(defaults.get("default_first_trigger_hp_ylim_min_uv", -200.0))
-            self.hp_ylim_max_spin = _spin(defaults.get("default_first_trigger_hp_ylim_max_uv", 200.0))
-            hp_form.addRow(self.hp_ylim_check)
-            hp_form.addRow("Y min (µV):", self.hp_ylim_min_spin)
-            hp_form.addRow("Y max (µV):", self.hp_ylim_max_spin)
-            layout.addWidget(hp_group)
             layout.addStretch()
             return w
 
@@ -441,6 +486,15 @@ def launch_qt_gui(
             layout = QVBoxLayout(w)
             layout.setContentsMargins(16, 16, 16, 16)
             layout.setSpacing(12)
+            hint = QLabel(
+                "This tab is the only place to choose what appears in the PDF. "
+                "Uncheck every box in a zoom column to omit that section. "
+                "Zoom time windows are set in the Zoom tab."
+            )
+            hint.setObjectName("hintLabel")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
             top = QHBoxLayout()
             self.mea_check = QCheckBox("MEA map")
             self.mea_check.setChecked(True)
@@ -480,8 +534,12 @@ def launch_qt_gui(
                 item = self.display_table.item(row, 0)
                 if item is not None:
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                    if panel_key == "spike_overlay":
+                        item.setToolTip(
+                            "Placed under First/Second stimulation (raw) in the same column. "
+                            "No overlay is drawn if that raw panel is off."
+                        )
                 self._display_checkboxes[panel_key] = {}
-                self._display_cell_wrappers[panel_key] = {}
                 for col, section_key in enumerate(section_keys, start=1):
                     cb = QCheckBox()
                     cb.setChecked(panel_key not in PANEL_DEFAULT_OFF)
@@ -492,8 +550,30 @@ def launch_qt_gui(
                     wl.setContentsMargins(0, 0, 0, 0)
                     self.display_table.setCellWidget(row, col, wrapper)
                     self._display_checkboxes[panel_key][section_key] = cb
-                    self._display_cell_wrappers[panel_key][section_key] = wrapper
-            layout.addWidget(self.display_table)
+                    if panel_key == "spike_overlay":
+                        cb.setToolTip(
+                            "Requires First or Second stimulation (raw) in this column. "
+                            "Spikes are taken only from that trigger and this time window."
+                        )
+            for panel_key in ("first_trigger_raw", "second_trigger_raw"):
+                for cb in self._display_checkboxes[panel_key].values():
+                    cb.toggled.connect(lambda _checked: self._sync_overlay_enabled_by_raw())
+            layout.addWidget(self.display_table, stretch=1)
+
+            hp_group = QGroupBox("Y axis — first/second filtered stimulation")
+            hp_form = QFormLayout(hp_group)
+            hp_form.setSpacing(10)
+            hp_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            self.hp_ylim_check = QCheckBox(
+                "Fix Y axis (µV) on first/second filtered stimulation panels"
+            )
+            self.hp_ylim_check.toggled.connect(self._update_hp_ylim_visibility)
+            self.hp_ylim_min_spin = _spin(defaults.get("default_first_trigger_hp_ylim_min_uv", -200.0))
+            self.hp_ylim_max_spin = _spin(defaults.get("default_first_trigger_hp_ylim_max_uv", 200.0))
+            hp_form.addRow(self.hp_ylim_check)
+            hp_form.addRow("Y min (µV):", self.hp_ylim_min_spin)
+            hp_form.addRow("Y max (µV):", self.hp_ylim_max_spin)
+            layout.addWidget(hp_group)
             return w
 
         def _build_perf_tab(self) -> QWidget:
@@ -538,8 +618,9 @@ def launch_qt_gui(
             self._add_file_row("")
             self._update_trigger_visibility()
             self._update_spike_mode_visibility()
-            self._update_zoom_visibility()
             self._update_hp_ylim_visibility()
+            self._apply_zoom_mode_default(str(d.get("default_zoom_mode", "both")))
+            self._sync_overlay_enabled_by_raw()
 
         def _add_file_row(self, path: str) -> None:
             row = self.FileEntryRow(self, initial_path=path)
@@ -607,42 +688,69 @@ def launch_qt_gui(
         def _sync_sections(self, changed: str) -> None:
             if self._section_sync_guard or self.edge_combo.currentData() != "none":
                 return
+            min_dur = max(0.001, float(self.section_trigger_end_spin.value()))
             if self._cached_duration_s is None or self._cached_duration_s <= 0:
+                if self.section_duration_spin.value() < min_dur:
+                    self._section_sync_guard = True
+                    try:
+                        self.section_duration_spin.setValue(min_dur)
+                    finally:
+                        self._section_sync_guard = False
                 return
             self._section_sync_guard = True
             try:
                 self._section_spec = changed
+                total = float(self._cached_duration_s)
                 if changed == "count":
-                    count = max(1, self.section_count_spin.value())
-                    self.section_duration_spin.setValue(self._cached_duration_s / float(count))
+                    count = max(1, int(self.section_count_spin.value()))
+                    duration = total / float(count)
+                    if duration < min_dur:
+                        count = max(1, int(total / min_dur))
+                        duration = total / float(count)
+                        self.section_count_spin.setValue(count)
+                    self.section_duration_spin.setValue(duration)
                 else:
-                    duration = max(0.001, self.section_duration_spin.value())
-                    count = max(1, int(self._cached_duration_s / duration))
-                    exact = self._cached_duration_s / float(count)
+                    duration = max(0.001, float(self.section_duration_spin.value()))
+                    if duration < min_dur:
+                        duration = min_dur
+                        self.section_duration_spin.setValue(duration)
+                    count = max(1, int(total / duration))
                     self.section_count_spin.setValue(count)
-                    self.section_duration_spin.setValue(exact)
             finally:
                 self._section_sync_guard = False
 
         def _update_trigger_visibility(self) -> None:
             no_trigger = self.edge_combo.currentData() == "none"
-            for w, show in (
-                (self.threshold_label, not no_trigger),
-                (self.threshold_spin, not no_trigger),
-                (self.pre_label, not no_trigger),
-                (self.pre_spin, not no_trigger),
-                (self.post_label, not no_trigger),
-                (self.post_spin, not no_trigger),
-                (self.section_count_label, no_trigger),
-                (self.section_count_spin, no_trigger),
-                (self.section_duration_label, no_trigger),
-                (self.section_duration_spin, no_trigger),
-                (self.section_trigger_start_label, no_trigger),
-                (self.section_trigger_start_spin, no_trigger),
-                (self.section_trigger_end_label, no_trigger),
-                (self.section_trigger_end_spin, no_trigger),
-            ):
-                w.setVisible(show)
+            form = self._trigger_form
+            analog_rows = (
+                (self.threshold_spin, self.threshold_label),
+                (self.pre_spin, self.pre_label),
+                (self.post_spin, self.post_label),
+            )
+            none_rows = (
+                (self.section_count_spin, self.section_count_label),
+                (self.section_duration_spin, self.section_duration_label),
+                (self.section_trigger_start_spin, self.section_trigger_start_label),
+                (self.section_trigger_end_spin, self.section_trigger_end_label),
+            )
+            if form is not None:
+                for field, label in analog_rows:
+                    _set_form_row_visible(form, field, label, not no_trigger)
+                for field, label in none_rows:
+                    _set_form_row_visible(form, field, label, no_trigger)
+                _set_form_row_visible(form, self.section_hint, self.section_hint, no_trigger)
+                form.invalidate()
+                parent = form.parentWidget()
+                if parent is not None:
+                    parent.updateGeometry()
+            else:
+                for field, label in analog_rows:
+                    field.setVisible(not no_trigger)
+                    label.setVisible(not no_trigger)
+                for field, label in none_rows:
+                    field.setVisible(no_trigger)
+                    label.setVisible(no_trigger)
+                self.section_hint.setVisible(no_trigger)
             if no_trigger:
                 self._refresh_duration()
 
@@ -653,53 +761,37 @@ def launch_qt_gui(
             self.spike_rms_label.setVisible(not fixed)
             self.spike_rms_mult_spin.setVisible(not fixed)
 
-        def _update_zoom_visibility(self) -> None:
-            mode = str(self.zoom_mode_combo.currentData() or "both")
+        def _apply_zoom_mode_default(self, mode: str) -> None:
+            """Apply CLI/default zoom mode by checking Display columns only."""
             onset_on = mode in ("onset", "both")
             end_on = mode in ("trigger_end", "both")
-            self.onset_group.setVisible(onset_on)
-            self.end_group.setVisible(end_on)
-            self._sync_display_columns_with_zoom(onset_on=onset_on, end_on=end_on)
+            for panel_key in PANEL_FIELD_NAMES:
+                cbs = self._display_checkboxes.get(panel_key) or {}
+                for section_key, keep in (
+                    ("zoom_onset", onset_on),
+                    ("zoom_trigger_end", end_on),
+                ):
+                    cb = cbs.get(section_key)
+                    if cb is None or keep:
+                        continue
+                    cb.blockSignals(True)
+                    cb.setChecked(False)
+                    cb.blockSignals(False)
 
-        def _sync_display_columns_with_zoom(self, *, onset_on: bool, end_on: bool) -> None:
-            """Enable/disable Display columns according to the Zoom mode."""
+        def _sync_overlay_enabled_by_raw(self) -> None:
+            """Overlay can be toggled only where a first/second raw panel is selected."""
             if not self._display_checkboxes:
                 return
-            for panel_key in PANEL_FIELD_NAMES:
-                cbs = self._display_checkboxes[panel_key]
-                wrappers = self._display_cell_wrappers.get(panel_key, {})
-                cbs["zoom_onset"].setEnabled(onset_on)
-                cbs["zoom_trigger_end"].setEnabled(end_on)
-                onset_wrap = wrappers.get("zoom_onset")
-                end_wrap = wrappers.get("zoom_trigger_end")
-                if onset_wrap is not None:
-                    onset_wrap.setEnabled(onset_on)
-                    onset_wrap.setObjectName(
-                        "" if onset_on else "displayColumnDisabled"
-                    )
-                    onset_wrap.style().unpolish(onset_wrap)
-                    onset_wrap.style().polish(onset_wrap)
-                if end_wrap is not None:
-                    end_wrap.setEnabled(end_on)
-                    end_wrap.setObjectName("" if end_on else "displayColumnDisabled")
-                    end_wrap.style().unpolish(end_wrap)
-                    end_wrap.style().polish(end_wrap)
-            if hasattr(self, "display_table"):
-                onset_header = "Onset zoom" if onset_on else "Onset zoom (disabled)"
-                end_header = "End zoom" if end_on else "End zoom (disabled)"
-                self.display_table.setHorizontalHeaderLabels(
-                    ["Panel", "Full view", onset_header, end_header]
+            overlay_cbs = self._display_checkboxes.get("spike_overlay")
+            first_cbs = self._display_checkboxes.get("first_trigger_raw")
+            second_cbs = self._display_checkboxes.get("second_trigger_raw")
+            if not overlay_cbs or not first_cbs or not second_cbs:
+                return
+            for section_key, overlay_cb in overlay_cbs.items():
+                raw_on = bool(
+                    first_cbs[section_key].isChecked() or second_cbs[section_key].isChecked()
                 )
-                active = QBrush(QColor("#f8fafc"))
-                active_bg = QBrush(QColor("#334155"))
-                muted = QBrush(QColor("#e2e8f0"))
-                muted_bg = QBrush(QColor("#94a3b8"))
-                for col, enabled in ((2, onset_on), (3, end_on)):
-                    item = self.display_table.horizontalHeaderItem(col)
-                    if item is None:
-                        continue
-                    item.setForeground(active if enabled else muted)
-                    item.setBackground(active_bg if enabled else muted_bg)
+                overlay_cb.setEnabled(raw_on)
 
         def _update_hp_ylim_visibility(self) -> None:
             enabled = self.hp_ylim_check.isChecked()
@@ -718,33 +810,33 @@ def launch_qt_gui(
             if selected:
                 self.probe_json_edit.setText(selected)
 
-        def _section_panels_from_ui(
-            self, section_key: str, *, enabled: bool = True
-        ) -> SectionPanels:
-            if not enabled:
-                return SectionPanels(
-                    **{panel_key: False for panel_key in PANEL_FIELD_NAMES}
-                )
+        def _section_panels_from_ui(self, section_key: str) -> SectionPanels:
             kwargs = {
                 panel_key: self._display_checkboxes[panel_key][section_key].isChecked()
                 for panel_key in PANEL_FIELD_NAMES
             }
             return SectionPanels(**kwargs)
 
+        def _zoom_mode_from_display(self) -> str:
+            onset = self._section_panels_from_ui("zoom_onset").any_enabled()
+            end = self._section_panels_from_ui("zoom_trigger_end").any_enabled()
+            if onset and end:
+                return "both"
+            if onset:
+                return "onset"
+            if end:
+                return "trigger_end"
+            return "none"
+
         def _build_plot_display(self) -> PlotDisplaySettings:
-            mode = str(self.zoom_mode_combo.currentData() or "both")
-            onset_on = mode in ("onset", "both")
-            end_on = mode in ("trigger_end", "both")
             return PlotDisplaySettings(
                 mea_layout=self.mea_check.isChecked(),
                 impedance=self.impedance_check.isChecked(),
                 summary_rms_page=self.summary_rms_check.isChecked(),
                 summary_impedance_page=self.summary_imp_check.isChecked(),
                 full_view=self._section_panels_from_ui("full_view"),
-                zoom_onset=self._section_panels_from_ui("zoom_onset", enabled=onset_on),
-                zoom_trigger_end=self._section_panels_from_ui(
-                    "zoom_trigger_end", enabled=end_on
-                ),
+                zoom_onset=self._section_panels_from_ui("zoom_onset"),
+                zoom_trigger_end=self._section_panels_from_ui("zoom_trigger_end"),
             )
 
         def _build_configs(self) -> list[AnalysisConfig]:
@@ -767,7 +859,7 @@ def launch_qt_gui(
             edge = str(self.edge_combo.currentData() or "falling")
             if edge not in ("falling", "rising", "none"):
                 raise ValueError("Invalid stimulation mode.")
-            zoom_mode = str(self.zoom_mode_combo.currentData() or "both")
+            zoom_mode = self._zoom_mode_from_display()
             zoom_onset_t0 = float(self.zoom_onset_t0_spin.value())
             zoom_onset_t1 = float(self.zoom_onset_t1_spin.value())
             zoom_end_t0 = float(self.zoom_end_t0_spin.value())
@@ -838,6 +930,7 @@ def launch_qt_gui(
                 spike_threshold_mode=str(self.spike_mode_combo.currentData()),
                 spike_threshold_rms_multiplier=float(self.spike_rms_mult_spin.value()),
                 psth_bin_window_s=float(self.psth_bin_spin.value()),
+                spike_scope_tscale_ms=float(self.spike_scope_tscale_combo.currentData() or 4),
                 rms_window_s=float(self.rms_window_spin.value()),
                 zoom_mode=zoom_mode,
                 zoom_onset_t0_s=zoom_onset_t0,
@@ -945,16 +1038,16 @@ def launch_qt_gui(
                 "  font-weight: 500;"
                 "}"
                 "QDialog#appMessageDialog QLabel#msgTitle {"
-                "  font-size: 15px;"
+                "  font-size: 22px;"
                 "  font-weight: 700;"
                 "  color: #0f172a;"
                 "}"
                 "QDialog#appMessageDialog QLabel#msgBody {"
-                "  font-size: 13px;"
+                "  font-size: 20px;"
                 "  color: #334155;"
                 "}"
                 "QDialog#appMessageDialog QLabel#msgDetailLabel {"
-                "  font-size: 12px;"
+                "  font-size: 19px;"
                 "  font-weight: 600;"
                 "  color: #475569;"
                 "}"
@@ -964,7 +1057,7 @@ def launch_qt_gui(
                 "  border: 2px solid #8896ab;"
                 "  border-radius: 8px;"
                 "  padding: 8px 10px;"
-                "  font-size: 12px;"
+                "  font-size: 19px;"
                 "  selection-background-color: #99f6e4;"
                 "  selection-color: #0f172a;"
                 "}"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence, Tuple
 import math
@@ -16,6 +17,8 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.collections import LineCollection
+from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
 
 from concurrent.futures import ThreadPoolExecutor
@@ -28,6 +31,10 @@ from core import (
     resolve_channel_workers,
 )
 from intan_rhx_dsp import (
+    INTAN_SPIKE_POST_DETECT_SAMPLES,
+    INTAN_SPIKE_PRE_DETECT_SAMPLES,
+    INTAN_SPIKE_SCOPE_TSCALES_MS,
+    INTAN_SPIKE_SCOPE_YSCALES_UV,
     IntanDspSettings,
     detect_spikes_intan,
     sliding_rms_intan_profile,
@@ -42,8 +49,22 @@ from display_config import (
     ZoomMode,
     resolve_display_label,
 )
-from plot_utils import downsample_points, shift_axes_down, shorten_filename_for_windows
-from probe_layout import draw_probe_layout_on_axes, load_probe_layout_json, match_contact_index
+from pdf_layout import (
+    LayoutFonts,
+    Slot,
+    build_stacked_pages,
+    estimate_legend_rows,
+    place_legend_below,
+    psth_table_bbox,
+    save_figure_to_pdf,
+)
+from plot_utils import downsample_points, shorten_filename_for_windows
+from probe_layout import (
+    draw_probe_layout_on_axes,
+    load_probe_layout_json,
+    match_contact_index,
+    mea_panel_size_in,
+)
 
 # Zoom panel window (s), time relative to trigger (t=0)
 ZOOM_T0 = -0.1
@@ -52,18 +73,42 @@ ZOOM_T1 = 0.2
 # ISI: only spikes within [-ISI_HALF_WINDOW_S, +ISI_HALF_WINDOW_S] (s relative to stimulation)
 ISI_HALF_WINDOW_S = 1.0
 
+# Superimposed spike waveforms: Intan RHX Spike Scope (spikeplot.cpp).
+# Display window is [-T/2, +T] ms around detection; snippets are 300 pre + 600 post samples.
+SPIKE_OVERLAY_MAX_TRACES = 3000
+
 # X-axis label for all time-relative-to-trigger plots
 TIME_REL_XLABEL = "Time relative to stimulation (s)"
-LEGEND_FONT_SIZE = 8
-AXIS_TITLE_FONT_SIZE = 9
-AXIS_LABEL_FONT_SIZE = 8
-TICK_LABEL_FONT_SIZE = 7
-# Three-part PDF layout (inches). Panel height in the PDF is controlled by:
-#   1. THREE_PART_PAGE_HEIGHT_*  — total page height
-#   2. THREE_PART_PANEL_HEIGHT_SCALE — global multiplier on panel height
-#   3. THREE_PART_GRID_HSPACE — lower = more height for plots, less for row gaps
-# Default layout targets screen/PDF review (~38 in page height at 72 DPI).
-# Set env PLOT_ERG_HIGH_QUALITY_PDF=1 to restore the older very tall export (128 in @ 120 DPI).
+LEGEND_FONT_SIZE = 16
+AXIS_TITLE_FONT_SIZE = 18
+AXIS_LABEL_FONT_SIZE = 16
+TICK_LABEL_FONT_SIZE = 16
+SECTION_HEADER_FONT_SIZE = 20
+UNAVAILABLE_FONT_SIZE = 16
+ANNOTATION_FONT_SIZE = 14
+TABLE_FONT_SIZE = 16
+
+# MEA map text (independent of the PDF fonts above)
+MEA_TITLE_FONT_SIZE = 16
+MEA_CONTACT_LABEL_FONT_MIN = 4.0
+MEA_CONTACT_LABEL_FONT_MAX = 8.0
+MEA_CONTACT_LABEL_FONT_SCALE = 60.0
+
+plt.rcParams.update(
+    {
+        "font.size": AXIS_LABEL_FONT_SIZE,
+        "axes.titlesize": AXIS_TITLE_FONT_SIZE,
+        "axes.labelsize": AXIS_LABEL_FONT_SIZE,
+        "xtick.labelsize": TICK_LABEL_FONT_SIZE,
+        "ytick.labelsize": TICK_LABEL_FONT_SIZE,
+        "legend.fontsize": LEGEND_FONT_SIZE,
+        "pdf.compression": 6,
+        "pdf.fonttype": 42,
+        "path.simplify": True,
+        "path.simplify_threshold": 0.35,
+        "agg.path.chunksize": 20000,
+    }
+)
 _HIGH_QUALITY_PDF = os.environ.get("PLOT_ERG_HIGH_QUALITY_PDF", "").strip().lower() in {
     "1",
     "true",
@@ -71,103 +116,40 @@ _HIGH_QUALITY_PDF = os.environ.get("PLOT_ERG_HIGH_QUALITY_PDF", "").strip().lowe
     "on",
 }
 THREE_PART_PAGE_WIDTH_IN = 12.0
-if _HIGH_QUALITY_PDF:
-    THREE_PART_PAGE_HEIGHT_NO_IMP = (128.0, 2.2)
-    THREE_PART_PAGE_HEIGHT_IMP = (138.0, 2.7)
-    PDF_DPI = 120
-else:
-    THREE_PART_PAGE_HEIGHT_NO_IMP = (100.0, 0.9)
-    THREE_PART_PAGE_HEIGHT_IMP = (110.0, 1.0)
-    PDF_DPI = 72
-THREE_PART_PANEL_HEIGHT_SCALE = 1.0  # e.g. 1.25 for 25% taller panels (same width)
-THREE_PART_PAGE_HEIGHT_REF = 120.0
-THREE_PART_GRID_HSPACE = 0.52
-# Leave room for y-axis tick labels + vertical ylabels (e.g. "Trial # (grouped by file)").
-THREE_PART_SUBPLOT_LEFT = 0.10
-THREE_PART_SUBPLOT_RIGHT = 0.99
-THREE_PART_SUBPLOT_BOTTOM = 0.01
-THREE_PART_SUBPLOT_TOP = 0.99
+PDF_DPI = 120 if _HIGH_QUALITY_PDF else 100
+THREE_PART_PANEL_HEIGHT_SCALE = 1.15 if _HIGH_QUALITY_PDF else 1.0
+MAX_CHANNEL_PAGE_HEIGHT_IN = 36.0
 SUMMARY_PAGE_WIDTH_IN = 16.0
 SUMMARY_PAGE_HEIGHT_IN = 9.0
-TRACE_PANEL_LEGEND_KWARGS = {
-    "loc": "upper center",
-    "bbox_to_anchor": (0.5, -0.15),
-    "fontsize": LEGEND_FONT_SIZE,
-    "framealpha": None,
-}
-PANEL_ROW_SPEC: list[tuple[str, float]] = [
-    ("mean_raw", 1.70),
-    ("mean_filtered", 1.60),
-    ("first_trigger_raw", 1.35),
-    ("first_trigger_hp", 1.25),
-    ("second_trigger_raw", 1.35),
-    ("second_trigger_hp", 1.25),
-    ("rms", 1.30),
-    ("raster", 1.20),
-    ("psth", 1.45),
-    ("trial_rate", 1.05),
-    ("isi", 1.15),
-]
-SECTION_HEADER_HEIGHT = 0.08
-MEA_ROW_HEIGHT = 2.2
-IMPEDANCE_HEADER_HEIGHT = 0.08
-IMPEDANCE_PANEL_HEIGHT = 0.92
-# Legacy full layout height units (MEA + 3× panels + 2 headers) for scaling.
-THREE_PART_ROW_HEIGHTS = [
-    *[h for _k, h in PANEL_ROW_SPEC],
-    SECTION_HEADER_HEIGHT,
-    *[h for _k, h in PANEL_ROW_SPEC],
-    SECTION_HEADER_HEIGHT,
-    *[h for _k, h in PANEL_ROW_SPEC],
-]
-_DEFAULT_LAYOUT_HEIGHT_UNITS = MEA_ROW_HEIGHT + sum(THREE_PART_ROW_HEIGHTS)
-_INCHES_PER_HEIGHT_UNIT = THREE_PART_PAGE_HEIGHT_NO_IMP[0] / max(_DEFAULT_LAYOUT_HEIGHT_UNITS, 1e-6)
-THREE_PART1_PANEL_KEYS = [
-    "ax_full",
-    "ax_full_filt",
-    "ax_first_trigger",
-    "ax_first_trigger_hp",
-    "ax_second_trigger",
-    "ax_second_trigger_hp",
-    "ax_full_rms",
-    "ax_raster_f",
-    "ax_fr_f",
-    "ax_trial_fr_f",
-    "ax_isi_f",
-]
-THREE_PART2_PANEL_KEYS = [
-    "ax_hdr2",
-    "ax_zoom",
-    "ax_zoom_filt",
-    "ax_zoom_first",
-    "ax_zoom_first_hp",
-    "ax_zoom_second",
-    "ax_zoom_second_hp",
-    "ax_zoom_rms",
-    "ax_raster_z",
-    "ax_fr_z",
-    "ax_trial_fr_z",
-    "ax_isi_z",
-]
-THREE_PART2_CURVE_KEYS = [k for k in THREE_PART2_PANEL_KEYS if not k.startswith("ax_hdr")]
-THREE_PART3_PANEL_KEYS = [
-    "ax_hdr3",
-    "ax_zoom_end",
-    "ax_zoom_end_filt",
-    "ax_zoom_end_first",
-    "ax_zoom_end_first_hp",
-    "ax_zoom_end_second",
-    "ax_zoom_end_second_hp",
-    "ax_zoom_end_rms",
-    "ax_raster_ze",
-    "ax_fr_ze",
-    "ax_trial_fr_ze",
-    "ax_isi_ze",
-]
-THREE_PART3_CURVE_KEYS = [k for k in THREE_PART3_PANEL_KEYS if not k.startswith("ax_hdr")]
-THREE_PART_AXIS_ORDER = (
-    THREE_PART1_PANEL_KEYS + THREE_PART2_PANEL_KEYS + THREE_PART3_PANEL_KEYS
+
+
+@dataclass(frozen=True)
+class PanelSpec:
+    """One togglable graph type. Add a new PDF graph by appending a spec here."""
+
+    field: str
+    plot_height_in: float
+    has_legend: bool = False
+    extra_below: str = "none"
+
+
+# Data-axes heights in inches (title / xlabel / legend are added by pdf_layout).
+PANEL_SPECS: tuple[PanelSpec, ...] = (
+    PanelSpec("mean_raw", 2.20, has_legend=True),
+    PanelSpec("mean_filtered", 2.10, has_legend=True),
+    PanelSpec("first_trigger_raw", 1.90, has_legend=True),
+    PanelSpec("first_trigger_hp", 1.80, has_legend=True),
+    PanelSpec("second_trigger_raw", 1.90, has_legend=True),
+    PanelSpec("second_trigger_hp", 1.80, has_legend=True),
+    PanelSpec("rms", 1.70, has_legend=True),
+    PanelSpec("raster", 1.85, has_legend=True),
+    PanelSpec("psth", 1.90, has_legend=True),
+    PanelSpec("trial_rate", 1.45, has_legend=True),
+    PanelSpec("isi", 1.55, has_legend=True),
+    PanelSpec("spike_overlay", 2.00, has_legend=True),
 )
+MEA_PLOT_HEIGHT_IN = 4.80
+IMPEDANCE_PLOT_HEIGHT_IN = 2.40
 
 _FULL_PANEL_TO_AXIS: dict[str, str] = {
     "mean_raw": "ax_full",
@@ -210,6 +192,17 @@ _ZOOM_END_PANEL_TO_AXIS: dict[str, str] = {
     "trial_rate": "ax_trial_fr_ze",
     "isi": "ax_isi_ze",
 }
+
+# Overlay is injected just after first/second raw, not as a standalone Display row.
+_TRIGGER_OVERLAY_AXIS: dict[str, dict[str, str]] = {
+    "full": {"first": "ax_overlay_first_f", "second": "ax_overlay_second_f"},
+    "zoom_onset": {"first": "ax_overlay_first_z", "second": "ax_overlay_second_z"},
+    "zoom_trigger_end": {"first": "ax_overlay_first_ze", "second": "ax_overlay_second_ze"},
+}
+_SPIKE_OVERLAY_SPEC = next(spec for spec in PANEL_SPECS if spec.field == "spike_overlay")
+_OVERLAY_AXIS_KEYS: tuple[str, ...] = tuple(
+    key for mapping in _TRIGGER_OVERLAY_AXIS.values() for key in mapping.values()
+)
 _PROFILE_ENABLED = os.environ.get("PLOT_ERG_PROFILE", "1").strip().lower() in {
     "1",
     "true",
@@ -277,6 +270,24 @@ def _section_included(zoom_mode: ZoomMode, section: str) -> bool:
     return False
 
 
+def _want_trigger_spike_overlay(panels: SectionPanels, which: str) -> bool:
+    """Overlay exists only if the matching first/second raw panel is enabled."""
+    raw_on = panels.first_trigger_raw if which == "first" else panels.second_trigger_raw
+    return bool(raw_on and panels.spike_overlay)
+
+
+def _overlay_slot_for(section: str, which: str) -> Slot:
+    spec = _SPIKE_OVERLAY_SPEC
+    return Slot(
+        key=_TRIGGER_OVERLAY_AXIS[section][which],
+        kind="plot",
+        plot_height_in=_scaled_plot_height_in(spec.plot_height_in),
+        has_legend=spec.has_legend,
+        extra_below="none",
+        table_rows=0,
+    )
+
+
 def _panel_axis_key(section: str, panel: str) -> str | None:
     if section == "full":
         return _FULL_PANEL_TO_AXIS.get(panel)
@@ -337,12 +348,21 @@ def _draw_mea_layout_panel(
             "MEA layout unavailable for this channel",
             ha="left",
             va="center",
-            fontsize=10,
+            fontsize=UNAVAILABLE_FONT_SIZE,
             transform=ax.transAxes,
         )
         return
-    draw_probe_layout_on_axes(ax, probe_layout, channel_name, set_mea_title=False)
-    ax.set_title(f"MEA map — channel: {channel_name}", fontsize=10, pad=4)
+    draw_probe_layout_on_axes(
+        ax,
+        probe_layout,
+        channel_name,
+        set_mea_title=False,
+        title_fontsize=MEA_TITLE_FONT_SIZE,
+        contact_label_font_min=MEA_CONTACT_LABEL_FONT_MIN,
+        contact_label_font_max=MEA_CONTACT_LABEL_FONT_MAX,
+        contact_label_font_scale=MEA_CONTACT_LABEL_FONT_SCALE,
+    )
+    ax.set_title(f"MEA map — channel: {channel_name}", fontsize=MEA_TITLE_FONT_SIZE, pad=4)
 
 
 def _soften_figure_linewidths(
@@ -380,36 +400,71 @@ def _soften_figure_linewidths(
                 pass
 
 
-def _three_part_page_height(
-    recording_count: int,
-    *,
-    include_imp: bool = False,
-    height_units: float | None = None,
-) -> float:
-    units = float(height_units) if height_units is not None else float(_DEFAULT_LAYOUT_HEIGHT_UNITS)
-    if height_units is None and include_imp:
-        units += IMPEDANCE_HEADER_HEIGHT + IMPEDANCE_PANEL_HEIGHT
-    per_recording = (
-        THREE_PART_PAGE_HEIGHT_IMP[1] if include_imp else THREE_PART_PAGE_HEIGHT_NO_IMP[1]
+def _pdf_fonts() -> LayoutFonts:
+    return LayoutFonts(
+        legend=LEGEND_FONT_SIZE,
+        axis_title=AXIS_TITLE_FONT_SIZE,
+        axis_label=AXIS_LABEL_FONT_SIZE,
+        tick=TICK_LABEL_FONT_SIZE,
+        section_header=SECTION_HEADER_FONT_SIZE,
+        mea_title=MEA_TITLE_FONT_SIZE,
+        table=TABLE_FONT_SIZE,
+        unavailable=UNAVAILABLE_FONT_SIZE,
     )
-    height_in = units * _INCHES_PER_HEIGHT_UNIT
-    height_in += per_recording * float(max(1, recording_count) - 1)
-    return max(4.0, height_in * max(0.5, float(THREE_PART_PANEL_HEIGHT_SCALE)))
 
 
-def _layout_rows_for_page(
+def _scaled_plot_height_in(height_in: float) -> float:
+    return float(height_in) * max(0.5, float(THREE_PART_PANEL_HEIGHT_SCALE))
+
+
+def _channel_page_sections(display: PlotDisplaySettings, zoom_mode: ZoomMode) -> list[str]:
+    """Enabled temporal sections, in PDF order. One PDF page is created per section."""
+    sections: list[str] = []
+    if _section_included(zoom_mode, "full") and display.full_view.any_enabled():
+        sections.append("full")
+    if _section_included(zoom_mode, "zoom_onset") and display.zoom_onset.any_enabled():
+        sections.append("zoom_onset")
+    if _section_included(zoom_mode, "zoom_trigger_end") and display.zoom_trigger_end.any_enabled():
+        sections.append("zoom_trigger_end")
+    return sections
+
+
+def _layout_slots_for_page(
     display: PlotDisplaySettings,
     zoom_mode: ZoomMode,
     *,
+    page_sections: Sequence[str],
     include_mea: bool,
     include_impedance: bool,
     zoom_onset_t0: float,
     zoom_onset_t1: float,
-) -> list[tuple[str, float, str | None]]:
-    """Build ordered (axis_key, height_ratio, optional_header_text) for visible panels only."""
-    rows: list[tuple[str, float, str | None]] = []
+    n_legend_rows: int,
+    probe_layout: Any = None,
+) -> list[Slot]:
+    """Build the ordered slot list for one page (only enabled panels)."""
+    slots: list[Slot] = []
+    wanted = set(page_sections)
     if include_mea:
-        rows.append(("ax_top", MEA_ROW_HEIGHT, None))
+        max_w = THREE_PART_PAGE_WIDTH_IN - 1.28 - 0.28
+        if probe_layout is not None:
+            mea_w, mea_h = mea_panel_size_in(
+                probe_layout,
+                max_width_in=max_w,
+                max_height_in=10.5,
+                font_min=MEA_CONTACT_LABEL_FONT_MIN,
+                font_max=MEA_CONTACT_LABEL_FONT_MAX,
+                font_scale=MEA_CONTACT_LABEL_FONT_SCALE,
+            )
+        else:
+            mea_w, mea_h = max_w, _scaled_plot_height_in(MEA_PLOT_HEIGHT_IN)
+        slots.append(
+            Slot(
+                key="ax_top",
+                kind="mea",
+                plot_height_in=mea_h,
+                width_in=mea_w,
+            )
+        )
 
     def _append_section(
         section: str,
@@ -418,15 +473,42 @@ def _layout_rows_for_page(
         header_key: str | None,
         header_text: str | None,
     ) -> None:
-        if not _section_included(zoom_mode, section):
+        if section not in wanted or not _section_included(zoom_mode, section):
             return
-        enabled = [(pk, h) for pk, h in PANEL_ROW_SPEC if getattr(panels, pk)]
+        enabled = [
+            spec
+            for spec in PANEL_SPECS
+            if spec.field != "spike_overlay" and getattr(panels, spec.field)
+        ]
         if not enabled:
             return
         if header_key is not None and header_text is not None:
-            rows.append((header_key, SECTION_HEADER_HEIGHT, header_text))
-        for pk, height in enabled:
-            rows.append((axis_map[pk], height, None))
+            slots.append(
+                Slot(
+                    key=header_key,
+                    kind="header",
+                    plot_height_in=0.32,
+                    header_text=header_text,
+                )
+            )
+        for spec in enabled:
+            extra = spec.extra_below if spec.extra_below in {"none", "psth_table"} else "none"
+            slots.append(
+                Slot(
+                    key=axis_map[spec.field],
+                    kind="plot",
+                    plot_height_in=_scaled_plot_height_in(spec.plot_height_in),
+                    has_legend=spec.has_legend,
+                    extra_below=extra,  # type: ignore[arg-type]
+                    table_rows=n_legend_rows if extra == "psth_table" else 0,
+                )
+            )
+            if spec.field == "first_trigger_raw" and _want_trigger_spike_overlay(panels, "first"):
+                slots.append(_overlay_slot_for(section, "first"))
+            elif spec.field == "second_trigger_raw" and _want_trigger_spike_overlay(
+                panels, "second"
+            ):
+                slots.append(_overlay_slot_for(section, "second"))
 
     _append_section("full", display.full_view, _FULL_PANEL_TO_AXIS, None, None)
     _append_section(
@@ -444,22 +526,99 @@ def _layout_rows_for_page(
         "Stimulation-end zoom (next rising edge)",
     )
     if include_impedance:
-        rows.append(
-            (
-                "ax_imp_hdr",
-                IMPEDANCE_HEADER_HEIGHT,
-                "Part 4 — Impedance |Z| @ 1 kHz vs session",
+        slots.append(
+            Slot(
+                key="ax_imp_hdr",
+                kind="header",
+                plot_height_in=0.32,
+                header_text="Part 4 — Impedance |Z| @ 1 kHz vs session",
             )
         )
-        rows.append(("ax_imp", IMPEDANCE_PANEL_HEIGHT, None))
-    return rows
+        slots.append(
+            Slot(
+                key="ax_imp",
+                kind="plot",
+                plot_height_in=_scaled_plot_height_in(IMPEDANCE_PLOT_HEIGHT_IN),
+                has_legend=False,
+            )
+        )
+    return slots
+
+
+_SHAREX_FIELDS = frozenset(
+    {
+        "mean_raw",
+        "mean_filtered",
+        "first_trigger_raw",
+        "first_trigger_hp",
+        "second_trigger_raw",
+        "second_trigger_hp",
+        "rms",
+        "raster",
+        "psth",
+    }
+)
+
+
+def _sharex_groups_for_slots() -> dict[str, str]:
+    groups: dict[str, str] = {}
+    for field, key in _FULL_PANEL_TO_AXIS.items():
+        if field in _SHAREX_FIELDS:
+            groups[key] = "full"
+    for field, key in _ZOOM_ONSET_PANEL_TO_AXIS.items():
+        if field in _SHAREX_FIELDS:
+            groups[key] = "zoom_onset"
+    for field, key in _ZOOM_END_PANEL_TO_AXIS.items():
+        if field in _SHAREX_FIELDS:
+            groups[key] = "zoom_trigger_end"
+    return groups
+
+
+def _legend_below(
+    ax: Any,
+    ncol: int = 1,
+    handles: Sequence[Any] | None = None,
+    labels: Sequence[str] | None = None,
+) -> Any:
+    if ax is None:
+        return None
+    return place_legend_below(
+        ax,
+        _pdf_fonts(),
+        ncol=ncol,
+        handles=handles,
+        labels=labels,
+    )
+
+
+def _attach_missing_legends(axes: dict[str, Any]) -> None:
+    """Add a below-graph legend on plot axes that have labels but no legend yet."""
+    for ax in axes.values():
+        if ax is None or not ax.get_visible():
+            continue
+        if ax.get_legend() is not None:
+            continue
+        handles, labels = ax.get_legend_handles_labels()
+        keep_handles: list[Any] = []
+        keep_labels: list[str] = []
+        for handle, lab in zip(handles, labels):
+            if lab and lab != "_nolegend_":
+                keep_handles.append(handle)
+                keep_labels.append(lab)
+        if not keep_labels:
+            continue
+        _legend_below(ax, handles=keep_handles, labels=keep_labels)
 
 
 def _apply_compact_axis_fonts(fig: Any) -> None:
-    """Reduce subplot titles and axis label/tick font sizes on a figure."""
+    """Apply subplot title, axis label, and tick font sizes on a figure."""
     for ax in fig.axes:
-        if ax.get_title():
-            ax.title.set_fontsize(AXIS_TITLE_FONT_SIZE)
+        title = ax.get_title()
+        if title:
+            if title.startswith("MEA"):
+                ax.title.set_fontsize(MEA_TITLE_FONT_SIZE)
+            else:
+                ax.title.set_fontsize(AXIS_TITLE_FONT_SIZE)
         if ax.get_xlabel():
             ax.xaxis.label.set_fontsize(AXIS_LABEL_FONT_SIZE)
         if ax.get_ylabel():
@@ -480,178 +639,72 @@ def _build_three_part_page_axes(
     include_impedance_panel: bool,
     display: PlotDisplaySettings | None = None,
     zoom_mode: ZoomMode = "both",
+    page_sections: Sequence[str] | None = None,
+    n_legend_rows: int = 2,
+    legend_labels: Sequence[str] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
-    """Create page axes only for panels enabled by display/zoom settings."""
-    del first_row_height_ratio  # layout is driven by display settings
-    recording_count = max(1, int(n_recordings))
+    """Create page axes for one channel section using the stacked inch layout."""
+    del first_row_height_ratio
+    fonts = _pdf_fonts()
     display_settings = display or PlotDisplaySettings.all_on()
+    sections = list(page_sections) if page_sections else _channel_page_sections(display_settings, zoom_mode)
     include_mea = bool(first_row_mea_channel_name) and display_settings.mea_layout
-    rows = _layout_rows_for_page(
+    labels = [str(lab) for lab in (legend_labels or []) if str(lab).strip()]
+    axes_width_in = THREE_PART_PAGE_WIDTH_IN - 1.28 - 0.28
+    rows_from_labels = estimate_legend_rows(labels, fonts, axes_width_in) if labels else 1
+    legend_rows = max(int(n_legend_rows), rows_from_labels, 1)
+    slots = _layout_slots_for_page(
         display_settings,
         zoom_mode,
+        page_sections=sections,
         include_mea=include_mea,
         include_impedance=include_impedance_panel,
         zoom_onset_t0=zoom_t0,
         zoom_onset_t1=zoom_t1,
+        n_legend_rows=legend_rows,
+        probe_layout=probe_layout,
     )
-    if not rows:
-        # Fallback: keep a minimal blank page rather than crashing.
-        rows = [("ax_full", 1.70, None)]
+    if not slots:
+        slots = [Slot(key="ax_full", kind="plot", plot_height_in=_scaled_plot_height_in(2.0), has_legend=True)]
 
-    height_units = sum(h for _k, h, _t in rows)
-    page_height_in = _three_part_page_height(
-        recording_count,
-        include_imp=include_impedance_panel,
-        height_units=height_units,
+    pages = build_stacked_pages(
+        slots,
+        fonts=fonts,
+        n_legend_rows=legend_rows,
+        width_in=THREE_PART_PAGE_WIDTH_IN,
+        sharex_groups=_sharex_groups_for_slots(),
+        max_height_in=MAX_CHANNEL_PAGE_HEIGHT_IN,
     )
-    height_ratios = [h for _k, h, _t in rows]
-    fig = plt.figure(figsize=(THREE_PART_PAGE_WIDTH_IN, page_height_in))
-    gs = fig.add_gridspec(
-        len(height_ratios),
-        1,
-        height_ratios=height_ratios,
-        hspace=THREE_PART_GRID_HSPACE,
-    )
-
-    axes: dict[str, Any] = {}
-    sharex_by_section: dict[str, Any] = {}
-    section_of_axis = {
-        **{v: "full" for v in _FULL_PANEL_TO_AXIS.values()},
-        **{v: "zoom_onset" for v in _ZOOM_ONSET_PANEL_TO_AXIS.values()},
-        **{v: "zoom_trigger_end" for v in _ZOOM_END_PANEL_TO_AXIS.values()},
-    }
-    sharex_keys = {
-        "ax_full",
-        "ax_full_filt",
-        "ax_first_trigger",
-        "ax_first_trigger_hp",
-        "ax_second_trigger",
-        "ax_second_trigger_hp",
-        "ax_full_rms",
-        "ax_raster_f",
-        "ax_fr_f",
-        "ax_zoom",
-        "ax_zoom_filt",
-        "ax_zoom_first",
-        "ax_zoom_first_hp",
-        "ax_zoom_second",
-        "ax_zoom_second_hp",
-        "ax_raster_z",
-        "ax_fr_z",
-        "ax_zoom_end",
-        "ax_zoom_end_filt",
-        "ax_zoom_end_first",
-        "ax_zoom_end_first_hp",
-        "ax_zoom_end_second",
-        "ax_zoom_end_second_hp",
-        "ax_raster_ze",
-        "ax_fr_ze",
-    }
-
-    for idx, (key, _height, header_text) in enumerate(rows):
-        section = section_of_axis.get(key)
-        sharex = sharex_by_section.get(section) if section and key in sharex_keys else None
-        ax = fig.add_subplot(gs[idx, 0], sharex=sharex)
-        axes[key] = ax
-        if section and key in sharex_keys and section not in sharex_by_section:
-            sharex_by_section[section] = ax
-        if key in {"ax_hdr2", "ax_hdr3", "ax_imp_hdr"} or header_text is not None:
-            ax.axis("off")
-            if header_text:
-                ax.text(
-                    0.02,
-                    0.04,
-                    header_text,
-                    ha="left",
-                    va="bottom",
-                    fontsize=11,
-                    fontweight="bold",
-                    transform=ax.transAxes,
-                )
-        elif key == "ax_top":
-            if first_row_mea_channel_name is not None:
-                _draw_mea_layout_panel(ax, probe_layout, first_row_mea_channel_name)
-            else:
-                ax.axis("off")
-                if first_row_text:
-                    ax.text(
-                        0.02,
-                        0.5,
-                        first_row_text,
-                        ha="left",
-                        va="center",
-                        fontsize=11,
-                        fontweight="bold",
-                        transform=ax.transAxes,
-                    )
-    return fig, axes
-
-
-def _shift_panel_group_down(
-    axes: dict[str, Any],
-    panel_keys: Sequence[str],
-    start_key: str,
-    delta: float,
-) -> None:
-    """Shift a contiguous panel group downward (figure coordinates)."""
-    if start_key not in panel_keys or start_key not in axes:
-        return
-    start_idx = panel_keys.index(start_key)
-    shift_axes_down(
-        [axes[key] for key in panel_keys[start_idx:] if key in axes],
-        float(delta),
-    )
-
-
-def _fit_axes_vertical_to_figure(
-    axes: dict[str, Any],
-    *,
-    bottom: float = THREE_PART_SUBPLOT_BOTTOM,
-    top: float = THREE_PART_SUBPLOT_TOP,
-) -> None:
-    """Remap stacked axes into [bottom, top] when legend/section shifts push content off-page."""
-    if not axes:
-        return
-    y_min = min(float(ax.get_position().y0) for ax in axes.values())
-    y_max = max(float(ax.get_position().y1) for ax in axes.values())
-    content_h = y_max - y_min
-    avail_h = float(top) - float(bottom)
-    if content_h <= 1e-9 or avail_h <= 1e-9:
-        return
-    if y_min >= bottom - 1e-6 and y_max <= top + 1e-6:
-        return
-    for ax in axes.values():
-        pos = ax.get_position()
-        rel_bottom = (float(pos.y0) - y_min) / content_h
-        rel_height = float(pos.height) / content_h
-        ax.set_position(
-            [pos.x0, bottom + rel_bottom * avail_h, pos.width, rel_height * avail_h]
+    if not pages:
+        pages = build_stacked_pages(
+            [Slot(key="ax_full", kind="plot", plot_height_in=_scaled_plot_height_in(2.0), has_legend=True)],
+            fonts=fonts,
+            n_legend_rows=legend_rows,
+            width_in=THREE_PART_PAGE_WIDTH_IN,
+            max_height_in=MAX_CHANNEL_PAGE_HEIGHT_IN,
         )
-
-
-def _enforce_min_vertical_gap(
-    axes: dict[str, Any],
-    axis_order: Sequence[str],
-    below_start_key: str,
-    min_gap: float,
-) -> None:
-    """Ensure a minimum figure-coordinate gap between the row above a section header and that header."""
-    if below_start_key not in axes or below_start_key not in axis_order:
-        return
-    start_idx = axis_order.index(below_start_key)
-    if start_idx <= 0:
-        return
-    above_key = axis_order[start_idx - 1]
-    if above_key not in axes:
-        return
-    below_axes = [axes[key] for key in axis_order[start_idx:] if key in axes]
-    if not below_axes:
-        return
-    pos_above = axes[above_key].get_position()
-    pos_below = below_axes[0].get_position()
-    delta = float(min_gap) - float(pos_above.y0 - pos_below.y1)
-    if delta > 0:
-        shift_axes_down(below_axes, delta)
+    axes: dict[str, Any] = {}
+    figs: list[Any] = []
+    for page in pages:
+        axes.update(page.axes)
+        figs.append(page.fig)
+    if "ax_top" in axes:
+        if first_row_mea_channel_name is not None:
+            _draw_mea_layout_panel(axes["ax_top"], probe_layout, first_row_mea_channel_name)
+        else:
+            axes["ax_top"].axis("off")
+            if first_row_text:
+                axes["ax_top"].text(
+                    0.02,
+                    0.5,
+                    first_row_text,
+                    ha="left",
+                    va="center",
+                    fontsize=SECTION_HEADER_FONT_SIZE,
+                    fontweight="bold",
+                    transform=axes["ax_top"].transAxes,
+                )
+    return figs, axes
 
 
 @_profiled("pdf_savefig_channel_page")
@@ -662,138 +715,24 @@ def _finalize_and_save_three_part_page(
     axes: dict[str, Any],
     n_recordings: int,
 ) -> None:
-    tick_keys = [
-        "ax_full",
-        "ax_full_filt",
-        "ax_first_trigger_hp",
-        "ax_first_trigger",
-        "ax_second_trigger_hp",
-        "ax_second_trigger",
-        "ax_full_rms",
-        "ax_zoom",
-        "ax_zoom_filt",
-        "ax_zoom_first_hp",
-        "ax_zoom_first",
-        "ax_zoom_second_hp",
-        "ax_zoom_second",
-        "ax_zoom_rms",
-        "ax_raster_f",
-        "ax_fr_f",
-        "ax_trial_fr_f",
-        "ax_isi_f",
-        "ax_raster_z",
-        "ax_fr_z",
-        "ax_trial_fr_z",
-        "ax_isi_z",
-        "ax_raster_ze",
-        "ax_fr_ze",
-        "ax_trial_fr_ze",
-        "ax_isi_ze",
-        "ax_zoom_end",
-        "ax_zoom_end_filt",
-        "ax_zoom_end_first_hp",
-        "ax_zoom_end_first",
-        "ax_zoom_end_second_hp",
-        "ax_zoom_end_second",
-        "ax_zoom_end_rms",
-    ]
-    if "ax_imp" in axes:
-        tick_keys.append("ax_imp")
-    for key in tick_keys:
-        if key in axes:
-            axes[key].tick_params(axis="x", labelbottom=True)
-    fig.subplots_adjust(
-        left=THREE_PART_SUBPLOT_LEFT,
-        right=THREE_PART_SUBPLOT_RIGHT,
-        top=THREE_PART_SUBPLOT_TOP,
-        bottom=THREE_PART_SUBPLOT_BOTTOM,
-        hspace=THREE_PART_GRID_HSPACE,
-    )
-    recording_count = max(1, int(n_recordings))
-    include_imp = "ax_imp" in axes
-    visible_units = sum(
-        float(ax.get_position().height) for ax in axes.values() if ax.get_visible()
-    )
-    # Use figure inches already set at build time; scale legend gaps from recording count.
-    page_height_scale = max(
-        1.0,
-        fig.get_figheight() / max(THREE_PART_PAGE_HEIGHT_REF, 1e-6),
-    )
-    del visible_units  # kept for potential future compacting
-    gap_legend = max(
-        0.0025,
-        (0.006 + 0.003 * float(recording_count - 1)) * max(1.0, page_height_scale),
-    )
-    gap_legend_hp = gap_legend * 0.55
-    gap_4_5 = max(
-        0.006,
-        (0.010 + 0.003 * float(recording_count - 1)) * max(1.0, page_height_scale),
-    )
-    gap_section = 0.026 + 0.006 * float(recording_count - 1)
-
-    axis_order = [k for k in THREE_PART_AXIS_ORDER if k in axes]
-    if include_imp:
-        if "ax_imp_hdr" in axes:
-            axis_order.append("ax_imp_hdr")
-        if "ax_imp" in axes:
-            axis_order.append("ax_imp")
-
-    part1_legend_shifts = (
-        ("ax_full", gap_legend),
-        ("ax_full_filt", gap_legend),
-        ("ax_first_trigger", gap_legend),
-        ("ax_first_trigger_hp", gap_legend_hp),
-        ("ax_second_trigger", gap_legend),
-        ("ax_second_trigger_hp", gap_legend_hp),
-        ("ax_fr_f", gap_4_5),
-    )
-    part2_legend_shifts = (
-        ("ax_zoom", gap_legend),
-        ("ax_zoom_filt", gap_legend),
-        ("ax_zoom_first", gap_legend),
-        ("ax_zoom_first_hp", gap_legend_hp),
-        ("ax_zoom_second", gap_legend),
-        ("ax_zoom_second_hp", gap_legend_hp),
-        ("ax_fr_z", gap_4_5),
-    )
-    part3_legend_shifts = (
-        ("ax_zoom_end", gap_legend),
-        ("ax_zoom_end_filt", gap_legend),
-        ("ax_zoom_end_first", gap_legend),
-        ("ax_zoom_end_first_hp", gap_legend_hp),
-        ("ax_zoom_end_second", gap_legend),
-        ("ax_zoom_end_second_hp", gap_legend_hp),
-        ("ax_fr_ze", gap_4_5),
-    )
-    for start_key, gap in part1_legend_shifts:
-        _shift_panel_group_down(axes, THREE_PART1_PANEL_KEYS, start_key, gap)
-    for start_key, gap in part2_legend_shifts:
-        # Keep Part 2 section title glued to the first curve panel (legend clearance).
-        if start_key == "ax_zoom":
-            _shift_panel_group_down(axes, THREE_PART2_PANEL_KEYS, "ax_hdr2", gap)
-        else:
-            _shift_panel_group_down(axes, THREE_PART2_CURVE_KEYS, start_key, gap)
-    for start_key, gap in part3_legend_shifts:
-        if start_key == "ax_zoom_end":
-            _shift_panel_group_down(axes, THREE_PART3_PANEL_KEYS, "ax_hdr3", gap)
-        else:
-            _shift_panel_group_down(axes, THREE_PART3_CURVE_KEYS, start_key, gap)
-
-    _enforce_min_vertical_gap(axes, axis_order, "ax_hdr2", gap_section)
-    _enforce_min_vertical_gap(axes, axis_order, "ax_hdr3", gap_section)
-    if include_imp and "ax_imp_hdr" in axes:
-        _enforce_min_vertical_gap(axes, axis_order, "ax_imp_hdr", gap_section)
-
-    panel_width = THREE_PART_SUBPLOT_RIGHT - THREE_PART_SUBPLOT_LEFT
+    del n_recordings
     for ax in axes.values():
-        pos = ax.get_position()
-        ax.set_position([THREE_PART_SUBPLOT_LEFT, pos.y0, panel_width, pos.height])
-    _fit_axes_vertical_to_figure(axes)
-    _soften_figure_linewidths(fig)
-    _apply_compact_axis_fonts(fig)
-    # Avoid bbox_inches="tight" on huge multi-panel figures (very slow).
-    pdf.savefig(fig, dpi=PDF_DPI, pad_inches=0.15)
-    plt.close(fig)
+        if ax is None or not ax.get_visible():
+            continue
+        if ax.axison and ax.get_xlabel():
+            ax.tick_params(axis="x", labelbottom=True)
+    _attach_missing_legends(axes)
+    figures = fig if isinstance(fig, (list, tuple)) else (fig,)
+    for one_fig in figures:
+        if one_fig is None:
+            continue
+        save_figure_to_pdf(
+            pdf,
+            one_fig,
+            dpi=PDF_DPI,
+            soften_linewidths=_soften_figure_linewidths,
+            apply_fonts=_apply_compact_axis_fonts,
+        )
 
 
 def _spike_times_per_trial(
@@ -888,10 +827,10 @@ def _add_psth_mean_table(ax_fr: Any, rows: list[tuple[str, float]]) -> None:
         colLabels=["Signal", "Mean FR (Hz)"],
         cellLoc="left",
         colLoc="left",
-        bbox=[0.0, -0.90, 1.0, 0.42],
+        bbox=psth_table_bbox(ax_fr, _pdf_fonts(), len(rows)),
     )
     tbl.auto_set_font_size(False)
-    tbl.set_fontsize(7)
+    tbl.set_fontsize(TABLE_FONT_SIZE)
     tbl.scale(1.0, 1.75)
 
 
@@ -1058,7 +997,15 @@ def _trigger_end_zoom_bounds(
 
 
 def _mark_unavailable_axis(ax: Any, message: str) -> None:
-    ax.text(0.5, 0.5, message, ha="center", va="center", transform=ax.transAxes)
+    ax.text(
+        0.5,
+        0.5,
+        message,
+        ha="center",
+        va="center",
+        transform=ax.transAxes,
+        fontsize=UNAVAILABLE_FONT_SIZE,
+    )
     ax.set_axis_off()
 
 
@@ -1356,7 +1303,6 @@ def _plot_mean_section_trace_panels(
         ax_raw.set_ylabel("Potential (µV)")
         ax_raw.set_xlabel(TIME_REL_XLABEL)
         ax_raw.grid(True, alpha=0.3)
-        ax_raw.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
 
     if ax_filt is not None:
         _add_trace_reference_overlays(ax_filt, **overlay_kwargs)
@@ -1364,7 +1310,6 @@ def _plot_mean_section_trace_panels(
         ax_filt.set_ylabel("Potential (µV)")
         ax_filt.set_xlabel(TIME_REL_XLABEL)
         ax_filt.grid(True, alpha=0.3)
-        ax_filt.legend(ncol=legend_cols, **TRACE_PANEL_LEGEND_KWARGS)
 
     _plot_stim_event_panel(
         ax_first_hp,
@@ -1561,20 +1506,12 @@ def _add_raster_threshold_legend(
         unique_labels = [f"Threshold: {threshold_caption}"]
     entry_count = len(unique_labels)
     ncol = 1
-    rows = max(1, entry_count)
-    # Extra vertical offset when many stacked legend rows (single column).
-    legend_y = -0.22 - 0.035 * max(0, rows - 1)
-    legend = ax_raster.legend(
-        unique_handles,
-        unique_labels,
-        loc="upper center",
-        bbox_to_anchor=(0.5, legend_y),
+    del entry_count
+    legend = _legend_below(
+        ax_raster,
         ncol=ncol,
-        fontsize=8,
-        framealpha=0.95,
-        borderaxespad=0.0,
-        handlelength=1.8,
-        columnspacing=1.2,
+        handles=unique_handles,
+        labels=unique_labels,
     )
     if legend is not None:
         legend.set_in_layout(False)
@@ -1774,6 +1711,228 @@ def _draw_spike_panels_multi_channel(
             ax_isi.set_axis_off()
 
 
+def _extract_spike_waveforms(
+    source: AmplifierSpikeSource,
+    ch: int,
+    spike_times_per_trial: list[np.ndarray],
+    *,
+    pre_samples: int = INTAN_SPIKE_PRE_DETECT_SAMPLES,
+    post_samples: int = INTAN_SPIKE_POST_DETECT_SAMPLES,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """HIGH snippets aligned on detection, as in RHX Spike Scope (spikeplot.cpp).
+
+    Buffer is ``[t - pre_samples, t + post_samples)``. Returns
+    ``(t_ms, waveforms, t_rel_s)`` with t=0 at the threshold-crossing sample.
+    """
+    fs = float(source.fs)
+    pre_n = max(0, int(pre_samples))
+    post_n = max(1, int(post_samples))
+    win_len = pre_n + post_n
+    t_ms = (np.arange(-pre_n, post_n, dtype=np.float64) / fs) * 1e3
+    empty = (
+        t_ms,
+        np.empty((0, win_len), dtype=np.float32),
+        np.empty(0, dtype=np.float64),
+    )
+    row = source.high_trace_for_channel(ch)
+    n_samples = int(np.asarray(row).shape[0])
+    triggers = np.asarray(source.valid_triggers, dtype=np.int64)
+    if triggers.size == 0 or n_samples < win_len:
+        return empty
+    snippets: list[np.ndarray] = []
+    t_rel_keep: list[float] = []
+    n_trials = min(len(spike_times_per_trial), int(triggers.size))
+    for trial_i in range(n_trials):
+        st_arr = np.asarray(spike_times_per_trial[trial_i], dtype=np.float64).ravel()
+        if st_arr.size == 0:
+            continue
+        trig = int(triggers[trial_i])
+        centers = trig + np.rint(st_arr * fs).astype(np.int64)
+        for t_val, center in zip(st_arr, centers):
+            start = int(center) - pre_n
+            end = int(center) + post_n
+            if start < 0 or end > n_samples:
+                continue
+            snippet = np.asarray(row[start:end], dtype=np.float32)
+            if snippet.shape[0] != win_len:
+                continue
+            snippets.append(snippet)
+            t_rel_keep.append(float(t_val))
+    if not snippets:
+        return empty
+    return t_ms, np.vstack(snippets), np.asarray(t_rel_keep, dtype=np.float64)
+
+
+def _spike_scope_time_window_ms(tscale_ms: float) -> tuple[float, float]:
+    """Intan Spike Scope x-axis: tMin = −T/2, tMax = +T (systemstate.cpp)."""
+    t = float(tscale_ms)
+    if t not in INTAN_SPIKE_SCOPE_TSCALES_MS:
+        nearest = min(INTAN_SPIKE_SCOPE_TSCALES_MS, key=lambda v: abs(v - t))
+        t = float(nearest)
+    return (-t / 2.0, t)
+
+
+def _spike_scope_xtick_divisor_ms(tscale_ms: float) -> int:
+    t = int(round(float(tscale_ms)))
+    if t == 10:
+        return 2
+    if t in (16, 20):
+        return 4
+    return 1
+
+
+def _spike_scope_ylim_uv(abs_peak: float) -> float:
+    peak = max(0.0, float(abs_peak))
+    for scale in INTAN_SPIKE_SCOPE_YSCALES_UV:
+        if peak <= scale:
+            return float(scale)
+    return float(INTAN_SPIKE_SCOPE_YSCALES_UV[-1])
+
+
+def _subsample_overlay_rows(
+    waveforms: np.ndarray,
+    sampling_percent: int,
+    max_traces: int = SPIKE_OVERLAY_MAX_TRACES,
+) -> np.ndarray:
+    """Evenly keep a subset of spike snippets for display."""
+    n = int(waveforms.shape[0])
+    if n <= 1:
+        return waveforms
+    pct = max(1, min(100, int(sampling_percent)))
+    keep = n if pct >= 100 else max(1, int(np.ceil(n * pct / 100.0)))
+    keep = min(keep, int(max_traces), n)
+    if keep >= n:
+        return waveforms
+    idx = np.linspace(0, n - 1, keep).astype(np.int64)
+    return waveforms[idx]
+
+
+def _draw_spike_overlay_panel(
+    ax: Any,
+    overlay_per_recording: Sequence[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    labels: Sequence[str],
+    *,
+    t_range_s: Optional[Tuple[float, float]] = None,
+    section_title: str = "",
+    sampling_percent: int = 100,
+    legend_visible: Sequence[bool] | None = None,
+    intan_dsp: IntanDspSettings | None = None,
+    tscale_ms: float = 4.0,
+    thresholds_uv: Sequence[float] | None = None,
+) -> None:
+    """Overlay HIGH snippets like RHX Spike Scope (spikeplot.cpp)."""
+    if ax is None:
+        return
+    short, _ = _spike_pipeline_captions(intan_dsp=intan_dsp)
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
+    n_rec = len(overlay_per_recording)
+    dense = n_rec > 2
+    line_alpha = 0.10 if not dense else 0.06
+    line_width = 0.45 if not dense else 0.35
+    sec = f"{section_title} — " if section_title else ""
+    t_min_ms, t_max_ms = _spike_scope_time_window_ms(tscale_ms)
+    abs_peak = 0.0
+    n_all_total = 0
+    has_any = False
+    for rec_idx, (t_ms, waves, t_rel_spk) in enumerate(overlay_per_recording):
+        t_ms = np.asarray(t_ms, dtype=np.float64)
+        waves = np.asarray(waves)
+        t_rel_spk = np.asarray(t_rel_spk, dtype=np.float64)
+        if t_range_s is not None and waves.shape[0] > 0 and t_rel_spk.size == waves.shape[0]:
+            t0, t1 = float(t_range_s[0]), float(t_range_s[1])
+            keep = (t_rel_spk >= t0) & (t_rel_spk <= t1)
+            waves = waves[keep]
+        n_all = int(waves.shape[0])
+        n_all_total += n_all
+        if n_all == 0 or t_ms.size == 0:
+            continue
+        time_mask = (t_ms >= t_min_ms - 1e-9) & (t_ms <= t_max_ms + 1e-9)
+        if not np.any(time_mask):
+            time_mask = np.ones(t_ms.size, dtype=bool)
+        t_disp = t_ms[time_mask]
+        waves_disp = waves[:, time_mask]
+        has_any = True
+        color = colors[rec_idx % len(colors)]
+        shown = _subsample_overlay_rows(waves_disp, sampling_percent)
+        n_shown = int(shown.shape[0])
+        shown_f = np.asarray(shown, dtype=np.float64)
+        if shown_f.size:
+            abs_peak = max(abs_peak, float(np.nanpercentile(np.abs(shown_f), 99.0)))
+        if n_shown > 0:
+            segs = np.empty((n_shown, t_disp.size, 2), dtype=np.float64)
+            segs[:, :, 0] = t_disp
+            segs[:, :, 1] = shown_f
+            ax.add_collection(
+                LineCollection(
+                    segs,
+                    colors=(to_rgba(color, alpha=line_alpha),),
+                    linewidths=line_width,
+                    rasterized=True,
+                    zorder=1,
+                )
+            )
+        show_leg = True if legend_visible is None else bool(legend_visible[rec_idx])
+        label = labels[rec_idx] if rec_idx < len(labels) else f"Recording {rec_idx + 1}"
+        if n_shown < n_all:
+            rec_label = f"{label} (n={n_all}, {n_shown} shown)"
+        else:
+            rec_label = f"{label} (n={n_all})"
+        ax.plot(
+            [],
+            [],
+            color=color,
+            linewidth=1.2,
+            label=rec_label if show_leg else "_nolegend_",
+        )
+        if thresholds_uv is not None and rec_idx < len(thresholds_uv):
+            thr = float(thresholds_uv[rec_idx])
+            ax.axhline(
+                thr,
+                color=color,
+                linestyle="--",
+                linewidth=0.85,
+                zorder=2,
+                alpha=0.85,
+            )
+            abs_peak = max(abs_peak, abs(thr))
+    if not has_any:
+        ax.text(
+            0.5,
+            0.5,
+            "No spikes to overlay in this window",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=UNAVAILABLE_FONT_SIZE,
+        )
+        ax.set_axis_off()
+        return
+    ax.axhline(0.0, color="0.35", linewidth=0.8, zorder=2)
+    ax.axvline(0.0, color="0.35", linestyle=":", linewidth=0.9, zorder=2)
+    if intan_dsp is not None and intan_dsp.artifact_suppression_enabled:
+        art = float(intan_dsp.artifact_threshold_uv)
+        ax.axhline(art, color="#2563eb", linestyle=":", linewidth=0.8, zorder=2, alpha=0.7)
+        ax.axhline(-art, color="#2563eb", linestyle=":", linewidth=0.8, zorder=2, alpha=0.7)
+    ax.set_xlabel("Time relative to detection (ms)")
+    ax.set_ylabel("Amplitude (µV)")
+    ax.set_title(
+        f"{sec}Spike Scope overlay — [{t_min_ms:g}, {t_max_ms:g}] ms "
+        f"(n={n_all_total}) — {short}"
+    )
+    ax.set_xlim(t_min_ms, t_max_ms)
+    y_lim = _spike_scope_ylim_uv(abs_peak)
+    ax.set_ylim(-y_lim, y_lim)
+    divisor = _spike_scope_xtick_divisor_ms(tscale_ms)
+    ticks = [
+        float(t)
+        for t in range(int(np.ceil(t_min_ms)), int(np.floor(t_max_ms)) + 1)
+        if t == int(t_min_ms) or t == int(t_max_ms) or t % divisor == 0
+    ]
+    if ticks:
+        ax.set_xticks(ticks)
+    ax.grid(True, alpha=0.3)
+
+
 def _spike_threshold_caption(
     threshold_uv: float,
     polarity: str | None = None,
@@ -1839,7 +1998,11 @@ class _PlotRenderCache:
         self._mean_raw: dict[tuple[int, int], np.ndarray] = {}
         self._mean_hp: dict[tuple[int, int], np.ndarray] = {}
         self._rms: dict[tuple[int, int | None], tuple[np.ndarray, np.ndarray]] = {}
-        self._spikes: dict[tuple[int, int, float], list[np.ndarray]] = {}
+        self._spikes: dict[tuple[int, int, float, tuple[float, float] | None], list[np.ndarray]] = {}
+        self._waveforms: dict[
+            tuple[int, int, float, tuple[float, float] | None],
+            tuple[np.ndarray, np.ndarray, np.ndarray],
+        ] = {}
         self._channel_rms_uv: dict[tuple[int, int], float] = {}
         self._threshold: dict[tuple[int, int], tuple[float, str]] = {}
 
@@ -2063,20 +2226,74 @@ class _PlotRenderCache:
         self._threshold[key] = resolved
         return resolved
 
+    @staticmethod
+    def _t_range_key(
+        t_range_s: tuple[float, float] | None,
+    ) -> tuple[float, float] | None:
+        if t_range_s is None:
+            return None
+        t0, t1 = float(t_range_s[0]), float(t_range_s[1])
+        return (round(t0, 9), round(t1, 9))
+
     def spike_times_per_trial(
         self,
         src_idx: int,
         source: AmplifierSpikeSource,
         ch: int,
         threshold_uv: float,
+        t_range_s: tuple[float, float] | None = None,
+        trigger_index: int | None = None,
     ) -> list[np.ndarray]:
-        key = (src_idx, ch, float(threshold_uv))
+        key = (
+            src_idx,
+            ch,
+            float(threshold_uv),
+            self._t_range_key(t_range_s),
+            trigger_index,
+        )
         cached = self._spikes.get(key)
         if cached is not None:
             return cached
-        spikes = source.spike_times_per_trial_for_channel(ch, self.t_rel, threshold_uv)
+        spikes = source.spike_times_per_trial_for_channel(
+            ch,
+            self.t_rel,
+            threshold_uv,
+            t_range_s=t_range_s,
+            trigger_index=trigger_index,
+        )
         self._spikes[key] = spikes
         return spikes
+
+    def spike_waveforms(
+        self,
+        src_idx: int,
+        source: AmplifierSpikeSource,
+        ch: int,
+        threshold_uv: float,
+        t_range_s: tuple[float, float] | None = None,
+        trigger_index: int | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        key = (
+            src_idx,
+            ch,
+            float(threshold_uv),
+            self._t_range_key(t_range_s),
+            trigger_index,
+        )
+        cached = self._waveforms.get(key)
+        if cached is not None:
+            return cached
+        times = self.spike_times_per_trial(
+            src_idx,
+            source,
+            ch,
+            threshold_uv,
+            t_range_s=t_range_s,
+            trigger_index=trigger_index,
+        )
+        extracted = _extract_spike_waveforms(source, ch, times)
+        self._waveforms[key] = extracted
+        return extracted
 
 
 def _draw_impedance_evolution_panel(
@@ -2096,7 +2313,7 @@ def _draw_impedance_evolution_panel(
             ha="center",
             va="center",
             transform=ax_imp.transAxes,
-            fontsize=10,
+            fontsize=UNAVAILABLE_FONT_SIZE,
         )
         ax_imp.set_axis_off()
         return
@@ -2129,17 +2346,17 @@ def _draw_impedance_evolution_panel(
             xytext=(0, 6),
             ha="center",
             va="bottom",
-            fontsize=6,
+            fontsize=ANNOTATION_FONT_SIZE,
             alpha=0.9,
             zorder=4,
         )
-    ax_imp.set_ylabel("|Z| @ 1 kHz (Ω)", fontsize=8)
-    ax_imp.set_xlabel("Session time (_YYMMDD_HHMMSS)", fontsize=8)
+    ax_imp.set_ylabel("|Z| @ 1 kHz (Ω)", fontsize=AXIS_LABEL_FONT_SIZE)
+    ax_imp.set_xlabel("Session time (_YYMMDD_HHMMSS)", fontsize=AXIS_LABEL_FONT_SIZE)
     ax_imp.margins(x=0.08)
     date_locator = mdates.AutoDateLocator()
     ax_imp.xaxis.set_major_locator(date_locator)
     ax_imp.xaxis.set_major_formatter(mdates.ConciseDateFormatter(date_locator))
-    ax_imp.tick_params(axis="both", labelsize=7)
+    ax_imp.tick_params(axis="both", labelsize=TICK_LABEL_FONT_SIZE)
     ax_imp.grid(True, which="major", alpha=0.35)
     for label in ax_imp.get_xticklabels():
         label.set_rotation(18)
@@ -2174,7 +2391,7 @@ def _append_mean_impedance_summary_page(
             ha="center",
             va="center",
             transform=ax.transAxes,
-            fontsize=11,
+            fontsize=UNAVAILABLE_FONT_SIZE,
         )
         ax.set_axis_off()
     else:
@@ -2205,7 +2422,7 @@ def _append_mean_impedance_summary_page(
         ax.set_ylabel("Mean |Z| (Ω), log scale")
         ax.set_xlabel("Session time")
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d\n%H:%M"))
-        ax.tick_params(axis="x", labelsize=8)
+        ax.tick_params(axis="x", labelsize=TICK_LABEL_FONT_SIZE)
         ax.grid(True, which="major", alpha=0.35)
         ax.grid(True, which="minor", alpha=0.12)
         for label in ax.get_xticklabels():
@@ -2218,17 +2435,17 @@ def _append_mean_impedance_summary_page(
                     (times_num[int(i)], means_arr[int(i)]),
                     textcoords="offset points",
                     xytext=(4, 4),
-                    fontsize=6,
+                    fontsize=ANNOTATION_FONT_SIZE,
                     alpha=0.85,
                 )
 
-    _soften_figure_linewidths(fig)
-    _apply_compact_axis_fonts(fig)
-    pdf.savefig(fig, dpi=PDF_DPI)
-    plt.close(fig)
-
-
-@_profiled("rms_from_source_window")
+    save_figure_to_pdf(
+        pdf,
+        fig,
+        dpi=PDF_DPI,
+        soften_linewidths=_soften_figure_linewidths,
+        apply_fonts=_apply_compact_axis_fonts,
+    )
 def _mean_rms_profile_from_source_window(
     source: AmplifierSpikeSource,
     t0_s: float,
@@ -2339,7 +2556,7 @@ def _plot_rms_series(
             ha="center",
             va="center",
             transform=ax.transAxes,
-            fontsize=10,
+            fontsize=UNAVAILABLE_FONT_SIZE,
         )
         ax.set_axis_off()
 
@@ -2382,13 +2599,16 @@ def _append_mean_rms_evolution_page(
             ha="center",
             va="center",
             transform=ax.transAxes,
-            fontsize=11,
+            fontsize=UNAVAILABLE_FONT_SIZE,
         )
         ax.set_axis_off()
-    _soften_figure_linewidths(fig)
-    _apply_compact_axis_fonts(fig)
-    pdf.savefig(fig, dpi=PDF_DPI)
-    plt.close(fig)
+    save_figure_to_pdf(
+        pdf,
+        fig,
+        dpi=PDF_DPI,
+        soften_linewidths=_soften_figure_linewidths,
+        apply_fonts=_apply_compact_axis_fonts,
+    )
 
 
 def plot_channel_multi_comparison(
@@ -2406,6 +2626,7 @@ def plot_channel_multi_comparison(
     spike_threshold_polarity: str = "negative",
     spike_threshold_mode: str = "fixed",
     spike_threshold_rms_multiplier: float = 4.0,
+    spike_scope_tscale_ms: float = 4.0,
     psth_bin_window_s: float = 0.025,
     rms_window_s: float = 0.050,
     zoom_mode: ZoomMode = "both",
@@ -2540,7 +2761,7 @@ def plot_channel_multi_comparison(
                 _hp_note, hp_legend = _intan_hp_mean_filter_captions(src.intan_dsp)
                 intan_hp_legends.append(hp_legend)
 
-            fig, _axes = _build_three_part_page_axes(
+            figs, _axes = _build_three_part_page_axes(
                 zoom_t0=zoom_onset_t0,
                 zoom_t1=zoom_onset_t1,
                 n_recordings=len(plot_indices),
@@ -2551,6 +2772,12 @@ def plot_channel_multi_comparison(
                 include_impedance_panel=bool(impedance_sessions) and display.impedance,
                 display=display,
                 zoom_mode=zoom_mode,
+                n_legend_rows=max(1, sum(1 for flag in legend_flags if flag)) + 3,
+                legend_labels=[
+                    labels[i] if i < len(labels) else f"Recording {i + 1}"
+                    for i, flag in zip(plot_indices, legend_flags)
+                    if flag
+                ],
             )
             ax_full = _axes.get("ax_full")
             ax_full_filt = _axes.get("ax_full_filt")
@@ -2809,6 +3036,14 @@ def plot_channel_multi_comparison(
                     (ax_zoom_end_second_hp, "Second filtered stimulation unavailable"),
                     (ax_zoom_end_second, "Second raw stimulation unavailable"),
                     (ax_zoom_end_rms, "RMS unavailable"),
+                    (
+                        _axes.get("ax_overlay_first_ze"),
+                        "Spike overlay unavailable\n(no rising edge after stimulation)",
+                    ),
+                    (
+                        _axes.get("ax_overlay_second_ze"),
+                        "Spike overlay unavailable\n(no rising edge after stimulation)",
+                    ),
                 ):
                     if ax is not None and ax.get_visible():
                         _mark_unavailable_axis(ax, msg)
@@ -2847,6 +3082,19 @@ def plot_channel_multi_comparison(
                     for i, (_thr_uv, caption) in enumerate(thresholds_and_captions)
                 ]
 
+                def _end_spike_range(src_idx: int) -> tuple[float, float] | None:
+                    if trigger_end_rising_rel_s_list is None or src_idx >= len(
+                        trigger_end_rising_rel_s_list
+                    ):
+                        return None
+                    marker = trigger_end_rising_rel_s_list[src_idx]
+                    if marker is None:
+                        return None
+                    return (
+                        float(marker) + float(zoom_end_t0),
+                        float(marker) + float(zoom_end_t1),
+                    )
+
                 def _draw_spikes_for_section(
                     section: SectionPanels,
                     ax_raster: Any,
@@ -2855,9 +3103,29 @@ def plot_channel_multi_comparison(
                     ax_isi: Any,
                     t_range: tuple[float, float] | None,
                     sec_title: str = "",
+                    ranges_per_recording: Sequence[tuple[float, float] | None] | None = None,
                 ) -> None:
                     if not section.any_enabled():
                         return
+                    st_section: list[list[np.ndarray]] = []
+                    for rec_i, (src_idx, (thr_uv, _caption)) in enumerate(
+                        zip(plot_indices, thresholds_and_captions)
+                    ):
+                        if ranges_per_recording is not None:
+                            rng = ranges_per_recording[rec_i]
+                            if rng is None:
+                                rng = (0.0, 0.0)
+                        else:
+                            rng = t_range
+                        st_section.append(
+                            render_cache.spike_times_per_trial(
+                                src_idx,
+                                spike_sources[src_idx],
+                                ch,
+                                thr_uv,
+                                t_range_s=rng,
+                            )
+                        )
                     _draw_spike_panels_multi_channel(
                         ax_raster,
                         ax_fr,
@@ -2872,7 +3140,7 @@ def plot_channel_multi_comparison(
                         intan_dsp=spike_sources[0].intan_dsp,
                         t_range_s=t_range,
                         section_title=sec_title,
-                        spikes_per_recording=st_list,
+                        spikes_per_recording=st_section,
                         sampling_percent=sampling_percent,
                         threshold_caption=threshold_caption,
                         threshold_entries=threshold_entries,
@@ -2883,8 +3151,77 @@ def plot_channel_multi_comparison(
                         show_isi=section.isi,
                     )
 
+                def _draw_trigger_overlay(
+                    section: SectionPanels,
+                    which: str,
+                    ax: Any,
+                    t_range: tuple[float, float] | None,
+                    sec_title: str = "",
+                    ranges_per_recording: Sequence[tuple[float, float] | None] | None = None,
+                ) -> None:
+                    if ax is None or not _want_trigger_spike_overlay(section, which):
+                        return
+                    trigger_index = 0 if which == "first" else 1
+                    trigger_label = (
+                        "First stimulation" if which == "first" else "Second stimulation"
+                    )
+                    overlay_section: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+                    for rec_i, (src_idx, (thr_uv, _caption)) in enumerate(
+                        zip(plot_indices, thresholds_and_captions)
+                    ):
+                        if ranges_per_recording is not None:
+                            rng = ranges_per_recording[rec_i]
+                            if rng is None:
+                                rng = (0.0, 0.0)
+                        else:
+                            rng = t_range
+                        overlay_section.append(
+                            render_cache.spike_waveforms(
+                                src_idx,
+                                spike_sources[src_idx],
+                                ch,
+                                thr_uv,
+                                t_range_s=rng,
+                                trigger_index=trigger_index,
+                            )
+                        )
+                    title = (
+                        f"{sec_title} — {trigger_label}" if sec_title else trigger_label
+                    )
+                    _draw_spike_overlay_panel(
+                        ax,
+                        overlay_section,
+                        record_labels,
+                        t_range_s=None,
+                        section_title=title,
+                        sampling_percent=sampling_percent,
+                        legend_visible=legend_flags,
+                        intan_dsp=spike_sources[0].intan_dsp,
+                        tscale_ms=spike_scope_tscale_ms,
+                        thresholds_uv=[thr_uv for thr_uv, _cap in thresholds_and_captions],
+                    )
+
                 if _section_included(zoom_mode, "full"):
-                    _draw_spikes_for_section(full_panels, ax_raster_f, ax_fr_f, ax_trial_fr_f, ax_isi_f, None)
+                    _draw_spikes_for_section(
+                        full_panels,
+                        ax_raster_f,
+                        ax_fr_f,
+                        ax_trial_fr_f,
+                        ax_isi_f,
+                        None,
+                    )
+                    _draw_trigger_overlay(
+                        full_panels,
+                        "first",
+                        _axes.get("ax_overlay_first_f"),
+                        None,
+                    )
+                    _draw_trigger_overlay(
+                        full_panels,
+                        "second",
+                        _axes.get("ax_overlay_second_f"),
+                        None,
+                    )
                 if _section_included(zoom_mode, "zoom_onset"):
                     _draw_spikes_for_section(
                         onset_panels,
@@ -2895,7 +3232,22 @@ def plot_channel_multi_comparison(
                         (zoom_onset_t0, zoom_onset_t1),
                         "Onset zoom",
                     )
+                    _draw_trigger_overlay(
+                        onset_panels,
+                        "first",
+                        _axes.get("ax_overlay_first_z"),
+                        (zoom_onset_t0, zoom_onset_t1),
+                        "Onset zoom",
+                    )
+                    _draw_trigger_overlay(
+                        onset_panels,
+                        "second",
+                        _axes.get("ax_overlay_second_z"),
+                        (zoom_onset_t0, zoom_onset_t1),
+                        "Onset zoom",
+                    )
                 if _section_included(zoom_mode, "zoom_trigger_end") and end_zoom_range is not None:
+                    end_ranges = [_end_spike_range(src_idx) for src_idx in plot_indices]
                     _draw_spikes_for_section(
                         end_panels,
                         ax_raster_ze,
@@ -2904,6 +3256,23 @@ def plot_channel_multi_comparison(
                         ax_isi_ze,
                         end_zoom_range,
                         "End zoom",
+                        ranges_per_recording=end_ranges,
+                    )
+                    _draw_trigger_overlay(
+                        end_panels,
+                        "first",
+                        _axes.get("ax_overlay_first_ze"),
+                        end_zoom_range,
+                        "End zoom",
+                        ranges_per_recording=end_ranges,
+                    )
+                    _draw_trigger_overlay(
+                        end_panels,
+                        "second",
+                        _axes.get("ax_overlay_second_ze"),
+                        end_zoom_range,
+                        "End zoom",
+                        ranges_per_recording=end_ranges,
                     )
             else:
                 for ax in (ax_raster_f, ax_fr_f, ax_raster_z, ax_fr_z, ax_raster_ze, ax_fr_ze):
@@ -2915,16 +3284,20 @@ def plot_channel_multi_comparison(
                             ha="center",
                             va="center",
                             transform=ax.transAxes,
-                            fontsize=9,
+                            fontsize=UNAVAILABLE_FONT_SIZE,
                         )
                         ax.set_axis_off()
                 for ax in (ax_isi_f, ax_isi_z, ax_isi_ze):
                     if ax is not None and ax.get_visible():
-                        ax.text(0.5, 0.5, "ISI unavailable", ha="center", va="center", transform=ax.transAxes)
+                        ax.text(0.5, 0.5, "ISI unavailable", ha="center", va="center", transform=ax.transAxes, fontsize=UNAVAILABLE_FONT_SIZE)
                         ax.set_axis_off()
+                for key in _OVERLAY_AXIS_KEYS:
+                    ax = _axes.get(key)
+                    if ax is not None and ax.get_visible():
+                        _mark_unavailable_axis(ax, "Spike overlay unavailable\n(missing mmap source)")
 
             _finalize_and_save_three_part_page(
-                fig=fig,
+                fig=figs,
                 pdf=pdf,
                 axes=_axes,
                 n_recordings=len(plot_indices),

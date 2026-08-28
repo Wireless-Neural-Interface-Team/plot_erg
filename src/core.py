@@ -179,7 +179,12 @@ def no_trigger_sections_and_timebase(
     section_trigger_start_s: float,
     section_trigger_end_s: float,
 ) -> tuple[np.ndarray, np.ndarray, int, int, int, float]:
-    """Split recording into sections; average an imaginary trigger window in each."""
+    """Split recording into equal sections; t=0 is the imaginary stimulation onset.
+
+    Each section is extracted in full. ``section_trigger_start_s`` / ``_end_s``
+    place t=0 and the stimulation-end marker inside the section; they do not
+    crop the plotted window.
+    """
     if n_samples < 2:
         raise RuntimeError("Recording too short for section averaging.")
     total_s = float(n_samples) / float(fs)
@@ -204,21 +209,18 @@ def no_trigger_sections_and_timebase(
         float(section_trigger_end_s),
     )
     start_n = int(round(float(section_trigger_start_s) * fs))
-    end_n = int(round(float(section_trigger_end_s) * fs))
     start_n = max(0, min(start_n, section_len - 1))
-    end_n = max(start_n + 1, min(end_n, section_len))
-    window_n = end_n - start_n
-    if window_n < 2:
-        raise RuntimeError("Imaginary stimulation window too short (< 2 samples).")
     starts = np.arange(n_sections, dtype=np.int64) * section_len
     triggers = starts + start_n
-    if np.any(triggers + window_n > n_samples):
+    pre_n = int(start_n)
+    post_n = int(section_len - start_n)
+    if pre_n + post_n < 2:
+        raise RuntimeError("Section window too short (< 2 samples).")
+    if np.any(triggers - pre_n < 0) or np.any(triggers + post_n > n_samples):
         raise RuntimeError(
-            "Imaginary stimulation window extends beyond the recording for at least one section."
+            "Section window extends beyond the recording for at least one section."
         )
-    pre_n = 0
-    post_n = window_n
-    t_rel = np.arange(0, window_n, dtype=np.float64) / float(fs)
+    t_rel = np.arange(-pre_n, post_n, dtype=np.float64) / float(fs)
     return triggers, t_rel, pre_n, post_n, n_sections, section_duration_resolved
 
 
@@ -239,7 +241,10 @@ def resolve_recording_windows(
             section_trigger_start_s=config.section_trigger_start_s,
             section_trigger_end_s=config.section_trigger_end_s,
         )
-        return starts, t_rel, pre_n, post_n, n_sections, n_sections, None
+        end_rel_s = float(config.section_trigger_end_s) - float(config.section_trigger_start_s)
+        if end_rel_s <= 0:
+            end_rel_s = None
+        return starts, t_rel, pre_n, post_n, n_sections, n_sections, end_rel_s
 
     trigger_indices = detect_edges(analog_in0, threshold=config.threshold, edge=config.edge)
     if trigger_indices.size == 0:
@@ -412,26 +417,62 @@ class AmplifierSpikeSource:
         t_rel: np.ndarray,
         threshold: float,
         refractory_s: float = 0.001,
+        t_range_s: tuple[float, float] | None = None,
+        trigger_index: int | None = None,
     ) -> list[np.ndarray]:
-        """Detect spikes per trial on filtered trace (mmap slices per trial)."""
+        """Detect spikes per trial on filtered trace, optionally limited to ``t_range_s``.
+
+        ``t_range_s`` is (t0, t1) in seconds relative to stimulation. When omitted,
+        detection uses the full pre/post trial window.
+        ``trigger_index`` restricts detection to one stimulation (0 = first, 1 = second).
+        """
         del refractory_s  # Intan uses snippet_size refractory instead.
         from dataclasses import replace
 
         row = self._high_row(ch)
         dsp = replace(self.intan_dsp, spike_threshold_uv=float(threshold))
-        spike_times_by_trial: list[np.ndarray] = []
-        for trigger_index in self.valid_triggers:
-            sample_start = int(trigger_index - self.pre_n)
-            sample_end = int(trigger_index + self.post_n)
+        fs = float(self.fs)
+        if t_range_s is not None:
+            win_t0, win_t1 = float(t_range_s[0]), float(t_range_s[1])
+        else:
+            win_t0, win_t1 = None, None
+        all_triggers = np.asarray(self.valid_triggers, dtype=np.int64)
+        n_trig = int(all_triggers.size)
+        empty = np.empty(0, dtype=np.float64)
+        if n_trig == 0:
+            return []
+        if trigger_index is not None:
+            sel = int(trigger_index)
+            if sel < 0 or sel >= n_trig:
+                return [empty.copy() for _ in range(n_trig)]
+            trial_indices = [sel]
+        else:
+            trial_indices = list(range(n_trig))
+        spike_times_by_trial: list[np.ndarray] = [empty.copy() for _ in range(n_trig)]
+        for trial_i in trial_indices:
+            trigger_index_abs = int(all_triggers[trial_i])
+            if win_t0 is None or win_t1 is None or win_t1 <= win_t0:
+                sample_start = int(trigger_index_abs - self.pre_n)
+                sample_end = int(trigger_index_abs + self.post_n)
+            else:
+                sample_start = int(trigger_index_abs + int(round(win_t0 * fs)))
+                sample_end = int(trigger_index_abs + int(round(win_t1 * fs)))
+                sample_start = max(sample_start, int(trigger_index_abs - self.pre_n))
+                sample_end = min(sample_end, int(trigger_index_abs + self.post_n))
+            if sample_end - sample_start < 2:
+                continue
             spike_sample_indices = detect_spikes_intan(
                 row,
                 dsp,
                 start_sample=sample_start,
                 end_sample=sample_end,
             )
-            rel = spike_sample_indices - int(trigger_index) + int(self.pre_n)
+            rel = spike_sample_indices - int(trigger_index_abs) + int(self.pre_n)
             rel = rel[(rel >= 0) & (rel < int(t_rel.size))]
-            spike_times_by_trial.append(np.asarray(t_rel[rel], dtype=np.float64))
+            times = np.asarray(t_rel[rel], dtype=np.float64)
+            if win_t0 is not None and win_t1 is not None:
+                times = times[(times >= win_t0) & (times <= win_t1)]
+            spike_times_by_trial[trial_i] = times
         return spike_times_by_trial
 
     def mean_rms_for_channel(self, ch: int) -> float:
