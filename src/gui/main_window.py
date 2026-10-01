@@ -1,1321 +1,1365 @@
-"""Tabbed Qt main window for plot_erg."""
+"""Visionneuse interactive pour enregistrements Intan RHS / ERG.
+
+Disposition inspirée d’Intan RHX :
+- gauche  : Session (enregistrements + canaux)
+- centre  : affichage d’ondes (fond noir)
+- bas     : Control Panel (WIDE / LOW / HIGH + outils)
+- journal : optionnel (menu Vue)
+"""
 
 from __future__ import annotations
 
-import re
-from datetime import datetime
+import json
+import time
+from dataclasses import replace
 from pathlib import Path
-from typing import Callable
+from types import SimpleNamespace
+from typing import Any, Callable
+
+from PySide6.QtCore import QByteArray, QSettings, Qt
+from PySide6.QtGui import QAction, QFont, QKeySequence
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QDockWidget,
+    QFileDialog,
+    QInputDialog,
+    QLabel,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QTabWidget,
+    QToolBar,
+    QVBoxLayout,
+    QWidget,
+)
 
 from config import AnalysisConfig
-from display_config import (
-    PANEL_DEFAULT_OFF,
-    PANEL_FIELD_NAMES,
-    PANEL_LABELS,
-    PlotDisplaySettings,
-    RECORDING_COLOR_PRESETS,
-    RecordingStyle,
-    SectionPanels,
-    resolve_display_label,
+from display_config import resolve_recording_plot_colors
+from gui.defaults import (
+    build_config_from_defaults,
+    probe_path_from_defaults,
+    viewer_settings_from_defaults,
 )
-from gui.analysis_thread import create_analysis_thread_class
+from gui.jobs import BuildRequest, BuildWorker, ChannelEnsureRequest, ChannelEnsureWorker, Debouncer, TaskWorker
 from gui.styles import APP_STYLESHEET
+from gui.widgets.channel_panel import ChannelPanel
+from gui.widgets.control_panel import ControlPanel
+from gui.widgets.dialogs import CacheDialog, ExportDatasetDialog
+from gui.widgets.frozen_graph_window import FrozenGraphWindow
+from gui.widgets.graph_picker import pick_graph_for_channel
+from gui.widgets.panel_canvas import DetachedPanelWindow
+from gui.widgets.panel_grid import ViewTabPage
+from gui.widgets.panel_picker import pick_panels
+from gui.widgets.recordings_panel import RecordingEntry, RecordingsPanel
+from gui.widgets.session_panel import SessionPanel
+from gui.widgets.status_panel import StatusPanel
+from gui.widgets.view_session_window import ViewSessionWindow
+from panel_registry import RenderRequest, highlight_zooms_from_placements
+from view_config import (
+    GLOBAL_PANEL_FIELD_NAMES,
+    PanelPlacement,
+    ViewTab,
+    ViewerSettings,
+    WorkspaceLayout,
+)
+
+_ORG = "plot_erg"
+_APP = "viewer"
+
+
+def _impedance_sessions(entries: list[RecordingEntry]) -> list[Any]:
+    """Sessions d’impédance uniques, dans l’ordre d’apparition."""
+    sessions: list[Any] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        for session in getattr(entry.recording, "impedance_sessions", []) or []:
+            marker = (str(getattr(session, "label", "")), str(getattr(session, "csv_path", "")))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            sessions.append(session)
+    return sessions
+
+
+class ViewerWindow(QMainWindow):
+    """Fenêtre principale style RHX : session, scope, control panel."""
+
+    def __init__(
+        self,
+        defaults: dict[str, Any] | None = None,
+        *,
+        pdf_callback: Callable[[list[AnalysisConfig]], None] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._defaults = dict(defaults or {})
+        self._pdf_callback = pdf_callback
+        self._workspace = WorkspaceLayout()
+        self._settings = viewer_settings_from_defaults(self._defaults)
+        self._probe_path: Path | None = None
+        self._probe_layout: Any | None = None
+        self._build_worker: BuildWorker | None = None
+        self._ensure_worker: ChannelEnsureWorker | None = None
+        self._task_worker: TaskWorker | None = None
+        self._detached: dict[str, DetachedPanelWindow] = {}
+        self._frozen: dict[str, FrozenGraphWindow] = {}
+        self._view_sessions: dict[str, ViewSessionWindow] = {}
+        self._config_dirty = False
+        self._force_redraw = False
+        self._cache_root: Path | None = None
+        self._warned_channel_mismatch = False
+        self._pending_ensure_all = False
+        self._pending_frozen_id: str | None = None
+
+        self.setWindowTitle("plot_erg — Intan RHX viewer")
+        self.resize(1600, 960)
+
+        # Centre = scope + control panel (comme RHX).
+        self.tabs = QTabWidget(self)
+        self.tabs.setObjectName("centralViews")
+        self.tabs.setDocumentMode(True)
+        self.tabs.setMovable(True)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        self.control_panel = ControlPanel(self)
+        central = QWidget(self)
+        central_layout = QVBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self.tabs, 1)
+        central_layout.addWidget(self.control_panel, 0)
+        self.setCentralWidget(central)
+
+        self.recordings_panel = RecordingsPanel(self)
+        self.channel_panel = ChannelPanel(self)
+        self.session_panel = SessionPanel(self.recordings_panel, self.channel_panel, self)
+        self.status_panel = StatusPanel(self)
+        # Alias pour compatibilité avec le code qui parlait d’analysis_panel.
+        self.analysis_panel = self.control_panel
+
+        self._dock_session = self._add_dock(
+            "Session", self.session_panel, Qt.DockWidgetArea.LeftDockWidgetArea
+        )
+        self._dock_status = self._add_dock(
+            "Journal", self.status_panel, Qt.DockWidgetArea.BottomDockWidgetArea
+        )
+        self._dock_status.hide()
+        self.resizeDocks([self._dock_session], [320], Qt.Orientation.Horizontal)
+
+        self._redraw_debouncer = Debouncer(110, self)
+        self._redraw_debouncer.triggered.connect(self._redraw_active_tab)
+
+        self.recordings_panel.buildRequested.connect(lambda: self.start_processing())
+        self.recordings_panel.entriesChanged.connect(self._on_entries_changed)
+        self.recordings_panel.styleChanged.connect(lambda: self._schedule_redraw(force=True))
+        self.channel_panel.channelChanged.connect(self._on_channel_changed)
+        self.channel_panel.openGraphRequested.connect(self.open_graph_for_channel)
+        self.control_panel.filterChanged.connect(self._on_analysis_changed)
+        self.control_panel.showAnalysisRequested.connect(self.open_analysis_view)
+        self.control_panel.openSpikesRequested.connect(self.open_spike_view)
+        self.control_panel.openGraphRequested.connect(
+            lambda: self.open_graph_for_channel(self.channel_panel.current_channel or "")
+        )
+        self.control_panel.processRequested.connect(lambda: self.start_processing())
+
+        self._status_progress = QProgressBar()
+        self._status_progress.setRange(0, 1000)
+        self._status_progress.setValue(0)
+        self._status_progress.setMaximumWidth(160)
+        self._status_progress.setMaximumHeight(14)
+        self._status_progress.setTextVisible(False)
+        self._status_progress.hide()
+        self._status_message = QLabel("Ajoutez un .rhs, puis Traiter (F5).")
+        self.statusBar().addWidget(self._status_progress, 0)
+        self.statusBar().addWidget(self._status_message, 1)
+
+        self._build_actions()
+        self._rebuild_tabs()
+        self.tabs.tabBar().hide()
+        self._apply_probe_from_defaults()
+        self._restore_state()
+        self.status_panel.set_idle("Prêt.")
+
+    # ------------------------------------------------------------------- setup
+
+    def _add_dock(self, title: str, widget: QWidget, area: Qt.DockWidgetArea) -> QDockWidget:
+        dock = QDockWidget(title, self)
+        dock.setObjectName(f"dock_{title.lower().replace(' ', '_').replace('&', '')}")
+        dock.setWidget(widget)
+        dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea
+            | Qt.DockWidgetArea.BottomDockWidgetArea
+        )
+        self.addDockWidget(area, dock)
+        return dock
+
+    def _build_actions(self) -> None:
+        file_menu = self.menuBar().addMenu("&Fichier")
+        act_add = QAction("Ajouter Intan .rhs…", self)
+        act_add.setShortcut(QKeySequence.StandardKey.Open)
+        act_add.triggered.connect(self.recordings_panel.browse_rhs)
+        act_open_processed = QAction("Ouvrir un dataset traité…", self)
+        act_open_processed.triggered.connect(self.recordings_panel.browse_processed)
+        act_export_dataset = QAction("Exporter un dataset traité…", self)
+        act_export_dataset.setToolTip(
+            "Écrire un dataset réutilisable qui se rouvre instantanément plus tard."
+        )
+        act_export_dataset.triggered.connect(self.export_processed_dataset)
+        act_export_pdf = QAction("Exporter le rapport PDF…", self)
+        act_export_pdf.triggered.connect(self.export_pdf_report)
+        act_export_figure = QAction("Enregistrer la vue actuelle en image…", self)
+        act_export_figure.triggered.connect(self.save_view_images)
+        act_quit = QAction("Quitter", self)
+        act_quit.setShortcut(QKeySequence.StandardKey.Quit)
+        act_quit.triggered.connect(self.close)
+        for action in (act_add, act_open_processed):
+            file_menu.addAction(action)
+        file_menu.addSeparator()
+        for action in (act_export_dataset, act_export_pdf, act_export_figure):
+            file_menu.addAction(action)
+        file_menu.addSeparator()
+        file_menu.addAction(act_quit)
+
+        run_menu = self.menuBar().addMenu("&Traitement")
+        self._act_process = QAction("Traiter", self)
+        self._act_process.setShortcut(QKeySequence("F5"))
+        self._act_process.triggered.connect(lambda: self.start_processing())
+        self._act_cancel = QAction("Annuler", self)
+        self._act_cancel.setShortcut(QKeySequence("Esc"))
+        self._act_cancel.setEnabled(False)
+        self._act_cancel.triggered.connect(self.cancel_processing)
+        act_reprocess_all = QAction("Retraiter tous les enregistrements", self)
+        act_reprocess_all.triggered.connect(lambda: self.start_processing(all_rows=True))
+        self._act_ensure_channel = QAction("Calculer le canal sélectionné", self)
+        self._act_ensure_channel.setShortcut(QKeySequence("F6"))
+        self._act_ensure_channel.setToolTip(
+            "Filtrer et analyser uniquement le canal actuellement sélectionné."
+        )
+        self._act_ensure_channel.triggered.connect(self.ensure_selected_channels)
+        self._act_ensure_all = QAction("Calculer tous les canaux", self)
+        self._act_ensure_all.setShortcut(QKeySequence("F7"))
+        self._act_ensure_all.setToolTip(
+            "Calculer tous les canaux pour les panneaux résumé et montage."
+        )
+        self._act_ensure_all.triggered.connect(self.ensure_all_channels)
+        for action in (
+            self._act_process,
+            self._act_cancel,
+            act_reprocess_all,
+            self._act_ensure_channel,
+            self._act_ensure_all,
+        ):
+            run_menu.addAction(action)
+        run_menu.addSeparator()
+        act_cache = QAction("Gestionnaire de cache…", self)
+        act_cache.triggered.connect(self.open_cache_manager)
+        run_menu.addAction(act_cache)
+
+        view_menu = self.menuBar().addMenu("&Vue")
+        act_configure = QAction("Configurer les panneaux du montage…", self)
+        act_configure.setShortcut(QKeySequence("Ctrl+P"))
+        act_configure.triggered.connect(self.configure_current_view)
+        act_redraw = QAction("Redessiner", self)
+        act_redraw.setShortcut(QKeySequence("Ctrl+R"))
+        act_redraw.triggered.connect(lambda: self._schedule_redraw(force=True))
+        act_analysis = QAction("Ouvrir l’analyse…", self)
+        act_analysis.triggered.connect(self.open_analysis_view)
+        act_spikes = QAction("Ouvrir les spikes…", self)
+        act_spikes.triggered.connect(self.open_spike_view)
+        view_menu.addAction(act_configure)
+        view_menu.addAction(act_redraw)
+        view_menu.addSeparator()
+        view_menu.addAction(act_analysis)
+        view_menu.addAction(act_spikes)
+        view_menu.addSeparator()
+        for dock in (self._dock_session, self._dock_status):
+            view_menu.addAction(dock.toggleViewAction())
+
+        channel_menu = self.menuBar().addMenu("&Canal")
+        act_prev = QAction("Canal précédent", self)
+        act_prev.setShortcut(QKeySequence("Ctrl+Left"))
+        act_prev.triggered.connect(lambda: self.channel_panel.step(-1))
+        act_next = QAction("Canal suivant", self)
+        act_next.setShortcut(QKeySequence("Ctrl+Right"))
+        act_next.triggered.connect(lambda: self.channel_panel.step(1))
+        act_open_graph = QAction("Ouvrir un graphique…", self)
+        act_open_graph.setShortcut(QKeySequence("Ctrl+G"))
+        act_open_graph.triggered.connect(
+            lambda: self.open_graph_for_channel(self.channel_panel.current_channel or "")
+        )
+        channel_menu.addAction(act_prev)
+        channel_menu.addAction(act_next)
+        channel_menu.addSeparator()
+        channel_menu.addAction(act_open_graph)
+        channel_menu.addAction(self._act_ensure_channel)
+        channel_menu.addAction(self._act_ensure_all)
+
+        help_menu = self.menuBar().addMenu("&Aide")
+        act_about = QAction("À propos", self)
+        act_about.triggered.connect(self._show_about)
+        help_menu.addAction(act_about)
+
+        toolbar = QToolBar("Principal", self)
+        toolbar.setObjectName("mainToolbar")
+        toolbar.setMovable(False)
+        self.addToolBar(toolbar)
+        for action in (act_add, self._act_process, self._act_cancel):
+            toolbar.addAction(action)
+        toolbar.addSeparator()
+        toolbar.addAction(act_prev)
+        toolbar.addAction(act_next)
+        toolbar.addAction(act_open_graph)
+        toolbar.addSeparator()
+        toolbar.addAction(act_analysis)
+        toolbar.addAction(act_spikes)
+
+    # -------------------------------------------------------------- view tabs
+
+    def _rebuild_tabs(self) -> None:
+        current = self.tabs.currentIndex()
+        self.tabs.blockSignals(True)
+        while self.tabs.count():
+            page = self.tabs.widget(0)
+            self.tabs.removeTab(0)
+            page.deleteLater()
+        for tab in self._workspace.tabs:
+            page = ViewTabPage(self)
+            page.grid.removeRequested.connect(self._on_panel_removed)
+            page.grid.detachRequested.connect(self._on_panel_detached)
+            page.grid.renderFinished.connect(self._on_render_finished)
+            page.grid.configure(
+                tab.panels, columns=tab.columns, panel_height=tab.panel_height_px
+            )
+            self.tabs.addTab(page, tab.name)
+        index = min(max(0, current if current >= 0 else self._workspace.active_index),
+                    max(0, self.tabs.count() - 1))
+        self.tabs.setCurrentIndex(index)
+        self.tabs.blockSignals(False)
+        self.tabs.tabBar().hide()
+        self._schedule_redraw(force=True)
+
+    def _current_page(self) -> ViewTabPage | None:
+        page = self.tabs.currentWidget()
+        return page if isinstance(page, ViewTabPage) else None
+
+    def _current_tab(self) -> ViewTab | None:
+        index = self.tabs.currentIndex()
+        if 0 <= index < len(self._workspace.tabs):
+            return self._workspace.tabs[index]
+        return None
+
+    def _replace_tab(self, index: int, tab: ViewTab) -> None:
+        tabs = list(self._workspace.tabs)
+        if not (0 <= index < len(tabs)):
+            return
+        tabs[index] = tab
+        self._workspace = self._workspace.with_tabs(tabs)
+        self.tabs.setTabText(index, tab.name)
+        page = self.tabs.widget(index)
+        if isinstance(page, ViewTabPage):
+            page.grid.configure(tab.panels, columns=tab.columns, panel_height=tab.panel_height_px)
+        self._schedule_redraw(force=True)
+
+    def configure_current_view(self) -> None:
+        tab = self._current_tab()
+        if tab is None:
+            return
+        updated = pick_panels(tab, self)
+        if updated is not None:
+            self._replace_tab(self.tabs.currentIndex(), updated)
+
+    def add_view(self) -> None:
+        name, ok = QInputDialog.getText(self, "Nouvelle vue", "Nom de la vue :", text="Nouvelle vue")
+        if not ok:
+            return
+        tab = ViewTab(name=name.strip() or "Nouvelle vue")
+        updated = pick_panels(tab, self)
+        tab = updated if updated is not None else tab
+        self._workspace = self._workspace.with_tabs([*self._workspace.tabs, tab])
+        self._rebuild_tabs()
+        self.tabs.setCurrentIndex(self.tabs.count() - 1)
+
+    def duplicate_current_view(self) -> None:
+        tab = self._current_tab()
+        if tab is None:
+            return
+        copy = replace(tab, name=f"{tab.name} (copie)")
+        tabs = list(self._workspace.tabs)
+        tabs.insert(self.tabs.currentIndex() + 1, copy)
+        self._workspace = self._workspace.with_tabs(tabs)
+        self._rebuild_tabs()
+
+    def rename_current_view(self) -> None:
+        tab = self._current_tab()
+        if tab is None:
+            return
+        name, ok = QInputDialog.getText(self, "Renommer la vue", "Nom de la vue :", text=tab.name)
+        if ok and name.strip():
+            self._replace_tab(self.tabs.currentIndex(), replace(tab, name=name.strip()))
+
+    def remove_current_view(self) -> None:
+        if len(self._workspace.tabs) <= 1:
+            QMessageBox.information(self, "Supprimer la vue", "Au moins une vue doit rester.")
+            return
+        index = self.tabs.currentIndex()
+        tabs = list(self._workspace.tabs)
+        tabs.pop(index)
+        self._workspace = self._workspace.with_tabs(tabs)
+        self._rebuild_tabs()
+
+    def reset_views(self) -> None:
+        self._workspace = WorkspaceLayout()
+        self._rebuild_tabs()
+
+    def save_layout(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Enregistrer la disposition", str(Path.home() / "plot_erg_layout.json"), "JSON (*.json)"
+        )
+        if not path:
+            return
+        payload = {
+            "active_index": self.tabs.currentIndex(),
+            "tabs": [
+                {
+                    "name": tab.name,
+                    "columns": tab.columns,
+                    "panel_height_px": tab.panel_height_px,
+                    "panels": [
+                        {"panel": p.panel, "section": p.section} for p in tab.panels
+                    ],
+                }
+                for tab in self._workspace.tabs
+            ],
+        }
+        Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self._set_status(f"Disposition enregistrée : {path}")
+
+    def load_layout(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Charger une disposition", str(Path.home()), "JSON (*.json)"
+        )
+        if not path:
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            tabs = tuple(
+                ViewTab(
+                    name=str(raw.get("name", "View")),
+                    columns=int(raw.get("columns", 2)),
+                    panel_height_px=int(raw.get("panel_height_px", 300)),
+                    panels=tuple(
+                        PanelPlacement(
+                            panel=str(item.get("panel")),
+                            section=str(item.get("section", "full")),  # type: ignore[arg-type]
+                        )
+                        for item in raw.get("panels", [])
+                        if item.get("panel")
+                    ),
+                )
+                for raw in payload.get("tabs", [])
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Charger une disposition", f"Impossible de lire cette disposition :\n{exc}")
+            return
+        if not tabs:
+            QMessageBox.warning(self, "Charger une disposition", "Ce fichier ne contient aucune vue.")
+            return
+        self._workspace = WorkspaceLayout(tabs=tabs, active_index=int(payload.get("active_index", 0)))
+        self._rebuild_tabs()
+        self._set_status(f"Disposition chargée : {path}")
+
+    def _on_panel_removed(self, placement: PanelPlacement) -> None:
+        tab = self._current_tab()
+        if tab is None:
+            return
+        panels = [p for p in tab.panels if p.key != placement.key]
+        self._replace_tab(self.tabs.currentIndex(), tab.with_panels(panels))
+
+    def _on_panel_detached(self, placement: PanelPlacement) -> None:
+        existing = self._detached.get(placement.key)
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
+        window = DetachedPanelWindow(placement, self)
+        window.closed.connect(lambda key=placement.key: self._detached.pop(key, None))
+        self._detached[placement.key] = window
+        window.show()
+        request = self._make_request(placement)
+        if request is not None:
+            window.render(request)
+
+    # --------------------------------------------------------------- rendering
+
+    def _schedule_redraw(self, *, force: bool = False) -> None:
+        self._force_redraw = self._force_redraw or force
+        self._redraw_debouncer.request()
+
+    def _redraw_active_tab(self) -> None:
+        force = self._force_redraw
+        self._force_redraw = False
+        self._settings = self._default_viewer_settings()
+        page = self._current_page()
+        if page is None:
+            return
+        if force:
+            for index in range(self.tabs.count()):
+                other = self.tabs.widget(index)
+                if isinstance(other, ViewTabPage) and other is not page:
+                    other.grid.invalidate_all()
+        page.grid.schedule_render(self._make_request_or_blank, force=force)
+        for key, window in list(self._detached.items()):
+            request = self._make_request(PanelPlacement(*self._split_key(key)))
+            if request is not None:
+                window.render(request)
+
+    def _default_viewer_settings(self) -> ViewerSettings:
+        """Réglages d’affichage de la vue centrale (non éditables ici)."""
+        settings = viewer_settings_from_defaults(self._defaults)
+        return replace(
+            settings,
+            analysis=self.control_panel.analysis_settings(),
+            continuous_stream=self.control_panel.continuous_stream(),  # type: ignore[arg-type]
+            continuous_mark_stims=self.control_panel.mark_stimulations(),
+        )
+
+    def _seed_settings_for_window(self) -> ViewerSettings:
+        """Valeurs par défaut injectées à l’ouverture d’une fenêtre de vue."""
+        return self._default_viewer_settings()
+
+    def open_graph_for_channel(self, channel: str) -> None:
+        channel = str(channel or "").strip()
+        if not channel:
+            QMessageBox.information(self, "Ouvrir un graphique", "Sélectionnez d’abord un canal.")
+            return
+        ready = self.recordings_panel.ready_entries()
+        if not ready:
+            QMessageBox.information(
+                self, "Ouvrir un graphique", "Traitez un enregistrement (F5) avant d’ouvrir des graphiques."
+            )
+            return
+        choice = pick_graph_for_channel(channel, self)
+        if choice is None:
+            return
+        recording = ready[0].recording
+        resolved = recording.channel_index(channel)
+        if resolved is None:
+            QMessageBox.warning(self, "Ouvrir un graphique", f"Canal introuvable : {channel}")
+            return
+        self.channel_panel.select(channel, emit=False)
+        window = FrozenGraphWindow(
+            placement=choice.placement,
+            channel_name=channel,
+            channel_index=int(resolved),
+            base_settings=self._seed_settings_for_window(),
+            parent=self,
+        )
+        window.set_trial_count(int(getattr(recording, "n_trials", 0) or 0))
+        window.set_request_factory(self._make_frozen_request)
+        window.closed.connect(self._on_frozen_closed)
+        window.refreshRequested.connect(self._on_frozen_refresh)
+        self._frozen[window.window_id] = window
+        window.show()
+        if window.needs_channel_compute():
+            self._ensure_channels_for_indices(
+                [int(resolved)], then_redraw_frozen=window.window_id
+            )
+        else:
+            window.redraw()
+        self._set_status(f"Fenêtre : {channel} — {choice.label}")
+
+    def _make_frozen_request(self, window: FrozenGraphWindow) -> RenderRequest | None:
+        entries = self._plotted() or self.recordings_panel.ready_entries()
+        if not entries:
+            return None
+        return self._build_render_request(
+            window.placement,
+            entries,
+            channel_index=int(window.channel_index),
+            channel_name=window.channel_name,
+            settings=window.local_settings(),
+        )
+
+    def _on_frozen_closed(self, window_id: str) -> None:
+        self._frozen.pop(str(window_id), None)
+
+    def _on_frozen_refresh(self, window: FrozenGraphWindow) -> None:
+        if window.needs_channel_compute():
+            self._ensure_channels_for_indices(
+                [int(window.channel_index)], then_redraw_frozen=window.window_id
+            )
+        else:
+            window.redraw()
+
+    def _ensure_channels_for_indices(
+        self, channels: list[int], *, then_redraw_frozen: str | None = None
+    ) -> None:
+        """Lancer le calcul des canaux manquants (vue active ou fenêtre figée)."""
+        self._pending_frozen_id = then_redraw_frozen
+        self._start_channel_ensure(channels, allow_empty_redraw=then_redraw_frozen is None)
+
+    def _on_analysis_changed(self) -> None:
+        self._schedule_redraw(force=True)
+
+    def open_analysis_view(self) -> None:
+        settings = self.analysis_panel.analysis_settings()
+        panels = settings.selected_trace_panels()
+        if not panels:
+            QMessageBox.information(
+                self,
+                "Analyse",
+                "Sélectionnez au moins un graphique (brut / passe-haut / passe-bas / RMS).",
+            )
+            return
+        self._open_view_session(
+            title="Analyse",
+            placements=tuple(PanelPlacement(panel=p, section="full") for p in panels),
+        )
+
+    def open_spike_view(self) -> None:
+        self._open_view_session(
+            title="Spikes",
+            placements=(
+                PanelPlacement("analysis_raster", "full"),
+                PanelPlacement("analysis_psth", "full"),
+                PanelPlacement("analysis_isi", "full"),
+                PanelPlacement("analysis_overlay", "full"),
+            ),
+        )
+
+    def _open_view_session(
+        self, *, title: str, placements: tuple[PanelPlacement, ...]
+    ) -> None:
+        ready = self.recordings_panel.ready_entries()
+        if not ready:
+            QMessageBox.information(
+                self, title, "Traitez un enregistrement (F5) avant d’ouvrir une vue."
+            )
+            return
+        channel = self.channel_panel.current_channel or ""
+        if not channel:
+            QMessageBox.information(self, title, "Sélectionnez d’abord un canal.")
+            return
+        recording = ready[0].recording
+        resolved = recording.channel_index(channel)
+        if resolved is None:
+            QMessageBox.warning(self, title, f"Canal introuvable : {channel}")
+            return
+        window = ViewSessionWindow(
+            title=title,
+            placements=placements,
+            channel_name=channel,
+            channel_index=int(resolved),
+            base_settings=self._seed_settings_for_window(),
+            parent=self,
+        )
+        window.set_trial_count(int(getattr(recording, "n_trials", 0) or 0))
+        window.set_request_factory(self._make_session_request)
+        window.closed.connect(self._on_view_session_closed)
+        window.refreshRequested.connect(self._on_view_session_refresh)
+        self._view_sessions[window.window_id] = window
+        window.show()
+        if window.needs_channel_compute():
+            self._ensure_channels_for_indices(
+                [int(resolved)], then_redraw_frozen=window.window_id
+            )
+        else:
+            window.redraw()
+        self._set_status(f"Vue « {title} » — {self.analysis_panel.analysis_settings().describe()}")
+
+    def _make_session_request(
+        self, window: ViewSessionWindow, placement: PanelPlacement
+    ) -> RenderRequest | None:
+        entries = self._plotted() or self.recordings_panel.ready_entries()
+        if not entries:
+            return None
+        return self._build_render_request(
+            placement,
+            entries,
+            channel_index=int(window.channel_index),
+            channel_name=window.channel_name,
+            settings=window.local_settings(),
+            highlight_zooms=highlight_zooms_from_placements(window.placements),
+        )
+
+    def _on_view_session_closed(self, window_id: str) -> None:
+        self._view_sessions.pop(str(window_id), None)
+
+    def _on_view_session_refresh(self, window: ViewSessionWindow) -> None:
+        if window.needs_channel_compute():
+            self._ensure_channels_for_indices(
+                [int(window.channel_index)], then_redraw_frozen=window.window_id
+            )
+        else:
+            window.redraw()
+
+    @staticmethod
+    def _split_key(key: str) -> tuple[str, str]:
+        if "@" in key:
+            panel, section = key.split("@", 1)
+            return panel, section
+        return key, "full"
+
+    def _on_tab_changed(self, index: int) -> None:
+        self._workspace = replace(self._workspace, active_index=max(0, index))
+        self._schedule_redraw()
+
+    def _on_render_finished(self, panels: int, seconds: float) -> None:
+        if panels <= 0:
+            return
+        tab = self._current_tab()
+        self.status_panel.set_render_summary(panels, seconds, tab=tab.name if tab else "")
+        self._set_status(f"{panels} panneau(x) redessiné(s) en {seconds * 1000:.0f} ms")
+
+    def _plotted(self) -> list[RecordingEntry]:
+        return self.recordings_panel.plotted_entries()
+
+    def _build_render_request(
+        self,
+        placement: PanelPlacement,
+        entries: list[RecordingEntry],
+        *,
+        channel_index: int,
+        channel_name: str,
+        settings: ViewerSettings,
+        highlight_zooms: tuple[tuple[float, float, str], ...] = (),
+    ) -> RenderRequest:
+        """Construire une requête de rendu à partir des enregistrements prêts."""
+        return RenderRequest(
+            placement=placement,
+            recordings=[entry.recording for entry in entries],
+            labels=[entry.display_label for entry in entries],
+            colors=resolve_recording_plot_colors(
+                [entry.style for entry in entries], list(range(len(entries)))
+            ),
+            legend_flags=[entry.style.legend_visible for entry in entries],
+            channel_index=channel_index,
+            channel_name=channel_name,
+            settings=settings,
+            probe_layout=self._probe_layout,
+            impedance_sessions=_impedance_sessions(self.recordings_panel.ready_entries()),
+            highlight_zooms=highlight_zooms,
+        )
+
+    def _make_request_or_blank(self, placement: PanelPlacement) -> RenderRequest:
+        request = self._make_request(placement)
+        if request is not None:
+            return request
+        return RenderRequest(
+            placement=placement,
+            recordings=[],
+            labels=[],
+            colors=[],
+            legend_flags=[],
+            channel_index=0,
+            channel_name="",
+            settings=self._settings,
+            probe_layout=self._probe_layout,
+            impedance_sessions=[],
+        )
+
+    def _make_request(self, placement: PanelPlacement) -> RenderRequest | None:
+        entries = self._plotted()
+        channel = self.channel_panel.current_channel or ""
+        channel_index = 0
+        if entries:
+            recordings = [entry.recording for entry in entries]
+            resolved = recordings[0].channel_index(channel)
+            channel_index = int(resolved) if resolved is not None else 0
+            self._check_channel_alignment(recordings, channel_index, channel)
+        return self._build_render_request(
+            placement,
+            entries,
+            channel_index=channel_index,
+            channel_name=channel,
+            settings=self._settings,
+        )
+
+    def _check_channel_alignment(
+        self, recordings: list[Any], channel_index: int, channel: str
+    ) -> None:
+        if self._warned_channel_mismatch or len(recordings) < 2:
+            return
+        for recording in recordings[1:]:
+            names = recording.channel_names
+            if not (0 <= channel_index < len(names)) or names[channel_index] != channel:
+                self._warned_channel_mismatch = True
+                self.status_panel.append_log(
+                    "Attention : les enregistrements comparés n’ont pas le même ordre de canaux ; "
+                    "les panneaux utilisent la position du premier enregistrement."
+                )
+                return
+
+    # -------------------------------------------------------------- processing
+
+    def _on_entries_changed(self) -> None:
+        self._refresh_channels()
+        self._schedule_redraw(force=True)
+
+    def _on_channel_changed(self, channel: str) -> None:
+        self.control_panel.set_channel(channel)
+        for index in range(self.tabs.count()):
+            page = self.tabs.widget(index)
+            if isinstance(page, ViewTabPage):
+                page.grid.invalidate_all()
+        # Montage central seulement — les fenêtres de vue gardent leur canal figé.
+        self._schedule_redraw(force=True)
+
+    def _apply_probe_from_defaults(self) -> None:
+        path = probe_path_from_defaults(self._defaults)
+        if path == self._probe_path:
+            return
+        self._probe_path = path
+        self._probe_layout = None
+        if path is not None and Path(path).exists():
+            try:
+                from probe_layout import load_probe_layout_json
+
+                self._probe_layout = load_probe_layout_json(Path(path))
+                self.status_panel.append_log(f"Sonde chargée : {path}")
+            except Exception as exc:
+                self.status_panel.append_log(f"Impossible de lire la sonde : {exc}")
+        self.channel_panel.set_probe(self._probe_layout)
+        self._schedule_redraw(force=True)
+
+    def _build_config(self, rhs_file: Path) -> AnalysisConfig:
+        return build_config_from_defaults(self._defaults, rhs_file)
+
+    def start_processing(self, *, all_rows: bool = False) -> None:
+        if self._build_worker is not None and self._build_worker.isRunning():
+            return
+        entries = self.recordings_panel.entries
+        if not entries:
+            QMessageBox.information(
+                self, "Rien à traiter", "Ajoutez au moins un fichier .rhs ou un dataset traité."
+            )
+            return
+        targets = (
+            entries
+            if (all_rows or self._config_dirty)
+            else [e for e in entries if not e.is_ready]
+        )
+        if not targets:
+            self._set_status("Tout est déjà prêt.")
+            self.ensure_selected_channels()
+            return
+
+        requests: list[BuildRequest] = []
+        processed_entries: list[RecordingEntry] = []
+        for entry in targets:
+            if entry.is_processed:
+                processed_entries.append(entry)
+                continue
+            config = self._build_config(entry.path)
+            config = replace(config, recording_label=entry.label or None, recording_style=entry.style)
+            requests.append(
+                BuildRequest(
+                    config=config,
+                    label=entry.display_label,
+                    style=entry.style,
+                    row_id=entry.row_id,
+                )
+            )
+            self.recordings_panel.set_status(entry.row_id, "queued", "waiting")
+        if requests:
+            self._cache_root = self._resolve_cache_root(requests[0].config)
+
+        for entry in processed_entries:
+            self._open_processed_entry(entry)
+
+        if not requests:
+            self._config_dirty = False
+            self._schedule_redraw(force=True)
+            return
+
+        worker = BuildWorker(requests, self._cache_root, self)
+        worker.progressed.connect(self._on_pipeline_progress)
+        worker.logged.connect(self.status_panel.append_log)
+        worker.recording_ready.connect(self._on_recording_ready)
+        worker.recording_failed.connect(self._on_recording_failed)
+        worker.finished_all.connect(self._on_build_finished)
+        self._build_worker = worker
+        self._set_busy(True)
+        self.status_panel.set_headline(f"Traitement de {len(requests)} enregistrement(s)…")
+        worker.start()
+
+    def _resolve_cache_root(self, config: AnalysisConfig) -> Path:
+        from erg_cache import default_cache_root
+
+        return default_cache_root(config)
+
+    def _open_processed_entry(self, entry: RecordingEntry) -> None:
+        from dataset_builder import open_dataset
+
+        self.recordings_panel.set_status(entry.row_id, "building", "ouverture du dataset")
+        started = time.perf_counter()
+        try:
+            recording = open_dataset(entry.path, label=entry.label or None, style=entry.style)
+        except Exception as exc:
+            self.recordings_panel.set_status(entry.row_id, "failed", str(exc))
+            self.status_panel.append_log(f"Impossible d’ouvrir {entry.path.name} : {exc}")
+            return
+        elapsed = time.perf_counter() - started
+        report = SimpleNamespace(
+            recording=entry.display_label,
+            timings=(),
+            total_s=elapsed,
+            reused_bundle=True,
+        )
+        self.recordings_panel.set_result(entry.row_id, recording, report)
+        self.status_panel.append_log(f"Dataset traité ouvert : {entry.path}")
+        self.status_panel.add_timing(entry.display_label, "Ouvert depuis un dataset traité", elapsed)
+        self._refresh_channels()
+        self._schedule_redraw(force=True)
+
+    def cancel_processing(self) -> None:
+        if self._build_worker is not None and self._build_worker.isRunning():
+            self._build_worker.request_stop()
+            self.status_panel.set_headline("Annulation…")
+        if self._ensure_worker is not None and self._ensure_worker.isRunning():
+            self._ensure_worker.request_stop()
+            self.status_panel.set_headline("Annulation du calcul de canal…")
+        if self._task_worker is not None and self._task_worker.isRunning():
+            self._task_worker.request_stop()
+
+    def _on_recording_ready(self, row_id: int, recording: Any, report: Any) -> None:
+        self.recordings_panel.set_result(row_id, recording, report)
+        self.status_panel.add_report(report)
+        self._refresh_channels()
+
+    def _on_recording_failed(self, row_id: int, message: str) -> None:
+        self.recordings_panel.set_status(row_id, "failed", message)
+        self._set_status(f"Échec du traitement : {message}")
+
+    def _on_build_finished(self, ok: bool) -> None:
+        self._set_busy(False)
+        self._build_worker = None
+        self._config_dirty = False
+        if ok:
+            self.status_panel.set_headline("Enregistrement prêt.")
+            self._set_status("Prêt — choisissez un canal, puis Analyse / Spikes / Graphique.")
+            self.session_panel.show_channels()
+        else:
+            self.status_panel.set_headline("Traitement terminé avec des erreurs ou annulé.")
+        self._refresh_channels()
+        self._schedule_redraw(force=True)
+
+    def _set_busy(self, busy: bool) -> None:
+        self.recordings_panel.set_busy(busy)
+        self.control_panel.set_busy(busy)
+        self._act_process.setEnabled(not busy)
+        self._act_cancel.setEnabled(busy)
+        self._act_ensure_channel.setEnabled(not busy)
+        self._act_ensure_all.setEnabled(not busy)
+        self._status_progress.setVisible(busy)
+        if not busy:
+            self._status_progress.setValue(0)
+
+    def _on_pipeline_progress(self, event: Any) -> None:
+        self.status_panel.on_progress(event)
+        overall = float(getattr(event, "overall_fraction", 0.0) or 0.0)
+        self._status_progress.setValue(int(max(0.0, min(1.0, overall)) * 1000))
+        stage = str(getattr(event, "stage_label", "") or "")
+        recording = str(getattr(event, "recording", "") or "")
+        if recording and stage:
+            self._status_message.setText(f"{recording} — {stage}")
+        elif stage:
+            self._status_message.setText(stage)
+
+    def _channels_for_current_view(self, *, all_channels: bool = False) -> list[int]:
+        """Channel indices the GUI needs right now."""
+        plotted = self._plotted()
+        if not plotted:
+            return []
+        recording = plotted[0].recording
+        n_channels = int(getattr(recording, "n_channels", 0))
+        if n_channels <= 0:
+            return []
+        if all_channels or self._pending_ensure_all:
+            return list(range(n_channels))
+
+        tab = self._current_tab()
+        wants_global = False
+        if tab is not None:
+            wants_global = any(
+                placement.panel in GLOBAL_PANEL_FIELD_NAMES for placement in tab.panels
+            )
+        if wants_global and recording.ready_channels and len(recording.ready_channels) >= n_channels:
+            return list(range(n_channels))
+
+        channel = self.channel_panel.current_channel or ""
+        resolved = recording.channel_index(channel)
+        if resolved is None:
+            return [0] if n_channels else []
+        return [int(resolved)]
+
+    def ensure_selected_channels(self) -> None:
+        self._pending_ensure_all = False
+        self._start_channel_ensure(self._channels_for_current_view(all_channels=False))
+
+    def ensure_all_channels(self) -> None:
+        self._pending_ensure_all = True
+        self._start_channel_ensure(self._channels_for_current_view(all_channels=True))
+
+    def _start_channel_ensure(
+        self, channels: list[int], *, allow_empty_redraw: bool = True
+    ) -> None:
+        if self._build_worker is not None and self._build_worker.isRunning():
+            return
+        if self._ensure_worker is not None and self._ensure_worker.isRunning():
+            return
+        plotted = self._plotted() or self.recordings_panel.ready_entries()
+        frozen_id = self._pending_frozen_id
+        if not plotted or not channels:
+            if frozen_id:
+                self._redraw_pending_window(frozen_id)
+            elif allow_empty_redraw:
+                self._schedule_redraw(force=True)
+            return
+
+        requests: list[ChannelEnsureRequest] = []
+        for entry in plotted:
+            recording = entry.recording
+            if recording is None or getattr(recording, "source", None) is None:
+                continue
+            missing = [
+                ch
+                for ch in channels
+                if 0 <= ch < recording.n_channels and not recording.is_channel_ready(ch)
+            ]
+            if not missing:
+                continue
+            config = self._build_config(entry.path)
+            config = replace(config, recording_label=entry.label or None, recording_style=entry.style)
+            requests.append(
+                ChannelEnsureRequest(
+                    recording=recording,
+                    config=config,
+                    channels=missing,
+                    label=entry.display_label,
+                )
+            )
+
+        if not requests:
+            if frozen_id:
+                self._redraw_pending_window(frozen_id)
+            else:
+                self._schedule_redraw(force=True)
+            plotted_now = self._plotted()
+            self.channel_panel.set_reference_recording(
+                plotted_now[0].recording if plotted_now else None
+            )
+            return
+
+        worker = ChannelEnsureWorker(requests, self)
+        worker.progressed.connect(self._on_pipeline_progress)
+        worker.logged.connect(self.status_panel.append_log)
+        worker.failed.connect(lambda message: self._set_status(f"Échec du calcul de canal : {message}"))
+        worker.finished_all.connect(self._on_ensure_finished)
+        self._ensure_worker = worker
+        self._set_busy(True)
+        n = sum(len(request.channels) for request in requests)
+        self.status_panel.set_headline(f"Calcul de {n} canal(aux)…")
+        worker.start()
+
+    def _on_ensure_finished(self, ok: bool) -> None:
+        self._set_busy(False)
+        self._ensure_worker = None
+        self._pending_ensure_all = False
+        frozen_id = self._pending_frozen_id
+        self._pending_frozen_id = None
+        if ok:
+            self.status_panel.set_headline("Canaux prêts.")
+            self._set_status("Canaux prêts.")
+        else:
+            self.status_panel.set_headline("Calcul des canaux terminé avec des erreurs ou annulé.")
+        plotted = self._plotted()
+        self.channel_panel.set_reference_recording(plotted[0].recording if plotted else None)
+        self._redraw_pending_window(frozen_id)
+        self._schedule_redraw(force=True)
+
+    def _redraw_pending_window(self, window_id: str | None) -> None:
+        if not window_id:
+            return
+        if window_id in self._frozen:
+            self._frozen[window_id].redraw()
+            return
+        if window_id in self._view_sessions:
+            self._view_sessions[window_id].redraw()
+            return
+
+    def _refresh_channels(self) -> None:
+        names = self.recordings_panel.common_channel_names()
+        if not names:
+            ready = self.recordings_panel.first_ready()
+            names = list(ready.recording.channel_names) if ready is not None else []
+        self.channel_panel.set_channels(names)
+        self.channel_panel.set_probe(self._probe_layout)
+        plotted = self._plotted()
+        recording = plotted[0].recording if plotted else None
+        if recording is None:
+            ready = self.recordings_panel.first_ready()
+            recording = ready.recording if ready is not None else None
+        self.channel_panel.set_reference_recording(recording)
+        n_trials = int(getattr(recording, "n_trials", 0) or 0) if recording is not None else 0
+        self.control_panel.set_trial_count(n_trials)
+        self.control_panel.set_channel(self.channel_panel.current_channel)
+
+    # ------------------------------------------------------------------ export
+
+    def export_processed_dataset(self) -> None:
+        ready = self.recordings_panel.ready_entries()
+        if not ready:
+            QMessageBox.information(
+                self, "Export", "Traitez au moins un enregistrement avant d’exporter."
+            )
+            return
+        default_dir = ready[0].path.parent
+        dialog = ExportDatasetDialog(default_dir, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = dialog.options()
+        options.directory.mkdir(parents=True, exist_ok=True)
+
+        def task() -> list[str]:
+            from processed_dataset import archive_bundle, dataset_target_path
+            from dataset_builder import export_dataset
+
+            written: list[str] = []
+            for entry in ready:
+                target = dataset_target_path(options.directory, entry.display_label)
+                bundle = export_dataset(
+                    entry.recording,
+                    target,
+                    include_streams=options.include_streams,
+                    include_trigger_windows=options.include_trigger_windows,
+                    include_overlay=options.include_overlay,
+                    progress=print,
+                )
+                written.append(str(bundle))
+                if options.make_archive:
+                    archive = archive_bundle(bundle, bundle.with_suffix(".zip"))
+                    written.append(str(archive))
+            return written
+
+        def done(result: Any) -> None:
+            paths = result or []
+            self.status_panel.append_log("Exporté :\n" + "\n".join(str(p) for p in paths))
+            QMessageBox.information(
+                self,
+                "Export terminé",
+                "Dataset(s) traité(s) écrit(s) :\n\n" + "\n".join(str(p) for p in paths),
+            )
+
+        self._run_task(task, done, "Export du dataset traité…")
+
+    def export_pdf_report(self) -> None:
+        if self._pdf_callback is None:
+            QMessageBox.information(
+                self, "Rapport PDF", "Le pipeline PDF est indisponible dans cette session."
+            )
+            return
+        entries = [e for e in self.recordings_panel.entries if not e.is_processed]
+        if not entries:
+            QMessageBox.information(
+                self,
+                "Rapport PDF",
+                "Le rapport PDF est généré à partir d’enregistrements .rhs. Ajoutez-en au moins un.",
+            )
+            return
+        default_name = f"{entries[0].display_label}.pdf"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Enregistrer le rapport PDF",
+            str(entries[0].path.parent / default_name),
+            "PDF (*.pdf)",
+        )
+        if not path:
+            return
+        target = Path(path)
+        display = self._workspace.to_plot_display()
+        configs: list[AnalysisConfig] = []
+        for entry in entries:
+            configs.append(
+                replace(
+                    self._build_config(entry.path),
+                    save_dir=target.parent,
+                    pdf_title=target.stem,
+                    recording_label=entry.label or None,
+                    recording_style=entry.style,
+                    plot_display=display,
+                    zoom_mode=self._workspace.zoom_mode(),
+                )
+            )
+        callback = self._pdf_callback
+
+        def task() -> str:
+            callback(configs)
+            return str(target)
+
+        def done(result: Any) -> None:
+            self.status_panel.append_log(f"Rapport PDF écrit près de {result}")
+            QMessageBox.information(
+                self, "Rapport PDF", f"Rapport généré dans :\n{target.parent}"
+            )
+
+        self._run_task(task, done, "Génération du rapport PDF…")
+
+    def save_view_images(self) -> None:
+        page = self._current_page()
+        tab = self._current_tab()
+        if page is None or tab is None or page.grid.panel_count == 0:
+            QMessageBox.information(self, "Enregistrer des images", "Cette vue n’a aucun panneau à enregistrer.")
+            return
+        directory = QFileDialog.getExistingDirectory(
+            self, "Choisir un dossier pour les images des panneaux", str(Path.home())
+        )
+        if not directory:
+            return
+        root = Path(directory)
+        page.grid.render_dirty_now(self._make_request_or_blank)
+        written = 0
+        for placement in page.grid.placements:
+            canvas = page.grid.panel_widget(placement)
+            if canvas is None:
+                continue
+            safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in placement.key)
+            out = root / f"{tab.name}_{safe}.png"
+            canvas.figure.savefig(out, dpi=200, bbox_inches="tight")
+            written += 1
+        self._set_status(f"{written} image(s) écrite(s) dans {root}")
+        self.status_panel.append_log(f"{written} image(s) de panneau écrite(s) dans {root}")
+
+    def _run_task(
+        self, task: Callable[[], Any], on_success: Callable[[Any], None], headline: str
+    ) -> None:
+        if self._task_worker is not None and self._task_worker.isRunning():
+            QMessageBox.information(self, "Occupé", "Un autre export est déjà en cours.")
+            return
+        worker = TaskWorker(task, self)
+        worker.logged.connect(self.status_panel.append_log)
+
+        def _success(result: Any) -> None:
+            self._task_worker = None
+            self._set_busy(False)
+            self.status_panel.set_headline("Terminé.")
+            on_success(result)
+
+        def _failed(message: str) -> None:
+            self._task_worker = None
+            self._set_busy(False)
+            self.status_panel.set_headline("Échec.")
+            QMessageBox.warning(self, "Tâche échouée", message)
+
+        worker.succeeded.connect(_success)
+        worker.failed.connect(_failed)
+        self._task_worker = worker
+        self._set_busy(True)
+        self.status_panel.set_headline(headline)
+        worker.start()
+
+    # ------------------------------------------------------------------- cache
+
+    def open_cache_manager(self) -> None:
+        root = self._cache_root
+        if root is None:
+            entries = self.recordings_panel.entries
+            if entries:
+                root = self._resolve_cache_root(self._build_config(entries[0].path))
+        if root is None:
+            QMessageBox.information(
+                self, "Cache", "Ajoutez d’abord un enregistrement pour résoudre le dossier de cache."
+            )
+            return
+        protected = {
+            Path(getattr(entry.recording, "bundle_root", "") or "")
+            for entry in self.recordings_panel.ready_entries()
+            if getattr(entry.recording, "bundle_root", None)
+        }
+        CacheDialog(root, protected, self).exec()
+
+    # ------------------------------------------------------------------- misc
+
+    def _set_status(self, message: str) -> None:
+        self._status_message.setText(message)
+
+    def _show_about(self) -> None:
+        QMessageBox.information(
+            self,
+            "À propos de plot_erg",
+            "Visionneuse ERG — interface inspirée d’Intan RHX.\n\n"
+            "1. Session → Ajouter un .rhs, puis Traiter.\n"
+            "2. Control Panel → WIDE / LOW / HIGH pour le montage.\n"
+            "3. Canaux → sélection sur la carte MEA.\n"
+            "4. Analyse / Spike Scope / Graph… pour les outils.\n"
+            "5. Dans chaque fenêtre : mode, stimulation, zooms.",
+        )
+
+    def _restore_state(self) -> None:
+        settings = QSettings(_ORG, _APP)
+        geometry = settings.value("geometry")
+        if isinstance(geometry, QByteArray):
+            self.restoreGeometry(geometry)
+        state = settings.value("windowState")
+        if isinstance(state, QByteArray):
+            self.restoreState(state)
+        # Journal optionnel : ne pas le rouvrir automatiquement.
+        self._dock_status.hide()
+
+    def closeEvent(self, event: Any) -> None:  # noqa: D102
+        settings = QSettings(_ORG, _APP)
+        settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("windowState", self.saveState())
+        if self._build_worker is not None and self._build_worker.isRunning():
+            self._build_worker.request_stop()
+            self._build_worker.wait(4000)
+        if self._ensure_worker is not None and self._ensure_worker.isRunning():
+            self._ensure_worker.request_stop()
+            self._ensure_worker.wait(4000)
+        if self._task_worker is not None and self._task_worker.isRunning():
+            self._task_worker.request_stop()
+            self._task_worker.wait(4000)
+        for window in list(self._detached.values()):
+            try:
+                window.close()
+            except RuntimeError:
+                pass
+        self._detached.clear()
+        for window in list(self._frozen.values()):
+            try:
+                window.close()
+            except RuntimeError:
+                pass
+        self._frozen.clear()
+        for window in list(self._view_sessions.values()):
+            try:
+                window.close()
+            except RuntimeError:
+                pass
+        self._view_sessions.clear()
+        self.recordings_panel.clear()
+        super().closeEvent(event)
 
 
 def launch_qt_gui(
-    run_callback: Callable[[AnalysisConfig], None],
-    run_comparison_callback: Callable[[AnalysisConfig, AnalysisConfig], None],
+    run_callback: Callable[[AnalysisConfig], None] | None = None,
+    run_comparison_callback: Callable[[AnalysisConfig, AnalysisConfig], None] | None = None,
     run_multi_comparison_callback: Callable[[list[AnalysisConfig]], None] | None = None,
-    **defaults,
+    **defaults: Any,
 ) -> int:
-    try:
-        from PySide6.QtCore import Qt
-        from PySide6.QtGui import QFont
-        from PySide6.QtWidgets import (
-            QApplication,
-            QCheckBox,
-            QComboBox,
-            QDialog,
-            QDialogButtonBox,
-            QDoubleSpinBox,
-            QFileDialog,
-            QFormLayout,
-            QGridLayout,
-            QGroupBox,
-            QHBoxLayout,
-            QHeaderView,
-            QLabel,
-            QLineEdit,
-            QMainWindow,
-            QMessageBox,
-            QProgressBar,
-            QPushButton,
-            QScrollArea,
-            QSpinBox,
-            QTabWidget,
-            QTableWidget,
-            QTableWidgetItem,
-            QTextEdit,
-            QVBoxLayout,
-            QWidget,
-        )
-    except ImportError as exc:
-        raise RuntimeError("PySide6 is not installed. Run: pip install PySide6") from exc
-
-    AnalysisThread = create_analysis_thread_class()
+    """Ouvrir la visionneuse interactive. Les callbacks pilotent l’export PDF classique."""
+    del run_callback, run_comparison_callback  # the viewer always uses the multi path
     app = QApplication.instance() or QApplication([])
-    app.setFont(QFont("Segoe UI", 15))
+    app.setStyle("Fusion")
+    font = QFont("Segoe UI")
+    font.setPointSize(10)
+    app.setFont(font)
     app.setStyleSheet(APP_STYLESHEET)
-
-    # ------------------------------------------------------------------ helpers
-    def _spin(
-        value: float,
-        *,
-        minimum: float = -1e6,
-        maximum: float = 1e6,
-        decimals: int = 4,
-        step: float = 0.01,
-    ) -> QDoubleSpinBox:
-        w = QDoubleSpinBox()
-        w.setRange(minimum, maximum)
-        w.setDecimals(decimals)
-        w.setSingleStep(step)
-        w.setValue(float(value))
-        return w
-
-    def _int_spin(value: int, *, minimum: int = 0, maximum: int = 10000) -> QSpinBox:
-        w = QSpinBox()
-        w.setRange(minimum, maximum)
-        w.setValue(int(value))
-        return w
-
-    def _set_form_row_visible(
-        form: QFormLayout, field: QWidget, label: QWidget, visible: bool
-    ) -> None:
-        """Show or hide a QFormLayout row (Qt 6.4+ setRowVisible, with fallback)."""
-        row = -1
-        getter = getattr(form, "getWidgetPosition", None)
-        if callable(getter):
-            pos = getter(field)
-            if pos is not None:
-                row = int(pos[0])
-        setter = getattr(form, "setRowVisible", None)
-        if row >= 0 and callable(setter):
-            setter(row, visible)
-            return
-        label.setVisible(visible)
-        field.setVisible(visible)
-
-  # ===========================================================================
-    class MainWindow(QMainWindow):
-        def __init__(self) -> None:
-            super().__init__()
-            self.setWindowTitle("Intan RHS Stimulation Plotter")
-            self.resize(1100, 920)
-            self._run_callback = run_callback
-            self._run_comparison_callback = run_comparison_callback
-            self._run_multi_callback = run_multi_comparison_callback
-            self._analysis_thread = None
-            spec = str(defaults.get("default_section_spec") or "count")
-            self._section_spec = spec if spec in ("count", "duration") else "count"
-            self._cached_duration_s: float | None = None
-            self._section_sync_guard = False
-            self._trigger_form: QFormLayout | None = None
-            self._file_rows: list[MainWindow.FileEntryRow] = []
-            self._display_checkboxes: dict[str, dict[str, QCheckBox]] = {}
-            self._column_master_checks: dict[str, QCheckBox] = {}
-            self._last_auto_pdf_title: str = ""
-            self._build_ui()
-            self._apply_defaults(defaults)
-
-        class FileEntryRow(QWidget):
-            def __init__(
-                self,
-                outer: MainWindow,
-                *,
-                initial_path: str = "",
-                default_color_hex: str = "",
-            ) -> None:
-                super().__init__()
-                self.outer = outer
-                self.setObjectName("fileEntryRow")
-                layout = QHBoxLayout(self)
-                layout.setContentsMargins(10, 8, 10, 8)
-                layout.setSpacing(8)
-                self.path_edit = QLineEdit(initial_path)
-                self.path_edit.setPlaceholderText("Path to .rhs file")
-                self.legend_edit = QLineEdit()
-                self.legend_edit.setPlaceholderText("Custom legend (empty = file name)")
-                self.color_combo = QComboBox()
-                self.color_combo.setMinimumWidth(110)
-                self.color_combo.setToolTip("Curve color for this recording in multi-trace plots")
-                for name, hex_color in RECORDING_COLOR_PRESETS:
-                    self.color_combo.addItem(name, hex_color)
-                preset_idx = 0
-                if default_color_hex:
-                    for i in range(self.color_combo.count()):
-                        if str(self.color_combo.itemData(i) or "") == default_color_hex:
-                            preset_idx = i
-                            break
-                self.color_combo.setCurrentIndex(preset_idx)
-                self.color_combo.currentIndexChanged.connect(self._refresh_color_swatch)
-                self.plot_check = QCheckBox("Plot")
-                self.plot_check.setChecked(True)
-                self.plot_check.setToolTip("Show plots for this recording")
-                self.legend_check = QCheckBox("Legend")
-                self.legend_check.setChecked(True)
-                self.legend_check.setToolTip("Include this recording in legends")
-                browse_btn = QPushButton("Browse…")
-                browse_btn.setObjectName("secondaryButton")
-                remove_btn = QPushButton("Remove")
-                remove_btn.setObjectName("dangerButton")
-                browse_btn.clicked.connect(self._browse)
-                remove_btn.clicked.connect(self._remove)
-                self.path_edit.textChanged.connect(outer._on_files_changed)
-                self.legend_edit.textChanged.connect(outer._on_files_changed)
-                self.color_combo.currentIndexChanged.connect(outer._on_files_changed)
-                layout.addWidget(self.path_edit, stretch=3)
-                layout.addWidget(self.legend_edit, stretch=2)
-                layout.addWidget(self.color_combo)
-                layout.addWidget(self.plot_check)
-                layout.addWidget(self.legend_check)
-                layout.addWidget(browse_btn)
-                layout.addWidget(remove_btn)
-                self._refresh_color_swatch()
-
-            def _refresh_color_swatch(self) -> None:
-                hex_color = str(self.color_combo.currentData() or "").strip()
-                if hex_color:
-                    self.color_combo.setStyleSheet(
-                        f"QComboBox {{ border: 2px solid {hex_color}; "
-                        f"padding-left: 4px; }}"
-                    )
-                else:
-                    self.color_combo.setStyleSheet("")
-
-            def _browse(self) -> None:
-                selected, _ = QFileDialog.getOpenFileName(
-                    self.outer,
-                    "RHS file",
-                    "",
-                    "Intan RHS (*.rhs);;All files (*)",
-                )
-                if selected:
-                    self.path_edit.setText(selected)
-                    if not self.legend_edit.text().strip():
-                        self.legend_edit.setText(Path(selected).stem)
-
-            def _remove(self) -> None:
-                self.outer._remove_file_row(self)
-
-            def path(self) -> str:
-                return self.path_edit.text().strip()
-
-            def style(self) -> RecordingStyle:
-                color = str(self.color_combo.currentData() or "").strip() or None
-                return RecordingStyle(
-                    plot_visible=self.plot_check.isChecked(),
-                    legend_visible=self.legend_check.isChecked(),
-                    color=color,
-                )
-
-            def label(self) -> str | None:
-                text = self.legend_edit.text().strip()
-                return text or None
-
-        def _build_ui(self) -> None:
-            central = QWidget()
-            central.setObjectName("centralWidget")
-            self.setCentralWidget(central)
-            root = QVBoxLayout(central)
-            root.setContentsMargins(14, 14, 14, 14)
-            root.setSpacing(12)
-
-            self.tabs = QTabWidget()
-            self.tabs.addTab(self._build_files_tab(), "Files")
-            self.tabs.addTab(self._build_trigger_tab(), "Stimulation")
-            self.tabs.addTab(self._build_output_tab(), "PDF output")
-            self.tabs.addTab(self._build_filter_tab(), "Intan filter")
-            self.tabs.addTab(self._build_spikes_tab(), "Spikes / PSTH")
-            self.tabs.addTab(self._build_zoom_tab(), "Zoom")
-            self.tabs.addTab(self._build_display_tab(), "Display")
-            self.tabs.addTab(self._build_perf_tab(), "Performance")
-            root.addWidget(self.tabs)
-
-            action_row = QHBoxLayout()
-            self.run_btn = QPushButton("Run analysis")
-            self.run_btn.clicked.connect(self._run_analysis)
-            self.stop_btn = QPushButton("Stop")
-            self.stop_btn.setObjectName("dangerButton")
-            self.stop_btn.setEnabled(False)
-            self.stop_btn.clicked.connect(self._stop_analysis)
-            action_row.addWidget(self.run_btn)
-            action_row.addWidget(self.stop_btn)
-            action_row.addStretch()
-            root.addLayout(action_row)
-
-            self.progress = QProgressBar()
-            self.progress.setRange(0, 0)
-            self.progress.setVisible(False)
-            root.addWidget(self.progress)
-
-            self.status_label = QLabel("Add one or more .rhs files, then run the analysis.")
-            self.status_label.setObjectName("statusLabel")
-            root.addWidget(self.status_label)
-
-            self.log_view = QTextEdit()
-            self.log_view.setObjectName("logView")
-            self.log_view.setReadOnly(True)
-            self.log_view.setPlaceholderText("Run logs appear here…")
-            self.log_view.setMinimumHeight(160)
-            root.addWidget(self.log_view)
-
-        def _build_files_tab(self) -> QWidget:
-            w = QWidget()
-            w.setObjectName("filesTab")
-            layout = QVBoxLayout(w)
-            layout.setContentsMargins(16, 16, 16, 16)
-            layout.setSpacing(10)
-            info = QLabel(
-                "Add recordings to compare. Set a custom legend, curve color "
-                "(blue, orange, …), and plot/legend visibility."
-            )
-            info.setObjectName("hintLabel")
-            info.setWordWrap(True)
-            layout.addWidget(info)
-
-            header = QHBoxLayout()
-            for text, stretch in (
-                (".rhs file", 3),
-                ("Legend", 2),
-                ("Color", 1),
-                ("Display", 1),
-            ):
-                lbl = QLabel(text)
-                lbl.setObjectName("columnHeader")
-                header.addWidget(lbl, stretch)
-            header.addStretch()
-            layout.addLayout(header)
-
-            self.files_container = QWidget()
-            self.files_container.setObjectName("filesContainer")
-            self.files_layout = QVBoxLayout(self.files_container)
-            self.files_layout.setContentsMargins(0, 0, 0, 0)
-            self.files_layout.setSpacing(10)
-            scroll = QScrollArea()
-            scroll.setObjectName("filesScroll")
-            scroll.setWidgetResizable(True)
-            scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-            scroll.viewport().setObjectName("filesScrollViewport")
-            scroll.setWidget(self.files_container)
-            layout.addWidget(scroll, stretch=1)
-
-            add_btn = QPushButton("Add file")
-            add_btn.setObjectName("secondaryButton")
-            add_btn.clicked.connect(lambda: self._add_file_row(""))
-            layout.addWidget(add_btn)
-            return w
-
-        def _build_trigger_tab(self) -> QWidget:
-            w = QWidget()
-            form = QFormLayout(w)
-            form.setContentsMargins(16, 16, 16, 16)
-            form.setSpacing(12)
-            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self._trigger_form = form
-            self.edge_combo = QComboBox()
-            self.edge_combo.addItem("Falling edge", "falling")
-            self.edge_combo.addItem("Rising edge", "rising")
-            self.edge_combo.addItem("No stimulation", "none")
-            self.edge_combo.currentIndexChanged.connect(self._update_trigger_visibility)
-            self.threshold_spin = _spin(defaults.get("default_threshold", 1.0), minimum=0.0)
-            self.pre_spin = _spin(defaults.get("default_pre_s", 2.0), minimum=0.0)
-            self.post_spin = _spin(defaults.get("default_post_s", 10.0), minimum=0.0)
-            self.section_count_spin = _int_spin(defaults.get("default_section_count", 10), minimum=1)
-            trigger_end_default = float(defaults.get("default_section_trigger_end_s", 4.0) or 4.0)
-            raw_section_duration = defaults.get("default_section_duration_s")
-            if raw_section_duration is None or float(raw_section_duration) <= 0:
-                section_duration_default = max(trigger_end_default + 1.0, 5.0)
-            else:
-                section_duration_default = float(raw_section_duration)
-            self.section_duration_spin = _spin(section_duration_default, minimum=0.001)
-            self.section_trigger_start_spin = _spin(
-                defaults.get("default_section_trigger_start_s", 1.0), minimum=0.0
-            )
-            self.section_trigger_end_spin = _spin(trigger_end_default, minimum=0.0)
-            self.section_count_spin.setKeyboardTracking(False)
-            self.section_duration_spin.setKeyboardTracking(False)
-            self.threshold_label = QLabel("ANALOG_IN 0 threshold:")
-            self.pre_label = QLabel("Pre-stimulation (s):")
-            self.post_label = QLabel("Post-stimulation (s):")
-            self.section_count_label = QLabel("Number of sections:")
-            self.section_duration_label = QLabel("Section duration (s):")
-            self.section_trigger_start_label = QLabel("Imaginary stimulation start (s):")
-            self.section_trigger_end_label = QLabel("Imaginary stimulation end (s):")
-            self.section_duration_spin.setToolTip(
-                "Length of each recording split. The PDF time axis covers this full duration."
-            )
-            self.section_trigger_start_spin.setToolTip(
-                "Places t=0 inside each section. Does not crop the PDF."
-            )
-            self.section_trigger_end_spin.setToolTip(
-                "Stimulation-end marker inside each section. Does not crop the PDF."
-            )
-            form.addRow("Stimulation mode:", self.edge_combo)
-            form.addRow(self.threshold_label, self.threshold_spin)
-            form.addRow(self.pre_label, self.pre_spin)
-            form.addRow(self.post_label, self.post_spin)
-            form.addRow(self.section_count_label, self.section_count_spin)
-            form.addRow(self.section_duration_label, self.section_duration_spin)
-            form.addRow(self.section_trigger_start_label, self.section_trigger_start_spin)
-            form.addRow(self.section_trigger_end_label, self.section_trigger_end_spin)
-            self.section_hint = QLabel(
-                "The PDF shows the full section. Imaginary start/end only set t=0 and the end marker."
-            )
-            self.section_hint.setObjectName("hintLabel")
-            self.section_hint.setWordWrap(True)
-            form.addRow(self.section_hint)
-            self.section_count_spin.valueChanged.connect(lambda _v: self._sync_sections("count"))
-            self.section_duration_spin.valueChanged.connect(lambda _v: self._sync_sections("duration"))
-            self.section_trigger_end_spin.valueChanged.connect(
-                lambda _v: self._sync_sections(self._section_spec)
-            )
-            return w
-
-        def _build_output_tab(self) -> QWidget:
-            w = QWidget()
-            form = QFormLayout(w)
-            form.setContentsMargins(16, 16, 16, 16)
-            form.setSpacing(12)
-            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.save_dir_edit = QLineEdit()
-            self.save_dir_edit.setPlaceholderText("Empty = .rhs file folder")
-            browse_save = QPushButton("Browse…")
-            browse_save.setObjectName("secondaryButton")
-            save_row = QHBoxLayout()
-            save_row.addWidget(self.save_dir_edit)
-            save_row.addWidget(browse_save)
-            browse_save.clicked.connect(self._browse_save_dir)
-            self.pdf_title_edit = QLineEdit()
-            self.pdf_title_edit.setPlaceholderText(
-                "Empty = automatic name from .rhs files"
-            )
-            self.probe_json_edit = QLineEdit()
-            self.probe_json_edit.setPlaceholderText("Optional — probeinterface JSON (MEA map)")
-            browse_probe = QPushButton("Browse…")
-            browse_probe.setObjectName("secondaryButton")
-            probe_row = QHBoxLayout()
-            probe_row.addWidget(self.probe_json_edit)
-            probe_row.addWidget(browse_probe)
-            browse_probe.clicked.connect(self._browse_probe_json)
-            form.addRow("PDF output folder:", save_row)
-            form.addRow("PDF name:", self.pdf_title_edit)
-            form.addRow("MEA probe (JSON):", probe_row)
-            return w
-
-        def _build_filter_tab(self) -> QWidget:
-            w = QWidget()
-            form = QFormLayout(w)
-            form.setContentsMargins(16, 16, 16, 16)
-            form.setSpacing(12)
-            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.filter_type_combo = QComboBox()
-            self.filter_type_combo.addItem("Bessel", "bessel")
-            self.filter_type_combo.addItem("Butterworth", "butterworth")
-            self.filter_order_spin = _int_spin(defaults.get("default_intan_filter_order", 2), minimum=1, maximum=8)
-            self.filter_cutoff_spin = _spin(
-                defaults.get("default_intan_filter_cutoff_hz", 250.0), minimum=0.1, maximum=50000.0, decimals=1
-            )
-            note = QLabel(
-                "High-pass and low-pass are always both applied separately "
-                "(same cutoff, order, and prototype — never cascaded)."
-            )
-            note.setWordWrap(True)
-            form.addRow(note)
-            form.addRow("Prototype:", self.filter_type_combo)
-            form.addRow("Order (1–8):", self.filter_order_spin)
-            form.addRow("Cutoff frequency (Hz):", self.filter_cutoff_spin)
-            return w
-
-        def _build_spikes_tab(self) -> QWidget:
-            w = QWidget()
-            form = QFormLayout(w)
-            form.setContentsMargins(16, 16, 16, 16)
-            form.setSpacing(12)
-            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.spike_mode_combo = QComboBox()
-            self.spike_mode_combo.addItem("Fixed threshold (same for all channels)", "fixed")
-            self.spike_mode_combo.addItem("× mean RMS multiplier per channel", "rms_multiple")
-            self.spike_mode_combo.currentIndexChanged.connect(self._update_spike_mode_visibility)
-            self.spike_polarity_combo = QComboBox()
-            self.spike_polarity_combo.addItem("Negative — below threshold", "negative")
-            self.spike_polarity_combo.addItem("Positive — above threshold", "positive")
-            self.spike_fixed_spin = _spin(defaults.get("default_spike_threshold_uv", 70.0), minimum=0.001)
-            self.spike_rms_mult_spin = _spin(
-                defaults.get("default_spike_threshold_rms_multiplier", 4.0), minimum=0.001
-            )
-            self.psth_bin_spin = _spin(defaults.get("default_psth_bin_window_s", 0.025), minimum=0.001)
-            self.rms_window_spin = _spin(defaults.get("default_rms_window_s", 1.0), minimum=0.001)
-            self.spike_fixed_label = QLabel("Fixed threshold (µV):")
-            self.spike_rms_label = QLabel("RMS multiplier:")
-            form.addRow("Spike threshold mode:", self.spike_mode_combo)
-            form.addRow("Polarity:", self.spike_polarity_combo)
-            form.addRow(self.spike_fixed_label, self.spike_fixed_spin)
-            form.addRow(self.spike_rms_label, self.spike_rms_mult_spin)
-            form.addRow("PSTH window (s):", self.psth_bin_spin)
-            form.addRow("RMS window (s):", self.rms_window_spin)
-            self.spike_overlay_pre_spin = _spin(
-                defaults.get("default_spike_overlay_pre_ms", 2.0),
-                minimum=0.0,
-                maximum=500.0,
-                decimals=2,
-                step=0.5,
-            )
-            self.spike_overlay_post_spin = _spin(
-                defaults.get("default_spike_overlay_post_ms", 4.0),
-                minimum=0.1,
-                maximum=500.0,
-                decimals=2,
-                step=0.5,
-            )
-            self.spike_overlay_pre_spin.setToolTip(
-                "Time before threshold crossing shown in the spike overlay (ms)."
-            )
-            self.spike_overlay_post_spin.setToolTip(
-                "Time after threshold crossing shown in the spike overlay (ms)."
-            )
-            form.addRow("Overlay — before detection (ms):", self.spike_overlay_pre_spin)
-            form.addRow("Overlay — after detection (ms):", self.spike_overlay_post_spin)
-            overlay_hint = QLabel(
-                "Show or hide superimposed waveforms per section in the Display tab "
-                "(row “Spike overlay”, at the end of each section: all spikes detected "
-                "with the threshold across all stimulations)."
-            )
-            overlay_hint.setObjectName("hintLabel")
-            overlay_hint.setWordWrap(True)
-            form.addRow(overlay_hint)
-            return w
-
-        def _build_zoom_tab(self) -> QWidget:
-            w = QWidget()
-            layout = QVBoxLayout(w)
-            layout.setContentsMargins(16, 16, 16, 16)
-            layout.setSpacing(12)
-            hint = QLabel(
-                "Time windows only. Enable or disable onset/end sections with the "
-                "Display tab columns (uncheck every box in a column to omit it)."
-            )
-            hint.setObjectName("hintLabel")
-            hint.setWordWrap(True)
-            layout.addWidget(hint)
-
-            onset_group = QGroupBox("Stimulation onset zoom")
-            onset_form = QFormLayout(onset_group)
-            onset_form.setSpacing(10)
-            onset_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.zoom_onset_t0_spin = _spin(defaults.get("default_zoom_onset_t0_s", -0.1))
-            self.zoom_onset_t1_spin = _spin(defaults.get("default_zoom_onset_t1_s", 0.2))
-            onset_form.addRow("Start (s rel. stimulation):", self.zoom_onset_t0_spin)
-            onset_form.addRow("End (s rel. stimulation):", self.zoom_onset_t1_spin)
-            layout.addWidget(onset_group)
-
-            end_group = QGroupBox("Stimulation end zoom (next rising edge)")
-            end_form = QFormLayout(end_group)
-            end_form.setSpacing(10)
-            end_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.zoom_end_t0_spin = _spin(defaults.get("default_zoom_end_t0_s", -0.1))
-            self.zoom_end_t1_spin = _spin(defaults.get("default_zoom_end_t1_s", 0.2))
-            end_form.addRow("Start (s rel. stimulation end):", self.zoom_end_t0_spin)
-            end_form.addRow("End (s rel. stimulation end):", self.zoom_end_t1_spin)
-            layout.addWidget(end_group)
-            layout.addStretch()
-            return w
-
-        def _build_display_tab(self) -> QWidget:
-            w = QWidget()
-            layout = QVBoxLayout(w)
-            layout.setContentsMargins(16, 16, 16, 16)
-            layout.setSpacing(12)
-            hint = QLabel(
-                "This tab is the only place to choose what appears in the PDF. "
-                "Uncheck every box in a zoom column to omit that section. "
-                "Use the column master checkboxes to toggle a whole zoom column. "
-                "Zoom time windows are set in the Zoom tab."
-            )
-            hint.setObjectName("hintLabel")
-            hint.setWordWrap(True)
-            layout.addWidget(hint)
-
-            top = QHBoxLayout()
-            self.mea_check = QCheckBox("MEA map")
-            self.mea_check.setChecked(True)
-            self.impedance_check = QCheckBox("Impedance panel")
-            self.impedance_check.setChecked(True)
-            self.summary_rms_check = QCheckBox("RMS summary page")
-            self.summary_rms_check.setChecked(True)
-            self.summary_rms_table_check = QCheckBox("RMS per-channel table")
-            self.summary_rms_table_check.setChecked(True)
-            self.summary_imp_check = QCheckBox("Impedance summary page")
-            self.summary_imp_check.setChecked(True)
-            self.summary_second_stim_montage_check = QCheckBox(
-                "All-channels montage (mean / 2nd / 2nd→3rd LP)"
-            )
-            self.summary_second_stim_montage_check.setChecked(False)
-            self.summary_second_stim_montage_check.setToolTip(
-                "Summary pages: trial-averaged LP/HP, 2nd stim LP/HP, then a "
-                "continuous low-pass montage spanning from the 2nd stim window "
-                "through the 3rd stim window (all channels stacked)."
-            )
-            for cb in (
-                self.mea_check,
-                self.impedance_check,
-                self.summary_rms_check,
-                self.summary_rms_table_check,
-                self.summary_imp_check,
-                self.summary_second_stim_montage_check,
-            ):
-                top.addWidget(cb)
-            top.addStretch()
-            layout.addLayout(top)
-
-            column_masters = QHBoxLayout()
-            column_masters.addStretch(1)
-            self.onset_zoom_all_check = QCheckBox("All Onset zoom")
-            self.onset_zoom_all_check.setTristate(True)
-            self.onset_zoom_all_check.setToolTip(
-                "Check or uncheck every panel in the Onset zoom column."
-            )
-            self.end_zoom_all_check = QCheckBox("All End zoom")
-            self.end_zoom_all_check.setTristate(True)
-            self.end_zoom_all_check.setToolTip(
-                "Check or uncheck every panel in the End zoom column."
-            )
-            self._column_master_checks: dict[str, QCheckBox] = {
-                "zoom_onset": self.onset_zoom_all_check,
-                "zoom_trigger_end": self.end_zoom_all_check,
-            }
-            self.onset_zoom_all_check.clicked.connect(
-                lambda: self._on_column_master_clicked("zoom_onset")
-            )
-            self.end_zoom_all_check.clicked.connect(
-                lambda: self._on_column_master_clicked("zoom_trigger_end")
-            )
-            column_masters.addWidget(self.onset_zoom_all_check)
-            column_masters.addWidget(self.end_zoom_all_check)
-            layout.addLayout(column_masters)
-
-            self.display_table = QTableWidget(len(PANEL_FIELD_NAMES), 4)
-            self.display_table.setAlternatingRowColors(True)
-            self.display_table.setShowGrid(True)
-            self.display_table.setMinimumHeight(520)
-            self.display_table.setHorizontalHeaderLabels(
-                ["Panel", "Full view", "Onset zoom", "End zoom"]
-            )
-            self.display_table.verticalHeader().setVisible(False)
-            self.display_table.verticalHeader().setDefaultSectionSize(34)
-            self.display_table.horizontalHeader().setMinimumSectionSize(110)
-            self.display_table.horizontalHeader().setDefaultSectionSize(130)
-            for col in range(4):
-                self.display_table.horizontalHeader().setSectionResizeMode(
-                    col, QHeaderView.ResizeMode.Stretch
-                )
-            section_keys = ("full_view", "zoom_onset", "zoom_trigger_end")
-            for row, panel_key in enumerate(PANEL_FIELD_NAMES):
-                self.display_table.setItem(row, 0, QTableWidgetItem(PANEL_LABELS[panel_key]))
-                item = self.display_table.item(row, 0)
-                if item is not None:
-                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                    if panel_key == "spike_overlay":
-                        item.setToolTip(
-                            "Placed at the end of the section. Overlays every spike "
-                            "detected with the configured threshold on all stimulations "
-                            "(and the time window of that section)."
-                        )
-                self._display_checkboxes[panel_key] = {}
-                for col, section_key in enumerate(section_keys, start=1):
-                    cb = QCheckBox()
-                    cb.setChecked(panel_key not in PANEL_DEFAULT_OFF)
-                    wrapper = QWidget()
-                    wl = QHBoxLayout(wrapper)
-                    wl.addWidget(cb)
-                    wl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                    wl.setContentsMargins(0, 0, 0, 0)
-                    self.display_table.setCellWidget(row, col, wrapper)
-                    self._display_checkboxes[panel_key][section_key] = cb
-                    if panel_key == "spike_overlay":
-                        cb.setToolTip(
-                            "All spikes in this section’s time window, aligned on "
-                            "threshold crossing, with the threshold line shown."
-                        )
-                    if section_key in self._column_master_checks:
-                        cb.toggled.connect(
-                            lambda _checked, key=section_key: self._sync_column_master_checkbox(key)
-                        )
-            for section_key in self._column_master_checks:
-                self._sync_column_master_checkbox(section_key)
-            layout.addWidget(self.display_table, stretch=1)
-
-            hp_group = QGroupBox("Y axis — first/second high-pass stimulation")
-            hp_form = QFormLayout(hp_group)
-            hp_form.setSpacing(10)
-            hp_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.hp_ylim_check = QCheckBox(
-                "Fix Y axis (µV) on first/second high-pass stimulation panels"
-            )
-            self.hp_ylim_check.toggled.connect(self._update_hp_ylim_visibility)
-            self.hp_ylim_min_spin = _spin(defaults.get("default_first_trigger_hp_ylim_min_uv", -200.0))
-            self.hp_ylim_max_spin = _spin(defaults.get("default_first_trigger_hp_ylim_max_uv", 200.0))
-            hp_form.addRow(self.hp_ylim_check)
-            hp_form.addRow("Y min (µV):", self.hp_ylim_min_spin)
-            hp_form.addRow("Y max (µV):", self.hp_ylim_max_spin)
-            layout.addWidget(hp_group)
-            return w
-
-        def _build_perf_tab(self) -> QWidget:
-            w = QWidget()
-            form = QFormLayout(w)
-            form.setContentsMargins(16, 16, 16, 16)
-            form.setSpacing(12)
-            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.channel_workers_combo = QComboBox()
-            for n in range(16, 0, -1):
-                label = f"{n} worker{'s' if n > 1 else ''}"
-                if n == 16:
-                    label += " (max)"
-                self.channel_workers_combo.addItem(label, n)
-            self.channel_workers_combo.addItem("Auto (max CPU, capped at 16)", None)
-            self.sampling_spin = _int_spin(defaults.get("default_sampling_percent", 100), minimum=1, maximum=100)
-            form.addRow("Workers per channel:", self.channel_workers_combo)
-            form.addRow("Spike display sampling (%):", self.sampling_spin)
-            return w
-
-        def _apply_defaults(self, d: dict) -> None:
-            edge = d.get("default_edge", "falling")
-            idx = self.edge_combo.findData(edge)
-            if idx >= 0:
-                self.edge_combo.setCurrentIndex(idx)
-            for combo, key, fallback in (
-                (self.filter_type_combo, "default_intan_filter_type", "bessel"),
-                (self.spike_mode_combo, "default_spike_threshold_mode", "fixed"),
-                (self.spike_polarity_combo, "default_spike_threshold_polarity", "negative"),
-            ):
-                i = combo.findData(d.get(key, fallback))
-                if i >= 0:
-                    combo.setCurrentIndex(i)
-            if d.get("default_probe_layout_json"):
-                self.probe_json_edit.setText(str(d["default_probe_layout_json"]))
-            if d.get("default_channel_workers") is not None:
-                i = self.channel_workers_combo.findData(int(d["default_channel_workers"]))
-                if i >= 0:
-                    self.channel_workers_combo.setCurrentIndex(i)
-            self.hp_ylim_check.setChecked(bool(d.get("default_first_trigger_hp_ylim_enabled", False)))
-            self._add_file_row("")
-            self._update_trigger_visibility()
-            self._update_spike_mode_visibility()
-            self._update_hp_ylim_visibility()
-            self._apply_zoom_mode_default(str(d.get("default_zoom_mode", "both")))
-
-        def _add_file_row(self, path: str) -> None:
-            # Skip "Auto" when assigning a distinct default color per new row.
-            named = [hex_c for _name, hex_c in RECORDING_COLOR_PRESETS if hex_c]
-            default_hex = named[len(self._file_rows) % len(named)] if named else ""
-            row = self.FileEntryRow(
-                self,
-                initial_path=path,
-                default_color_hex=default_hex,
-            )
-            if path:
-                row.legend_edit.setText(Path(path).stem)
-            self._file_rows.append(row)
-            self.files_layout.addWidget(row)
-            self._on_files_changed()
-
-        def _remove_file_row(self, row: FileEntryRow) -> None:
-            if row in self._file_rows:
-                self._file_rows.remove(row)
-            self.files_layout.removeWidget(row)
-            row.deleteLater()
-            self._on_files_changed()
-
-        def _suggest_pdf_title(self) -> str:
-            paths = self._collect_paths()
-            if len(paths) >= 2:
-                return f"{Path(paths[0]).stem}_vs_{len(paths) - 1}_others"
-            if len(paths) == 1:
-                return Path(paths[0]).stem
-            return ""
-
-        def _refresh_pdf_title(self) -> None:
-            suggested = self._suggest_pdf_title()
-            current = self.pdf_title_edit.text().strip()
-            # Keep user edits; auto-update while empty or still matching last suggestion.
-            if not current or current == self._last_auto_pdf_title:
-                self.pdf_title_edit.setText(suggested)
-                self._last_auto_pdf_title = suggested
-
-        def _on_files_changed(self) -> None:
-            self._refresh_duration()
-            self._refresh_pdf_title()
-
-        def _collect_paths(self) -> list[str]:
-            seen: set[str] = set()
-            out: list[str] = []
-            for row in self._file_rows:
-                p = row.path()
-                if not p:
-                    continue
-                resolved = str(Path(p).resolve())
-                if resolved not in seen:
-                    seen.add(resolved)
-                    out.append(p)
-            return out
-
-        def _refresh_duration(self) -> None:
-            from core import peek_rhs_recording_info
-
-            paths = self._collect_paths()
-            durations: list[float] = []
-            for path in paths:
-                try:
-                    n_samples, fs = peek_rhs_recording_info(Path(path))
-                    durations.append(float(n_samples) / float(fs))
-                except Exception:
-                    continue
-            self._cached_duration_s = min(durations) if durations else None
-            if self.edge_combo.currentData() == "none":
-                self._sync_sections(self._section_spec)
-
-        def _sync_sections(self, changed: str) -> None:
-            if self._section_sync_guard or self.edge_combo.currentData() != "none":
-                return
-            min_dur = max(0.001, float(self.section_trigger_end_spin.value()))
-            if self._cached_duration_s is None or self._cached_duration_s <= 0:
-                if self.section_duration_spin.value() < min_dur:
-                    self._section_sync_guard = True
-                    try:
-                        self.section_duration_spin.setValue(min_dur)
-                    finally:
-                        self._section_sync_guard = False
-                return
-            self._section_sync_guard = True
-            try:
-                self._section_spec = changed
-                total = float(self._cached_duration_s)
-                if changed == "count":
-                    count = max(1, int(self.section_count_spin.value()))
-                    duration = total / float(count)
-                    if duration < min_dur:
-                        count = max(1, int(total / min_dur))
-                        duration = total / float(count)
-                        self.section_count_spin.setValue(count)
-                    self.section_duration_spin.setValue(duration)
-                else:
-                    duration = max(0.001, float(self.section_duration_spin.value()))
-                    if duration < min_dur:
-                        duration = min_dur
-                        self.section_duration_spin.setValue(duration)
-                    count = max(1, int(total / duration))
-                    self.section_count_spin.setValue(count)
-            finally:
-                self._section_sync_guard = False
-
-        def _update_trigger_visibility(self) -> None:
-            no_trigger = self.edge_combo.currentData() == "none"
-            form = self._trigger_form
-            analog_rows = (
-                (self.threshold_spin, self.threshold_label),
-                (self.pre_spin, self.pre_label),
-                (self.post_spin, self.post_label),
-            )
-            none_rows = (
-                (self.section_count_spin, self.section_count_label),
-                (self.section_duration_spin, self.section_duration_label),
-                (self.section_trigger_start_spin, self.section_trigger_start_label),
-                (self.section_trigger_end_spin, self.section_trigger_end_label),
-            )
-            if form is not None:
-                for field, label in analog_rows:
-                    _set_form_row_visible(form, field, label, not no_trigger)
-                for field, label in none_rows:
-                    _set_form_row_visible(form, field, label, no_trigger)
-                _set_form_row_visible(form, self.section_hint, self.section_hint, no_trigger)
-                form.invalidate()
-                parent = form.parentWidget()
-                if parent is not None:
-                    parent.updateGeometry()
-            else:
-                for field, label in analog_rows:
-                    field.setVisible(not no_trigger)
-                    label.setVisible(not no_trigger)
-                for field, label in none_rows:
-                    field.setVisible(no_trigger)
-                    label.setVisible(no_trigger)
-                self.section_hint.setVisible(no_trigger)
-            if no_trigger:
-                self._refresh_duration()
-
-        def _update_spike_mode_visibility(self) -> None:
-            fixed = self.spike_mode_combo.currentData() == "fixed"
-            self.spike_fixed_label.setVisible(fixed)
-            self.spike_fixed_spin.setVisible(fixed)
-            self.spike_rms_label.setVisible(not fixed)
-            self.spike_rms_mult_spin.setVisible(not fixed)
-
-        def _apply_zoom_mode_default(self, mode: str) -> None:
-            """Apply CLI/default zoom mode by checking Display columns only."""
-            onset_on = mode in ("onset", "both")
-            end_on = mode in ("trigger_end", "both")
-            for panel_key in PANEL_FIELD_NAMES:
-                cbs = self._display_checkboxes.get(panel_key) or {}
-                for section_key, keep in (
-                    ("zoom_onset", onset_on),
-                    ("zoom_trigger_end", end_on),
-                ):
-                    cb = cbs.get(section_key)
-                    if cb is None or keep:
-                        continue
-                    cb.blockSignals(True)
-                    cb.setChecked(False)
-                    cb.blockSignals(False)
-            for section_key in ("zoom_onset", "zoom_trigger_end"):
-                self._sync_column_master_checkbox(section_key)
-
-        def _on_column_master_clicked(self, section_key: str) -> None:
-            """Toggle a whole zoom column: check all unless already fully checked."""
-            states = [
-                bool(self._display_checkboxes[panel_key][section_key].isChecked())
-                for panel_key in PANEL_FIELD_NAMES
-            ]
-            self._set_display_column_checked(section_key, not all(states))
-
-        def _set_display_column_checked(self, section_key: str, checked: bool) -> None:
-            """Check or uncheck every panel checkbox in one Display column."""
-            for panel_key in PANEL_FIELD_NAMES:
-                cb = self._display_checkboxes.get(panel_key, {}).get(section_key)
-                if cb is None:
-                    continue
-                cb.blockSignals(True)
-                cb.setChecked(checked)
-                cb.blockSignals(False)
-            self._sync_column_master_checkbox(section_key)
-
-        def _sync_column_master_checkbox(self, section_key: str) -> None:
-            """Keep All Onset/End zoom masters in sync with their column cells."""
-            master = getattr(self, "_column_master_checks", {}).get(section_key)
-            if master is None or not self._display_checkboxes:
-                return
-            states = [
-                bool(self._display_checkboxes[panel_key][section_key].isChecked())
-                for panel_key in PANEL_FIELD_NAMES
-            ]
-            if all(states):
-                state = Qt.CheckState.Checked
-            elif not any(states):
-                state = Qt.CheckState.Unchecked
-            else:
-                state = Qt.CheckState.PartiallyChecked
-            master.blockSignals(True)
-            master.setCheckState(state)
-            master.blockSignals(False)
-
-        def _update_hp_ylim_visibility(self) -> None:
-            enabled = self.hp_ylim_check.isChecked()
-            self.hp_ylim_min_spin.setEnabled(enabled)
-            self.hp_ylim_max_spin.setEnabled(enabled)
-
-        def _browse_save_dir(self) -> None:
-            selected = QFileDialog.getExistingDirectory(self, "PDF output folder")
-            if selected:
-                self.save_dir_edit.setText(selected)
-
-        def _browse_probe_json(self) -> None:
-            selected, _ = QFileDialog.getOpenFileName(
-                self, "JSON probeinterface", "", "JSON (*.json);;All (*)"
-            )
-            if selected:
-                self.probe_json_edit.setText(selected)
-
-        def _section_panels_from_ui(self, section_key: str) -> SectionPanels:
-            kwargs = {
-                panel_key: self._display_checkboxes[panel_key][section_key].isChecked()
-                for panel_key in PANEL_FIELD_NAMES
-            }
-            return SectionPanels(**kwargs)
-
-        def _zoom_mode_from_display(self) -> str:
-            onset = self._section_panels_from_ui("zoom_onset").any_enabled()
-            end = self._section_panels_from_ui("zoom_trigger_end").any_enabled()
-            if onset and end:
-                return "both"
-            if onset:
-                return "onset"
-            if end:
-                return "trigger_end"
-            return "none"
-
-        def _build_plot_display(self) -> PlotDisplaySettings:
-            return PlotDisplaySettings(
-                mea_layout=self.mea_check.isChecked(),
-                impedance=self.impedance_check.isChecked(),
-                summary_rms_page=self.summary_rms_check.isChecked(),
-                summary_rms_table_page=self.summary_rms_table_check.isChecked(),
-                summary_impedance_page=self.summary_imp_check.isChecked(),
-                summary_second_stim_montage_page=self.summary_second_stim_montage_check.isChecked(),
-                full_view=self._section_panels_from_ui("full_view"),
-                zoom_onset=self._section_panels_from_ui("zoom_onset"),
-                zoom_trigger_end=self._section_panels_from_ui("zoom_trigger_end"),
-            )
-
-        def _build_configs(self) -> list[AnalysisConfig]:
-            from core import validate_section_trigger_window
-            from probe_layout import load_probe_layout_json
-
-            paths_with_meta: list[tuple[str, FileEntryRow]] = [
-                (row.path(), row) for row in self._file_rows if row.path()
-            ]
-            if not paths_with_meta:
-                raise ValueError("Add at least one .rhs file.")
-            seen: set[str] = set()
-            unique: list[tuple[str, FileEntryRow]] = []
-            for path, row in paths_with_meta:
-                key = str(Path(path).resolve())
-                if key not in seen:
-                    seen.add(key)
-                    unique.append((path, row))
-
-            edge = str(self.edge_combo.currentData() or "falling")
-            if edge not in ("falling", "rising", "none"):
-                raise ValueError("Invalid stimulation mode.")
-            zoom_mode = self._zoom_mode_from_display()
-            zoom_onset_t0 = float(self.zoom_onset_t0_spin.value())
-            zoom_onset_t1 = float(self.zoom_onset_t1_spin.value())
-            zoom_end_t0 = float(self.zoom_end_t0_spin.value())
-            zoom_end_t1 = float(self.zoom_end_t1_spin.value())
-            if zoom_mode in ("onset", "both") and zoom_onset_t1 <= zoom_onset_t0:
-                raise ValueError("Onset zoom: end must be strictly greater than start.")
-            if zoom_mode in ("trigger_end", "both") and zoom_end_t1 <= zoom_end_t0:
-                raise ValueError("End zoom: end must be strictly greater than start.")
-
-            overlay_pre = float(self.spike_overlay_pre_spin.value())
-            overlay_post = float(self.spike_overlay_post_spin.value())
-            if overlay_pre < 0:
-                raise ValueError("Spike overlay: time before detection must be ≥ 0 ms.")
-            if overlay_post <= 0:
-                raise ValueError("Spike overlay: time after detection must be > 0 ms.")
-
-            section_count = int(self.section_count_spin.value())
-            section_duration = float(self.section_duration_spin.value())
-            section_duration_s = section_duration if self._section_spec == "duration" else None
-            section_trigger_start = float(self.section_trigger_start_spin.value())
-            section_trigger_end = float(self.section_trigger_end_spin.value())
-            if edge == "none":
-                if section_count < 1:
-                    raise ValueError("Number of sections must be ≥ 1.")
-                seg_dur = section_duration_s
-                if seg_dur is None and self._cached_duration_s is not None:
-                    seg_dur = self._cached_duration_s / float(section_count)
-                if seg_dur is not None:
-                    validate_section_trigger_window(
-                        seg_dur, section_trigger_start, section_trigger_end
-                    )
-
-            save_text = self.save_dir_edit.text().strip()
-            save_dir = Path(save_text) if save_text else None
-            pdf_title = self.pdf_title_edit.text().strip() or self._suggest_pdf_title() or None
-            probe_text = self.probe_json_edit.text().strip()
-            probe_path: Path | None = None
-            if probe_text:
-                probe_path = Path(probe_text)
-                if not probe_path.exists():
-                    raise ValueError(f"Probe JSON file not found: {probe_path}")
-                load_probe_layout_json(probe_path)
-
-            channel_workers = self.channel_workers_combo.currentData()
-            if channel_workers is not None:
-                channel_workers = int(channel_workers)
-                if channel_workers <= 0 or channel_workers > 16:
-                    raise ValueError("Workers per channel: between 1 and 16.")
-
-            sampling = int(self.sampling_spin.value())
-            if sampling < 1 or sampling > 100:
-                raise ValueError("Sampling: between 1 and 100%.")
-
-            hp_enabled = self.hp_ylim_check.isChecked()
-            hp_min = float(self.hp_ylim_min_spin.value())
-            hp_max = float(self.hp_ylim_max_spin.value())
-            if hp_enabled and hp_max <= hp_min:
-                raise ValueError("HP Y axis: max must be strictly greater than min.")
-
-            plot_display = self._build_plot_display()
-            shared = dict(
-                threshold=float(self.threshold_spin.value()),
-                edge=edge,
-                pre_s=float(self.pre_spin.value()),
-                post_s=float(self.post_spin.value()),
-                section_count=section_count,
-                section_duration_s=section_duration_s,
-                section_spec=self._section_spec,
-                section_trigger_start_s=section_trigger_start,
-                section_trigger_end_s=section_trigger_end,
-                save_dir=save_dir,
-                pdf_title=pdf_title,
-                spike_threshold_uv=float(self.spike_fixed_spin.value()),
-                spike_threshold_polarity=str(self.spike_polarity_combo.currentData()),
-                spike_threshold_mode=str(self.spike_mode_combo.currentData()),
-                spike_threshold_rms_multiplier=float(self.spike_rms_mult_spin.value()),
-                psth_bin_window_s=float(self.psth_bin_spin.value()),
-                spike_overlay_pre_ms=overlay_pre,
-                spike_overlay_post_ms=overlay_post,
-                rms_window_s=float(self.rms_window_spin.value()),
-                zoom_mode=zoom_mode,
-                zoom_onset_t0_s=zoom_onset_t0,
-                zoom_onset_t1_s=zoom_onset_t1,
-                zoom_end_t0_s=zoom_end_t0,
-                zoom_end_t1_s=zoom_end_t1,
-                first_trigger_hp_ylim_enabled=hp_enabled,
-                first_trigger_hp_ylim_min_uv=hp_min,
-                first_trigger_hp_ylim_max_uv=hp_max,
-                intan_filter_order=int(self.filter_order_spin.value()),
-                intan_filter_type=str(self.filter_type_combo.currentData()),
-                intan_filter_cutoff_hz=float(self.filter_cutoff_spin.value()),
-                channel_workers=channel_workers,
-                sampling_percent=sampling,
-                probe_layout_json=probe_path,
-                plot_display=plot_display,
-            )
-
-            configs: list[AnalysisConfig] = []
-            for path, row in unique:
-                configs.append(
-                    AnalysisConfig(
-                        rhs_file=Path(path),
-                        recording_label=row.label(),
-                        recording_style=row.style(),
-                        **shared,  # type: ignore[arg-type]
-                    )
-                )
-            return configs
-
-        def _append_log(self, message: str) -> None:
-            ts = datetime.now().strftime("%H:%M:%S")
-            self.log_view.append(f"[{ts}] {message}")
-            self.log_view.ensureCursorVisible()
-
-        def _set_busy(self, running: bool) -> None:
-            self.progress.setVisible(running)
-            self.stop_btn.setEnabled(running)
-            self.run_btn.setEnabled(not running)
-            self.tabs.setEnabled(not running)
-
-        def _finalize_thread(self) -> None:
-            self._set_busy(False)
-            if self._analysis_thread is not None:
-                self._analysis_thread.deleteLater()
-            self._analysis_thread = None
-
-        def _on_ok(self, output: str) -> None:
-            self._finalize_thread()
-            if output:
-                for line in output.splitlines():
-                    if line.strip():
-                        self._append_log(line)
-            pdf_m = re.search(r"(?:Comparison )?PDF written: (.+)", output)
-            pdf_path = pdf_m.group(1).strip() if pdf_m else None
-            self.status_label.setText(
-                f"Done — {pdf_path}" if pdf_path else "Analysis complete."
-            )
-            self._show_message(
-                "Success",
-                "Analysis complete."
-                if pdf_path
-                else "Analysis complete.\nSee the log for the PDF path.",
-                QMessageBox.Icon.Information,
-                detail=pdf_path,
-                detail_label="PDF file",
-            )
-
-        def _on_err(self, msg: str) -> None:
-            self._finalize_thread()
-            self.status_label.setText("Failed.")
-            self._append_log(f"Error: {msg}")
-            self._show_message("Error", msg, QMessageBox.Icon.Critical)
-
-        def _on_interrupted(self, msg: str) -> None:
-            self._finalize_thread()
-            self.status_label.setText("Analysis interrupted.")
-            self._append_log(msg)
-
-        def _show_message(
-            self,
-            title: str,
-            text: str,
-            icon: QMessageBox.Icon,
-            *,
-            detail: str | None = None,
-            detail_label: str | None = None,
-        ) -> None:
-            """Readable modal dialog (avoids broken QMessageBox path layout)."""
-            dlg = QDialog(self)
-            dlg.setWindowTitle(title)
-            dlg.setModal(True)
-            dlg.setMinimumWidth(460)
-            dlg.setMaximumWidth(640)
-            dlg.setObjectName("appMessageDialog")
-            dlg.setStyleSheet(
-                "QDialog#appMessageDialog {"
-                "  background-color: #ffffff;"
-                "  color: #0f172a;"
-                "}"
-                "QDialog#appMessageDialog QLabel {"
-                "  background: transparent;"
-                "  color: #0f172a;"
-                "  font-weight: 500;"
-                "}"
-                "QDialog#appMessageDialog QLabel#msgTitle {"
-                "  font-size: 22px;"
-                "  font-weight: 700;"
-                "  color: #0f172a;"
-                "}"
-                "QDialog#appMessageDialog QLabel#msgBody {"
-                "  font-size: 20px;"
-                "  color: #334155;"
-                "}"
-                "QDialog#appMessageDialog QLabel#msgDetailLabel {"
-                "  font-size: 19px;"
-                "  font-weight: 600;"
-                "  color: #475569;"
-                "}"
-                "QDialog#appMessageDialog QLineEdit {"
-                "  background-color: #f8fafc;"
-                "  color: #0f172a;"
-                "  border: 2px solid #8896ab;"
-                "  border-radius: 8px;"
-                "  padding: 8px 10px;"
-                "  font-size: 19px;"
-                "  selection-background-color: #99f6e4;"
-                "  selection-color: #0f172a;"
-                "}"
-                "QDialog#appMessageDialog QPushButton {"
-                "  background-color: #0f766e;"
-                "  color: #ffffff;"
-                "  border: 2px solid #0d5c56;"
-                "  border-radius: 8px;"
-                "  padding: 8px 22px;"
-                "  font-weight: 700;"
-                "  min-width: 88px;"
-                "}"
-                "QDialog#appMessageDialog QPushButton:hover {"
-                "  background-color: #0d9488;"
-                "}"
-            )
-
-            root = QVBoxLayout(dlg)
-            root.setContentsMargins(20, 18, 20, 16)
-            root.setSpacing(12)
-
-            top = QHBoxLayout()
-            top.setSpacing(14)
-            icon_label = QLabel()
-            icon_label.setFixedSize(36, 36)
-            icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            std = dlg.style()
-            if std is not None:
-                pm = std.standardIcon(self._dialog_icon(icon)).pixmap(36, 36)
-                icon_label.setPixmap(pm)
-            top.addWidget(icon_label, alignment=Qt.AlignmentFlag.AlignTop)
-
-            text_col = QVBoxLayout()
-            text_col.setSpacing(6)
-            title_lbl = QLabel(title)
-            title_lbl.setObjectName("msgTitle")
-            text_col.addWidget(title_lbl)
-            body = QLabel(text)
-            body.setObjectName("msgBody")
-            body.setWordWrap(True)
-            body.setTextInteractionFlags(
-                Qt.TextInteractionFlag.TextSelectableByMouse
-            )
-            text_col.addWidget(body)
-            top.addLayout(text_col, stretch=1)
-            root.addLayout(top)
-
-            if detail:
-                if detail_label:
-                    dl = QLabel(detail_label)
-                    dl.setObjectName("msgDetailLabel")
-                    root.addWidget(dl)
-                path_edit = QLineEdit(detail)
-                path_edit.setReadOnly(True)
-                path_edit.setCursorPosition(0)
-                path_edit.setToolTip(detail)
-                root.addWidget(path_edit)
-
-            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
-            buttons.accepted.connect(dlg.accept)
-            root.addWidget(buttons, alignment=Qt.AlignmentFlag.AlignRight)
-            dlg.exec()
-
-        @staticmethod
-        def _dialog_icon(icon: QMessageBox.Icon):
-            from PySide6.QtWidgets import QStyle
-
-            mapping = {
-                QMessageBox.Icon.Information: QStyle.StandardPixmap.SP_MessageBoxInformation,
-                QMessageBox.Icon.Warning: QStyle.StandardPixmap.SP_MessageBoxWarning,
-                QMessageBox.Icon.Critical: QStyle.StandardPixmap.SP_MessageBoxCritical,
-                QMessageBox.Icon.Question: QStyle.StandardPixmap.SP_MessageBoxQuestion,
-            }
-            return mapping.get(icon, QStyle.StandardPixmap.SP_MessageBoxInformation)
-
-        def _stop_analysis(self) -> None:
-            if self._analysis_thread is not None and self._analysis_thread.isRunning():
-                self._append_log("Stop requested — waiting for checkpoints…")
-                self._analysis_thread.request_stop()
-
-        def _run_analysis(self) -> None:
-            if self._analysis_thread is not None and self._analysis_thread.isRunning():
-                return
-            try:
-                configs = self._build_configs()
-            except Exception as exc:
-                self._append_log(f"Error: {exc}")
-                self._show_message("Validation", str(exc), QMessageBox.Icon.Warning)
-                return
-
-            def task() -> None:
-                if len(configs) == 1:
-                    self._run_callback(configs[0])
-                    return
-                if len(configs) == 2:
-                    self._run_comparison_callback(configs[0], configs[1])
-                    return
-                if self._run_multi_callback is not None:
-                    self._run_multi_callback(configs)
-                    return
-                raise RuntimeError("Multi-file comparison unavailable.")
-
-            thread = AnalysisThread(task)
-            thread.finished_ok.connect(self._on_ok)
-            thread.finished_err.connect(self._on_err)
-            thread.finished_interrupted.connect(self._on_interrupted)
-            self._analysis_thread = thread
-            labels = [
-                resolve_display_label(cfg.rhs_file.stem, cfg.recording_label) for cfg in configs
-            ]
-            self.status_label.setText("Analysis in progress…")
-            self._append_log("Starting: " + " | ".join(labels))
-            out_dir = configs[0].save_dir or configs[0].rhs_file.parent
-            self._append_log(f"PDF folder: {out_dir}")
-            self._set_busy(True)
-            thread.start()
-
-        def closeEvent(self, event) -> None:  # noqa: N802
-            if self._analysis_thread is not None and self._analysis_thread.isRunning():
-                self._append_log("Closing: stopping current processing…")
-                self._analysis_thread.request_stop()
-                self._analysis_thread.wait()
-            super().closeEvent(event)
-
-    window = MainWindow()
+    window = ViewerWindow(defaults, pdf_callback=run_multi_comparison_callback)
     window.show()
+    initial = defaults.get("initial_rhs_files") or []
+    if initial:
+        window.recordings_panel.add_paths(Path(p) for p in initial)
     return app.exec()

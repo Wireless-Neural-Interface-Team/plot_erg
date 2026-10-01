@@ -32,27 +32,27 @@ PANEL_FIELD_NAMES: tuple[str, ...] = (
 )
 
 PANEL_LABELS: dict[str, str] = {
-    "mean_raw": "Raw trial-averaged",
-    "mean_hp": "High-pass trial-averaged",
-    "mean_lp": "Low-pass trial-averaged",
-    "first_trigger_raw": "First stimulation (raw)",
-    "first_trigger_hp": "First stimulation (high-pass)",
-    "first_trigger_lp": "First stimulation (low-pass)",
-    "second_trigger_raw": "Second stimulation (raw)",
-    "second_trigger_hp": "Second stimulation (high-pass)",
-    "second_trigger_lp": "Second stimulation (low-pass)",
-    "rms": "RMS (trial-averaged)",
-    "first_rms": "RMS (first stimulation)",
-    "second_rms": "RMS (second stimulation)",
-    "psth": "PSTH / trial-averaged FR",
-    "first_psth": "PSTH / FR (first stimulation)",
-    "second_psth": "PSTH / FR (second stimulation)",
-    "isi": "ISI (all stimulations)",
-    "first_isi": "ISI (first stimulation)",
-    "second_isi": "ISI (second stimulation)",
-    "trial_rate": "Rate per trial (not averaged)",
-    "raster": "Raster (all stimulations)",
-    "spike_overlay": "Spike overlay (all spikes, end of section)",
+    "mean_raw": "Moyenne d’essais — brut",
+    "mean_hp": "Moyenne d’essais — passe-haut",
+    "mean_lp": "Moyenne d’essais — passe-bas",
+    "first_trigger_raw": "1re stimulation (brut)",
+    "first_trigger_hp": "1re stimulation (passe-haut)",
+    "first_trigger_lp": "1re stimulation (passe-bas)",
+    "second_trigger_raw": "2e stimulation (brut)",
+    "second_trigger_hp": "2e stimulation (passe-haut)",
+    "second_trigger_lp": "2e stimulation (passe-bas)",
+    "rms": "RMS (moyenne d’essais)",
+    "first_rms": "RMS (1re stimulation)",
+    "second_rms": "RMS (2e stimulation)",
+    "psth": "PSTH / FR moyenne",
+    "first_psth": "PSTH / FR (1re stimulation)",
+    "second_psth": "PSTH / FR (2e stimulation)",
+    "isi": "ISI (toutes stimulations)",
+    "first_isi": "ISI (1re stimulation)",
+    "second_isi": "ISI (2e stimulation)",
+    "trial_rate": "Taux par essai (non moyenné)",
+    "raster": "Raster (toutes stimulations)",
+    "spike_overlay": "Superposition de spikes",
 }
 
 # Panels that stay unchecked by default in the Display table.
@@ -140,19 +140,17 @@ class RecordingStyle:
         return cls(plot_visible=True, legend_visible=True)
 
 
-# Named presets offered in the GUI (matplotlib tab10 + Auto).
+# Named presets for GUI recordings.
 RECORDING_COLOR_PRESETS: tuple[tuple[str, str], ...] = (
     ("Auto", ""),
-    ("Blue", "#1f77b4"),
-    ("Orange", "#ff7f0e"),
-    ("Green", "#2ca02c"),
-    ("Red", "#d62728"),
-    ("Purple", "#9467bd"),
-    ("Brown", "#8c564b"),
-    ("Pink", "#e377c2"),
-    ("Gray", "#7f7f7f"),
-    ("Olive", "#bcbd22"),
-    ("Cyan", "#17becf"),
+    ("Blue", "#2563eb"),
+    ("Red", "#dc2626"),
+    ("Green", "#16a34a"),
+    ("Orange", "#ea580c"),
+    ("Purple", "#7c3aed"),
+    ("Cyan", "#0891b2"),
+    ("Yellow", "#ca8a04"),
+    ("Gray", "#4b5563"),
 )
 
 
@@ -165,7 +163,7 @@ def resolve_recording_plot_colors(
     """Resolve one plot color per visible recording (custom or fallback cycle)."""
     cycle = [str(c) for c in (fallback or [hex_ for _, hex_ in RECORDING_COLOR_PRESETS[1:] if hex_])]
     if not cycle:
-        cycle = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+        cycle = ["#2563eb", "#dc2626", "#16a34a", "#ea580c"]
     out: list[str] = []
     for k, idx in enumerate(indices):
         style = styles[int(idx)] if 0 <= int(idx) < len(styles) else None
