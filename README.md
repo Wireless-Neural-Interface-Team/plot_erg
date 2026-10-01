@@ -39,7 +39,8 @@ python src/cli.py "session01.rhs" --save-dir "plots"
 - `--threshold`, `--pre`, `--post`
 - `--zoom-mode`: `none`, `onset`, `trigger_end`, `both`
 - `--zoom-onset-t0-s` / `--zoom-onset-t1-s`, `--zoom-end-t0-s` / `--zoom-end-t1-s`
-- `--intan-spike-filter`, `--intan-filter-type`, `--intan-filter-order`, `--intan-filter-cutoff-hz`
+- `--intan-filter-type`, `--intan-filter-order`, `--intan-filter-cutoff-hz` (HP and LP always both applied separately)
 - `--spike-threshold-mode`, `--psth-bin-window-s`, `--rms-window-s`
+- `--spike-overlay-pre-ms`, `--spike-overlay-post-ms` (overlay window around detection; panel at end of section with all threshold spikes)
 
 Amplifier traces are in **microvolts (µV)**.

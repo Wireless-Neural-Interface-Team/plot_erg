@@ -77,12 +77,15 @@ _BUTTERWORTH_SPECS: dict[int, list[tuple[float, float]]] = {
 
 @dataclass(frozen=True)
 class IntanDspSettings:
-    """Defaults match Intan RHX SystemState (v3.5.1) HIGH filter."""
+    """Defaults match Intan RHX SystemState (v3.5.1) software filters.
+
+    High-pass and low-pass are always computed separately with the same
+    order / prototype / cutoff (never cascaded into a band-pass).
+    """
 
     fs: float
     rhs_version_major: int = 3
     notch_filter_frequency_hz: float = 0.0
-    spike_filter_kind: SpikeFilterKind = "highpass"
     filter_order: int = 2
     filter_type: FilterType = "bessel"
     filter_cutoff_hz: float = 250.0
@@ -107,28 +110,28 @@ class IntanDspSettings:
         order = int(self.filter_order)
         if order < 1 or order > 8:
             raise ValueError("Spike filter order must be between 1 and 8.")
-        kind = self.spike_filter_kind
-        if kind not in ("highpass", "lowpass"):
-            raise ValueError("Spike filter kind must be highpass or lowpass.")
+        if self.filter_type not in ("bessel", "butterworth"):
+            raise ValueError("Filter type must be bessel or butterworth.")
         nyq = float(self.fs) / 2.0
         if fc >= nyq:
             raise ValueError(
                 f"Spike filter cutoff ({fc:g} Hz) must be below Nyquist ({nyq:g} Hz)."
             )
 
-    def filter_pass_label(self) -> str:
-        return "high-pass" if self.spike_filter_kind == "highpass" else "low-pass"
+    @staticmethod
+    def filter_pass_label(kind: SpikeFilterKind) -> str:
+        return "high-pass" if kind == "highpass" else "low-pass"
 
-    def filter_title_label(self) -> str:
+    def filter_title_label(self, kind: SpikeFilterKind = "highpass") -> str:
         """Compact filter description for plot titles (type, pass band, cutoff)."""
         return (
-            f"{self.filter_type} {self.filter_pass_label()} "
+            f"{self.filter_type} {self.filter_pass_label(kind)} "
             f"@ {self.filter_cutoff_hz:g} Hz"
         )
 
-    def filter_short_label(self) -> str:
+    def filter_short_label(self, kind: SpikeFilterKind = "highpass") -> str:
         return (
-            f"{self.filter_type} {self.filter_pass_label()} order {self.filter_order} "
+            f"{self.filter_type} {self.filter_pass_label(kind)} order {self.filter_order} "
             f"@ {self.filter_cutoff_hz:g} Hz"
         )
 
@@ -138,7 +141,6 @@ class IntanDspSettings:
         data: dict[str, Any],
         *,
         spike_threshold_uv: float = -70.0,
-        spike_filter_kind: SpikeFilterKind = "highpass",
         filter_order: int = 2,
         filter_type: FilterType = "bessel",
         filter_cutoff_hz: float = 250.0,
@@ -157,7 +159,6 @@ class IntanDspSettings:
             fs=fs,
             rhs_version_major=major,
             notch_filter_frequency_hz=notch,
-            spike_filter_kind=spike_filter_kind,
             filter_order=int(filter_order),
             filter_type=filter_type,
             filter_cutoff_hz=float(filter_cutoff_hz),
@@ -177,6 +178,7 @@ class IntanDspSettings:
     def load_json(cls, path: Path) -> IntanDspSettings:
         raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
         field_names = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        # Ignore legacy spike_filter_kind (HP+LP are always both computed now).
         filtered = {k: v for k, v in raw.items() if k in field_names}
         settings = cls(**filtered)
         settings.validate_filter()
@@ -318,8 +320,8 @@ def _cascade(signal: np.ndarray, coeffs: list[_BiquadCoeffs]) -> np.ndarray:
 
 def build_intan_filter_sos(
     settings: IntanDspSettings,
-) -> tuple[np.ndarray | None, np.ndarray]:
-    """Precompute SOS sections for notch (optional) + software HP/LP (reuse per channel)."""
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
+    """Precompute SOS: optional notch + separate high-pass and low-pass (same params)."""
     notch_sos: np.ndarray | None = None
     if settings.apply_notch_to_wideband():
         notch_sos = _coeffs_to_sos(
@@ -331,14 +333,15 @@ def build_intan_filter_sos(
                 )
             ]
         )
-    filt_chain = _filter_biquad_chain(
-        settings.spike_filter_kind,
+    common = (
         settings.filter_order,
         settings.filter_cutoff_hz,
         settings.fs,
         settings.filter_type,
     )
-    return notch_sos, _coeffs_to_sos(filt_chain)
+    hp_sos = _coeffs_to_sos(_filter_biquad_chain("highpass", *common))
+    lp_sos = _coeffs_to_sos(_filter_biquad_chain("lowpass", *common))
+    return notch_sos, hp_sos, lp_sos
 
 
 def filter_wideband_with_sos(
@@ -355,30 +358,34 @@ def filter_wideband_with_sos(
 def wideband_to_filtered(
     wideband_uv: np.ndarray,
     settings: IntanDspSettings,
+    *,
+    kind: SpikeFilterKind = "highpass",
 ) -> np.ndarray:
-    """Convert wideband amplifier (µV) to Intan software-filtered waveform (HIGH or LOW)."""
-    notch_sos, filter_sos = build_intan_filter_sos(settings)
-    return filter_wideband_with_sos(wideband_uv, notch_sos, filter_sos)
+    """Convert wideband amplifier (µV) to one Intan software-filtered waveform (HP or LP)."""
+    notch_sos, hp_sos, lp_sos = build_intan_filter_sos(settings)
+    sos = hp_sos if kind == "highpass" else lp_sos
+    return filter_wideband_with_sos(wideband_uv, notch_sos, sos)
 
 
 def wideband_to_high(
     wideband_uv: np.ndarray,
     settings: IntanDspSettings,
 ) -> np.ndarray:
-    """Alias: HIGH path when spike_filter_kind is highpass."""
-    return wideband_to_filtered(wideband_uv, settings)
+    """HIGH (high-pass) path used for spike detection / RMS."""
+    return wideband_to_filtered(wideband_uv, settings, kind="highpass")
 
 
 def write_filtered_stack_channelwise(
     amplifier: np.ndarray,
-    path: Path,
+    high_path: Path,
+    low_path: Path,
     settings: IntanDspSettings,
     *,
     channel_workers: int = 1,
     cancel_check: Any | None = None,
     progress_every: int = 0,
-) -> Path:
-    """Filter wideband to disk per channel (parallel workers, no full output stack in RAM)."""
+) -> tuple[Path, Path]:
+    """Filter wideband to HP + LP memmaps per channel (separate cascades, shared params)."""
     from concurrent.futures import ThreadPoolExecutor
 
     from memmap_io import open_writable_memmap
@@ -388,32 +395,40 @@ def write_filtered_stack_channelwise(
         raise ValueError("write_filtered_stack_channelwise expects [n_channels, n_samples].")
     n_ch, n_samp = int(arr.shape[0]), int(arr.shape[1])
     workers = max(1, min(int(channel_workers), 16, n_ch))
-    out = open_writable_memmap(path, (n_ch, n_samp), np.dtype(np.float32))
-    notch_sos, filter_sos = build_intan_filter_sos(settings)
+    high_out = open_writable_memmap(high_path, (n_ch, n_samp), np.dtype(np.float32))
+    low_out = open_writable_memmap(low_path, (n_ch, n_samp), np.dtype(np.float32))
+    notch_sos, hp_sos, lp_sos = build_intan_filter_sos(settings)
 
-    def _one(ch: int) -> tuple[int, np.ndarray]:
+    def _one(ch: int) -> tuple[int, np.ndarray, np.ndarray]:
         if cancel_check is not None:
             cancel_check()
-        filtered = filter_wideband_with_sos(np.asarray(arr[ch], dtype=np.float64), notch_sos, filter_sos)
-        return ch, np.asarray(filtered, dtype=np.float32)
+        row = np.asarray(arr[ch], dtype=np.float64)
+        if notch_sos is not None:
+            row = sosfilt(notch_sos, row)
+        hi = sosfilt(hp_sos, row)
+        lo = sosfilt(lp_sos, row)
+        return ch, np.asarray(hi, dtype=np.float32), np.asarray(lo, dtype=np.float32)
 
     try:
         if workers <= 1 or n_ch == 1:
             for ch in range(n_ch):
-                _, row = _one(ch)
-                out[ch] = row
+                _, hi_row, lo_row = _one(ch)
+                high_out[ch] = hi_row
+                low_out[ch] = lo_row
                 if progress_every > 0 and (ch + 1) % progress_every == 0:
-                    print(f"  filter → {path.name}: channel {ch + 1}/{n_ch}")
+                    print(f"  filter → HP+LP: channel {ch + 1}/{n_ch}")
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                for ch, row in pool.map(_one, range(n_ch)):
-                    out[ch] = row
+                for ch, hi_row, lo_row in pool.map(_one, range(n_ch)):
+                    high_out[ch] = hi_row
+                    low_out[ch] = lo_row
             if progress_every > 0:
-                print(f"  filter → {path.name}: {n_ch} channels ({workers} workers)")
-        out.flush()
+                print(f"  filter → HP+LP: {n_ch} channels ({workers} workers)")
+        high_out.flush()
+        low_out.flush()
     finally:
-        del out
-    return path
+        del high_out, low_out
+    return high_path, low_path
 
 
 def rms_intan_at_index(high: np.ndarray, end_index: int, settings: IntanDspSettings) -> float:

@@ -48,7 +48,7 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple:
     work_dir = resolve_work_dir(config)
     intan_dsp = build_intan_dsp_settings(data, config)
     stack_shape = (int(amplifier_raw.shape[0]), int(amplifier_raw.shape[1]))
-    amp_path, _ = persist_amp_and_filtered_stacks(
+    amp_path, _, _ = persist_amp_and_filtered_stacks(
         work_dir,
         intan_dsp,
         stack_shape,
@@ -167,12 +167,21 @@ def parse_args() -> argparse.Namespace:
         help="PSTH time window (s) used for each PSTH point.",
     )
     parser.add_argument(
-        "--spike-scope-tscale-ms",
+        "--spike-overlay-pre-ms",
         type=float,
-        default=defaults.spike_scope_tscale_ms,
+        default=defaults.spike_overlay_pre_ms,
         help=(
-            "Intan Spike Scope time scale T in ms (2, 4, 6, 10, 16, or 20). "
-            "Overlay window is [-T/2, +T] around detection (default: 4 → −2 to +4 ms)."
+            "Spike overlay window start before detection (ms, default: 2). "
+            "Displayed interval is [-pre, +post] around the threshold crossing."
+        ),
+    )
+    parser.add_argument(
+        "--spike-overlay-post-ms",
+        type=float,
+        default=defaults.spike_overlay_post_ms,
+        help=(
+            "Spike overlay window end after detection (ms, default: 4). "
+            "Displayed interval is [-pre, +post] around the threshold crossing."
         ),
     )
     parser.add_argument(
@@ -230,28 +239,22 @@ def parse_args() -> argparse.Namespace:
         help="RMS computation window (s) for moving-RMS profile.",
     )
     parser.add_argument(
-        "--intan-spike-filter",
-        choices=("highpass", "lowpass"),
-        default=defaults.intan_spike_filter_kind,
-        help="Intan software filter for raster/PSTH/ISI (default: highpass).",
-    )
-    parser.add_argument(
         "--intan-filter-order",
         type=int,
         default=defaults.intan_filter_order,
-        help="Intan software filter order 1–8 (default: 2).",
+        help="Intan software filter order 1–8 for both HP and LP (default: 2).",
     )
     parser.add_argument(
         "--intan-filter-type",
         choices=("bessel", "butterworth"),
         default=defaults.intan_filter_type,
-        help="Intan filter prototype: bessel or butterworth (default: bessel).",
+        help="Intan filter prototype for both HP and LP: bessel or butterworth (default: bessel).",
     )
     parser.add_argument(
         "--intan-filter-cutoff-hz",
         type=float,
         default=defaults.intan_filter_cutoff_hz,
-        help="Intan software filter cutoff in Hz (default: 250).",
+        help="Intan HP and LP cutoff in Hz (default: 250).",
     )
     parser.add_argument(
         "--work-dir",
@@ -331,10 +334,9 @@ def run(config: AnalysisConfig) -> None:
     if config.edge == "none":
         print("Segmentation: equal sections with imaginary stimulation window")
     print(
-        "Mean traces in PDF: raw amplifier + Intan software filter "
-        f"({config.intan_filter_type} "
-        f"{'HP' if config.intan_spike_filter_kind == 'highpass' else 'LP'} "
-        f"{config.intan_filter_cutoff_hz:g} Hz, order {config.intan_filter_order})"
+        "Mean traces in PDF: raw + separate Intan HP and LP "
+        f"({config.intan_filter_type} @ {config.intan_filter_cutoff_hz:g} Hz, "
+        f"order {config.intan_filter_order})"
     )
     print(f"PDF written: {pdf_path}")
     print(f"Compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
@@ -367,10 +369,9 @@ def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
     print(f"A/B compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
     print(f"A/B PDF render time: {stats['t_render_s']:.2f} s")
     print(
-        "Mean traces in PDF: raw amplifier + Intan software filter "
-        f"({config_a.intan_filter_type} "
-        f"{'HP' if config_a.intan_spike_filter_kind == 'highpass' else 'LP'} "
-        f"{config_a.intan_filter_cutoff_hz:g} Hz, order {config_a.intan_filter_order})"
+        "Mean traces in PDF: raw + separate Intan HP and LP "
+        f"({config_a.intan_filter_type} @ {config_a.intan_filter_cutoff_hz:g} Hz, "
+        f"order {config_a.intan_filter_order})"
     )
     print(f"Comparison PDF written: {pdf_path}")
     print(f"Total time (comparison + PDF): {stats['t_total_s']:.2f} s")
@@ -504,6 +505,7 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             work = Path(amp_path).parent
             amp_mm = load_readonly_memmap(Path(amp_path))
             high_mm = load_readonly_memmap(work / "high_intan.npy")
+            low_mm = load_readonly_memmap(work / "low_intan.npy")
             from intan_rhx_dsp import IntanDspSettings
 
             intan_dsp = IntanDspSettings.load_json(work / "intan_dsp.json")
@@ -511,6 +513,7 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
                 AmplifierSpikeSource(
                     amplifier=amp_mm,
                     highpass=high_mm,
+                    lowpass=low_mm,
                     valid_triggers=valid_triggers,
                     pre_n=int(pre_n),
                     post_n=int(post_n),
@@ -559,7 +562,8 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             spike_threshold_polarity=tuned[0].spike_threshold_polarity,
             spike_threshold_mode=tuned[0].spike_threshold_mode,
             spike_threshold_rms_multiplier=tuned[0].spike_threshold_rms_multiplier,
-            spike_scope_tscale_ms=tuned[0].spike_scope_tscale_ms,
+            spike_overlay_pre_ms=tuned[0].spike_overlay_pre_ms,
+            spike_overlay_post_ms=tuned[0].spike_overlay_post_ms,
             psth_bin_window_s=tuned[0].psth_bin_window_s,
             rms_window_s=tuned[0].rms_window_s,
             zoom_mode=tuned[0].zoom_mode,
@@ -632,14 +636,14 @@ def main() -> None:
         spike_threshold_mode=args.spike_threshold_mode,
         spike_threshold_rms_multiplier=args.spike_threshold_rms_multiplier,
         psth_bin_window_s=args.psth_bin_window_s,
-        spike_scope_tscale_ms=args.spike_scope_tscale_ms,
+        spike_overlay_pre_ms=args.spike_overlay_pre_ms,
+        spike_overlay_post_ms=args.spike_overlay_post_ms,
         rms_window_s=args.rms_window_s,
         zoom_mode=args.zoom_mode,
         zoom_onset_t0_s=args.zoom_onset_t0_s,
         zoom_onset_t1_s=args.zoom_onset_t1_s,
         zoom_end_t0_s=args.zoom_end_t0_s,
         zoom_end_t1_s=args.zoom_end_t1_s,
-        intan_spike_filter_kind=args.intan_spike_filter,
         intan_filter_order=args.intan_filter_order,
         intan_filter_type=args.intan_filter_type,
         intan_filter_cutoff_hz=args.intan_filter_cutoff_hz,
@@ -687,11 +691,11 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    if float(config.spike_scope_tscale_ms) not in (2.0, 4.0, 6.0, 10.0, 16.0, 20.0):
-        print(
-            "Error: --spike-scope-tscale-ms must be one of 2, 4, 6, 10, 16, 20.",
-            file=sys.stderr,
-        )
+    if float(config.spike_overlay_pre_ms) < 0:
+        print("Error: --spike-overlay-pre-ms must be >= 0.", file=sys.stderr)
+        sys.exit(2)
+    if float(config.spike_overlay_post_ms) <= 0:
+        print("Error: --spike-overlay-post-ms must be > 0.", file=sys.stderr)
         sys.exit(2)
     try:
         run(config)

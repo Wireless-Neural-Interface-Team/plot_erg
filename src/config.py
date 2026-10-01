@@ -9,7 +9,6 @@ from display_config import PlotDisplaySettings, RecordingStyle, ZoomMode
 EdgeKind = Literal["falling", "rising", "none"]
 SpikeThresholdMode = Literal["fixed", "rms_multiple"]
 SpikeThresholdPolarity = Literal["negative", "positive"]
-SpikeFilterKind = Literal["highpass", "lowpass"]
 IntanFilterType = Literal["bessel", "butterworth"]
 SectionSpecKind = Literal["count", "duration"]
 
@@ -33,8 +32,9 @@ class AnalysisConfig:
     spike_threshold_mode: SpikeThresholdMode = "fixed"
     spike_threshold_rms_multiplier: float = 4.0
     psth_bin_window_s: float = 0.050
-    # Intan Spike Scope time scale T (ms): display window is [-T/2, +T] around detection.
-    spike_scope_tscale_ms: float = 4.0
+    # Spike overlay window around detection (ms): [-pre, +post].
+    spike_overlay_pre_ms: float = 2.0
+    spike_overlay_post_ms: float = 4.0
     # Zoom: mode selects which temporal sections are rendered in the PDF.
     zoom_mode: ZoomMode = "both"
     zoom_onset_t0_s: float = -0.1
@@ -45,7 +45,7 @@ class AnalysisConfig:
     first_trigger_hp_ylim_min_uv: float = -200.0
     first_trigger_hp_ylim_max_uv: float = 200.0
     rms_window_s: float = 1.0
-    intan_spike_filter_kind: SpikeFilterKind = "highpass"
+    # HP and LP are always both applied separately (same order/type/cutoff).
     intan_filter_order: int = 2
     intan_filter_type: IntanFilterType = "bessel"
     intan_filter_cutoff_hz: float = 250.0

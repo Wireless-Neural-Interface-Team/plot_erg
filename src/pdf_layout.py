@@ -21,6 +21,11 @@ PT_IN = 1.0 / 72.0
 SlotKind = Literal["header", "mea", "plot"]
 ExtraBelow = Literal["none", "psth_table"]
 
+# Vertical gap (inches) after each slot, before the next graph/title.
+SLOT_GAP_IN = 0.42
+MEA_SLOT_GAP_IN = 0.32
+HEADER_SLOT_GAP_IN = 0.10
+
 
 @dataclass(frozen=True)
 class LayoutFonts:
@@ -102,18 +107,18 @@ def table_block_in(fonts: LayoutFonts, n_data_rows: int) -> float:
 
 def title_block_in(fonts: LayoutFonts, *, mea: bool = False) -> float:
     size = fonts.mea_title if mea else fonts.axis_title
-    return text_height_in(size, 1.2) + 0.10
+    return text_height_in(size, 1.2) + 0.16
 
 
 def header_block_in(fonts: LayoutFonts) -> float:
-    return text_height_in(fonts.section_header, 1.25) + 0.10
+    return text_height_in(fonts.section_header, 1.25) + 0.14
 
 
 def slot_below_in(slot: Slot, fonts: LayoutFonts, n_legend_rows: int) -> float:
     if slot.kind == "header":
-        return 0.04
+        return HEADER_SLOT_GAP_IN
     if slot.kind == "mea":
-        return 0.12
+        return MEA_SLOT_GAP_IN
     below = xlabel_block_in(fonts)
     extras: list[float] = []
     if slot.has_legend:
@@ -122,7 +127,7 @@ def slot_below_in(slot: Slot, fonts: LayoutFonts, n_legend_rows: int) -> float:
         extras.append(table_block_in(fonts, slot.table_rows or n_legend_rows))
     if extras:
         below += max(extras)
-    return below + 0.16
+    return below + SLOT_GAP_IN
 
 
 def slot_above_in(slot: Slot, fonts: LayoutFonts) -> float:

@@ -25,7 +25,6 @@ from intan_rhx_dsp import (
     IntanDspSettings,
     build_intan_filter_sos,
     detect_spikes_intan,
-    filter_wideband_with_sos,
     mean_rms_intan_channel,
     write_filtered_stack_channelwise,
 )
@@ -359,12 +358,13 @@ def cleanup_plot_erg_root_if_empty(work_dir: Path | None) -> None:
 
 
 class AmplifierSpikeSource:
-    """Per-trigger windows on Intan RHX HIGH waveforms (spikeplot / cpuinterface)."""
+    """Per-trigger windows on Intan RHX waveforms (spikes on HIGH / high-pass)."""
 
     def __init__(
         self,
         amplifier: np.ndarray,
         highpass: np.ndarray,
+        lowpass: np.ndarray,
         valid_triggers: np.ndarray,
         pre_n: int,
         post_n: int,
@@ -373,6 +373,7 @@ class AmplifierSpikeSource:
     ) -> None:
         self.amplifier = amplifier
         self.highpass = highpass
+        self.lowpass = lowpass
         self.valid_triggers = np.asarray(valid_triggers, dtype=np.int64)
         self.pre_n = pre_n
         self.post_n = post_n
@@ -383,8 +384,12 @@ class AmplifierSpikeSource:
         self._closed = False
 
     def _high_row(self, ch: int) -> np.ndarray:
-        """1D mmap/view for one channel (no full-row copy)."""
+        """1D mmap/view for one high-pass channel (no full-row copy)."""
         return self.highpass[ch]
+
+    def _low_row(self, ch: int) -> np.ndarray:
+        """1D mmap/view for one low-pass channel (no full-row copy)."""
+        return self.lowpass[ch]
 
     def _amp_row(self, ch: int) -> np.ndarray:
         """1D mmap/view for one amplifier channel (no full-row copy)."""
@@ -420,7 +425,7 @@ class AmplifierSpikeSource:
         t_range_s: tuple[float, float] | None = None,
         trigger_index: int | None = None,
     ) -> list[np.ndarray]:
-        """Detect spikes per trial on filtered trace, optionally limited to ``t_range_s``.
+        """Detect spikes per trial on high-pass trace, optionally limited to ``t_range_s``.
 
         ``t_range_s`` is (t0, t1) in seconds relative to stimulation. When omitted,
         detection uses the full pre/post trial window.
@@ -476,14 +481,14 @@ class AmplifierSpikeSource:
         return spike_times_by_trial
 
     def mean_rms_for_channel(self, ch: int) -> float:
-        """RMS over the last 1 s of filtered trace (Spike Scope, spikeplot.cpp)."""
+        """RMS over the last 1 s of high-pass trace (Spike Scope, spikeplot.cpp)."""
         return mean_rms_intan_channel(self._high_row(ch), self.intan_dsp)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        for arr in (self.amplifier, self.highpass):
+        for arr in (self.amplifier, self.highpass, self.lowpass):
             try:
                 if isinstance(arr, np.memmap):
                     arr._mmap.close()
@@ -491,6 +496,7 @@ class AmplifierSpikeSource:
                 pass
         self.amplifier = np.empty((0,))
         self.highpass = np.empty((0,))
+        self.lowpass = np.empty((0,))
         if self.work_dir is not None and self.work_dir.exists():
             shutil.rmtree(self.work_dir, ignore_errors=True)
             cleanup_plot_erg_root_if_empty(self.work_dir)
@@ -540,16 +546,19 @@ def intan_memmap_cache_valid(
     intan_dsp: IntanDspSettings,
     shape: tuple[int, int],
 ) -> bool:
-    """True when on-disk amplifier + filtered stacks match current DSP settings."""
+    """True when on-disk amplifier + HP/LP filtered stacks match current DSP settings."""
     amp_path = work_dir / "amplifier_raw.npy"
     high_path = work_dir / "high_intan.npy"
+    low_path = work_dir / "low_intan.npy"
     json_path = work_dir / "intan_dsp.json"
-    if not (amp_path.exists() and high_path.exists() and json_path.exists()):
+    if not (amp_path.exists() and high_path.exists() and low_path.exists() and json_path.exists()):
         return False
     try:
         if tuple(np.load(amp_path, mmap_mode="r").shape) != shape:
             return False
         if tuple(np.load(high_path, mmap_mode="r").shape) != shape:
+            return False
+        if tuple(np.load(low_path, mmap_mode="r").shape) != shape:
             return False
         return IntanDspSettings.load_json(json_path) == intan_dsp
     except Exception:
@@ -564,68 +573,85 @@ def persist_amp_and_filtered_stacks(
     amplifier_2d: np.ndarray | None = None,
     amplifier_memmap: np.memmap | None = None,
     channel_workers: int | None = None,
-) -> tuple[Path, Path]:
-    """One pass per channel: write amplifier_raw + high_intan (fast SOS filter)."""
+) -> tuple[Path, Path, Path]:
+    """One pass per channel: write amplifier_raw + high_intan + low_intan (separate SOS)."""
     from memmap_io import open_writable_memmap
 
     amp_path = work_dir / "amplifier_raw.npy"
     high_path = work_dir / "high_intan.npy"
+    low_path = work_dir / "low_intan.npy"
 
     if intan_memmap_cache_valid(work_dir, intan_dsp, shape):
         print("Reusing cached amplifier / filtered memmaps (.plot_erg).")
-        return amp_path, high_path
+        return amp_path, high_path, low_path
 
     intan_dsp.save_json(work_dir / "intan_dsp.json")
 
     n_ch, n_samp = int(shape[0]), int(shape[1])
     workers = resolve_channel_workers(channel_workers, n_ch)
-    notch_sos, filter_sos = build_intan_filter_sos(intan_dsp)
+    notch_sos, hp_sos, lp_sos = build_intan_filter_sos(intan_dsp)
     progress_every = max(1, n_ch // 10) if n_ch >= 20 else 0
 
     if amplifier_2d is not None:
         src = np.asarray(amplifier_2d)
         amp_mm = open_writable_memmap(amp_path, (n_ch, n_samp), np.dtype(np.float32))
         high_mm = open_writable_memmap(high_path, (n_ch, n_samp), np.dtype(np.float32))
-        print(f"Writing amplifier + Intan filter ({workers} worker(s), fused pass)...")
+        low_mm = open_writable_memmap(low_path, (n_ch, n_samp), np.dtype(np.float32))
+        print(f"Writing amplifier + Intan HP/LP ({workers} worker(s), fused pass)...")
 
-        def _fused(ch: int) -> tuple[int, np.ndarray, np.ndarray]:
+        from scipy.signal import sosfilt
+
+        def _fused(ch: int) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
             check_analysis_cancelled()
             row = np.asarray(src[ch], dtype=np.float32)
-            filtered = filter_wideband_with_sos(row, notch_sos, filter_sos)
-            return ch, row, np.asarray(filtered, dtype=np.float32)
+            x = np.asarray(row, dtype=np.float64)
+            if notch_sos is not None:
+                x = sosfilt(notch_sos, x)
+            hi = sosfilt(hp_sos, x)
+            lo = sosfilt(lp_sos, x)
+            return (
+                ch,
+                row,
+                np.asarray(hi, dtype=np.float32),
+                np.asarray(lo, dtype=np.float32),
+            )
 
         try:
             if workers <= 1 or n_ch == 1:
                 for ch in range(n_ch):
-                    _, amp_row, hi_row = _fused(ch)
+                    _, amp_row, hi_row, lo_row = _fused(ch)
                     amp_mm[ch] = amp_row
                     high_mm[ch] = hi_row
+                    low_mm[ch] = lo_row
                     if progress_every > 0 and (ch + 1) % progress_every == 0:
                         print(f"  fused pass: channel {ch + 1}/{n_ch}")
             else:
                 with ThreadPoolExecutor(max_workers=workers) as pool:
-                    for ch, amp_row, hi_row in pool.map(_fused, range(n_ch)):
+                    for ch, amp_row, hi_row, lo_row in pool.map(_fused, range(n_ch)):
                         amp_mm[ch] = amp_row
                         high_mm[ch] = hi_row
+                        low_mm[ch] = lo_row
                 if progress_every > 0:
                     print(f"  fused pass: {n_ch} channels ({workers} workers)")
             amp_mm.flush()
             high_mm.flush()
+            low_mm.flush()
         finally:
-            del amp_mm, high_mm
-        return amp_path, high_path
+            del amp_mm, high_mm, low_mm
+        return amp_path, high_path, low_path
 
     if amplifier_memmap is not None:
-        print(f"Computing Intan software filter ({workers} worker(s), channel batches)...")
+        print(f"Computing Intan HP+LP software filters ({workers} worker(s), channel batches)...")
         write_filtered_stack_channelwise(
             amplifier_memmap,
             high_path,
+            low_path,
             intan_dsp,
             channel_workers=workers,
             cancel_check=check_analysis_cancelled,
             progress_every=progress_every,
         )
-        return amp_path, high_path
+        return amp_path, high_path, low_path
 
     raise ValueError("persist_amp_and_filtered_stacks requires amplifier_2d or amplifier_memmap.")
 
@@ -638,7 +664,6 @@ def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> In
             config.spike_threshold_uv,
             config.spike_threshold_polarity,
         ),
-        spike_filter_kind=config.intan_spike_filter_kind,  # type: ignore[arg-type]
         filter_order=int(config.intan_filter_order),
         filter_type=config.intan_filter_type,  # type: ignore[arg-type]
         filter_cutoff_hz=float(config.intan_filter_cutoff_hz),
@@ -657,14 +682,15 @@ def persist_intan_high_stack(
     amplifier_memmap: np.memmap | None = None,
     intan_dsp: IntanDspSettings | None = None,
     channel_workers: int | None = None,
-) -> tuple[Path, Path, IntanDspSettings]:
-    """Write wideband + filtered Intan stacks under work_dir (channel batches)."""
+) -> tuple[Path, Path, Path, IntanDspSettings]:
+    """Write wideband + HP + LP Intan stacks under work_dir (channel batches)."""
     if intan_dsp is None:
         if data is None or config is None:
             raise ValueError("data and config are required when intan_dsp is not provided.")
         intan_dsp = build_intan_dsp_settings(data, config)
     amp_path = work_dir / "amplifier_raw.npy"
     high_path = work_dir / "high_intan.npy"
+    low_path = work_dir / "low_intan.npy"
     intan_dsp.save_json(work_dir / "intan_dsp.json")
     check_analysis_cancelled()
 
@@ -696,7 +722,7 @@ def persist_intan_high_stack(
         )
     else:
         raise ValueError("amplifier_2d or amplifier_memmap is required.")
-    return amp_path, high_path, intan_dsp
+    return amp_path, high_path, low_path, intan_dsp
 
 
 def extract_triggered_windows(

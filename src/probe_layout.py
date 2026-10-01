@@ -73,9 +73,8 @@ def _contact_name_matches_rhs(cid: str, channel_name: str) -> bool:
     return False
 
 
-def load_probe_layout_json(path: Path) -> ProbeLayout:
-    """Read a probeinterface JSON (``probes`` key). Raises if invalid."""
-    raw = json.loads(path.read_text(encoding="utf-8"))
+def _load_probeinterface(raw: dict[str, Any]) -> ProbeLayout:
+    """Parse probeinterface format (``probes[0].contact_positions``)."""
     probes = raw.get("probes")
     if not isinstance(probes, list) or not probes:
         raise ValueError("Probe JSON: missing or empty 'probes' section.")
@@ -108,6 +107,43 @@ def load_probe_layout_json(path: Path) -> ProbeLayout:
         contact_ids=tuple(ids),
         device_channel_indices=tuple(devs),
     )
+
+
+def _load_mea_editor(raw: dict[str, Any]) -> ProbeLayout:
+    """Parse mea_editor format (``electrodes`` list with ``x``, ``y``, ``intan_id``)."""
+    electrodes = raw.get("electrodes")
+    if not isinstance(electrodes, list) or not electrodes:
+        raise ValueError("MEA editor JSON: missing or empty 'electrodes' list.")
+    positions: list[list[float]] = []
+    ids: list[str] = []
+    devs: list[int | None] = []
+    for elec in electrodes:
+        if not isinstance(elec, dict):
+            continue
+        x = elec.get("x")
+        y = elec.get("y")
+        if x is None or y is None:
+            continue
+        positions.append([float(x), float(y)])
+        intan_id = str(elec.get("intan_id", "")).strip()
+        ids.append(intan_id if intan_id else f"NC-{elec.get('eid', len(ids))}")
+        devs.append(_as_int_or_none(elec.get("potentiostat_id")))
+    if not positions:
+        raise ValueError("MEA editor JSON: no valid electrodes found.")
+    arr = np.asarray(positions, dtype=np.float64)
+    return ProbeLayout(
+        positions_um=np.ascontiguousarray(arr),
+        contact_ids=tuple(ids),
+        device_channel_indices=tuple(devs),
+    )
+
+
+def load_probe_layout_json(path: Path) -> ProbeLayout:
+    """Read a probe JSON file. Supports both probeinterface and mea_editor formats."""
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if raw.get("specification") == "mea_editor" or "electrodes" in raw:
+        return _load_mea_editor(raw)
+    return _load_probeinterface(raw)
 
 
 def match_contact_index(layout: ProbeLayout, channel_name: str) -> int | None:

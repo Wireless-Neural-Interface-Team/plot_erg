@@ -13,6 +13,7 @@ from display_config import (
     PANEL_FIELD_NAMES,
     PANEL_LABELS,
     PlotDisplaySettings,
+    RECORDING_COLOR_PRESETS,
     RecordingStyle,
     SectionPanels,
     resolve_display_label,
@@ -110,7 +111,7 @@ def launch_qt_gui(
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle("Intan RHS Stimulation Plotter")
-            self.resize(1040, 820)
+            self.resize(1100, 920)
             self._run_callback = run_callback
             self._run_comparison_callback = run_comparison_callback
             self._run_multi_callback = run_multi_comparison_callback
@@ -122,12 +123,19 @@ def launch_qt_gui(
             self._trigger_form: QFormLayout | None = None
             self._file_rows: list[MainWindow.FileEntryRow] = []
             self._display_checkboxes: dict[str, dict[str, QCheckBox]] = {}
+            self._column_master_checks: dict[str, QCheckBox] = {}
             self._last_auto_pdf_title: str = ""
             self._build_ui()
             self._apply_defaults(defaults)
 
         class FileEntryRow(QWidget):
-            def __init__(self, outer: MainWindow, *, initial_path: str = "") -> None:
+            def __init__(
+                self,
+                outer: MainWindow,
+                *,
+                initial_path: str = "",
+                default_color_hex: str = "",
+            ) -> None:
                 super().__init__()
                 self.outer = outer
                 self.setObjectName("fileEntryRow")
@@ -138,6 +146,19 @@ def launch_qt_gui(
                 self.path_edit.setPlaceholderText("Path to .rhs file")
                 self.legend_edit = QLineEdit()
                 self.legend_edit.setPlaceholderText("Custom legend (empty = file name)")
+                self.color_combo = QComboBox()
+                self.color_combo.setMinimumWidth(110)
+                self.color_combo.setToolTip("Curve color for this recording in multi-trace plots")
+                for name, hex_color in RECORDING_COLOR_PRESETS:
+                    self.color_combo.addItem(name, hex_color)
+                preset_idx = 0
+                if default_color_hex:
+                    for i in range(self.color_combo.count()):
+                        if str(self.color_combo.itemData(i) or "") == default_color_hex:
+                            preset_idx = i
+                            break
+                self.color_combo.setCurrentIndex(preset_idx)
+                self.color_combo.currentIndexChanged.connect(self._refresh_color_swatch)
                 self.plot_check = QCheckBox("Plot")
                 self.plot_check.setChecked(True)
                 self.plot_check.setToolTip("Show plots for this recording")
@@ -152,12 +173,25 @@ def launch_qt_gui(
                 remove_btn.clicked.connect(self._remove)
                 self.path_edit.textChanged.connect(outer._on_files_changed)
                 self.legend_edit.textChanged.connect(outer._on_files_changed)
+                self.color_combo.currentIndexChanged.connect(outer._on_files_changed)
                 layout.addWidget(self.path_edit, stretch=3)
                 layout.addWidget(self.legend_edit, stretch=2)
+                layout.addWidget(self.color_combo)
                 layout.addWidget(self.plot_check)
                 layout.addWidget(self.legend_check)
                 layout.addWidget(browse_btn)
                 layout.addWidget(remove_btn)
+                self._refresh_color_swatch()
+
+            def _refresh_color_swatch(self) -> None:
+                hex_color = str(self.color_combo.currentData() or "").strip()
+                if hex_color:
+                    self.color_combo.setStyleSheet(
+                        f"QComboBox {{ border: 2px solid {hex_color}; "
+                        f"padding-left: 4px; }}"
+                    )
+                else:
+                    self.color_combo.setStyleSheet("")
 
             def _browse(self) -> None:
                 selected, _ = QFileDialog.getOpenFileName(
@@ -178,9 +212,11 @@ def launch_qt_gui(
                 return self.path_edit.text().strip()
 
             def style(self) -> RecordingStyle:
+                color = str(self.color_combo.currentData() or "").strip() or None
                 return RecordingStyle(
                     plot_visible=self.plot_check.isChecked(),
                     legend_visible=self.legend_check.isChecked(),
+                    color=color,
                 )
 
             def label(self) -> str | None:
@@ -241,15 +277,20 @@ def launch_qt_gui(
             layout.setContentsMargins(16, 16, 16, 16)
             layout.setSpacing(10)
             info = QLabel(
-                "Add recordings to compare. Set a custom legend "
-                "and control plot and legend entry visibility."
+                "Add recordings to compare. Set a custom legend, curve color "
+                "(blue, orange, …), and plot/legend visibility."
             )
             info.setObjectName("hintLabel")
             info.setWordWrap(True)
             layout.addWidget(info)
 
             header = QHBoxLayout()
-            for text, stretch in ((".rhs file", 3), ("Legend", 2), ("Display", 1)):
+            for text, stretch in (
+                (".rhs file", 3),
+                ("Legend", 2),
+                ("Color", 1),
+                ("Display", 1),
+            ):
                 lbl = QLabel(text)
                 lbl.setObjectName("columnHeader")
                 header.addWidget(lbl, stretch)
@@ -378,9 +419,6 @@ def launch_qt_gui(
             form.setContentsMargins(16, 16, 16, 16)
             form.setSpacing(12)
             form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            self.filter_kind_combo = QComboBox()
-            self.filter_kind_combo.addItem("High-pass", "highpass")
-            self.filter_kind_combo.addItem("Low-pass", "lowpass")
             self.filter_type_combo = QComboBox()
             self.filter_type_combo.addItem("Bessel", "bessel")
             self.filter_type_combo.addItem("Butterworth", "butterworth")
@@ -388,7 +426,12 @@ def launch_qt_gui(
             self.filter_cutoff_spin = _spin(
                 defaults.get("default_intan_filter_cutoff_hz", 250.0), minimum=0.1, maximum=50000.0, decimals=1
             )
-            form.addRow("Filter type (HP/LP):", self.filter_kind_combo)
+            note = QLabel(
+                "High-pass and low-pass are always both applied separately "
+                "(same cutoff, order, and prototype — never cascaded)."
+            )
+            note.setWordWrap(True)
+            form.addRow(note)
             form.addRow("Prototype:", self.filter_type_combo)
             form.addRow("Order (1–8):", self.filter_order_spin)
             form.addRow("Cutoff frequency (Hz):", self.filter_cutoff_spin)
@@ -421,25 +464,32 @@ def launch_qt_gui(
             form.addRow(self.spike_rms_label, self.spike_rms_mult_spin)
             form.addRow("PSTH window (s):", self.psth_bin_spin)
             form.addRow("RMS window (s):", self.rms_window_spin)
-            self.spike_scope_tscale_combo = QComboBox()
-            default_tscale = int(round(float(defaults.get("default_spike_scope_tscale_ms", 4.0))))
-            for ms in (2, 4, 6, 10, 16, 20):
-                tmin = -ms / 2.0
-                self.spike_scope_tscale_combo.addItem(
-                    f"{ms} ms  (−{abs(tmin):g} to +{ms:g} ms around detection)",
-                    ms,
-                )
-            tscale_idx = self.spike_scope_tscale_combo.findData(default_tscale)
-            if tscale_idx >= 0:
-                self.spike_scope_tscale_combo.setCurrentIndex(tscale_idx)
-            self.spike_scope_tscale_combo.setToolTip(
-                "Intan RHX Spike Scope time scale T: the overlay window is "
-                "[−T/2, +T] ms around the threshold crossing."
+            self.spike_overlay_pre_spin = _spin(
+                defaults.get("default_spike_overlay_pre_ms", 2.0),
+                minimum=0.0,
+                maximum=500.0,
+                decimals=2,
+                step=0.5,
             )
-            form.addRow("Spike Scope time scale:", self.spike_scope_tscale_combo)
+            self.spike_overlay_post_spin = _spin(
+                defaults.get("default_spike_overlay_post_ms", 4.0),
+                minimum=0.1,
+                maximum=500.0,
+                decimals=2,
+                step=0.5,
+            )
+            self.spike_overlay_pre_spin.setToolTip(
+                "Time before threshold crossing shown in the spike overlay (ms)."
+            )
+            self.spike_overlay_post_spin.setToolTip(
+                "Time after threshold crossing shown in the spike overlay (ms)."
+            )
+            form.addRow("Overlay — before detection (ms):", self.spike_overlay_pre_spin)
+            form.addRow("Overlay — after detection (ms):", self.spike_overlay_post_spin)
             overlay_hint = QLabel(
                 "Show or hide superimposed waveforms per section in the Display tab "
-                "(row “Spike overlay”, under First/Second stimulation raw)."
+                "(row “Spike overlay”, at the end of each section: all spikes detected "
+                "with the threshold across all stimulations)."
             )
             overlay_hint.setObjectName("hintLabel")
             overlay_hint.setWordWrap(True)
@@ -489,6 +539,7 @@ def launch_qt_gui(
             hint = QLabel(
                 "This tab is the only place to choose what appears in the PDF. "
                 "Uncheck every box in a zoom column to omit that section. "
+                "Use the column master checkboxes to toggle a whole zoom column. "
                 "Zoom time windows are set in the Zoom tab."
             )
             hint.setObjectName("hintLabel")
@@ -502,31 +553,71 @@ def launch_qt_gui(
             self.impedance_check.setChecked(True)
             self.summary_rms_check = QCheckBox("RMS summary page")
             self.summary_rms_check.setChecked(True)
+            self.summary_rms_table_check = QCheckBox("RMS per-channel table")
+            self.summary_rms_table_check.setChecked(True)
             self.summary_imp_check = QCheckBox("Impedance summary page")
             self.summary_imp_check.setChecked(True)
+            self.summary_second_stim_montage_check = QCheckBox(
+                "All-channels montage (mean / 2nd / 2nd→3rd LP)"
+            )
+            self.summary_second_stim_montage_check.setChecked(False)
+            self.summary_second_stim_montage_check.setToolTip(
+                "Summary pages: trial-averaged LP/HP, 2nd stim LP/HP, then a "
+                "continuous low-pass montage spanning from the 2nd stim window "
+                "through the 3rd stim window (all channels stacked)."
+            )
             for cb in (
                 self.mea_check,
                 self.impedance_check,
                 self.summary_rms_check,
+                self.summary_rms_table_check,
                 self.summary_imp_check,
+                self.summary_second_stim_montage_check,
             ):
                 top.addWidget(cb)
             top.addStretch()
             layout.addLayout(top)
 
+            column_masters = QHBoxLayout()
+            column_masters.addStretch(1)
+            self.onset_zoom_all_check = QCheckBox("All Onset zoom")
+            self.onset_zoom_all_check.setTristate(True)
+            self.onset_zoom_all_check.setToolTip(
+                "Check or uncheck every panel in the Onset zoom column."
+            )
+            self.end_zoom_all_check = QCheckBox("All End zoom")
+            self.end_zoom_all_check.setTristate(True)
+            self.end_zoom_all_check.setToolTip(
+                "Check or uncheck every panel in the End zoom column."
+            )
+            self._column_master_checks: dict[str, QCheckBox] = {
+                "zoom_onset": self.onset_zoom_all_check,
+                "zoom_trigger_end": self.end_zoom_all_check,
+            }
+            self.onset_zoom_all_check.clicked.connect(
+                lambda: self._on_column_master_clicked("zoom_onset")
+            )
+            self.end_zoom_all_check.clicked.connect(
+                lambda: self._on_column_master_clicked("zoom_trigger_end")
+            )
+            column_masters.addWidget(self.onset_zoom_all_check)
+            column_masters.addWidget(self.end_zoom_all_check)
+            layout.addLayout(column_masters)
+
             self.display_table = QTableWidget(len(PANEL_FIELD_NAMES), 4)
             self.display_table.setAlternatingRowColors(True)
             self.display_table.setShowGrid(True)
+            self.display_table.setMinimumHeight(520)
             self.display_table.setHorizontalHeaderLabels(
                 ["Panel", "Full view", "Onset zoom", "End zoom"]
             )
             self.display_table.verticalHeader().setVisible(False)
-            self.display_table.horizontalHeader().setSectionResizeMode(
-                0, QHeaderView.ResizeMode.Stretch
-            )
-            for col in range(1, 4):
+            self.display_table.verticalHeader().setDefaultSectionSize(34)
+            self.display_table.horizontalHeader().setMinimumSectionSize(110)
+            self.display_table.horizontalHeader().setDefaultSectionSize(130)
+            for col in range(4):
                 self.display_table.horizontalHeader().setSectionResizeMode(
-                    col, QHeaderView.ResizeMode.ResizeToContents
+                    col, QHeaderView.ResizeMode.Stretch
                 )
             section_keys = ("full_view", "zoom_onset", "zoom_trigger_end")
             for row, panel_key in enumerate(PANEL_FIELD_NAMES):
@@ -536,8 +627,9 @@ def launch_qt_gui(
                     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                     if panel_key == "spike_overlay":
                         item.setToolTip(
-                            "Placed under First/Second stimulation (raw) in the same column. "
-                            "No overlay is drawn if that raw panel is off."
+                            "Placed at the end of the section. Overlays every spike "
+                            "detected with the configured threshold on all stimulations "
+                            "(and the time window of that section)."
                         )
                 self._display_checkboxes[panel_key] = {}
                 for col, section_key in enumerate(section_keys, start=1):
@@ -552,20 +644,23 @@ def launch_qt_gui(
                     self._display_checkboxes[panel_key][section_key] = cb
                     if panel_key == "spike_overlay":
                         cb.setToolTip(
-                            "Requires First or Second stimulation (raw) in this column. "
-                            "Spikes are taken only from that trigger and this time window."
+                            "All spikes in this section’s time window, aligned on "
+                            "threshold crossing, with the threshold line shown."
                         )
-            for panel_key in ("first_trigger_raw", "second_trigger_raw"):
-                for cb in self._display_checkboxes[panel_key].values():
-                    cb.toggled.connect(lambda _checked: self._sync_overlay_enabled_by_raw())
+                    if section_key in self._column_master_checks:
+                        cb.toggled.connect(
+                            lambda _checked, key=section_key: self._sync_column_master_checkbox(key)
+                        )
+            for section_key in self._column_master_checks:
+                self._sync_column_master_checkbox(section_key)
             layout.addWidget(self.display_table, stretch=1)
 
-            hp_group = QGroupBox("Y axis — first/second filtered stimulation")
+            hp_group = QGroupBox("Y axis — first/second high-pass stimulation")
             hp_form = QFormLayout(hp_group)
             hp_form.setSpacing(10)
             hp_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             self.hp_ylim_check = QCheckBox(
-                "Fix Y axis (µV) on first/second filtered stimulation panels"
+                "Fix Y axis (µV) on first/second high-pass stimulation panels"
             )
             self.hp_ylim_check.toggled.connect(self._update_hp_ylim_visibility)
             self.hp_ylim_min_spin = _spin(defaults.get("default_first_trigger_hp_ylim_min_uv", -200.0))
@@ -600,7 +695,6 @@ def launch_qt_gui(
             if idx >= 0:
                 self.edge_combo.setCurrentIndex(idx)
             for combo, key, fallback in (
-                (self.filter_kind_combo, "default_intan_spike_filter_kind", "highpass"),
                 (self.filter_type_combo, "default_intan_filter_type", "bessel"),
                 (self.spike_mode_combo, "default_spike_threshold_mode", "fixed"),
                 (self.spike_polarity_combo, "default_spike_threshold_polarity", "negative"),
@@ -620,10 +714,16 @@ def launch_qt_gui(
             self._update_spike_mode_visibility()
             self._update_hp_ylim_visibility()
             self._apply_zoom_mode_default(str(d.get("default_zoom_mode", "both")))
-            self._sync_overlay_enabled_by_raw()
 
         def _add_file_row(self, path: str) -> None:
-            row = self.FileEntryRow(self, initial_path=path)
+            # Skip "Auto" when assigning a distinct default color per new row.
+            named = [hex_c for _name, hex_c in RECORDING_COLOR_PRESETS if hex_c]
+            default_hex = named[len(self._file_rows) % len(named)] if named else ""
+            row = self.FileEntryRow(
+                self,
+                initial_path=path,
+                default_color_hex=default_hex,
+            )
             if path:
                 row.legend_edit.setText(Path(path).stem)
             self._file_rows.append(row)
@@ -777,21 +877,46 @@ def launch_qt_gui(
                     cb.blockSignals(True)
                     cb.setChecked(False)
                     cb.blockSignals(False)
+            for section_key in ("zoom_onset", "zoom_trigger_end"):
+                self._sync_column_master_checkbox(section_key)
 
-        def _sync_overlay_enabled_by_raw(self) -> None:
-            """Overlay can be toggled only where a first/second raw panel is selected."""
-            if not self._display_checkboxes:
+        def _on_column_master_clicked(self, section_key: str) -> None:
+            """Toggle a whole zoom column: check all unless already fully checked."""
+            states = [
+                bool(self._display_checkboxes[panel_key][section_key].isChecked())
+                for panel_key in PANEL_FIELD_NAMES
+            ]
+            self._set_display_column_checked(section_key, not all(states))
+
+        def _set_display_column_checked(self, section_key: str, checked: bool) -> None:
+            """Check or uncheck every panel checkbox in one Display column."""
+            for panel_key in PANEL_FIELD_NAMES:
+                cb = self._display_checkboxes.get(panel_key, {}).get(section_key)
+                if cb is None:
+                    continue
+                cb.blockSignals(True)
+                cb.setChecked(checked)
+                cb.blockSignals(False)
+            self._sync_column_master_checkbox(section_key)
+
+        def _sync_column_master_checkbox(self, section_key: str) -> None:
+            """Keep All Onset/End zoom masters in sync with their column cells."""
+            master = getattr(self, "_column_master_checks", {}).get(section_key)
+            if master is None or not self._display_checkboxes:
                 return
-            overlay_cbs = self._display_checkboxes.get("spike_overlay")
-            first_cbs = self._display_checkboxes.get("first_trigger_raw")
-            second_cbs = self._display_checkboxes.get("second_trigger_raw")
-            if not overlay_cbs or not first_cbs or not second_cbs:
-                return
-            for section_key, overlay_cb in overlay_cbs.items():
-                raw_on = bool(
-                    first_cbs[section_key].isChecked() or second_cbs[section_key].isChecked()
-                )
-                overlay_cb.setEnabled(raw_on)
+            states = [
+                bool(self._display_checkboxes[panel_key][section_key].isChecked())
+                for panel_key in PANEL_FIELD_NAMES
+            ]
+            if all(states):
+                state = Qt.CheckState.Checked
+            elif not any(states):
+                state = Qt.CheckState.Unchecked
+            else:
+                state = Qt.CheckState.PartiallyChecked
+            master.blockSignals(True)
+            master.setCheckState(state)
+            master.blockSignals(False)
 
         def _update_hp_ylim_visibility(self) -> None:
             enabled = self.hp_ylim_check.isChecked()
@@ -833,7 +958,9 @@ def launch_qt_gui(
                 mea_layout=self.mea_check.isChecked(),
                 impedance=self.impedance_check.isChecked(),
                 summary_rms_page=self.summary_rms_check.isChecked(),
+                summary_rms_table_page=self.summary_rms_table_check.isChecked(),
                 summary_impedance_page=self.summary_imp_check.isChecked(),
+                summary_second_stim_montage_page=self.summary_second_stim_montage_check.isChecked(),
                 full_view=self._section_panels_from_ui("full_view"),
                 zoom_onset=self._section_panels_from_ui("zoom_onset"),
                 zoom_trigger_end=self._section_panels_from_ui("zoom_trigger_end"),
@@ -868,6 +995,13 @@ def launch_qt_gui(
                 raise ValueError("Onset zoom: end must be strictly greater than start.")
             if zoom_mode in ("trigger_end", "both") and zoom_end_t1 <= zoom_end_t0:
                 raise ValueError("End zoom: end must be strictly greater than start.")
+
+            overlay_pre = float(self.spike_overlay_pre_spin.value())
+            overlay_post = float(self.spike_overlay_post_spin.value())
+            if overlay_pre < 0:
+                raise ValueError("Spike overlay: time before detection must be ≥ 0 ms.")
+            if overlay_post <= 0:
+                raise ValueError("Spike overlay: time after detection must be > 0 ms.")
 
             section_count = int(self.section_count_spin.value())
             section_duration = float(self.section_duration_spin.value())
@@ -930,7 +1064,8 @@ def launch_qt_gui(
                 spike_threshold_mode=str(self.spike_mode_combo.currentData()),
                 spike_threshold_rms_multiplier=float(self.spike_rms_mult_spin.value()),
                 psth_bin_window_s=float(self.psth_bin_spin.value()),
-                spike_scope_tscale_ms=float(self.spike_scope_tscale_combo.currentData() or 4),
+                spike_overlay_pre_ms=overlay_pre,
+                spike_overlay_post_ms=overlay_post,
                 rms_window_s=float(self.rms_window_spin.value()),
                 zoom_mode=zoom_mode,
                 zoom_onset_t0_s=zoom_onset_t0,
@@ -940,7 +1075,6 @@ def launch_qt_gui(
                 first_trigger_hp_ylim_enabled=hp_enabled,
                 first_trigger_hp_ylim_min_uv=hp_min,
                 first_trigger_hp_ylim_max_uv=hp_max,
-                intan_spike_filter_kind=str(self.filter_kind_combo.currentData()),
                 intan_filter_order=int(self.filter_order_spin.value()),
                 intan_filter_type=str(self.filter_type_combo.currentData()),
                 intan_filter_cutoff_hz=float(self.filter_cutoff_spin.value()),

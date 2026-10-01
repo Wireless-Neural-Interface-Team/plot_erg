@@ -276,21 +276,26 @@ QTableWidget {{
     border: 2px solid #8896ab;
     border-radius: 8px;
     color: #0f172a;
+    font-size: 13px;
 }}
 QTableWidget::item {{
-    padding: 6px;
+    padding: 8px 10px;
 }}
 QTableWidget::item:disabled {{
     color: #94a3b8;
     background-color: #e2e8f0;
 }}
+QTableWidget QCheckBox::indicator {{
+    width: 22px;
+    height: 22px;
+}}
 QHeaderView::section {{
     background-color: #334155;
     color: #f8fafc;
-    padding: 8px 6px;
+    padding: 10px 8px;
     border: 1px solid #1e293b;
     font-weight: 700;
-    font-size: 12px;
+    font-size: 13px;
 }}
 QHeaderView::section:disabled {{
     background-color: #94a3b8;
