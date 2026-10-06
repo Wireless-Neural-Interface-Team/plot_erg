@@ -86,9 +86,10 @@ class InteractiveCanvas(QWidget):
         layout.addWidget(self._cursor_label)
 
         self._press_ax: Any | None = None
-        self._pan_origin: tuple[float, float] | None = None
+        self._press_xy: tuple[float, float] | None = None
         self._xlim0: tuple[float, float] | None = None
         self._ylim0: tuple[float, float] | None = None
+        self._pan_trans: Any | None = None
 
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
         self.canvas.mpl_connect("button_press_event", self._on_press)
@@ -148,68 +149,58 @@ class InteractiveCanvas(QWidget):
                 pass
             return
 
-        # Clic milieu ou droit : pan manuel.
+        # Clic milieu ou droit : pan (pixels + transform figé au press).
         if event.button not in (2, 3) or event.inaxes is None:
             return
-        if event.xdata is None or event.ydata is None:
+        if event.x is None or event.y is None:
             return
         self._press_ax = event.inaxes
-        self._pan_origin = (float(event.xdata), float(event.ydata))
-        self._xlim0 = event.inaxes.get_xlim()
-        self._ylim0 = event.inaxes.get_ylim()
+        self._press_xy = (float(event.x), float(event.y))
+        self._xlim0 = tuple(event.inaxes.get_xlim())
+        self._ylim0 = tuple(event.inaxes.get_ylim())
+        # Figé : sinon chaque set_xlim change le mapping pixel→données et le pan décroche.
+        self._pan_trans = event.inaxes.transData.frozen()
         self.canvas.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
 
     def _on_release(self, event: Any) -> None:
         del event
         self._press_ax = None
-        self._pan_origin = None
+        self._press_xy = None
         self._xlim0 = None
         self._ylim0 = None
+        self._pan_trans = None
         self.canvas.unsetCursor()
 
     def _on_motion(self, event: Any) -> None:
+        # Pendant un pan : suivre les pixels (pas besoin de xdata / inaxes).
+        if (
+            self._press_ax is not None
+            and self._press_xy is not None
+            and self._xlim0 is not None
+            and self._ylim0 is not None
+            and self._pan_trans is not None
+        ):
+            if event.x is None or event.y is None:
+                return
+            try:
+                inv = self._pan_trans.inverted()
+                x0, y0 = inv.transform(self._press_xy)
+                x1, y1 = inv.transform((float(event.x), float(event.y)))
+                dx = float(x1 - x0)
+                dy = float(y1 - y0)
+                self._press_ax.set_xlim(self._xlim0[0] - dx, self._xlim0[1] - dx)
+                self._press_ax.set_ylim(self._ylim0[0] - dy, self._ylim0[1] - dy)
+                self.canvas.draw_idle()
+            except Exception:
+                pass
+            return
+
         if event.inaxes is not None and event.xdata is not None and event.ydata is not None:
             self._cursor_label.setText(
                 f"t = {event.xdata:.4g}   y = {event.ydata:.4g}   "
                 f"(molette zoom · clic droit pan · double-clic reset)"
             )
-        elif self._press_ax is None:
+        else:
             self._cursor_label.setText(
                 "Molette zoom · clic droit pan · double-clic reset"
             )
-
-        if self._press_ax is None or self._pan_origin is None or self._xlim0 is None:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-        # Convertir le déplacement en données via le delta écran pour un pan stable.
-        try:
-            x0, y0 = self._pan_origin
-            # Recalcule depuis le pixel pour éviter le feedback de set_xlim.
-            inv = self._press_ax.transData.inverted()
-            x1, y1 = inv.transform((event.x, event.y))
-            dx = x1 - x0
-            dy = y1 - y0
-            # Origin doit être en coords au moment du press en display... 
-            # Approche simple : utiliser event.xdata avec reset d'origin chaque frame
-            # est instable. On utilise plutôt le delta depuis le press en pixels.
-        except Exception:
-            return
-
-        # Pan basé sur pixels (robuste).
-        try:
-            display_origin = self._press_ax.transData.transform(self._pan_origin)
-            cur = (float(event.x), float(event.y))
-            dx_pix = cur[0] - display_origin[0]
-            dy_pix = cur[1] - display_origin[1]
-            inv = self._press_ax.transData.inverted()
-            x_a, y_a = inv.transform(display_origin)
-            x_b, y_b = inv.transform((display_origin[0] + dx_pix, display_origin[1] + dy_pix))
-            dx = x_b - x_a
-            dy = y_b - y_a
-            self._press_ax.set_xlim(self._xlim0[0] - dx, self._xlim0[1] - dx)
-            if self._ylim0 is not None:
-                self._press_ax.set_ylim(self._ylim0[0] - dy, self._ylim0[1] - dy)
-            self.canvas.draw_idle()
-        except Exception:
-            pass

@@ -103,6 +103,30 @@ LEGEND_LOCATIONS: tuple[LegendLocation, ...] = (
 AnalysisMode = Literal["average", "stimulation"]
 AnalysisStream = Literal["raw", "hp", "lp"]
 
+STREAM_SHORT_LABELS: dict[str, str] = {
+    "raw": "WIDE",
+    "hp": "HIGH",
+    "lp": "LOW",
+}
+
+
+@dataclass(frozen=True)
+class TimeRangeBar:
+    """Paire de barres temporelles [t0, t1] pour zoom / plage de traitement."""
+
+    t0_s: float
+    t1_s: float
+    label: str = ""
+    bar_id: str = ""
+
+    def ordered(self) -> tuple[float, float]:
+        a, b = float(self.t0_s), float(self.t1_s)
+        return (a, b) if a <= b else (b, a)
+
+    def with_bounds(self, t0_s: float, t1_s: float) -> TimeRangeBar:
+        return replace(self, t0_s=float(t0_s), t1_s=float(t1_s))
+
+
 # Progressive-analysis panels driven by :class:`AnalysisSettings`.
 ANALYSIS_PANEL_FIELD_NAMES: tuple[str, ...] = (
     "full_recording",
@@ -187,6 +211,10 @@ class AnalysisSettings:
     show_hp: bool = True
     show_lp: bool = True
     show_rms: bool = True
+    show_psth: bool = False
+    show_isi: bool = False
+    show_raster: bool = False
+    show_overlay: bool = False
 
     def trigger_index(self) -> int | None:
         """``None`` means average across trials; otherwise one stimulation index."""
@@ -205,6 +233,21 @@ class AnalysisSettings:
         if self.show_rms:
             panels.append("analysis_rms")
         return tuple(panels)
+
+    def selected_spike_panels(self) -> tuple[str, ...]:
+        panels: list[str] = []
+        if self.show_raster:
+            panels.append("analysis_raster")
+        if self.show_psth:
+            panels.append("analysis_psth")
+        if self.show_isi:
+            panels.append("analysis_isi")
+        if self.show_overlay:
+            panels.append("analysis_overlay")
+        return tuple(panels)
+
+    def selected_analysis_panels(self) -> tuple[str, ...]:
+        return self.selected_trace_panels() + self.selected_spike_panels()
 
     def describe(self) -> str:
         if self.mode == "stimulation":
@@ -240,6 +283,8 @@ class PanelStyle:
     line_width: float = 1.2
     grid: bool = True
     grid_alpha: float = 0.3
+    # Cadre (spines) autour de la zone de tracé.
+    show_borders: bool = True
     # Max points drawn per curve (min/max envelope decimation above this).
     max_points_per_curve: int = 6000
     tight_layout: bool = True
@@ -247,7 +292,7 @@ class PanelStyle:
 
 @dataclass(frozen=True)
 class AxisLimits:
-    """Optional manual y-axis bounds for a family of panels."""
+    """Optional manual axis bounds (X or Y) for panels that use them."""
 
     enabled: bool = False
     minimum: float = -200.0
@@ -273,6 +318,10 @@ class ViewerSettings:
     sampling_percent: int = 100
     spike_overlay_pre_ms: float = 2.0
     spike_overlay_post_ms: float = 4.0
+    # Échelle X manuelle (temps, s) — prioritaire sur la section / le zoom placement.
+    x_limits: AxisLimits = field(
+        default_factory=lambda: AxisLimits(enabled=False, minimum=-0.1, maximum=0.4)
+    )
     stim_hp_ylim: AxisLimits = field(default_factory=AxisLimits)
     rms_ylim: AxisLimits = field(
         default_factory=lambda: AxisLimits(enabled=True, minimum=0.0, maximum=20.0)
@@ -281,12 +330,35 @@ class ViewerSettings:
     legend: LegendSettings = field(default_factory=LegendSettings)
     style: PanelStyle = field(default_factory=PanelStyle)
     # Montage panels: how many channels to stack in one figure.
-    montage_channels: int = 32
+    # Kept modest — the default UX is channel-first, not a global montage.
+    montage_channels: int = 12
     montage_page: int = 0
+    # Noms de canaux exclus du montage (cases décochées dans Session → Channels).
+    hidden_channels: tuple[str, ...] = ()
     analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
-    # Continuous recording view: which stream to draw by default.
+    # Continuous recording view: primary stream (compat) + multi-stream montage.
     continuous_stream: AnalysisStream = "raw"
+    continuous_streams: tuple[AnalysisStream, ...] = ("raw",)
     continuous_mark_stims: bool = True
+    # Hauteur minimale d’une ligne canal×flux dans le montage continu (px).
+    montage_row_min_height_px: int = 72
+    # Barres de plage (zoom / traitement). Vide = extrémités au premier rendu.
+    range_bars: tuple[TimeRangeBar, ...] = ()
+    active_range_index: int = 0
+
+    def resolved_continuous_streams(self) -> tuple[AnalysisStream, ...]:
+        streams = tuple(s for s in self.continuous_streams if s in {"raw", "hp", "lp"})
+        if streams:
+            return streams  # type: ignore[return-value]
+        stream = self.continuous_stream if self.continuous_stream in {"raw", "hp", "lp"} else "raw"
+        return (stream,)  # type: ignore[return-value]
+
+    def active_range_bar(self) -> TimeRangeBar | None:
+        bars = self.range_bars
+        if not bars:
+            return None
+        index = max(0, min(len(bars) - 1, int(self.active_range_index)))
+        return bars[index]
 
     def zoom_onset_window(self) -> tuple[float, float]:
         return (float(self.zoom_onset_t0_s), float(self.zoom_onset_t1_s))
@@ -309,6 +381,8 @@ class ViewerSettings:
             problems.append("Superposition : le temps avant détection doit être ≥ 0 ms.")
         if self.spike_overlay_post_ms <= 0:
             problems.append("Superposition : le temps après détection doit être > 0 ms.")
+        if self.x_limits.enabled and self.x_limits.as_tuple() is None:
+            problems.append("Axe X : le maximum doit être > minimum.")
         if self.stim_hp_ylim.enabled and self.stim_hp_ylim.as_tuple() is None:
             problems.append("Axe Y passe-haut stim : le maximum doit être > minimum.")
         if self.rms_ylim.enabled and self.rms_ylim.as_tuple() is None:
@@ -331,6 +405,8 @@ class PanelPlacement:
     zoom_t0_s: float | None = None
     zoom_t1_s: float | None = None
     zoom_label: str = ""
+    # Identifiant d’instance (ex. bar_id d’une plage) — clé stable, pas affiché.
+    instance_id: str = ""
 
     @property
     def has_custom_zoom(self) -> bool:
@@ -338,12 +414,13 @@ class PanelPlacement:
 
     @property
     def key(self) -> str:
+        suffix = f"#{self.instance_id}" if self.instance_id else ""
         if self.has_custom_zoom:
             label = self.zoom_label.strip() or f"{self.zoom_t0_s}:{self.zoom_t1_s}"
-            return f"{self.panel}@custom:{label}"
+            return f"{self.panel}@custom:{label}{suffix}"
         if is_section_independent(self.panel):
-            return self.panel
-        return f"{self.panel}@{self.section}"
+            return f"{self.panel}{suffix}" if suffix else self.panel
+        return f"{self.panel}@{self.section}{suffix}"
 
     def title(self) -> str:
         label = panel_label(self.panel)
@@ -355,7 +432,7 @@ class PanelPlacement:
         return f"{label} — {SECTION_LABELS.get(self.section, self.section)}"
 
     def with_custom_zoom(
-        self, t0_s: float, t1_s: float, *, label: str = ""
+        self, t0_s: float, t1_s: float, *, label: str = "", instance_id: str = ""
     ) -> PanelPlacement:
         return replace(
             self,
@@ -363,6 +440,7 @@ class PanelPlacement:
             zoom_t0_s=float(t0_s),
             zoom_t1_s=float(t1_s),
             zoom_label=str(label or ""),
+            instance_id=str(instance_id or self.instance_id or ""),
         )
 
 
@@ -384,13 +462,18 @@ def _placements(section: SectionKey, panels: Sequence[str]) -> tuple[PanelPlacem
 
 
 def default_workspace_tabs() -> tuple[ViewTab, ...]:
-    """Vue de démarrage : montage brut continu de tous les canaux."""
+    """Vue de démarrage légère : aperçu du canal sélectionné uniquement.
+
+    Le montage multi-canaux reste disponible via *Revue montage*.
+    Les barres de plage et graphs d’analyse vivent dans Inspecter
+    (double-clic MEA / liste), pas sur la vue centrale.
+    """
     return (
         ViewTab(
-            name="Tous les canaux",
+            name="Canal",
             columns=1,
-            panel_height_px=720,
-            panels=(PanelPlacement("montage_continuous_raw"),),
+            panel_height_px=520,
+            panels=(PanelPlacement("full_recording"),),
         ),
     )
 

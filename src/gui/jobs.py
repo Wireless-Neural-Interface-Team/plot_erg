@@ -120,6 +120,10 @@ class ChannelEnsureRequest:
     channels: list[int]
     label: str
     force: bool = False
+    need_means: bool = True
+    need_rms: bool = True
+    need_spikes: bool = True
+    need_overlay: bool = True
 
 
 class ChannelEnsureWorker(QThread):
@@ -162,6 +166,10 @@ class ChannelEnsureWorker(QThread):
                             request.config,
                             progress=self.progressed.emit,
                             force=request.force,
+                            need_means=request.need_means,
+                            need_rms=request.need_rms,
+                            need_spikes=request.need_spikes,
+                            need_overlay=request.need_overlay,
                         )
                     except InterruptedError:
                         ok = False

@@ -257,6 +257,13 @@ def parse_args() -> argparse.Namespace:
         help="Intan HP and LP cutoff in Hz (default: 250).",
     )
     parser.add_argument(
+        "--software-notch-hz",
+        type=int,
+        choices=(0, 50, 60),
+        default=int(getattr(defaults, "software_notch_hz", 0) or 0),
+        help="Optional software notch before HP/LP: 0 (off), 50, or 60 Hz.",
+    )
+    parser.add_argument(
         "--work-dir",
         type=Path,
         default=None,
@@ -647,6 +654,7 @@ def main() -> None:
         intan_filter_order=args.intan_filter_order,
         intan_filter_type=args.intan_filter_type,
         intan_filter_cutoff_hz=args.intan_filter_cutoff_hz,
+        software_notch_hz=int(args.software_notch_hz),  # type: ignore[arg-type]
         work_dir=args.work_dir,
         comparison_workers=args.workers,
         channel_workers=args.channel_workers,

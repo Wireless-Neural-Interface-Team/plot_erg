@@ -8,6 +8,8 @@ channels worth looking at.
 
 from __future__ import annotations
 
+import math
+import re
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -23,13 +25,18 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 _UNMAPPED_FILL = QColor("#e2e8f0")
-_UNMAPPED_EDGE = QColor("#cbd5e1")
-_MAPPED_FILL = QColor("#93c5fd")
-_MAPPED_EDGE = QColor("#64748b")
+_UNMAPPED_EDGE = QColor("#94a3b8")
+_MAPPED_FILL = QColor("#bfdbfe")
+_MAPPED_EDGE = QColor("#475569")
+_HIDDEN_FILL = QColor("#f1f5f9")
+_HIDDEN_EDGE = QColor("#cbd5e1")
 _SELECTED_EDGE = QColor("#dc2626")
 _HOVER_EDGE = QColor("#2563eb")
 _LABEL_COLOR = QColor("#0f172a")
+_HIDDEN_LABEL = QColor("#94a3b8")
 _BACKGROUND = QColor("#f8fafc")
+_CLUSTER_FILL = QColor(226, 232, 240, 90)
+_CLUSTER_EDGE = QColor("#cbd5e1")
 
 # Low -> high gradient used when a per-channel metric is provided.
 _METRIC_LOW = QColor("#dbeafe")
@@ -43,6 +50,7 @@ class _Contact:
     x_um: float
     y_um: float
     channel_name: str | None
+    short_label: str
 
 
 def _lerp_color(low: QColor, high: QColor, t: float) -> QColor:
@@ -54,23 +62,112 @@ def _lerp_color(low: QColor, high: QColor, t: float) -> QColor:
     )
 
 
+def _short_label(contact_id: str) -> str:
+    """Compact label that fits inside a contact circle (full id stays in tooltip)."""
+    raw = str(contact_id).strip()
+    if not raw:
+        return "?"
+    # A-033 / A_033 / amp-A-033 → keep letter + number when possible.
+    match = re.search(r"([A-Za-z]+)\s*[-_]?\s*(\d+)\s*$", raw)
+    if match:
+        letter = match.group(1)
+        number = match.group(2).lstrip("0") or "0"
+        if len(letter) <= 2 and len(number) <= 3:
+            return f"{letter}{number}"
+        if len(number) <= 3:
+            return number
+    # Pure numeric id.
+    digits = re.sub(r"\D+", "", raw)
+    if digits:
+        compact = digits.lstrip("0") or "0"
+        return compact[-3:] if len(compact) > 3 else compact
+    return raw[-4:] if len(raw) > 4 else raw
+
+
+def _median_nearest_pitch_um(contacts: Sequence[_Contact]) -> float:
+    """Typical local electrode pitch — robust for multi-cluster probes."""
+    if len(contacts) < 2:
+        return 1.0
+    pitches: list[float] = []
+    for i, contact in enumerate(contacts):
+        best = float("inf")
+        for j, other in enumerate(contacts):
+            if i == j:
+                continue
+            dx = contact.x_um - other.x_um
+            dy = contact.y_um - other.y_um
+            dist = math.hypot(dx, dy)
+            if 0.0 < dist < best:
+                best = dist
+        if best < float("inf"):
+            pitches.append(best)
+    if not pitches:
+        return 1.0
+    pitches.sort()
+    return float(pitches[len(pitches) // 2])
+
+
+def _cluster_bounds(
+    contacts: Sequence[_Contact], gap_um: float
+) -> list[tuple[float, float, float, float]]:
+    """Axis-aligned bounds of contact clusters separated by more than ``gap_um``."""
+    if not contacts:
+        return []
+    parent = list(range(len(contacts)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i, a in enumerate(contacts):
+        for j in range(i + 1, len(contacts)):
+            b = contacts[j]
+            if math.hypot(a.x_um - b.x_um, a.y_um - b.y_um) <= gap_um:
+                union(i, j)
+
+    groups: dict[int, list[_Contact]] = {}
+    for i, contact in enumerate(contacts):
+        groups.setdefault(find(i), []).append(contact)
+
+    bounds: list[tuple[float, float, float, float]] = []
+    pad = max(gap_um * 0.35, 1.0)
+    for members in groups.values():
+        xs = [c.x_um for c in members]
+        ys = [c.y_um for c in members]
+        bounds.append(
+            (min(xs) - pad, max(xs) + pad, min(ys) - pad, max(ys) + pad)
+        )
+    return bounds
+
+
 class MeaMapWidget(QWidget):
     """Electrode map that emits the channel name of the contact being clicked."""
 
     channelSelected = Signal(str)
+    channelActivated = Signal(str)  # double-clic → inspecter le canal
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._contacts: list[_Contact] = []
         self._selected: str | None = None
         self._hover_index: int | None = None
+        self._hidden: set[str] = set()
         self._metric: dict[str, float] = {}
         self._metric_label = ""
         self._metric_range: tuple[float, float] = (0.0, 1.0)
         self._show_labels = True
         self._bounds_um: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0)
+        self._pitch_um = 1.0
+        self._cluster_bounds_um: list[tuple[float, float, float, float]] = []
         self._contact_radius_px = 8.0
-        self.setMinimumHeight(220)
+        self.setMinimumHeight(260)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -101,6 +198,7 @@ class MeaMapWidget(QWidget):
                         x_um=float(positions[index, 0]),
                         y_um=float(positions[index, 1]),
                         channel_name=matched,
+                        short_label=_short_label(cid),
                     )
                 )
         self._recompute_bounds()
@@ -128,6 +226,14 @@ class MeaMapWidget(QWidget):
         self._show_labels = bool(visible)
         self.update()
 
+    def set_hidden_channels(self, names: Sequence[str] | set[str] | None) -> None:
+        """Atténuer les contacts masqués dans le montage."""
+        hidden = {str(name) for name in (names or ())}
+        if hidden == self._hidden:
+            return
+        self._hidden = hidden
+        self.update()
+
     @property
     def has_probe(self) -> bool:
         return bool(self._contacts)
@@ -140,20 +246,24 @@ class MeaMapWidget(QWidget):
     def _recompute_bounds(self) -> None:
         if not self._contacts:
             self._bounds_um = (0.0, 1.0, 0.0, 1.0)
+            self._pitch_um = 1.0
+            self._cluster_bounds_um = []
             return
         xs = [c.x_um for c in self._contacts]
         ys = [c.y_um for c in self._contacts]
         x_min, x_max = min(xs), max(xs)
         y_min, y_max = min(ys), max(ys)
-        pad_x = max((x_max - x_min) * 0.08, 1.0)
-        pad_y = max((y_max - y_min) * 0.08, 1.0)
-        self._bounds_um = (x_min - pad_x, x_max + pad_x, y_min - pad_y, y_max + pad_y)
+        self._pitch_um = _median_nearest_pitch_um(self._contacts)
+        pad = max(self._pitch_um * 0.75, (x_max - x_min) * 0.06, (y_max - y_min) * 0.06, 1.0)
+        self._bounds_um = (x_min - pad, x_max + pad, y_min - pad, y_max + pad)
+        # Clusters séparés par > ~2.8 pas locaux.
+        self._cluster_bounds_um = _cluster_bounds(self._contacts, self._pitch_um * 2.8)
 
     def _plot_rect(self) -> QRectF:
-        margin = 6.0
+        margin = 8.0
         rect = QRectF(self.rect()).adjusted(margin, margin, -margin, -margin)
         if self._metric_label:
-            rect.setBottom(rect.bottom() - 16.0)
+            rect.setBottom(rect.bottom() - 18.0)
         x_min, x_max, y_min, y_max = self._bounds_um
         span_x = max(x_max - x_min, 1e-6)
         span_y = max(y_max - y_min, 1e-6)
@@ -169,10 +279,16 @@ class MeaMapWidget(QWidget):
             rect.setHeight(new_height)
         return rect
 
-    def _to_widget(self, contact: _Contact, rect: QRectF) -> QPointF:
+    def _um_to_px_scale(self, rect: QRectF) -> float:
         x_min, x_max, y_min, y_max = self._bounds_um
-        fx = (contact.x_um - x_min) / max(x_max - x_min, 1e-6)
-        fy = (contact.y_um - y_min) / max(y_max - y_min, 1e-6)
+        sx = rect.width() / max(x_max - x_min, 1e-6)
+        sy = rect.height() / max(y_max - y_min, 1e-6)
+        return min(sx, sy)
+
+    def _to_widget(self, x_um: float, y_um: float, rect: QRectF) -> QPointF:
+        x_min, x_max, y_min, y_max = self._bounds_um
+        fx = (x_um - x_min) / max(x_max - x_min, 1e-6)
+        fy = (y_um - y_min) / max(y_max - y_min, 1e-6)
         return QPointF(
             rect.left() + fx * rect.width(),
             rect.bottom() - fy * rect.height(),
@@ -185,15 +301,61 @@ class MeaMapWidget(QWidget):
         best: _Contact | None = None
         best_distance = float("inf")
         for contact in self._contacts:
-            point = self._to_widget(contact, rect)
+            point = self._to_widget(contact.x_um, contact.y_um, rect)
             dx = point.x() - position.x()
             dy = point.y() - position.y()
             distance = dx * dx + dy * dy
             if distance < best_distance:
                 best_distance = distance
                 best = contact
-        reach = max(self._contact_radius_px * 1.9, 12.0)
+        reach = max(self._contact_radius_px * 1.85, 11.0)
         return best if best_distance <= reach * reach else None
+
+    def _label_candidates(self, contact: _Contact) -> list[str]:
+        """Progressively shorter labels until one fits the disk."""
+        primary = contact.short_label
+        candidates = [primary]
+        digits = re.sub(r"\D+", "", primary)
+        if digits and digits != primary:
+            candidates.append(digits)
+        if digits and len(digits) > 2:
+            candidates.append(digits[-2:])
+        if digits:
+            candidates.append(digits[-1:])
+        # Unique-ish fallback from contact index when nothing else fits.
+        candidates.append(str(contact.index % 100))
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in candidates:
+            if item and item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    def _fit_label(
+        self, contact: _Contact, diameter: float, base: QFont
+    ) -> tuple[str, QFont] | None:
+        """Pick a short label + font that fit inside the contact disk."""
+        # Sous ~11 px de diamètre, le texte devient illisible : tooltip seulement.
+        if diameter < 11.0:
+            return None
+        max_size = min(11.0, max(6.0, diameter * 0.50))
+        min_size = 6.0
+        if max_size < min_size:
+            return None
+        for label in self._label_candidates(contact):
+            size = max_size
+            font = QFont(base)
+            font.setBold(True)
+            while size >= min_size - 1e-6:
+                font.setPointSizeF(size)
+                metrics = QFontMetricsF(font)
+                max_w = diameter * 0.90
+                max_h = diameter * 0.78
+                if metrics.horizontalAdvance(label) <= max_w and metrics.height() <= max_h:
+                    return label, font
+                size -= 0.5
+        return None
 
     # --------------------------------------------------------------- painting
 
@@ -207,64 +369,86 @@ class MeaMapWidget(QWidget):
             painter.drawText(
                 QRectF(self.rect()),
                 int(Qt.AlignmentFlag.AlignCenter),
-                "No MEA probe loaded.\nSelect a probe JSON in the parameters.",
+                "Aucun mapping chargé.\n"
+                "Utilisez Charger… juste au-dessus\n"
+                "pour ouvrir un JSON de sonde MEA.",
             )
             painter.end()
             return
 
         rect = self._plot_rect()
-        n_cols = max(1, len({round(c.x_um, 3) for c in self._contacts}))
-        n_rows = max(1, len({round(c.y_um, 3) for c in self._contacts}))
-        cell = min(rect.width() / n_cols, rect.height() / n_rows)
-        self._contact_radius_px = max(4.0, min(22.0, cell * 0.42))
-        font_size = max(5.0, min(10.0, self._contact_radius_px * 0.95))
-        font = QFont(self.font())
-        font.setPointSizeF(font_size)
-        painter.setFont(font)
-        metrics = QFontMetricsF(font)
-        label_fits = self._show_labels and metrics.height() <= cell * 0.92
+        scale = self._um_to_px_scale(rect)
+        pitch_px = max(self._pitch_um * scale, 1.0)
+        # Cercles un peu plus petits que le pas local (lisibilité sans chevauchement).
+        self._contact_radius_px = max(5.0, min(17.0, pitch_px * 0.40))
+        diameter = self._contact_radius_px * 2.0
 
+        # Fond léger par grappe (aide à lire les blocs séparés).
+        if len(self._cluster_bounds_um) > 1:
+            for x0, x1, y0, y1 in self._cluster_bounds_um:
+                p0 = self._to_widget(x0, y1, rect)
+                p1 = self._to_widget(x1, y0, rect)
+                cluster_rect = QRectF(p0, p1).normalized().adjusted(-4.0, -4.0, 4.0, 4.0)
+                painter.setBrush(_CLUSTER_FILL)
+                painter.setPen(QPen(_CLUSTER_EDGE, 1.0))
+                painter.drawRoundedRect(cluster_rect, 6.0, 6.0)
+
+        base_font = QFont(self.font())
         low, high = self._metric_range
         for contact in self._contacts:
-            point = self._to_widget(contact, rect)
+            point = self._to_widget(contact.x_um, contact.y_um, rect)
             radius = self._contact_radius_px
             mapped = contact.channel_name is not None
-            if mapped and contact.channel_name in self._metric:
+            is_hidden = bool(mapped and contact.channel_name in self._hidden)
+            if is_hidden:
+                fill, edge = _HIDDEN_FILL, _HIDDEN_EDGE
+            elif mapped and contact.channel_name in self._metric:
                 value = self._metric[contact.channel_name]
                 fill = _lerp_color(_METRIC_LOW, _METRIC_HIGH, (value - low) / max(high - low, 1e-9))
+                edge = _MAPPED_EDGE
             elif mapped:
-                fill = _MAPPED_FILL
+                fill, edge = _MAPPED_FILL, _MAPPED_EDGE
             else:
-                fill = _UNMAPPED_FILL
-            edge = _MAPPED_EDGE if mapped else _UNMAPPED_EDGE
-            width = 1.0
+                fill, edge = _UNMAPPED_FILL, _UNMAPPED_EDGE
+            width = 1.1
             if self._hover_index == contact.index:
                 edge, width = _HOVER_EDGE, 2.0
             if mapped and contact.channel_name == self._selected:
-                edge, width = _SELECTED_EDGE, 2.6
-                radius *= 1.05
+                edge, width = _SELECTED_EDGE, 2.4
+                radius *= 1.08
             painter.setBrush(fill)
             painter.setPen(QPen(edge, width))
             painter.drawEllipse(point, radius, radius)
-            if label_fits:
-                painter.setPen(QPen(_LABEL_COLOR))
-                text_rect = QRectF(
-                    point.x() - cell / 2.0,
-                    point.y() - metrics.height() / 2.0,
-                    cell,
-                    metrics.height(),
-                )
-                painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignCenter), contact.contact_id)
+
+            if not self._show_labels:
+                continue
+            fitted = self._fit_label(contact, diameter, base_font)
+            if fitted is None:
+                continue
+            label, font = fitted
+            painter.setFont(font)
+            metrics = QFontMetricsF(font)
+            text_rect = QRectF(
+                point.x() - radius,
+                point.y() - metrics.height() / 2.0,
+                radius * 2.0,
+                metrics.height(),
+            )
+            painter.setPen(QPen(_HIDDEN_LABEL if is_hidden else _LABEL_COLOR))
+            painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignCenter), label)
 
         if self._metric_label:
             painter.setPen(QPen(QColor("#475569")))
+            legend_font = QFont(self.font())
+            legend_font.setPointSizeF(max(8.0, legend_font.pointSizeF()))
+            painter.setFont(legend_font)
             legend_rect = QRectF(
                 6.0, float(self.height()) - 18.0, float(self.width()) - 12.0, 16.0
             )
             painter.drawText(
                 legend_rect,
                 int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-                f"{self._metric_label}: {low:.2f} (light) → {high:.2f} (dark)",
+                f"{self._metric_label}: {low:.2f} → {high:.2f}",
             )
         painter.end()
 
@@ -276,6 +460,14 @@ class MeaMapWidget(QWidget):
             self.set_selected_channel(contact.channel_name)
             self.channelSelected.emit(contact.channel_name)
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: Any) -> None:  # noqa: D102
+        contact = self._contact_at(QPointF(event.position()))
+        if contact is not None and contact.channel_name:
+            self.set_selected_channel(contact.channel_name)
+            self.channelSelected.emit(contact.channel_name)
+            self.channelActivated.emit(contact.channel_name)
+        super().mouseDoubleClickEvent(event)
 
     def mouseMoveEvent(self, event: Any) -> None:  # noqa: D102
         contact = self._contact_at(QPointF(event.position()))
@@ -292,9 +484,10 @@ class MeaMapWidget(QWidget):
                 if metric is not None and self._metric_label
                 else ""
             )
-            self.setToolTip(f"{contact.contact_id} → {contact.channel_name}{detail}")
+            hidden = "\n(masqué dans le montage)" if contact.channel_name in self._hidden else ""
+            self.setToolTip(f"{contact.contact_id} → {contact.channel_name}{detail}{hidden}")
         else:
-            self.setToolTip(f"{contact.contact_id} (not recorded)")
+            self.setToolTip(f"{contact.contact_id} (non enregistré)")
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event: Any) -> None:  # noqa: D102

@@ -1,9 +1,12 @@
 # Adrian Foy September 2023
+# Updated: vectorized SOS notch (same IIR coefficients as the original loop).
 
 """Module to apply a notch filter to an input signal"""
 
 import math
+
 import numpy as np
+from scipy.signal import sosfilt
 
 from intanutil.report import print_progress
 
@@ -24,11 +27,13 @@ def apply_notch_filter(header, data):
     print('Applying notch filter...')
     print_step = 10
     percent_done = print_step
+    fs = float(header['sample_rate'])
+    f_notch = float(header['notch_filter_frequency'])
     for i in range(header['num_amplifier_channels']):
         data['amplifier_data'][i, :] = notch_filter(
             data['amplifier_data'][i, :],
-            header['sample_rate'],
-            header['notch_filter_frequency'],
+            fs,
+            f_notch,
             10)
 
         percent_done = print_progress(i, header['num_amplifier_channels'],
@@ -50,26 +55,26 @@ def notch_filter(signal_in, f_sample, f_notch, bandwidth):
 
     out = notch_filter(signal_in, 30000, 60, 10);
     """
-    # Calculate parameters used to implement IIR filter
-    t_step = 1.0/f_sample
-    f_c = f_notch*t_step
-    signal_length = len(signal_in)
-    iir_parameters = calculate_iir_parameters(bandwidth, t_step, f_c)
+    x = np.asarray(signal_in, dtype=np.float64).ravel()
+    if x.size < 3:
+        return np.asarray(signal_in)
 
-    # Create empty signal_out NumPy array
-    signal_out = np.zeros(signal_length)
-
-    # Set the first 2 samples of signal_out to signal_in.
-    # If filtering a continuous data stream, change signal_out[0:1] to the
-    # previous final two values of signal_out
-    signal_out[0] = signal_in[0]
-    signal_out[1] = signal_in[1]
-
-    # Run filter.
-    for i in range(2, signal_length):
-        signal_out[i] = calculate_iir(i, signal_in, signal_out, iir_parameters)
-
-    return signal_out
+    # Same coefficients as the historical sample-wise IIR (calculate_iir_parameters).
+    t_step = 1.0 / float(f_sample)
+    f_c = float(f_notch) * t_step
+    d = math.exp(-2.0 * math.pi * (float(bandwidth) / 2.0) * t_step)
+    b = (1.0 + d * d) * math.cos(2.0 * math.pi * f_c)
+    a = (1.0 + d * d) / 2.0
+    # Transfer function (a0=1):
+    # y[n] = a*b2*x[n-2] + a*b1*x[n-1] + a*b0*x[n] - a2*y[n-2] - a1*y[n-1]
+    # with b0=1, b1=-2*cos(2πfc), b2=1, a1=-b, a2=d²
+    b0 = a * 1.0
+    b1 = a * (-2.0 * math.cos(2.0 * math.pi * f_c))
+    b2 = a * 1.0
+    a1 = -b
+    a2 = d * d
+    sos = np.array([[b0, b1, b2, 1.0, a1, a2]], dtype=np.float64)
+    return sosfilt(sos, x)
 
 
 def calculate_iir_parameters(bandwidth, t_step, f_c):

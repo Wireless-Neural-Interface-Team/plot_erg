@@ -233,6 +233,17 @@ QGroupBox::title {{
     color: {TEXT_MUTED};
     background-color: {CHROME_BG_LIGHT};
 }}
+QGroupBox#meaMapBox {{
+    background-color: {SCOPE_BG};
+    border: 1px solid {CHROME_BORDER_DARK};
+    margin-top: 10px;
+    min-height: 240px;
+}}
+QGroupBox#meaMapBox::title {{
+    color: {TEXT};
+    font-weight: 800;
+    background-color: {SCOPE_BG};
+}}
 
 /* ---- Labels ---- */
 QLabel {{

@@ -11,6 +11,7 @@ SpikeThresholdMode = Literal["fixed", "rms_multiple"]
 SpikeThresholdPolarity = Literal["negative", "positive"]
 IntanFilterType = Literal["bessel", "butterworth"]
 SectionSpecKind = Literal["count", "duration"]
+SoftwareNotchHz = Literal[0, 50, 60]
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,8 @@ class AnalysisConfig:
     intan_filter_order: int = 2
     intan_filter_type: IntanFilterType = "bessel"
     intan_filter_cutoff_hz: float = 250.0
+    # Optional software notch applied on wideband before HP/LP (0 = off).
+    software_notch_hz: SoftwareNotchHz = 0
     intan_artifact_threshold_uv: float = 2500.0
     intan_artifact_suppression_enabled: bool = True
     work_dir: Path | None = None

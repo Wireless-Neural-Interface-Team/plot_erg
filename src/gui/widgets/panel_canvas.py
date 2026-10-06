@@ -11,14 +11,16 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QSplitter,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 from gui.widgets.interactive_canvas import InteractiveCanvas
+from gui.widgets.view_params import LocalViewParams
 from panel_registry import RenderRequest, panel_info
-from view_config import PanelPlacement
+from view_config import PanelPlacement, ViewerSettings
 
 _STATUS_COLORS = {
     "ok": "#16a34a",
@@ -97,6 +99,18 @@ class PanelCanvas(QFrame):
         button.setCursor(Qt.CursorShape.PointingHandCursor)
         return button
 
+    def update_placement(self, placement: PanelPlacement) -> None:
+        """Mettre à jour le placement (ex. bornes de plage) sans recréer le widget."""
+        self.placement = placement
+        title = placement.title()
+        self._title.setText(title)
+        self._title.setToolTip(
+            f"{title}\n"
+            "Molette = zoom · Clic droit = pan · Double-clic = reset · "
+            "Boutons Home / Pan / Zoom dans la barre"
+        )
+        self._dirty = True
+
     # ----------------------------------------------------------------- drawing
 
     @property
@@ -120,7 +134,22 @@ class PanelCanvas(QFrame):
         started = time.perf_counter()
         try:
             status = render_panel(self.figure, request)
-            apply_intan_scope_style(self.figure)
+            # Montage multi-axes : éviter le post-pass O(n_axes) (freeze à chaque coche).
+            if self.placement.panel != "montage_continuous_raw":
+                apply_intan_scope_style(
+                    self.figure,
+                    grid=request.style.grid,
+                    grid_alpha=request.style.grid_alpha,
+                    show_borders=getattr(request.style, "show_borders", None),
+                    ticks_inside=getattr(request.style, "ticks_inside", None),
+                )
+            else:
+                try:
+                    from gui.theme import SCOPE_BG
+
+                    self.figure.patch.set_facecolor(SCOPE_BG)
+                except Exception:
+                    pass
         except Exception as exc:
             self.figure.clear()
             axes = self.figure.add_subplot(111)
@@ -136,11 +165,13 @@ class PanelCanvas(QFrame):
                 wrap=True,
             )
             axes.set_axis_off()
-            apply_intan_scope_style(self.figure)
+            apply_intan_scope_style(self.figure, grid=False, show_borders=False)
             status = "unavailable"
         self._last_render_s = time.perf_counter() - started
         self._plot.draw_idle()
-        self._plot.enable_default_pan()
+        # Laisser le clic gauche aux barres de plage (pan = clic droit / molette zoom).
+        if self.placement.panel not in {"montage_continuous_raw", "full_recording"}:
+            self._plot.enable_default_pan()
         self._dirty = False
         self._set_status(status, f"{self._last_render_s * 1000:.0f} ms")
         return status
@@ -164,17 +195,24 @@ class PanelCanvas(QFrame):
 
 
 class DetachedPanelWindow(QDialog):
-    """Panneau détaché : même canvas interactif."""
+    """Panneau détaché : canvas interactif + légende/style locaux."""
 
     closed = Signal(object)  # PanelPlacement
+    refreshRequested = Signal(object)  # DetachedPanelWindow
 
-    def __init__(self, placement: PanelPlacement, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        placement: PanelPlacement,
+        settings: ViewerSettings,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.placement = placement
+        self.settings = settings
         info = panel_info(placement.panel)
         self.setWindowTitle(placement.title())
         self.setWindowFlag(Qt.WindowType.Window, True)
-        self.resize(960, max(440, info.preferred_height_px + 140))
+        self.resize(1100, max(480, info.preferred_height_px + 160))
 
         self._plot = InteractiveCanvas(
             figsize=(8.0, 5.0),
@@ -189,14 +227,47 @@ class DetachedPanelWindow(QDialog):
         self._status = QLabel("—")
         self._status.setObjectName("panelStatus")
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
-        layout.setSpacing(4)
+        self.params = LocalViewParams(
+            settings,
+            show_analysis=False,
+            show_continuous=False,
+            show_display_extras=True,
+            parent=self,
+        )
+        self.params.changed.connect(self._on_local_params_changed)
+
+        plot_side = QWidget(self)
+        plot_layout = QVBoxLayout(plot_side)
+        plot_layout.setContentsMargins(6, 6, 6, 6)
+        plot_layout.setSpacing(4)
         header = QHBoxLayout()
         header.addWidget(QLabel(placement.title()), 1)
         header.addWidget(self._status, 0)
-        layout.addLayout(header)
-        layout.addWidget(self._plot, 1)
+        plot_layout.addLayout(header)
+        plot_layout.addWidget(self._plot, 1)
+
+        params_side = QWidget(self)
+        params_layout = QVBoxLayout(params_side)
+        params_layout.setContentsMargins(6, 6, 6, 6)
+        params_layout.addWidget(self.params, 1)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        splitter.addWidget(plot_side)
+        splitter.addWidget(params_side)
+        splitter.setStretchFactor(0, 4)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([780, 280])
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(splitter)
+
+    def local_settings(self) -> ViewerSettings:
+        return self.params.settings()
+
+    def _on_local_params_changed(self) -> None:
+        self.settings = self.local_settings()
+        self.refreshRequested.emit(self)
 
     def render(self, request: RenderRequest) -> str:
         from gui.mpl_theme import apply_intan_scope_style
@@ -205,7 +276,13 @@ class DetachedPanelWindow(QDialog):
         started = time.perf_counter()
         try:
             status = render_panel(self.figure, request)
-            apply_intan_scope_style(self.figure)
+            apply_intan_scope_style(
+                self.figure,
+                grid=request.style.grid,
+                grid_alpha=request.style.grid_alpha,
+                show_borders=request.style.show_borders,
+                ticks_inside=request.style.ticks_inside,
+            )
         except Exception as exc:
             self.figure.clear()
             axes = self.figure.add_subplot(111)
@@ -221,7 +298,7 @@ class DetachedPanelWindow(QDialog):
                 wrap=True,
             )
             axes.set_axis_off()
-            apply_intan_scope_style(self.figure)
+            apply_intan_scope_style(self.figure, grid=False, show_borders=False)
             status = "unavailable"
         elapsed = time.perf_counter() - started
         self._plot.draw_idle()

@@ -99,9 +99,38 @@ class PanelGrid(QScrollArea):
                 canvas.removeRequested.connect(self.removeRequested.emit)
                 canvas.detachRequested.connect(self.detachRequested.emit)
                 self._panels[placement.key] = canvas
+            else:
+                widget = self._panels[placement.key]
+                update = getattr(widget, "update_placement", None)
+                if callable(update):
+                    update(placement)
+                else:
+                    widget.placement = placement  # type: ignore[attr-defined]
+                    widget.invalidate()  # type: ignore[attr-defined]
 
         self._order = list(placements)
         self._relayout()
+
+    def set_panel_height(
+        self, panel_height: int, *, panels: Sequence[str] | None = None
+    ) -> None:
+        """Changer la hauteur min sans reconstruire la grille (rapide)."""
+        height = max(140, int(panel_height))
+        if height == self._panel_height and panels is None:
+            return
+        self._panel_height = height
+        wanted = set(panels) if panels is not None else None
+        for placement in self._order:
+            if wanted is not None and placement.panel not in wanted:
+                continue
+            widget = self._panels.get(placement.key)
+            if widget is None:
+                continue
+            info = panel_info(placement.panel)
+            min_h = max(height, info.preferred_height_px)
+            if placement.panel == "montage_continuous_raw":
+                min_h = max(min_h, height)
+            widget.setMinimumHeight(min_h)  # type: ignore[attr-defined]
 
     def _relayout(self) -> None:
         while self._layout.count():
@@ -128,6 +157,9 @@ class PanelGrid(QScrollArea):
             widget = self._panels[placement.key]
             info = panel_info(placement.panel)
             height = max(self._panel_height, info.preferred_height_px)
+            # Montage continu : hauteur proportionnelle au nombre de lignes canal×flux.
+            if placement.panel == "montage_continuous_raw":
+                height = max(height, self._panel_height)
             widget.setMinimumHeight(height)  # type: ignore[attr-defined]
             widget.setParent(self._container)  # type: ignore[attr-defined]
             row, column = divmod(index, self._columns)

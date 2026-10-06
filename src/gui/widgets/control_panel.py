@@ -1,4 +1,4 @@
-"""Panneau de contrôle bas — disposition type Intan RHX Control Panel."""
+"""Panneau de contrôle bas — canal actif et filtres d’aperçu."""
 
 from __future__ import annotations
 
@@ -6,28 +6,25 @@ from typing import Any
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QButtonGroup,
     QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QPushButton,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
-from view_config import AnalysisSettings
+from view_config import AnalysisStream
 
 
 class ControlPanel(QFrame):
-    """Filtres WIDE/LOW/HIGH, canal actif, ouverture des outils d’analyse."""
+    """Filtres WIDE/LOW/HIGH (multi) et canal actif.
+
+    L’inspection se lance via la barre d’outils / menus / double-clic MEA.
+    """
 
     filterChanged = Signal()
-    showAnalysisRequested = Signal()
-    openSpikesRequested = Signal()
-    openGraphRequested = Signal()
-    processRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -42,121 +39,62 @@ class ControlPanel(QFrame):
         self._channel_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._channel_label.setToolTip("Canal actuellement sélectionné")
 
-        self._btn_wide = QPushButton("WIDE", self)
-        self._btn_wide.setObjectName("filterWide")
-        self._btn_wide.setCheckable(True)
-        self._btn_wide.setChecked(True)
-        self._btn_wide.setToolTip("Brut (wideband) — signal complet")
-
-        self._btn_low = QPushButton("LOW", self)
-        self._btn_low.setObjectName("filterLow")
-        self._btn_low.setCheckable(True)
-        self._btn_low.setToolTip("Passe-bas — LFP / composantes lentes")
-
-        self._btn_high = QPushButton("HIGH", self)
-        self._btn_high.setObjectName("filterHigh")
-        self._btn_high.setCheckable(True)
-        self._btn_high.setToolTip("Passe-haut — spikes / composantes rapides")
-
-        self._filter_group = QButtonGroup(self)
-        self._filter_group.setExclusive(True)
-        for button in (self._btn_wide, self._btn_low, self._btn_high):
-            self._filter_group.addButton(button)
+        self._show_wide = QCheckBox("WIDE", self)
+        self._show_wide.setChecked(True)
+        self._show_wide.setToolTip("Aperçu canal / revue montage : signal brut (wideband)")
+        self._show_low = QCheckBox("LOW", self)
+        self._show_low.setToolTip("Aperçu canal / revue montage : passe-bas (LFP)")
+        self._show_high = QCheckBox("HIGH", self)
+        self._show_high.setToolTip("Aperçu canal / revue montage : passe-haut (spikes)")
 
         self._mark_stims = QCheckBox("Stim markers", self)
         self._mark_stims.setChecked(True)
-        self._mark_stims.setToolTip("Marquer les stimulations sur le montage")
+        self._mark_stims.setToolTip("Marquer les stimulations sur l’aperçu / le montage")
 
-        self._show_raw = QCheckBox("WIDE", self)
-        self._show_hp = QCheckBox("HIGH", self)
-        self._show_lp = QCheckBox("LOW", self)
-        self._show_rms = QCheckBox("RMS", self)
-        for box in (self._show_raw, self._show_hp, self._show_lp, self._show_rms):
-            box.setChecked(True)
-
-        self._btn_analysis = QPushButton("Analyse", self)
-        self._btn_analysis.setObjectName("primaryButton")
-        self._btn_analysis.setToolTip("Fenêtre d’analyse (traces cochées)")
-        self._btn_spikes = QPushButton("Spike Scope", self)
-        self._btn_spikes.setObjectName("secondaryButton")
-        self._btn_spikes.setToolTip("Raster · PSTH · ISI · superposition")
-        self._btn_graph = QPushButton("Graph…", self)
-        self._btn_graph.setToolTip("Choisir un graphique pour le canal (Ctrl+G)")
-        self._btn_process = QPushButton("Traiter", self)
-        self._btn_process.setObjectName("primaryButton")
-        self._btn_process.setToolTip("Traiter / actualiser (F5)")
-
-        for button in (self._btn_analysis, self._btn_spikes, self._btn_graph):
-            button.setEnabled(False)
-
-        # Rangée 1 : identité + filtre d’affichage montage
-        row1 = QHBoxLayout()
-        row1.setSpacing(8)
-        row1.addWidget(QLabel("Channel", self))
-        row1.addWidget(self._channel_label)
-        row1.addSpacing(12)
-        row1.addWidget(QLabel("Filter display", self))
-        for button in (self._btn_wide, self._btn_low, self._btn_high):
-            row1.addWidget(button)
-        row1.addSpacing(8)
-        row1.addWidget(self._mark_stims)
-        row1.addStretch(1)
-        row1.addWidget(self._btn_process)
-
-        # Rangée 2 : outils d’analyse
-        row2 = QHBoxLayout()
-        row2.setSpacing(8)
-        row2.addWidget(QLabel("Open", self))
-        for box in (self._show_raw, self._show_hp, self._show_lp, self._show_rms):
-            row2.addWidget(box)
-        row2.addSpacing(10)
-        row2.addWidget(self._btn_analysis)
-        row2.addWidget(self._btn_spikes)
-        row2.addWidget(self._btn_graph)
-        row2.addStretch(1)
-        self._hint = QLabel("Ajoutez un .rhs puis Traiter.", self)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addWidget(QLabel("Channel", self))
+        row.addWidget(self._channel_label)
+        row.addSpacing(12)
+        row.addWidget(QLabel("Flux", self))
+        for box in (self._show_wide, self._show_high, self._show_low):
+            row.addWidget(box)
+        row.addSpacing(8)
+        row.addWidget(self._mark_stims)
+        row.addStretch(1)
+        self._hint = QLabel("Ajoutez un .rhs puis Traiter (F5).", self)
         self._hint.setObjectName("hintLabel")
-        row2.addWidget(self._hint)
+        row.addWidget(self._hint)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 8, 10, 8)
         layout.setSpacing(6)
-        layout.addLayout(row1)
-        layout.addLayout(row2)
+        layout.addLayout(row)
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setMinimumHeight(86)
+        self.setMinimumHeight(48)
 
-        self._filter_group.buttonClicked.connect(self._emit_filter)
-        self._mark_stims.toggled.connect(self._emit_filter)
-        for box in (self._show_raw, self._show_hp, self._show_lp, self._show_rms):
-            box.toggled.connect(self._emit_filter)
-        self._btn_analysis.clicked.connect(self.showAnalysisRequested.emit)
-        self._btn_spikes.clicked.connect(self.openSpikesRequested.emit)
-        self._btn_graph.clicked.connect(self.openGraphRequested.emit)
-        self._btn_process.clicked.connect(self.processRequested.emit)
+        for box in (self._show_wide, self._show_high, self._show_low, self._mark_stims):
+            box.toggled.connect(self._on_stream_toggled)
 
     # ---------------------------------------------------------------- values
 
+    def continuous_streams(self) -> tuple[AnalysisStream, ...]:
+        streams: list[AnalysisStream] = []
+        if self._show_wide.isChecked():
+            streams.append("raw")
+        if self._show_high.isChecked():
+            streams.append("hp")
+        if self._show_low.isChecked():
+            streams.append("lp")
+        return tuple(streams) or ("raw",)
+
     def continuous_stream(self) -> str:
-        if self._btn_high.isChecked():
-            return "hp"
-        if self._btn_low.isChecked():
-            return "lp"
-        return "raw"
+        streams = self.continuous_streams()
+        return streams[0]
 
     def mark_stimulations(self) -> bool:
         return bool(self._mark_stims.isChecked())
-
-    def analysis_settings(self) -> AnalysisSettings:
-        return AnalysisSettings(
-            mode="average",
-            stim_index=0,
-            show_raw=self._show_raw.isChecked(),
-            show_hp=self._show_hp.isChecked(),
-            show_lp=self._show_lp.isChecked(),
-            show_rms=self._show_rms.isChecked(),
-        )
 
     def set_channel(self, channel: str | None) -> None:
         self._channel = (channel or "").strip()
@@ -168,23 +106,30 @@ class ControlPanel(QFrame):
         self._refresh_ready()
 
     def set_busy(self, busy: bool) -> None:
-        self._btn_process.setEnabled(not busy)
-        self._btn_process.setText("…" if busy else "Traiter")
+        """Pendant un build, l’inspection reste disponible si un canal est prêt."""
+        del busy
+        self._refresh_ready()
 
     def _refresh_ready(self) -> None:
         has_channel = bool(self._channel)
         ready = self._n_trials > 0
-        self._btn_analysis.setEnabled(ready and has_channel)
-        self._btn_spikes.setEnabled(ready and has_channel)
-        self._btn_graph.setEnabled(has_channel)
         if ready and has_channel:
-            self._hint.setText(f"{self._n_trials} stim(s) · {self._channel}")
+            self._hint.setText(
+                f"{self._n_trials} stim(s) · {self._channel} — Inspecter ou double-clic"
+            )
         elif has_channel:
-            self._hint.setText(f"Canal {self._channel}")
+            self._hint.setText(f"Canal {self._channel} — Traiter (F5) puis inspecter")
         else:
-            self._hint.setText("Ajoutez un .rhs puis Traiter.")
+            self._hint.setText("Ajoutez un .rhs, Traiter (F5), puis Inspecter.")
 
-    def _emit_filter(self, *_args: Any) -> None:
+    def _on_stream_toggled(self, *_args: Any) -> None:
         if self._updating:
             return
+        # Toujours au moins un flux affiché.
+        if not any(
+            box.isChecked() for box in (self._show_wide, self._show_high, self._show_low)
+        ):
+            self._updating = True
+            self._show_wide.setChecked(True)
+            self._updating = False
         self.filterChanged.emit()

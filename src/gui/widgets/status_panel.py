@@ -125,6 +125,11 @@ class StatusPanel(QWidget):
         self._overall.setValue(0)
         self._stage.setValue(0)
 
+    def set_progress_complete(self) -> None:
+        """Afficher 100 % une fois le chargement / l’affichage prêt."""
+        self._overall.setValue(1000)
+        self._stage.setValue(1000)
+
     def set_headline(self, message: str) -> None:
         self._headline.setText(message)
 

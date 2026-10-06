@@ -86,6 +86,8 @@ class IntanDspSettings:
     fs: float
     rhs_version_major: int = 3
     notch_filter_frequency_hz: float = 0.0
+    # User-selected software notch (0 / 50 / 60). Applied even on RHX v3+ files.
+    software_notch_hz: float = 0.0
     filter_order: int = 2
     filter_type: FilterType = "bessel"
     filter_cutoff_hz: float = 250.0
@@ -99,9 +101,20 @@ class IntanDspSettings:
     def rms_window_samples(self) -> int:
         return max(1, int(math.ceil(float(self.fs) * float(self.rms_window_s))))
 
+    def effective_notch_hz(self) -> float:
+        """Software notch applied in the HP/LP chain (0 = none).
+
+        Header notch for pre-RHX v3 files is applied once at RHS load time
+        (vectorized). Only an explicit ``software_notch_hz`` (50/60) is
+        re-applied here, so line noise can be cleaned on RHX v3+ recordings
+        without double-filtering legacy files.
+        """
+        soft = float(self.software_notch_hz or 0.0)
+        return soft if soft > 0 else 0.0
+
     def apply_notch_to_wideband(self) -> bool:
-        """True when wideband must be notch-filtered before software filter (pre-RHX v3)."""
-        return self.notch_filter_frequency_hz > 0 and self.rhs_version_major < 3
+        """True when wideband must be notch-filtered before HP/LP."""
+        return self.effective_notch_hz() > 0
 
     def validate_filter(self) -> None:
         fc = float(self.filter_cutoff_hz)
@@ -147,6 +160,7 @@ class IntanDspSettings:
         artifact_threshold_uv: float = 2500.0,
         artifact_suppression_enabled: bool = True,
         rms_window_s: float = INTAN_RMS_WINDOW_S,
+        software_notch_hz: float = 0.0,
     ) -> IntanDspSettings:
         freq = data.get("frequency_parameters") or {}
         fs = float(freq.get("amplifier_sample_rate") or data.get("sample_rate") or 0.0)
@@ -155,10 +169,14 @@ class IntanDspSettings:
         version = data.get("version") or {}
         major = int(version.get("major", 3))
         notch = float(freq.get("notch_filter_frequency") or 0.0)
+        soft = float(software_notch_hz or 0.0)
+        if soft not in (0.0, 50.0, 60.0):
+            soft = 0.0
         settings = cls(
             fs=fs,
             rhs_version_major=major,
             notch_filter_frequency_hz=notch,
+            software_notch_hz=soft,
             filter_order=int(filter_order),
             filter_type=filter_type,
             filter_cutoff_hz=float(filter_cutoff_hz),
@@ -323,11 +341,12 @@ def build_intan_filter_sos(
 ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
     """Precompute SOS: optional notch + separate high-pass and low-pass (same params)."""
     notch_sos: np.ndarray | None = None
-    if settings.apply_notch_to_wideband():
+    notch_hz = settings.effective_notch_hz()
+    if notch_hz > 0:
         notch_sos = _coeffs_to_sos(
             [
                 _second_order_notch(
-                    settings.notch_filter_frequency_hz,
+                    notch_hz,
                     INTAN_NOTCH_BANDWIDTH_HZ,
                     settings.fs,
                 )
@@ -502,46 +521,53 @@ def detect_spikes_intan(
     After a hit, search skips ``snippet_size`` samples (Intan refractory).
     Artifact snippets (any sample past spikeMax) are not counted as spikes
     but still consume the same refractory window.
+
+    Candidates are found with a vectorized scan; refractory / artifact checks
+    keep Intan ordering without a sample-by-sample Python loop over the whole
+    window.
     """
     n = int(np.asarray(high).shape[-1]) if np.ndim(high) >= 1 else int(np.asarray(high).size)
     if n < 2:
         return np.array([], dtype=np.int64)
     t0 = max(0, int(start_sample))
     t1 = n if end_sample is None else min(n, int(end_sample))
-    if t1 - t0 < settings.snippet_size + 2:
+    snippet = int(settings.snippet_size)
+    if t1 - t0 < snippet + 2:
         return np.array([], dtype=np.int64)
 
     x = np.asarray(high[t0:t1], dtype=np.float32).ravel()
-    win_len = x.size
+    win_len = int(x.size)
     thr = float(settings.spike_threshold_uv)
     artifact = float(settings.artifact_threshold_uv)
-    use_artifact = settings.artifact_suppression_enabled
-    snippet = int(settings.snippet_size)
+    use_artifact = bool(settings.artifact_suppression_enabled)
+
+    # Search only where a full snippet still fits (Intan behaviour).
+    search_end = win_len - snippet
+    if search_end <= 0:
+        return np.array([], dtype=np.int64)
+    region = x[:search_end]
+    if thr >= 0:
+        candidates = np.flatnonzero(region > thr)
+    else:
+        candidates = np.flatnonzero(region < thr)
+    if candidates.size == 0:
+        return np.array([], dtype=np.int64)
 
     spikes: list[int] = []
-    s = 0
-    while s < win_len - snippet:
-        surpassed = False
-        if thr >= 0:
-            if x[s] > thr:
-                surpassed = True
-        elif x[s] < thr:
-            surpassed = True
-        if not surpassed:
-            s += 1
+    next_allowed = 0
+    for s in candidates.tolist():
+        if s < next_allowed:
             continue
-        snippet_end = min(win_len, s + snippet)
-        seg = x[s:snippet_end]
+        snippet_end = s + snippet
         if use_artifact:
-            is_artifact = False
-            if thr >= 0 and np.any(seg >= artifact):
-                is_artifact = True
-            elif thr < 0 and np.any(seg <= -artifact):
-                is_artifact = True
+            seg = x[s:snippet_end]
+            if thr >= 0:
+                is_artifact = bool(np.any(seg >= artifact))
+            else:
+                is_artifact = bool(np.any(seg <= -artifact))
             if is_artifact:
-                # cpuinterface.cpp: artifacts still occupy SnippetSize (not counted as spikes).
-                s += snippet
+                next_allowed = snippet_end
                 continue
         spikes.append(s + t0)
-        s += snippet
+        next_allowed = snippet_end
     return np.asarray(spikes, dtype=np.int64)

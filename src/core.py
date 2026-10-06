@@ -289,17 +289,15 @@ def mean_time_to_next_rising_edge_s(
     """Mean time (s) from each trigger to the next rising-edge crossing (typical pulse end)."""
     trigger_indices = np.asarray(trigger_indices, dtype=np.int64)
     rising_idx = detect_edges(signal, threshold, "rising")
-    if rising_idx.size == 0:
+    if rising_idx.size == 0 or trigger_indices.size == 0:
         return None
-    deltas_s: list[float] = []
-    for tr in trigger_indices:
-        after = rising_idx[rising_idx > tr]
-        if after.size == 0:
-            continue
-        deltas_s.append(float(after[0] - tr) / fs)
-    if not deltas_s:
+    # First rising edge strictly after each trigger (O(T log R)).
+    positions = np.searchsorted(rising_idx, trigger_indices + 1, side="left")
+    valid = positions < rising_idx.size
+    if not np.any(valid):
         return None
-    return float(np.mean(deltas_s))
+    deltas = (rising_idx[positions[valid]] - trigger_indices[valid]).astype(np.float64) / float(fs)
+    return float(np.mean(deltas))
 
 
 def detect_spikes_at_threshold(
@@ -670,6 +668,7 @@ def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> In
         artifact_threshold_uv=float(config.intan_artifact_threshold_uv),
         artifact_suppression_enabled=bool(config.intan_artifact_suppression_enabled),
         rms_window_s=float(config.rms_window_s),
+        software_notch_hz=float(getattr(config, "software_notch_hz", 0) or 0),
     )
 
 

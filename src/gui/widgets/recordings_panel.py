@@ -75,11 +75,13 @@ class RecordingEntry:
 
 
 class RecordingsPanel(QWidget):
-    """Ajouter, retirer, styler et suivre les enregistrements comparés."""
+    """Liste des enregistrements : légende, couleur, statut ; Retirer la sélection.
+
+    Ajouter / ouvrir un traité / Traiter : barre d’outils et menus de la fenêtre.
+    """
 
     entriesChanged = Signal()
     styleChanged = Signal()
-    buildRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -107,25 +109,10 @@ class RecordingsPanel(QWidget):
         for column in (_COL_COLOR, _COL_PLOT, _COL_STATUS):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
 
-        add_rhs = QPushButton("Ajouter…")
-        add_rhs.setToolTip("Ajouter un ou plusieurs enregistrements Intan .rhs.")
-        add_rhs.clicked.connect(self.browse_rhs)
-        add_processed = QPushButton("Traité…")
-        add_processed.setToolTip(
-            f"Ouvrir un dataset déjà exporté ({DATASET_SUFFIX} / .zip)."
-        )
-        add_processed.clicked.connect(self.browse_processed)
         remove = QPushButton("Retirer")
         remove.setObjectName("dangerButton")
         remove.setToolTip("Retirer les lignes sélectionnées.")
         remove.clicked.connect(self.remove_selected)
-
-        self._build_button = QPushButton("Traiter")
-        self._build_button.setObjectName("primaryButton")
-        self._build_button.setToolTip(
-            "Traiter les enregistrements en attente (F5). Cache réutilisé si possible."
-        )
-        self._build_button.clicked.connect(self.buildRequested.emit)
 
         self._summary = QLabel("Aucun enregistrement.")
         self._summary.setObjectName("hintLabel")
@@ -133,10 +120,8 @@ class RecordingsPanel(QWidget):
 
         top = QHBoxLayout()
         top.setSpacing(4)
-        for widget in (add_rhs, add_processed, remove):
-            top.addWidget(widget)
+        top.addWidget(remove)
         top.addStretch(1)
-        top.addWidget(self._build_button)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -292,8 +277,8 @@ class RecordingsPanel(QWidget):
         self._refresh_summary()
 
     def set_busy(self, busy: bool) -> None:
-        self._build_button.setEnabled(not busy)
-        self._build_button.setText("…" if busy else "Traiter")
+        """Compatibilité : l’état occupé est géré par la barre d’outils principale."""
+        del busy
 
     # ----------------------------------------------------------------- rendering
 

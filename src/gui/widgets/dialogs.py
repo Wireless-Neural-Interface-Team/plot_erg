@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -196,7 +197,25 @@ class CacheDialog(QDialog):
         )
 
     def _prune(self) -> None:
-        removed = prune_cache(self._root, max_bytes=20 * 1024**3, keep=self._protected)
+        total = cache_size_bytes(self._root)
+        limit = 20 * 1024**3
+        if total <= limit:
+            QMessageBox.information(
+                self,
+                "Cache",
+                f"Le cache fait déjà {human_bytes(total)} (≤ 20 Go). Rien à supprimer.",
+            )
+            return
+        reply = QMessageBox.question(
+            self,
+            "Élaguer le cache",
+            f"Cache actuel : {human_bytes(total)}.\n"
+            f"Supprimer les entrées les plus anciennes jusqu’à ≈ 20 Go ?\n"
+            f"(Les datasets ouverts restent protégés.)",
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        removed = prune_cache(self._root, max_bytes=limit, keep=self._protected)
         self._summary.setText(f"{removed} dataset(s) supprimé(s).")
         self.refresh()
 

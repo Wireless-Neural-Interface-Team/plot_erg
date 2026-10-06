@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as _dt
 import gc
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -67,15 +68,19 @@ from processed_dataset import (
     recording_label_for,
 )
 
-STAGES: tuple[tuple[str, str, float], ...] = (
+# Weights for ``build_recording`` only. Channel work is a separate job and
+# reports its own 0→1 overall fraction via ``ensure_channels``.
+BUILD_STAGES: tuple[tuple[str, str, float], ...] = (
     ("read", "Reading recording", 3.0),
     ("segment", "Detecting stimulations", 0.4),
     ("finalize", "Preparing viewer", 0.2),
+)
+STAGES: tuple[tuple[str, str, float], ...] = BUILD_STAGES + (
     ("channel", "Computing selected channels", 2.0),
 )
 
 _STAGE_LABELS = {key: label for key, label, _w in STAGES}
-_STAGE_WEIGHTS = {key: weight for key, _l, weight in STAGES}
+_STAGE_WEIGHTS = {key: weight for key, _l, weight in BUILD_STAGES}
 _TOTAL_WEIGHT = sum(_STAGE_WEIGHTS.values())
 
 
@@ -303,17 +308,29 @@ def _dsp_settings_from_raw_meta(raw_meta: dict[str, Any], config: AnalysisConfig
 
 # ------------------------------------------------------------- filtered stream
 
+# Cap in-RAM filtered rows per bank (HP and LP each). Beyond this, oldest rows
+# are evicted; they are recomputed on next access.
+LAZY_FILTER_CACHE_MAX_CHANNELS = 8
+
 
 class LazyFilterBank:
     """Filters individual amplifier channels on first access and caches the row."""
 
-    def __init__(self, amplifier: np.ndarray, dsp: IntanDspSettings, kind: str) -> None:
+    def __init__(
+        self,
+        amplifier: np.ndarray,
+        dsp: IntanDspSettings,
+        kind: str,
+        *,
+        max_cached_channels: int = LAZY_FILTER_CACHE_MAX_CHANNELS,
+    ) -> None:
         if kind not in ("hp", "lp"):
             raise ValueError(f"Unsupported filter bank kind: {kind}")
         self._amplifier = amplifier
         self._dsp = dsp
         self._kind = kind
-        self._cache: dict[int, np.ndarray] = {}
+        self._max_cached = max(1, int(max_cached_channels))
+        self._cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self.shape = (int(amplifier.shape[0]), int(amplifier.shape[1]))
         notch_sos, hp_sos, lp_sos = build_intan_filter_sos(dsp)
         self._notch_sos = notch_sos
@@ -323,6 +340,7 @@ class LazyFilterBank:
         ch = int(index)
         cached = self._cache.get(ch)
         if cached is not None:
+            self._cache.move_to_end(ch)
             return cached
         from scipy.signal import sosfilt
 
@@ -332,6 +350,8 @@ class LazyFilterBank:
             signal = sosfilt(self._notch_sos, signal)
         filtered = np.asarray(sosfilt(self._sos, signal), dtype=np.float32)
         self._cache[ch] = filtered
+        while len(self._cache) > self._max_cached:
+            self._cache.popitem(last=False)
         return filtered
 
     def clear(self) -> None:
@@ -502,10 +522,16 @@ def ensure_channels(
     *,
     progress: ProgressCallback | None = None,
     force: bool = False,
+    need_means: bool = True,
+    need_rms: bool = True,
+    need_spikes: bool = True,
+    need_overlay: bool = True,
 ) -> list[int]:
     """Compute derived products for the requested channel indices.
 
     Returns the list of channels that were (re)computed.
+    Products can be selected so opening a simple average view does not pay
+    for spike overlays, and vice versa.
     """
     source = recording.source
     if source is None:
@@ -513,7 +539,24 @@ def ensure_channels(
 
     wanted = sorted({int(ch) for ch in channels if 0 <= int(ch) < recording.n_channels})
     if not force:
-        wanted = [ch for ch in wanted if not recording.is_channel_ready(ch)]
+        still: list[int] = []
+        for ch in wanted:
+            if not recording.is_channel_ready(ch):
+                still.append(ch)
+                continue
+            data = recording._channel_data.get(ch)  # noqa: SLF001 — intentional
+            if data is None:
+                still.append(ch)
+                continue
+            if need_means and not getattr(data, "means_ready", True):
+                still.append(ch)
+            elif need_rms and not getattr(data, "rms_ready", True):
+                still.append(ch)
+            elif need_spikes and not getattr(data, "spikes_ready", True):
+                still.append(ch)
+            elif need_overlay and not getattr(data, "overlay_ready", True):
+                still.append(ch)
+        wanted = still
     if not wanted:
         return []
 
@@ -524,6 +567,8 @@ def ensure_channels(
     pre_n = int(recording.meta.segmentation.pre_n)
     post_n = int(recording.meta.segmentation.post_n)
     workers = resolve_channel_workers(config.channel_workers, len(wanted))
+    # Cap concurrent workers to limit memmap / float64 peak RAM.
+    workers = min(workers, 4) if workers > 1 else workers
     computed: list[int] = []
 
     def _emit(fraction: float, message: str) -> None:
@@ -544,8 +589,21 @@ def ensure_channels(
 
     def _one(ch: int) -> tuple[int, ChannelData]:
         check_analysis_cancelled()
+        existing = recording._channel_data.get(ch)  # noqa: SLF001
         return ch, _compute_channel_data(
-            recording, source, config, ch, t_rel, triggers, pre_n, post_n
+            recording,
+            source,
+            config,
+            ch,
+            t_rel,
+            triggers,
+            pre_n,
+            post_n,
+            need_means=need_means,
+            need_rms=need_rms,
+            need_spikes=need_spikes,
+            need_overlay=need_overlay,
+            existing=existing,
         )
 
     total = max(1, len(wanted))
@@ -593,70 +651,119 @@ def _compute_channel_data(
     triggers: np.ndarray,
     pre_n: int,
     post_n: int,
+    *,
+    need_means: bool = True,
+    need_rms: bool = True,
+    need_spikes: bool = True,
+    need_overlay: bool = True,
+    existing: ChannelData | None = None,
 ) -> ChannelData:
+    from draw_primitives import _extract_spike_waveforms
     from plotting import (
-        _extract_spike_waveforms,
         _mean_rms_profile_from_source_window,
         _resolve_channel_spike_threshold,
     )
 
-    raw_row = np.asarray(source.amplifier[ch], dtype=np.float32)
-    hp_row = np.asarray(source.highpass[ch], dtype=np.float32)
-    lp_row = np.asarray(source.lowpass[ch], dtype=np.float32)
-    means = {
-        "raw": _mean_one_channel(raw_row, triggers, pre_n, post_n),
-        "hp": _mean_one_channel(hp_row, triggers, pre_n, post_n),
-        "lp": _mean_one_channel(lp_row, triggers, pre_n, post_n),
-    }
+    # Filter HP/LP once — shared by means, spikes and overlay.
+    need_hp = need_means or need_spikes or need_overlay or need_rms
+    need_lp = need_means
+    raw_row = np.asarray(source.amplifier[ch], dtype=np.float32) if need_means else None
+    hp_row = np.asarray(source.highpass[ch], dtype=np.float32) if need_hp else None
+    lp_row = np.asarray(source.lowpass[ch], dtype=np.float32) if need_lp else None
 
-    t0 = float(t_rel[0]) if t_rel.size else 0.0
-    t1 = float(t_rel[-1]) if t_rel.size else 0.0
-    rms_kinds = {"mean": None, "first": 0, "second": 1}
+    if need_means and raw_row is not None and hp_row is not None and lp_row is not None:
+        means = {
+            "raw": _mean_one_channel(raw_row, triggers, pre_n, post_n),
+            "hp": _mean_one_channel(hp_row, triggers, pre_n, post_n),
+            "lp": _mean_one_channel(lp_row, triggers, pre_n, post_n),
+        }
+    elif existing is not None and existing.means:
+        means = dict(existing.means)
+    else:
+        means = {}
+
     rms_profiles: dict[str, np.ndarray] = {}
     rms_time = np.empty(0, dtype=np.float64)
-    for kind, trigger_index in rms_kinds.items():
-        axis, values = _mean_rms_profile_from_source_window(
-            source,
-            t0,
-            t1,
-            float(config.rms_window_s),
-            channel_index=ch,
-            trigger_index=trigger_index,
-        )
-        if axis.size and rms_time.size == 0:
-            rms_time = np.asarray(axis, dtype=np.float64)
-        rms_profiles[kind] = np.asarray(values, dtype=np.float32)
+    if need_rms:
+        t0 = float(t_rel[0]) if t_rel.size else 0.0
+        t1 = float(t_rel[-1]) if t_rel.size else 0.0
+        rms_kinds = {"mean": None, "first": 0, "second": 1}
+        for kind, trigger_index in rms_kinds.items():
+            axis, values = _mean_rms_profile_from_source_window(
+                source,
+                t0,
+                t1,
+                float(config.rms_window_s),
+                channel_index=ch,
+                trigger_index=trigger_index,
+            )
+            if axis.size and rms_time.size == 0:
+                rms_time = np.asarray(axis, dtype=np.float64)
+            rms_profiles[kind] = np.asarray(values, dtype=np.float32)
+    elif existing is not None:
+        rms_profiles = dict(existing.rms_profiles)
+        rms_time = np.asarray(existing.rms_time, dtype=np.float64)
 
-    channel_rms = float(source.mean_rms_for_channel(ch))
-    threshold, caption = _resolve_channel_spike_threshold(
-        mode=config.spike_threshold_mode,
-        fixed_threshold_uv=config.spike_threshold_uv,
-        spike_threshold_polarity=config.spike_threshold_polarity,
-        rms_multiplier=config.spike_threshold_rms_multiplier,
-        source=source,
-        channel_index=ch,
-        mean_rms_uv=channel_rms,
-    )
-    trains = source.spike_times_per_trial_for_channel(ch, t_rel, float(threshold))
-    t_ms, waves, times = _extract_spike_waveforms(
-        source,
-        ch,
-        trains,
-        pre_ms=float(config.spike_overlay_pre_ms),
-        post_ms=float(config.spike_overlay_post_ms),
-    )
-    waves = np.asarray(waves, dtype=np.float32)
-    times = np.asarray(times, dtype=np.float32)
-    total = int(waves.shape[0])
-    overlay_mean = (
-        np.mean(np.asarray(waves, dtype=np.float64), axis=0).astype(np.float32)
-        if total
-        else None
-    )
-    if total > MAX_OVERLAY_SNIPPETS_PER_CHANNEL:
-        picks = np.linspace(0, total - 1, MAX_OVERLAY_SNIPPETS_PER_CHANNEL).astype(np.int64)
-        waves = waves[picks]
-        times = times[picks]
+    if need_spikes or need_overlay or need_rms:
+        channel_rms = float(source.mean_rms_for_channel(ch))
+        threshold, caption = _resolve_channel_spike_threshold(
+            mode=config.spike_threshold_mode,
+            fixed_threshold_uv=config.spike_threshold_uv,
+            spike_threshold_polarity=config.spike_threshold_polarity,
+            rms_multiplier=config.spike_threshold_rms_multiplier,
+            source=source,
+            channel_index=ch,
+            mean_rms_uv=channel_rms,
+        )
+    elif existing is not None:
+        channel_rms = float(existing.channel_rms_uv)
+        threshold = float(existing.threshold_uv)
+        caption = existing.threshold_caption
+    else:
+        channel_rms = 0.0
+        threshold = float(config.spike_threshold_uv)
+        caption = ""
+
+    if need_spikes or need_overlay:
+        trains = source.spike_times_per_trial_for_channel(ch, t_rel, float(threshold))
+    elif existing is not None:
+        trains = list(existing.spike_trains)
+    else:
+        trains = []
+
+    if need_overlay:
+        t_ms, waves, times = _extract_spike_waveforms(
+            source,
+            ch,
+            trains,
+            pre_ms=float(config.spike_overlay_pre_ms),
+            post_ms=float(config.spike_overlay_post_ms),
+        )
+        waves = np.asarray(waves, dtype=np.float32)
+        times = np.asarray(times, dtype=np.float32)
+        total = int(waves.shape[0])
+        overlay_mean = (
+            np.mean(np.asarray(waves, dtype=np.float64), axis=0).astype(np.float32)
+            if total
+            else None
+        )
+        if total > MAX_OVERLAY_SNIPPETS_PER_CHANNEL:
+            picks = np.linspace(0, total - 1, MAX_OVERLAY_SNIPPETS_PER_CHANNEL).astype(np.int64)
+            waves = waves[picks]
+            times = times[picks]
+        overlay_t_ms = np.asarray(t_ms, dtype=np.float64)
+    elif existing is not None:
+        overlay_t_ms = np.asarray(existing.overlay_t_ms, dtype=np.float64)
+        waves = np.asarray(existing.overlay_waves, dtype=np.float32)
+        times = np.asarray(existing.overlay_times, dtype=np.float32)
+        total = int(existing.overlay_total)
+        overlay_mean = existing.overlay_mean
+    else:
+        overlay_t_ms = np.empty(0, dtype=np.float64)
+        waves = np.empty((0, 0), dtype=np.float32)
+        times = np.empty(0, dtype=np.float32)
+        total = 0
+        overlay_mean = None
 
     del recording  # only used for typing / future hooks
     return ChannelData(
@@ -667,11 +774,15 @@ def _compute_channel_data(
         threshold_uv=float(threshold),
         threshold_caption=caption,
         spike_trains=[np.asarray(trial, dtype=np.float64) for trial in trains],
-        overlay_t_ms=np.asarray(t_ms, dtype=np.float64),
+        overlay_t_ms=overlay_t_ms,
         overlay_waves=waves,
         overlay_times=times,
         overlay_total=total,
         overlay_mean=overlay_mean,
+        overlay_ready=bool(need_overlay or (existing is not None and existing.overlay_ready)),
+        rms_ready=bool(need_rms or (existing is not None and existing.rms_ready)),
+        spikes_ready=bool(need_spikes or need_overlay or (existing is not None and existing.spikes_ready)),
+        means_ready=bool(need_means or (existing is not None and existing.means_ready)),
     )
 
 

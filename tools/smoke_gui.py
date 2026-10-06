@@ -187,7 +187,7 @@ def main() -> int:
         print(f"channel switch redraw: {redraw_s:.2f} s")
 
         # Opening a view window applies local display parameters (not a global dock).
-        from gui.widgets.frozen_graph_window import FrozenGraphWindow
+        from gui.widgets.view_session_window import ViewSessionWindow
         from view_config import PanelPlacement
 
         channel = window.channel_panel.current_channel or mapped[0]
@@ -197,25 +197,26 @@ def main() -> int:
         from dataclasses import replace as dc_replace
 
         seed = dc_replace(seed, psth_bin_window_s=0.1)
-        frozen = FrozenGraphWindow(
-            placement=PanelPlacement("analysis_psth", "full"),
+        session = ViewSessionWindow(
+            title="Smoke",
+            placements=(PanelPlacement("analysis_psth", "full"),),
             channel_name=channel,
             channel_index=int(resolved),
             base_settings=seed,
             parent=window,
         )
-        frozen.set_request_factory(window._make_frozen_request)
-        frozen.closed.connect(window._on_frozen_closed)
-        window._frozen[frozen.window_id] = frozen
-        frozen.show()
+        session.set_request_factory(window._make_session_request)
+        session.closed.connect(window._on_view_session_closed)
+        window._view_sessions[session.window_id] = session
+        session.show()
         app.processEvents()
-        frozen.redraw()
+        session.redraw()
         app.processEvents()
-        assert abs(frozen.local_settings().psth_bin_window_s - 0.1) < 1e-9
+        assert abs(session.local_settings().psth_bin_window_s - 0.1) < 1e-9
         print("local view-window parameter OK")
-        frozen.close()
+        session.close()
         app.processEvents()
-        window._frozen.pop(frozen.window_id, None)
+        window._view_sessions.pop(session.window_id, None)
 
         # The PDF path must still receive a coherent configuration.
         from gui.defaults import build_config_from_defaults

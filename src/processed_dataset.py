@@ -438,6 +438,11 @@ class ChannelData:
     overlay_times: np.ndarray
     overlay_total: int
     overlay_mean: np.ndarray | None
+    # False when spike overlay was skipped (lazy); True after a real extract pass.
+    overlay_ready: bool = True
+    rms_ready: bool = True
+    spikes_ready: bool = True
+    means_ready: bool = True
 
 
 class ProcessedRecording:
@@ -470,6 +475,8 @@ class ProcessedRecording:
         self.threshold_captions = list(threshold_captions)
         self.build_timings = list(build_timings)
         self._channel_data: dict[int, ChannelData] = {}
+        # Cache des enveloppes continues (stream, ch, max_points) → (t, y).
+        self._continuous_cache: dict[tuple[str, int, int], tuple[np.ndarray, np.ndarray]] = {}
 
     # ---------------------------------------------------------------- identity
 
@@ -541,10 +548,19 @@ class ProcessedRecording:
         return int(self.spikes.total_for_channel(ch))
 
     def continuous_trace(
-        self, stream: str, ch: int
+        self, stream: str, ch: int, *, max_points: int | None = None
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Absolute-time continuous trace ``(t_s, values_uv)`` for one channel."""
+        """Absolute-time continuous trace ``(t_s, values_uv)`` for one channel.
+
+        When ``max_points`` is set and the row is denser, returns a min/max
+        envelope so callers avoid building a full-rate time axis.
+        """
         empty = np.empty(0, dtype=np.float64)
+        limit = int(max_points) if max_points is not None else 0
+        cache_key = (str(stream), int(ch), limit)
+        cached = self._continuous_cache.get(cache_key)
+        if cached is not None:
+            return cached
         source = self.source
         if source is None:
             return empty, empty
@@ -555,14 +571,35 @@ class ProcessedRecording:
         }.get(stream)
         if array is None or ch < 0 or ch >= int(array.shape[0]):
             return empty, empty
-        row = np.asarray(array[ch], dtype=np.float64)
+        # Lecture memmap une seule fois ; garder float32 pour l’enveloppe (plus rapide).
+        row = np.asarray(array[ch])
         if row.size == 0:
             return empty, empty
         fs = float(self.meta.fs)
         if fs <= 0:
             return empty, empty
-        t = np.arange(row.size, dtype=np.float64) / fs
-        return t, row
+        if limit > 16 and row.size > limit:
+            # Enveloppe min/max vectorisée (pas de boucle Python par bin).
+            n_bins = max(1, limit // 2)
+            bin_size = max(1, row.size // n_bins)
+            usable = bin_size * n_bins
+            reshaped = np.asarray(row[:usable], dtype=np.float32).reshape(n_bins, bin_size)
+            lows = reshaped.min(axis=1)
+            highs = reshaped.max(axis=1)
+            mids = (np.arange(n_bins, dtype=np.float64) + 0.5) * (bin_size / fs)
+            out_t = np.repeat(mids, 2)
+            out_y = np.empty(n_bins * 2, dtype=np.float64)
+            out_y[0::2] = lows
+            out_y[1::2] = highs
+            result = (out_t, out_y)
+        else:
+            t = np.arange(row.size, dtype=np.float64) / fs
+            result = (t, np.asarray(row, dtype=np.float64))
+        # Cap mémoire : garder les enveloppes les plus récentes.
+        if len(self._continuous_cache) >= 512:
+            self._continuous_cache.clear()
+        self._continuous_cache[cache_key] = result
+        return result
 
     def stimulation_times_s(self) -> np.ndarray:
         """Absolute stimulation onset times in seconds."""

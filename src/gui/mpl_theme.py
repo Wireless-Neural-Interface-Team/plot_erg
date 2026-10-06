@@ -16,8 +16,31 @@ from gui.theme import (
 )
 
 
-def apply_intan_scope_style(figure: Any) -> None:
-    """Appliquer un fond clair lisible (pas de thème sombre)."""
+def _axis_grid_visible(ax: Any) -> bool:
+    """True si la grille est déjà active sur l’axe (réglage panneau / style)."""
+    try:
+        return any(
+            line.get_visible()
+            for line in list(ax.get_xgridlines()) + list(ax.get_ygridlines())
+        )
+    except Exception:
+        return False
+
+
+def apply_intan_scope_style(
+    figure: Any,
+    *,
+    grid: bool | None = None,
+    grid_alpha: float | None = None,
+    show_borders: bool | None = None,
+    ticks_inside: bool | None = None,
+) -> None:
+    """Appliquer un fond clair lisible (pas de thème sombre).
+
+    ``grid`` / ``grid_alpha`` / ``show_borders`` / ``ticks_inside`` : si fournis,
+    respectent le style utilisateur. Sinon, la visibilité déjà posée par le
+    rendu du panneau est conservée.
+    """
     try:
         figure.patch.set_facecolor(SCOPE_BG)
     except Exception:
@@ -32,8 +55,13 @@ def apply_intan_scope_style(figure: Any) -> None:
         for spine in ax.spines.values():
             spine.set_color(SCOPE_SPINE)
             spine.set_linewidth(0.8)
+            if show_borders is not None:
+                spine.set_visible(bool(show_borders))
 
-        ax.tick_params(colors=SCOPE_FG, which="both")
+        tick_kwargs: dict[str, Any] = {"colors": SCOPE_FG, "which": "both"}
+        if ticks_inside is not None:
+            tick_kwargs["direction"] = "in" if ticks_inside else "out"
+        ax.tick_params(**tick_kwargs)
         try:
             ax.xaxis.label.set_color(SCOPE_FG)
             ax.yaxis.label.set_color(SCOPE_FG)
@@ -45,8 +73,13 @@ def apply_intan_scope_style(figure: Any) -> None:
             title.set_color(SCOPE_TITLE)
 
         try:
-            ax.grid(True, color=SCOPE_GRID, linewidth=0.7, alpha=1.0)
-            ax.set_axisbelow(True)
+            show_grid = bool(grid) if grid is not None else _axis_grid_visible(ax)
+            if show_grid:
+                alpha = 1.0 if grid_alpha is None else float(grid_alpha)
+                ax.grid(True, color=SCOPE_GRID, linewidth=0.7, alpha=alpha)
+                ax.set_axisbelow(True)
+            else:
+                ax.grid(False)
         except Exception:
             pass
 

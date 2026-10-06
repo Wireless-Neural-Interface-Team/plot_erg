@@ -50,6 +50,7 @@ def filter_params(config: AnalysisConfig) -> dict[str, Any]:
         "order": int(config.intan_filter_order),
         "type": str(config.intan_filter_type),
         "cutoff_hz": float(config.intan_filter_cutoff_hz),
+        "software_notch_hz": int(getattr(config, "software_notch_hz", 0) or 0),
     }
 
 

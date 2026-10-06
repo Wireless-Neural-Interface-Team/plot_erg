@@ -39,7 +39,7 @@ def viewer_settings_from_defaults(defaults: Mapping[str, Any] | None = None) -> 
         rms_ylim=AxisLimits(enabled=True, minimum=0.0, maximum=20.0),
         legend=LegendSettings(),
         style=PanelStyle(),
-        montage_channels=32,
+        montage_channels=12,
         montage_page=0,
     )
 
@@ -107,6 +107,7 @@ def build_config_from_defaults(
         intan_filter_order=int(d.get("default_intan_filter_order", 2) or 2),
         intan_filter_type=str(d.get("default_intan_filter_type", "bessel")),  # type: ignore[arg-type]
         intan_filter_cutoff_hz=float(d.get("default_intan_filter_cutoff_hz", 250.0)),
+        software_notch_hz=int(d.get("default_software_notch_hz", 0) or 0),  # type: ignore[arg-type]
         work_dir=None,
         channel_workers=int(workers) if workers else None,
         sampling_percent=int(display.sampling_percent),

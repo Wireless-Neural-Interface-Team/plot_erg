@@ -50,6 +50,10 @@ python run_gui.py
 
 ### Window layout
 
+Channel-first workflow: the centre shows a **light preview of the selected
+channel**. Range bars live in the per-channel inspector, not on a global
+montage. The all-channel montage is optional (*View → Montage review…*).
+
 The window is a set of docks around the views; every dock can be moved, stacked,
 or hidden from the **View** menu.
 
@@ -57,7 +61,8 @@ or hidden from the **View** menu.
   curve colour, and two independent toggles (draw it, show it in legends).
 - **Channels** — the clickable MEA map plus a filterable channel list; they stay in
   sync, and the map contacts can be shaded by mean RMS or spike count so the
-  channels worth looking at stand out.
+  channels worth looking at stand out. **Double-click** a contact or list row to
+  inspect that channel (continuous traces + adjustable range bars).
 - **Parameters** — three tabs: *Display* and *Legend & style* apply immediately,
   *Processing* requires reprocessing (and says so).
 - **Progress & log** — per-stage progress, a table of loading times, and the full
@@ -65,11 +70,10 @@ or hidden from the **View** menu.
 
 ### Views and panels
 
-The centre of the window holds **view tabs**, each one an independent grid of
-panels. Use *View → Configure panels* (`Ctrl+P`) to pick which graphs a view
-shows, for which temporal section (full view, onset zoom, end zoom), in which
-order, and over how many columns. Views can be added, renamed, duplicated,
-removed, and the whole layout saved to or loaded from a JSON file.
+The centre holds the channel preview by default. Use *View → Configure panels*
+(`Ctrl+P`) to customise the grid, or *View → Montage review…* (`Ctrl+M`) for the
+optional multi-channel montage. In the channel inspector, move the range bars
+then *Process range* to add zooms and analysis graphs.
 
 Each panel has its own header showing how long its last redraw took, a toolbar
 for matplotlib zoom/pan/save, and buttons to open it in its own window or remove
