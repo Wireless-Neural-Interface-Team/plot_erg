@@ -106,13 +106,18 @@ class ViewerWindow(QMainWindow):
         self._channel_windows: dict[str, ChannelAnalysisWindow] = {}
         self._config_dirty = False
         self._force_redraw = False
+        self._redraw_inspectors = False
+        self._preserve_view = False
         self._cache_root: Path | None = None
         self._warned_channel_mismatch = False
         self._pending_ensure_all = False
         self._pending_window_id: str | None = None
-        self._ensure_queue: list[tuple[list[int], str | None, dict[str, bool]]] = []
+        self._ensure_background = False
+        self._ensure_accepting = False
+        self._channel_compute_active = False
+        self._in_montage = False
 
-        self.setWindowTitle("plot_erg — Intan RHX viewer")
+        self.setWindowTitle("plot_erg — Visionneuse Intan / ERG")
         self.resize(1600, 960)
 
         # Centre = aperçu canal + control panel.
@@ -147,8 +152,12 @@ class ViewerWindow(QMainWindow):
             "Journal", self.status_panel, Qt.DockWidgetArea.BottomDockWidgetArea
         )
         self._dock_status.hide()
+        self._dock_session.setMinimumWidth(240)
+        self._dock_params.setMinimumWidth(220)
+        # Pas de plafond : l’utilisateur peut élargir Paramètres librement.
+        self._dock_params.setMaximumWidth(16777215)
         self.resizeDocks([self._dock_session], [360], Qt.Orientation.Horizontal)
-        self.resizeDocks([self._dock_params], [340], Qt.Orientation.Horizontal)
+        self.resizeDocks([self._dock_params], [380], Qt.Orientation.Horizontal)
 
         self._redraw_debouncer = Debouncer(110, self)
         self._redraw_debouncer.triggered.connect(self._redraw_active_tab)
@@ -159,14 +168,19 @@ class ViewerWindow(QMainWindow):
         )
 
         self.recordings_panel.entriesChanged.connect(self._on_entries_changed)
-        self.recordings_panel.styleChanged.connect(lambda: self._schedule_redraw(force=True))
+        self.recordings_panel.styleChanged.connect(
+            lambda: self._schedule_redraw(force=True, inspectors=True)
+        )
+        self.recordings_panel.processRequested.connect(lambda: self.start_processing())
         self.channel_panel.channelChanged.connect(self._on_channel_changed)
         self.channel_panel.visibilityChanged.connect(self._on_channel_visibility_changed)
         self.channel_panel.inspectChannelRequested.connect(self.open_channel_focus)
         self.params_panel.viewChanged.connect(self._on_params_view_changed)
         self.params_panel.configChanged.connect(self._on_params_config_changed)
+        self.params_panel.processRequested.connect(lambda: self.start_processing())
         self.session_panel.probePathChanged.connect(self._on_session_probe_path)
         self.control_panel.filterChanged.connect(self._on_analysis_changed)
+        self.control_panel.stimMarkersChanged.connect(self._on_stim_markers_changed)
 
         # Sync display settings from the params dock.
         self._settings = self.params_panel.viewer_settings()
@@ -207,9 +221,10 @@ class ViewerWindow(QMainWindow):
 
     def _build_actions(self) -> None:
         file_menu = self.menuBar().addMenu("&Fichier")
-        act_add = QAction("Ajouter Intan .rhs…", self)
-        act_add.setShortcut(QKeySequence.StandardKey.Open)
-        act_add.triggered.connect(self.recordings_panel.browse_rhs)
+        self._act_add = QAction("Ajouter Intan .rhs…", self)
+        self._act_add.setShortcut(QKeySequence.StandardKey.Open)
+        self._act_add.setToolTip("Ajouter un ou plusieurs fichiers .rhs (Ctrl+O)")
+        self._act_add.triggered.connect(self._add_rhs_and_focus)
         act_open_processed = QAction("Ouvrir traité…", self)
         act_open_processed.setToolTip(
             "Ouvrir un dataset déjà exporté (.ergdataset / .zip) pour le comparer."
@@ -227,7 +242,7 @@ class ViewerWindow(QMainWindow):
         act_quit = QAction("Quitter", self)
         act_quit.setShortcut(QKeySequence.StandardKey.Quit)
         act_quit.triggered.connect(self.close)
-        for action in (act_add, act_open_processed):
+        for action in (self._act_add, act_open_processed):
             file_menu.addAction(action)
         file_menu.addSeparator()
         for action in (act_export_dataset, act_export_pdf, act_export_figure):
@@ -238,6 +253,7 @@ class ViewerWindow(QMainWindow):
         run_menu = self.menuBar().addMenu("&Traitement")
         self._act_process = QAction("Traiter", self)
         self._act_process.setShortcut(QKeySequence("F5"))
+        self._act_process.setToolTip("Traiter les enregistrements en attente (F5)")
         self._act_process.triggered.connect(lambda: self.start_processing())
         self._act_cancel = QAction("Annuler", self)
         self._act_cancel.setShortcut(QKeySequence("Esc"))
@@ -248,13 +264,14 @@ class ViewerWindow(QMainWindow):
         self._act_ensure_channel = QAction("Calculer le canal sélectionné", self)
         self._act_ensure_channel.setShortcut(QKeySequence("F6"))
         self._act_ensure_channel.setToolTip(
-            "Filtrer et analyser uniquement le canal actuellement sélectionné."
+            "Prioriser le canal affiché (le prefetch en arrière-plan continue ensuite)."
         )
         self._act_ensure_channel.triggered.connect(self.ensure_selected_channels)
         self._act_ensure_all = QAction("Calculer tous les canaux", self)
         self._act_ensure_all.setShortcut(QKeySequence("F7"))
         self._act_ensure_all.setToolTip(
-            "Calculer tous les canaux (résumés, revue montage)."
+            "Lancer / relancer le calcul de tous les canaux en arrière-plan "
+            "(le canal affiché reste prioritaire)."
         )
         self._act_ensure_all.triggered.connect(self.ensure_all_channels)
         for action in (
@@ -277,35 +294,42 @@ class ViewerWindow(QMainWindow):
         act_redraw = QAction("Redessiner", self)
         act_redraw.setShortcut(QKeySequence("Ctrl+R"))
         act_redraw.triggered.connect(lambda: self._schedule_redraw(force=True))
-        act_montage = QAction("Revue montage", self)
-        act_montage.setShortcut(QKeySequence("Ctrl+M"))
-        act_montage.setToolTip(
+        self._act_montage = QAction("Revue montage", self)
+        self._act_montage.setShortcut(QKeySequence("Ctrl+M"))
+        self._act_montage.setToolTip(
             "Montage continu de tous les canaux visibles (scrollable). "
             "Les barres de plage restent dans Inspecter."
         )
-        act_montage.triggered.connect(self.open_montage_review)
-        act_preview = QAction("Retour à l’aperçu canal", self)
-        act_preview.setToolTip("Vue centrale légère : canal sélectionné uniquement.")
-        act_preview.triggered.connect(self.return_to_channel_preview)
-        act_inspect = QAction("Inspecter", self)
-        act_inspect.setShortcuts(
+        self._act_montage.triggered.connect(self.open_montage_review)
+        self._act_preview = QAction("Retour à l’aperçu canal", self)
+        self._act_preview.setShortcut(QKeySequence("Ctrl+Shift+M"))
+        self._act_preview.setToolTip(
+            "Quitter la revue montage et revenir à l’aperçu du canal sélectionné (Ctrl+Shift+M)."
+        )
+        self._act_preview.setEnabled(False)
+        self._act_preview.triggered.connect(self.return_to_channel_preview)
+        self._act_inspect = QAction("Inspecter", self)
+        self._act_inspect.setShortcuts(
             [QKeySequence("Ctrl+I"), QKeySequence("Ctrl+Return")]
         )
-        act_inspect.setToolTip(
-            "Canal sélectionné : traces, barres de plage, graphs. "
-            "Mode moyenne / stimulation dans la fenêtre. "
+        self._act_inspect.setToolTip(
+            "Canal sélectionné : traces, barres de plage, graphs (Ctrl+I). "
             "Aussi : double-clic MEA / liste."
         )
-        act_inspect.triggered.connect(lambda: self.open_channel_focus())
+        self._act_inspect.triggered.connect(lambda: self.open_channel_focus())
         view_menu.addAction(act_configure)
         view_menu.addAction(act_redraw)
         view_menu.addSeparator()
-        view_menu.addAction(act_inspect)
-        view_menu.addAction(act_montage)
-        view_menu.addAction(act_preview)
+        view_menu.addAction(self._act_inspect)
+        view_menu.addAction(self._act_montage)
+        view_menu.addAction(self._act_preview)
         view_menu.addSeparator()
         for dock in (self._dock_session, self._dock_params, self._dock_status):
             view_menu.addAction(dock.toggleViewAction())
+        # Raccourci Journal (souvent masqué).
+        journal_toggle = self._dock_status.toggleViewAction()
+        journal_toggle.setShortcut(QKeySequence("Ctrl+J"))
+        journal_toggle.setToolTip("Afficher / masquer le journal (Ctrl+J)")
 
         channel_menu = self.menuBar().addMenu("&Canal")
         act_prev = QAction("Canal précédent", self)
@@ -317,7 +341,7 @@ class ViewerWindow(QMainWindow):
         channel_menu.addAction(act_prev)
         channel_menu.addAction(act_next)
         channel_menu.addSeparator()
-        channel_menu.addAction(act_inspect)
+        channel_menu.addAction(self._act_inspect)
         channel_menu.addAction(self._act_ensure_channel)
         channel_menu.addAction(self._act_ensure_all)
 
@@ -326,22 +350,25 @@ class ViewerWindow(QMainWindow):
         act_about.triggered.connect(self._show_about)
         help_menu.addAction(act_about)
 
-        # Barre : flux principal unique (pas de doublon dans le panneau Recordings).
         toolbar = QToolBar("Principal", self)
         toolbar.setObjectName("mainToolbar")
         toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
-        for action in (
-            act_add,
-            act_open_processed,
-            self._act_process,
-            self._act_cancel,
-        ):
-            toolbar.addAction(action)
+        toolbar.addAction(self._act_add)
+        toolbar.addAction(self._act_process)
+        toolbar.addAction(self._act_cancel)
         toolbar.addSeparator()
-        toolbar.addAction(act_inspect)
-        toolbar.addSeparator()
-        toolbar.addAction(act_montage)
+        toolbar.addAction(self._act_inspect)
+        toolbar.addAction(self._act_montage)
+        toolbar.addAction(self._act_preview)
+
+    def _add_rhs_and_focus(self) -> None:
+        before = len(self.recordings_panel.entries)
+        self.recordings_panel.browse_rhs()
+        if len(self.recordings_panel.entries) > before:
+            self.session_panel.show_recordings()
+            self._set_status("Fichier(s) ajouté(s) — cliquez Traiter (F5) pour calculer.")
 
     # -------------------------------------------------------------- view tabs
 
@@ -366,6 +393,13 @@ class ViewerWindow(QMainWindow):
         self.tabs.setCurrentIndex(index)
         self.tabs.blockSignals(False)
         self.tabs.tabBar().hide()
+        # Resynchroniser le badge Aperçu / Montage après reconstruction.
+        tab = self._current_tab()
+        is_montage = bool(
+            tab is not None
+            and any(p.panel == "montage_continuous_raw" for p in tab.panels)
+        )
+        self._set_view_mode(montage=is_montage)
         self._schedule_redraw(force=True)
 
     def _current_page(self) -> ViewTabPage | None:
@@ -401,6 +435,7 @@ class ViewerWindow(QMainWindow):
     def reset_views(self) -> None:
         self._workspace = WorkspaceLayout()
         self._rebuild_tabs()
+        self._set_view_mode(montage=False)
 
     def _on_panel_removed(self, placement: PanelPlacement) -> None:
         tab = self._current_tab()
@@ -446,26 +481,61 @@ class ViewerWindow(QMainWindow):
 
     # --------------------------------------------------------------- rendering
 
-    def _schedule_redraw(self, *, force: bool = False) -> None:
+    def _schedule_redraw(
+        self,
+        *,
+        force: bool = False,
+        inspectors: bool = False,
+        preserve_view: bool = False,
+    ) -> None:
         self._force_redraw = self._force_redraw or force
+        self._redraw_inspectors = self._redraw_inspectors or inspectors
+        if preserve_view:
+            self._preserve_view = True
         self._redraw_debouncer.request()
+
+    def _redraw_detached_windows(self) -> None:
+        """Rafraîchir les panneaux détachés (partagent les réglages de la vue centrale)."""
+        for window in list(self._detached.values()):
+            self._render_detached(window)
+
+    def _redraw_inspector_windows(self) -> None:
+        """Rafraîchir les fenêtres Inspecter uniquement quand les données/styles changent."""
+        for window in list(self._view_sessions.values()):
+            try:
+                window.redraw()
+            except Exception:
+                pass
+        for window in list(self._channel_windows.values()):
+            try:
+                window.redraw()
+            except Exception:
+                pass
 
     def _redraw_active_tab(self) -> None:
         force = self._force_redraw
+        redraw_inspectors = self._redraw_inspectors
+        preserve_view = self._preserve_view
         self._force_redraw = False
+        self._redraw_inspectors = False
+        # Garder preserve_view pendant toute la file de rendus async.
         self._settings = self._default_viewer_settings()
-        self._adapt_montage_height()
+        if not preserve_view:
+            self._adapt_montage_height()
         page = self._current_page()
-        if page is None:
-            return
-        if force:
-            for index in range(self.tabs.count()):
-                other = self.tabs.widget(index)
-                if isinstance(other, ViewTabPage) and other is not page:
-                    other.grid.invalidate_all()
-        page.grid.schedule_render(self._make_request_or_blank, force=force)
-        for window in list(self._detached.values()):
-            self._render_detached(window)
+        if page is not None:
+            if force and not preserve_view:
+                for index in range(self.tabs.count()):
+                    other = self.tabs.widget(index)
+                    if isinstance(other, ViewTabPage) and other is not page:
+                        other.grid.invalidate_all()
+            page.grid.schedule_render(self._make_request_or_blank, force=force)
+        self._redraw_detached_windows()
+        if redraw_inspectors:
+            self._redraw_inspector_windows()
+        # Flag consommé à la fin du cycle (sync + async via renderFinished).
+        if page is None or not getattr(page.grid, "_pending", None):
+            self._preserve_view = False
 
     def _on_params_view_changed(self) -> None:
         self._settings = self.params_panel.viewer_settings()
@@ -474,8 +544,9 @@ class ViewerWindow(QMainWindow):
     def _on_params_config_changed(self) -> None:
         self._config_dirty = True
         self.params_panel.set_dirty_message(
-            "Paramètres de traitement modifiés — appuyez sur Traiter (F5) pour recalculer."
+            "Paramètres de traitement modifiés — Traiter (F5) pour recalculer."
         )
+        self.params_panel.focus_processing_tab()
         self._set_status("Paramètres modifiés — F5 pour retraiter.")
         # Mapping MEA : appliquer tout de suite si le chemin a changé (pas besoin de F5).
         probe = self.params_panel.probe_layout_path()
@@ -487,6 +558,9 @@ class ViewerWindow(QMainWindow):
 
     def _on_channel_changed(self, channel: str) -> None:
         self.control_panel.set_channel(channel)
+        self._preserve_view = False
+        # Prioriser le canal regardé, même pendant un prefetch en arrière-plan.
+        self._prioritize_viewed_channels()
         tab = self._current_tab()
         # En revue montage, un clic sur une case change souvent la sélection :
         # coalescer avec le debounce de visibilité pour éviter un freeze par clic.
@@ -580,9 +654,12 @@ class ViewerWindow(QMainWindow):
         need_rms: bool = True,
         need_spikes: bool = True,
         need_overlay: bool = True,
+        priority: bool = True,
+        background: bool = False,
     ) -> None:
         """Lancer le calcul des canaux manquants (vue active ou fenêtre détachée)."""
-        self._pending_window_id = then_redraw_window
+        if then_redraw_window is not None:
+            self._pending_window_id = then_redraw_window
         self._start_channel_ensure(
             channels,
             allow_empty_redraw=then_redraw_window is None,
@@ -590,15 +667,23 @@ class ViewerWindow(QMainWindow):
             need_rms=need_rms,
             need_spikes=need_spikes,
             need_overlay=need_overlay,
+            priority=priority,
+            background=background,
         )
 
     def _on_analysis_changed(self) -> None:
+        self._preserve_view = False
         self._schedule_redraw(force=True)
+
+    def _on_stim_markers_changed(self) -> None:
+        """Bascule Stim : redessiner sans perdre zoom / position."""
+        self._schedule_redraw(force=True, preserve_view=True)
 
     def _make_session_request(
         self, window: ViewSessionWindow, placement: PanelPlacement
     ) -> RenderRequest | None:
-        entries = self._plotted() or self.recordings_panel.ready_entries()
+        # Respecter la case « Afficher » : pas de repli sur tous les fichiers prêts.
+        entries = self._plotted()
         if not entries:
             return None
         return self._build_render_request(
@@ -630,12 +715,17 @@ class ViewerWindow(QMainWindow):
 
     def _on_tab_changed(self, index: int) -> None:
         self._workspace = replace(self._workspace, active_index=max(0, index))
+        self._prioritize_viewed_channels()
         self._schedule_redraw()
 
     def _pipeline_busy(self) -> bool:
         return (
             (self._build_worker is not None and self._build_worker.isRunning())
-            or (self._ensure_worker is not None and self._ensure_worker.isRunning())
+            or (
+                self._ensure_worker is not None
+                and self._ensure_worker.isRunning()
+                and not self._ensure_background
+            )
         )
 
     def _mark_display_loaded(self) -> None:
@@ -646,6 +736,7 @@ class ViewerWindow(QMainWindow):
     def _on_render_finished(self, panels: int, seconds: float) -> None:
         if panels <= 0:
             return
+        self._preserve_view = False
         tab = self._current_tab()
         self.status_panel.set_render_summary(panels, seconds, tab=tab.name if tab else "")
         self._set_status(f"{panels} panneau(x) redessiné(s) en {seconds * 1000:.0f} ms")
@@ -665,6 +756,7 @@ class ViewerWindow(QMainWindow):
         tab = self._current_tab()
         if tab is not None and any(p.panel == "montage_continuous_raw" for p in tab.panels):
             self._set_status("Revue montage déjà affichée.")
+            self._set_view_mode(montage=True)
             return
         n_channels = int(getattr(ready[0].recording, "n_channels", 0) or 0)
         montage_tab = ViewTab(
@@ -675,23 +767,34 @@ class ViewerWindow(QMainWindow):
         )
         self._workspace = WorkspaceLayout(tabs=(montage_tab,), active_index=0)
         self._rebuild_tabs()
+        self._set_view_mode(montage=True)
+        self.session_panel.show_channels()
         n_hidden = len(self.channel_panel.hidden_channels)
         visible = max(0, n_channels - n_hidden)
         self._set_status(
             f"Revue montage — {visible}/{n_channels} canaux visibles "
-            "(décocher / Masquer dans Session → Channels). "
-            "Pour les barres de plage : double-clic un canal (Inspecter)."
+            "(cases / Masquer dans Session → Canaux). "
+            "Retour aperçu : Ctrl+Shift+M · Inspecter : double-clic."
         )
 
     def return_to_channel_preview(self) -> None:
         """Revenir à l’aperçu léger du canal sélectionné."""
         self._workspace = WorkspaceLayout()
         self._rebuild_tabs()
+        self._set_view_mode(montage=False)
         channel = self.channel_panel.current_channel or ""
         self._set_status(
             f"Aperçu canal{f' — {channel}' if channel else ''}. "
-            "Double-clic pour inspecter avec barres."
+            "Double-clic ou Ctrl+I pour inspecter."
         )
+
+    def _set_view_mode(self, *, montage: bool) -> None:
+        self._in_montage = bool(montage)
+        self.control_panel.set_view_mode("montage" if montage else "preview")
+        if hasattr(self, "_act_preview"):
+            self._act_preview.setEnabled(self._in_montage)
+        if hasattr(self, "_act_montage"):
+            self._act_montage.setEnabled(not self._in_montage)
 
     def open_channel_focus(self, channel: str | None = None) -> None:
         """Fenêtre d’inspection : traces + barres de plage + graphs d’analyse.
@@ -747,6 +850,11 @@ class ViewerWindow(QMainWindow):
         )
         window.set_trial_count(int(getattr(recording, "n_trials", 0) or 0))
         try:
+            stims = recording.stimulation_times_s()
+            window.set_stim_times([float(t) for t in stims])
+        except Exception:
+            window.set_stim_times([])
+        try:
             t, _ = recording.continuous_trace("raw", int(resolved))
             if t.size:
                 window.set_time_span(float(t[0]), float(t[-1]))
@@ -757,6 +865,11 @@ class ViewerWindow(QMainWindow):
         window.refreshRequested.connect(self._on_channel_window_refresh)
         self._channel_windows[window.window_id] = window
         window.show()
+        channel_ready = bool(
+            hasattr(recording, "is_channel_ready")
+            and recording.is_channel_ready(int(resolved))
+        )
+        window.set_channel_ready(channel_ready)
         if window.needs_channel_compute():
             self._ensure_channels_for_indices(
                 [int(resolved)], then_redraw_window=window.window_id
@@ -768,7 +881,8 @@ class ViewerWindow(QMainWindow):
     def _make_channel_analysis_request(
         self, window: ChannelAnalysisWindow, placement: PanelPlacement
     ) -> RenderRequest | None:
-        entries = self._plotted() or self.recordings_panel.ready_entries()
+        # Respecter la case « Afficher » : pas de repli sur tous les fichiers prêts.
+        entries = self._plotted()
         if not entries:
             return None
         return self._build_render_request(
@@ -817,8 +931,9 @@ class ViewerWindow(QMainWindow):
             channel_name=channel_name,
             settings=settings,
             probe_layout=self._probe_layout,
-            impedance_sessions=_impedance_sessions(self.recordings_panel.ready_entries()),
+            impedance_sessions=_impedance_sessions(entries),
             highlight_zooms=highlight_zooms,
+            preserve_view=bool(self._preserve_view),
         )
 
     def _make_request_or_blank(self, placement: PanelPlacement) -> RenderRequest:
@@ -836,6 +951,7 @@ class ViewerWindow(QMainWindow):
             settings=self._settings,
             probe_layout=self._probe_layout,
             impedance_sessions=[],
+            preserve_view=bool(self._preserve_view),
         )
 
     def _make_request(self, placement: PanelPlacement) -> RenderRequest | None:
@@ -921,6 +1037,15 @@ class ViewerWindow(QMainWindow):
 
     def start_processing(self, *, all_rows: bool = False) -> None:
         if self._build_worker is not None and self._build_worker.isRunning():
+            return
+        problems = self.params_panel.validate()
+        if problems:
+            self.params_panel.focus_processing_tab()
+            QMessageBox.warning(
+                self,
+                "Paramètres invalides",
+                "Corrigez avant de traiter :\n\n• " + "\n• ".join(problems),
+            )
             return
         entries = self.recordings_panel.entries
         if not entries:
@@ -1008,6 +1133,8 @@ class ViewerWindow(QMainWindow):
             self.status_panel.add_timing(display, "Ouvert depuis un dataset traité", elapsed)
             self._refresh_channels()
             self._schedule_redraw(force=True)
+            # Datasets exportés peuvent déjà avoir tous les canaux ; sinon prefetch.
+            self._start_background_prefetch()
 
         def failed(message: str) -> None:
             self.recordings_panel.set_status(row_id, "failed", message)
@@ -1034,8 +1161,9 @@ class ViewerWindow(QMainWindow):
         if self._build_worker is not None and self._build_worker.isRunning():
             self._build_worker.request_stop()
             self.status_panel.set_headline("Annulation…")
-        if self._ensure_worker is not None and self._ensure_worker.isRunning():
+        if self._ensure_worker is not None and self._ensure_accepting:
             self._ensure_worker.request_stop()
+            self._ensure_accepting = False
             self.status_panel.set_headline("Annulation du calcul de canal…")
         if self._task_worker is not None and self._task_worker.isRunning():
             self._task_worker.request_stop()
@@ -1055,26 +1183,38 @@ class ViewerWindow(QMainWindow):
         self._config_dirty = False
         self.params_panel.set_dirty_message("")
         if ok:
-            self.status_panel.set_headline("Enregistrement prêt.")
+            self.status_panel.set_headline("Enregistrement prêt — calcul des canaux…")
             self._mark_display_loaded()
-            self._set_status("Prêt — choisissez un canal, puis Inspecter (ou double-clic).")
+            self._set_status("Prêt — le canal affiché est prioritaire ; le reste suit en arrière-plan.")
             self.session_panel.show_channels()
         else:
             self.status_panel.set_headline("Traitement terminé avec des erreurs ou annulé.")
         self._refresh_channels()
         self._schedule_redraw(force=True)
+        if ok:
+            self._start_background_prefetch()
 
     def _set_busy(self, busy: bool) -> None:
         self.recordings_panel.set_busy(busy)
         self.control_panel.set_busy(busy)
         self._act_process.setEnabled(not busy)
-        self._act_cancel.setEnabled(busy)
+        build_or_channels = busy or self._channel_compute_active
+        self._act_cancel.setEnabled(build_or_channels)
         self._act_ensure_channel.setEnabled(not busy)
         self._act_ensure_all.setEnabled(not busy)
-        self._status_progress.setVisible(busy)
+        self._status_progress.setVisible(build_or_channels)
         if busy:
             self._dock_status.show()
             self._dock_status.raise_()
+
+    def _set_channel_compute_active(self, active: bool, *, background: bool = False) -> None:
+        self._channel_compute_active = bool(active)
+        self._ensure_background = bool(background) if active else False
+        build_busy = self._build_worker is not None and self._build_worker.isRunning()
+        self._act_cancel.setEnabled(active or build_busy)
+        self._status_progress.setVisible(active or build_busy)
+        if active and not background:
+            self._dock_status.show()
 
     def _on_pipeline_progress(self, event: Any) -> None:
         self.status_panel.on_progress(event)
@@ -1116,44 +1256,71 @@ class ViewerWindow(QMainWindow):
 
     def ensure_selected_channels(self) -> None:
         self._pending_ensure_all = False
-        self._start_channel_ensure(self._channels_for_current_view(all_channels=False))
+        self._start_channel_ensure(
+            self._channels_for_current_view(all_channels=False),
+            priority=True,
+            background=False,
+        )
 
     def ensure_all_channels(self) -> None:
         self._pending_ensure_all = True
-        self._start_channel_ensure(self._channels_for_current_view(all_channels=True))
+        self._start_channel_ensure(
+            self._channels_for_current_view(all_channels=True),
+            priority=False,
+            background=True,
+        )
 
-    def _start_channel_ensure(
+    def _prioritize_viewed_channels(self) -> None:
+        """Bump the currently viewed channel(s) ahead of background prefetch."""
+        if self._build_worker is not None and self._build_worker.isRunning():
+            return
+        channels = self._channels_for_current_view(all_channels=False)
+        if not channels:
+            return
+        self._start_channel_ensure(
+            channels,
+            allow_empty_redraw=False,
+            priority=True,
+            background=self._ensure_background,
+        )
+
+    def _start_background_prefetch(self) -> None:
+        """Compute every channel in the background after the skeleton is ready."""
+        plotted_or_ready = self.recordings_panel.ready_entries()
+        if not plotted_or_ready:
+            return
+        recording = plotted_or_ready[0].recording
+        n_channels = int(getattr(recording, "n_channels", 0) or 0)
+        if n_channels <= 0:
+            return
+        # Vue active d’abord, puis le reste.
+        viewed = self._channels_for_current_view(all_channels=False)
+        if viewed:
+            self._start_channel_ensure(
+                viewed,
+                allow_empty_redraw=False,
+                priority=True,
+                background=True,
+            )
+        remaining = [ch for ch in range(n_channels) if ch not in set(viewed)]
+        if remaining:
+            self._start_channel_ensure(
+                remaining,
+                allow_empty_redraw=False,
+                priority=False,
+                background=True,
+            )
+
+    def _build_ensure_requests(
         self,
         channels: list[int],
         *,
-        allow_empty_redraw: bool = True,
-        need_means: bool = True,
-        need_rms: bool = True,
-        need_spikes: bool = True,
-        need_overlay: bool = True,
-    ) -> None:
-        products = {
-            "need_means": need_means,
-            "need_rms": need_rms,
-            "need_spikes": need_spikes,
-            "need_overlay": need_overlay,
-        }
-        if self._build_worker is not None and self._build_worker.isRunning():
-            return
-        if self._ensure_worker is not None and self._ensure_worker.isRunning():
-            self._ensure_queue.append((list(channels), self._pending_window_id, products))
-            self.status_panel.append_log(
-                f"Calcul en file d’attente : {len(channels)} canal(aux)."
-            )
-            return
-        plotted = self._plotted() or self.recordings_panel.ready_entries()
-        window_id = self._pending_window_id
-        if not plotted or not channels:
-            if window_id:
-                self._redraw_pending_window(window_id)
-            elif allow_empty_redraw:
-                self._schedule_redraw(force=True)
-            return
+        need_means: bool,
+        need_rms: bool,
+        need_spikes: bool,
+        need_overlay: bool,
+    ) -> list[ChannelEnsureRequest]:
+        ready = self.recordings_panel.ready_entries()
 
         def _needs_work(recording: Any, ch: int) -> bool:
             if not recording.is_channel_ready(ch):
@@ -1172,7 +1339,7 @@ class ViewerWindow(QMainWindow):
             return False
 
         requests: list[ChannelEnsureRequest] = []
-        for entry in plotted:
+        for entry in ready:
             recording = entry.recording
             if recording is None or getattr(recording, "source", None) is None:
                 continue
@@ -1197,11 +1364,42 @@ class ViewerWindow(QMainWindow):
                     need_overlay=need_overlay,
                 )
             )
+        return requests
 
+    def _start_channel_ensure(
+        self,
+        channels: list[int],
+        *,
+        allow_empty_redraw: bool = True,
+        need_means: bool = True,
+        need_rms: bool = True,
+        need_spikes: bool = True,
+        need_overlay: bool = True,
+        priority: bool = True,
+        background: bool = False,
+    ) -> None:
+        if self._build_worker is not None and self._build_worker.isRunning():
+            return
+
+        window_id = self._pending_window_id
+        if not channels:
+            if window_id:
+                self._redraw_pending_window(window_id)
+            elif allow_empty_redraw:
+                self._schedule_redraw(force=True)
+            return
+
+        requests = self._build_ensure_requests(
+            channels,
+            need_means=need_means,
+            need_rms=need_rms,
+            need_spikes=need_spikes,
+            need_overlay=need_overlay,
+        )
         if not requests:
             if window_id:
                 self._redraw_pending_window(window_id)
-            else:
+            elif allow_empty_redraw:
                 self._schedule_redraw(force=True)
             plotted_now = self._plotted()
             self.channel_panel.set_reference_recording(
@@ -1209,41 +1407,93 @@ class ViewerWindow(QMainWindow):
             )
             return
 
-        worker = ChannelEnsureWorker(requests, self)
+        worker = self._ensure_worker
+        if worker is not None and self._ensure_accepting:
+            worker.submit(requests, priority=priority)
+            if not background:
+                self._ensure_background = False
+                self._set_channel_compute_active(True, background=False)
+                n = sum(len(request.channels) for request in requests)
+                self.status_panel.set_headline(
+                    f"Priorité : calcul de {n} canal(aux) regardé(s)…"
+                )
+                self.status_panel.append_log(
+                    f"Canal(aux) prioritaire(s) : {len(channels)} — le prefetch continue ensuite."
+                )
+            return
+
+        worker = ChannelEnsureWorker(requests, self, priority=priority)
         worker.progressed.connect(self._on_pipeline_progress)
         worker.logged.connect(self.status_panel.append_log)
+        worker.succeeded.connect(self._on_channel_computed)
+        worker.queue_changed.connect(self._on_ensure_queue_changed)
         worker.failed.connect(lambda message: self._set_status(f"Échec du calcul de canal : {message}"))
         worker.finished_all.connect(self._on_ensure_finished)
         self._ensure_worker = worker
-        self._set_busy(True)
+        self._ensure_accepting = True
+        self._set_channel_compute_active(True, background=background)
         n = sum(len(request.channels) for request in requests)
-        self.status_panel.set_headline(f"Calcul de {n} canal(aux)…")
+        if background and not priority:
+            self.status_panel.set_headline(f"Calcul en arrière-plan : {n} canal(aux)…")
+        elif background:
+            self.status_panel.set_headline(
+                f"Canal affiché d’abord, puis calcul en arrière-plan…"
+            )
+        else:
+            self.status_panel.set_headline(f"Calcul de {n} canal(aux)…")
         worker.start()
 
+    def _on_channel_computed(self, recording: Any, channels: list) -> None:
+        """Un canal vient d’être calculé — rafraîchir s’il est visible."""
+        ready_set = {int(ch) for ch in channels}
+        viewed = set(self._channels_for_current_view(all_channels=False))
+        if ready_set & viewed:
+            self._mark_display_loaded()
+            self._schedule_redraw(force=True, preserve_view=True)
+            window_id = self._pending_window_id
+            if window_id:
+                self._redraw_pending_window(window_id)
+                self._pending_window_id = None
+
+        for window in list(self._channel_windows.values()):
+            if int(window.channel_index) in ready_set:
+                window.set_channel_ready(True)
+                window.redraw()
+        for window in list(self._view_sessions.values()):
+            if int(window.channel_index) in ready_set:
+                window.redraw()
+
+        # Mettre à jour les métriques de la carte MEA dès qu’un canal arrive.
+        if recording is not None:
+            plotted = self._plotted()
+            ref = plotted[0].recording if plotted else recording
+            self.channel_panel.set_reference_recording(ref)
+
+    def _on_ensure_queue_changed(self, high: int, low: int) -> None:
+        if high > 0:
+            self.status_panel.set_headline(
+                f"Priorité vue : {high} canal(aux), puis {low} en arrière-plan…"
+            )
+        elif low > 0:
+            self.status_panel.set_headline(f"Calcul en arrière-plan : {low} canal(aux) restant(s)…")
+
     def _on_ensure_finished(self, ok: bool) -> None:
-        self._set_busy(False)
+        self._ensure_accepting = False
+        self._set_channel_compute_active(False)
         self._ensure_worker = None
         self._pending_ensure_all = False
         window_id = self._pending_window_id
         self._pending_window_id = None
         if ok:
-            self.status_panel.set_headline("Canaux prêts.")
+            self.status_panel.set_headline("Tous les canaux sont prêts.")
             self._set_status("Canaux prêts.")
+            self._mark_display_loaded()
         else:
             self.status_panel.set_headline("Calcul des canaux terminé avec des erreurs ou annulé.")
         plotted = self._plotted()
         self.channel_panel.set_reference_recording(plotted[0].recording if plotted else None)
         self._redraw_pending_window(window_id)
-        self._schedule_redraw(force=True)
-        if self._ensure_queue:
-            channels, pending_id, products = self._ensure_queue.pop(0)
-            self._pending_window_id = pending_id
-            self._start_channel_ensure(
-                channels, allow_empty_redraw=pending_id is None, **products
-            )
-        elif ok:
-            self._mark_display_loaded()
-
+        self._schedule_redraw(force=True, inspectors=window_id is None)
     def _redraw_pending_window(self, window_id: str | None) -> None:
         if not window_id:
             return
@@ -1251,7 +1501,9 @@ class ViewerWindow(QMainWindow):
             self._view_sessions[window_id].redraw()
             return
         if window_id in self._channel_windows:
-            self._channel_windows[window_id].redraw()
+            window = self._channel_windows[window_id]
+            window.set_channel_ready(True)
+            window.redraw()
             return
 
     def _refresh_channels(self) -> None:
@@ -1475,11 +1727,13 @@ class ViewerWindow(QMainWindow):
             self,
             "À propos de plot_erg",
             "Visionneuse ERG — paradigme canal d’abord.\n\n"
-            "1. Session → Ajouter un .rhs, puis Traiter (F5).\n"
-            "2. Clic sur la MEA : aperçu central du canal.\n"
-            "3. Inspecter (ou double-clic) : traces, barres, graphs.\n"
-            "4. Cocher les graphs ; « Traiter la plage » ajoute les zooms.\n"
-            "5. Revue montage : vue globale de tous les canaux (optionnel).",
+            "1. Ajouter un .rhs (Ctrl+O), puis Traiter (F5).\n"
+            "2. Canaux / carte MEA : clic = aperçu central.\n"
+            "3. Inspecter (Ctrl+I ou double-clic) : traces, plages, graphs.\n"
+            "4. « Appliquer les zooms » dans Inspecter pour chaque plage.\n"
+            "5. Revue montage (Ctrl+M) ; retour aperçu (Ctrl+Shift+M).\n\n"
+            "Mapping MEA optionnel : Session → Mapping MEA.\n"
+            "Journal : Ctrl+J.",
         )
 
     def _restore_state(self) -> None:
@@ -1492,6 +1746,9 @@ class ViewerWindow(QMainWindow):
             self.restoreState(state)
         # Journal optionnel : ne pas le rouvrir automatiquement.
         self._dock_status.hide()
+        # restoreState peut réappliquer d’anciennes contraintes — garder Paramètres élargissable.
+        self._dock_params.setMinimumWidth(220)
+        self._dock_params.setMaximumWidth(16777215)
 
     def closeEvent(self, event: Any) -> None:  # noqa: D102
         settings = QSettings(_ORG, _APP)

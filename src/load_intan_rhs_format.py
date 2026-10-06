@@ -9,8 +9,6 @@ software).
 import sys
 import time
 
-import matplotlib.pyplot as plt
-
 from intanutil.header import (read_header,
                               header_to_result)
 from intanutil.data import (calculate_data_size,
@@ -74,6 +72,8 @@ def read_data(filename):
 
 
 if __name__ == '__main__':
+    import matplotlib.pyplot as plt
+
     a = read_data(sys.argv[1])
     print(a)
 

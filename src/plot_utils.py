@@ -4,16 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Any, Sequence
-
 import numpy as np
-
-
-def shift_axes_down(axes: Sequence[Any], delta: float) -> None:
-    """Shift a group of axes downward (figure coordinates)."""
-    for ax in axes:
-        pos = ax.get_position()
-        ax.set_position([pos.x0, pos.y0 - delta, pos.width, pos.height])
 
 
 def shorten_filename_for_windows(output_dir: Path, filename: str, max_total_len: int = 240) -> str:
@@ -37,3 +28,28 @@ def downsample_points(x: np.ndarray, y: np.ndarray, sampling_percent: int) -> tu
     pct = max(1, min(100, int(sampling_percent)))
     step = max(1, int(np.ceil(100.0 / float(pct))))
     return x[::step], y[::step]
+
+
+def decimate_envelope(
+    x: np.ndarray, y: np.ndarray, max_points: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Min/max envelope decimation: keeps peaks while bounding the point count."""
+    x_arr = np.asarray(x)
+    y_arr = np.asarray(y)
+    n = int(x_arr.size)
+    limit = max(16, int(max_points))
+    if n <= limit:
+        return x_arr, y_arr
+    n_bins = max(8, limit // 2)
+    edges = np.linspace(0, n, n_bins + 1).astype(np.int64)
+    starts = edges[:-1]
+    valid = starts < n
+    starts = starts[valid]
+    lows = np.minimum.reduceat(y_arr, starts)
+    highs = np.maximum.reduceat(y_arr, starts)
+    mids = np.add.reduceat(x_arr, starts) / np.diff(np.append(starts, n))
+    out_x = np.repeat(mids, 2)
+    out_y = np.empty(out_x.size, dtype=np.float64)
+    out_y[0::2] = lows
+    out_y[1::2] = highs
+    return out_x, out_y

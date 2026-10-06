@@ -220,6 +220,13 @@ class LocalViewParams(QWidget):
         self._legend_visible = QCheckBox("Afficher les légendes")
         self._legend_visible.setChecked(bool(legend.visible))
         self._legend_location = QComboBox()
+        self._legend_location.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._legend_location.setMinimumContentsLength(10)
+        self._legend_location.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         for location in LEGEND_LOCATIONS:
             self._legend_location.addItem(
                 "Sous le panneau" if location == "below" else location.capitalize(),
@@ -358,6 +365,8 @@ class LocalViewParams(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.addWidget(scroll)
+        self.setMinimumWidth(220)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         self._debouncer = Debouncer(120, self)
         self._debouncer.triggered.connect(self.changed.emit)

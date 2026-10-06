@@ -75,13 +75,11 @@ class RecordingEntry:
 
 
 class RecordingsPanel(QWidget):
-    """Liste des enregistrements : légende, couleur, statut ; Retirer la sélection.
-
-    Ajouter / ouvrir un traité / Traiter : barre d’outils et menus de la fenêtre.
-    """
+    """Liste des enregistrements : ajouter / traiter / légende / statut."""
 
     entriesChanged = Signal()
     styleChanged = Signal()
+    processRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -109,7 +107,20 @@ class RecordingsPanel(QWidget):
         for column in (_COL_COLOR, _COL_PLOT, _COL_STATUS):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
 
-        remove = QPushButton("Retirer")
+        self._btn_add = QPushButton("Ajouter Intan .rhs…", self)
+        self._btn_add.setToolTip("Ajouter un ou plusieurs fichiers Intan .rhs (Ctrl+O).")
+        self._btn_add.clicked.connect(self.browse_rhs)
+        self._btn_open_processed = QPushButton("Ouvrir traité…", self)
+        self._btn_open_processed.setToolTip(
+            "Ouvrir un dataset déjà exporté (.ergdataset / .zip) pour le comparer."
+        )
+        self._btn_open_processed.clicked.connect(self.browse_processed)
+        self._btn_process = QPushButton("Traiter", self)
+        self._btn_process.setObjectName("primaryButton")
+        self._btn_process.setToolTip("Traiter les enregistrements en attente (F5).")
+        self._btn_process.clicked.connect(self.processRequested.emit)
+
+        remove = QPushButton("Retirer", self)
         remove.setObjectName("dangerButton")
         remove.setToolTip("Retirer les lignes sélectionnées.")
         remove.clicked.connect(self.remove_selected)
@@ -120,8 +131,11 @@ class RecordingsPanel(QWidget):
 
         top = QHBoxLayout()
         top.setSpacing(4)
-        top.addWidget(remove)
+        top.addWidget(self._btn_add)
+        top.addWidget(self._btn_open_processed)
+        top.addWidget(self._btn_process)
         top.addStretch(1)
+        top.addWidget(remove)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -277,8 +291,11 @@ class RecordingsPanel(QWidget):
         self._refresh_summary()
 
     def set_busy(self, busy: bool) -> None:
-        """Compatibilité : l’état occupé est géré par la barre d’outils principale."""
-        del busy
+        """Désactiver Ajouter / Traiter pendant un build."""
+        enabled = not busy
+        self._btn_add.setEnabled(enabled)
+        self._btn_open_processed.setEnabled(enabled)
+        self._btn_process.setEnabled(enabled)
 
     # ----------------------------------------------------------------- rendering
 
@@ -316,12 +333,12 @@ class RecordingsPanel(QWidget):
             # Afficher = tracer + légende (même bascule pour alléger la table).
             plot_box = self._centered_check(
                 entry.style.plot_visible,
-                "Afficher cet enregistrement sur les graphiques et dans les légendes.",
+                "Afficher / masquer les courbes de cet enregistrement.",
             )
             plot_box.toggled.connect(
                 lambda checked, rid=entry.row_id: self._on_plot_toggled(rid, checked)
             )
-            self.table.setCellWidget(row, _COL_PLOT, self._wrap(plot_box))
+            self.table.setCellWidget(row, _COL_PLOT, self._wrap_check(plot_box))
 
             self.table.setItem(row, _COL_STATUS, QTableWidgetItem(""))
             self._refresh_status_cell(entry)
@@ -336,13 +353,22 @@ class RecordingsPanel(QWidget):
         return box
 
     @staticmethod
-    def _wrap(widget: QWidget) -> QWidget:
+    def _wrap_check(box: QCheckBox) -> QWidget:
+        """Centrer la case ; un clic dans la marge de la cellule bascule aussi."""
         holder = QWidget()
+        holder.setToolTip(box.toolTip())
         layout = QHBoxLayout(holder)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addStretch(1)
-        layout.addWidget(widget)
+        layout.addWidget(box)
         layout.addStretch(1)
+
+        def _on_press(event: Any) -> None:
+            # Les clics sur la case vont au QCheckBox ; ici = marge autour.
+            box.toggle()
+            QWidget.mousePressEvent(holder, event)
+
+        holder.mousePressEvent = _on_press  # type: ignore[method-assign]
         return holder
 
     def _row_of(self, entry: RecordingEntry) -> int:

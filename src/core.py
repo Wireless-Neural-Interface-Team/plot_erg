@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-import functools
-import gc
 import importlib.util
-import io
 import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor
@@ -28,8 +25,6 @@ from intan_rhx_dsp import (
     mean_rms_intan_channel,
     write_filtered_stack_channelwise,
 )
-from memmap_io import load_readonly_memmap, write_2d_channelwise
-
 _analysis_cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
     "analysis_cancel_event",
     default=None,
@@ -121,30 +116,6 @@ def get_analog_in0_signal(data: dict[str, Any]) -> np.ndarray:
 def uses_analog_trigger(config: AnalysisConfig) -> bool:
     """True when segmentation uses ANALOG_IN 0 edges (not fixed sections)."""
     return config.edge != "none"
-
-
-def peek_rhs_recording_info(rhs_path: Path) -> tuple[int, float]:
-    """Read RHS header only: return (num_samples, sample_rate_hz)."""
-    if not rhs_path.exists():
-        raise FileNotFoundError(f"File not found: {rhs_path}")
-    from intanutil.data import calculate_num_samples, get_bytes_per_data_block
-    from intanutil.header import read_header
-
-    with open(rhs_path, "rb") as fid:
-        with contextlib.redirect_stdout(io.StringIO()):
-            header = read_header(fid)
-        fs = float(header["sample_rate"])
-        bytes_per_block = get_bytes_per_data_block(header)
-        bytes_remaining = os.path.getsize(rhs_path) - fid.tell()
-        if bytes_remaining <= 0:
-            raise RuntimeError(f"RHS file contains no data: {rhs_path}")
-        if bytes_remaining % bytes_per_block != 0:
-            raise RuntimeError(f"Invalid RHS file size: {rhs_path}")
-        num_blocks = int(bytes_remaining / bytes_per_block)
-        num_samples = int(calculate_num_samples(header, num_blocks))
-    if num_samples < 2:
-        raise RuntimeError(f"Recording too short: {rhs_path}")
-    return num_samples, fs
 
 
 def validate_section_trigger_window(
@@ -532,11 +503,6 @@ def resolve_channel_workers(channel_workers: int | None, n_channels: int) -> int
         return max(1, min(int(channel_workers), int(MAX_PARALLEL_CHANNELS), int(n_channels)))
     n_cpu = int(os.cpu_count() or 2)
     return max(1, min(int(n_channels), int(MAX_PARALLEL_CHANNELS), n_cpu))
-
-
-def persist_amplifier_float32(amplifier_2d: np.ndarray, path: Path) -> Path:
-    """Write amplifier stack channel-by-channel (float32 memmap)."""
-    return write_2d_channelwise(amplifier_2d, path, dtype=np.dtype(np.float32))
 
 
 def intan_memmap_cache_valid(

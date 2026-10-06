@@ -167,6 +167,7 @@ class MeaMapWidget(QWidget):
         self._pitch_um = 1.0
         self._cluster_bounds_um: list[tuple[float, float, float, float]] = []
         self._contact_radius_px = 8.0
+        self._label_fit_cache: dict[tuple[int, int], tuple[str, float] | None] = {}
         self.setMinimumHeight(260)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
@@ -178,6 +179,7 @@ class MeaMapWidget(QWidget):
     def set_probe(self, layout: Any | None, channel_names: Sequence[str]) -> None:
         """Bind a :class:`probe_layout.ProbeLayout` to the recording channels."""
         self._contacts = []
+        self._label_fit_cache.clear()
         if layout is not None:
             from probe_layout import _is_nc_contact, _contact_name_matches_rhs
 
@@ -339,9 +341,21 @@ class MeaMapWidget(QWidget):
         # Sous ~11 px de diamètre, le texte devient illisible : tooltip seulement.
         if diameter < 11.0:
             return None
+        bucket = int(diameter * 2.0)  # ~0.5 px buckets — stable across hover paints
+        cache_key = (contact.index, bucket)
+        cached = self._label_fit_cache.get(cache_key)
+        if cached is not None or cache_key in self._label_fit_cache:
+            if cached is None:
+                return None
+            label, size = cached
+            font = QFont(base)
+            font.setBold(True)
+            font.setPointSizeF(size)
+            return label, font
         max_size = min(11.0, max(6.0, diameter * 0.50))
         min_size = 6.0
         if max_size < min_size:
+            self._label_fit_cache[cache_key] = None
             return None
         for label in self._label_candidates(contact):
             size = max_size
@@ -353,8 +367,10 @@ class MeaMapWidget(QWidget):
                 max_w = diameter * 0.90
                 max_h = diameter * 0.78
                 if metrics.horizontalAdvance(label) <= max_w and metrics.height() <= max_h:
+                    self._label_fit_cache[cache_key] = (label, float(size))
                     return label, font
                 size -= 0.5
+        self._label_fit_cache[cache_key] = None
         return None
 
     # --------------------------------------------------------------- painting

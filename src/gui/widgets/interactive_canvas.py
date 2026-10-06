@@ -101,6 +101,54 @@ class InteractiveCanvas(QWidget):
     def draw_idle(self) -> None:
         self.canvas.draw_idle()
 
+    def capture_view_limits(
+        self,
+    ) -> list[tuple[tuple[float, float], tuple[float, float]]] | None:
+        """Snapshot des (xlim, ylim) de chaque axe — pour survivre à un redessin."""
+        axes = list(self.figure.axes)
+        if not axes:
+            return None
+        limits: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        for ax in axes:
+            try:
+                xlim = (float(ax.get_xlim()[0]), float(ax.get_xlim()[1]))
+                ylim = (float(ax.get_ylim()[0]), float(ax.get_ylim()[1]))
+            except Exception:
+                return None
+            if not np.isfinite([*xlim, *ylim]).all() or xlim[0] == xlim[1]:
+                return None
+            limits.append((xlim, ylim))
+        return limits
+
+    def restore_view_limits(
+        self,
+        limits: list[tuple[tuple[float, float], tuple[float, float]]] | None,
+    ) -> None:
+        """Rétablir un snapshot de vue (ignore les axes en trop / manquants)."""
+        if not limits:
+            return
+        axes = list(self.figure.axes)
+        if not axes:
+            return
+        n = min(len(axes), len(limits))
+        for index in range(n):
+            xlim, ylim = limits[index]
+            ax = axes[index]
+            try:
+                ax.set_xlim(xlim[0], xlim[1])
+                if np.isfinite(ylim).all() and ylim[0] != ylim[1]:
+                    ax.set_ylim(ylim[0], ylim[1])
+            except Exception:
+                pass
+        # Même base temporelle si le nombre d’axes a changé (ex. flux ajouté).
+        if len(axes) > n and limits:
+            xlim0 = limits[0][0]
+            for ax in axes[n:]:
+                try:
+                    ax.set_xlim(xlim0[0], xlim0[1])
+                except Exception:
+                    pass
+
     def enable_default_pan(self) -> None:
         """Activer le mode Pan de la toolbar après un redraw (si pas déjà actif)."""
         try:

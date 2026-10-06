@@ -1,10 +1,7 @@
-"""Every parameter of the analysis, split by how expensive a change is.
+"""Paramètres d’affichage et de traitement, selon le coût d’un changement.
 
-- *Display* and *Legend & style* edits only change how cached data is drawn, so
-  they emit :attr:`ParamsPanel.viewChanged` and the panels redraw immediately.
-- *Processing* edits change what gets computed, so they emit
-  :attr:`ParamsPanel.configChanged`; the hierarchical cache means only the
-  affected stages are recomputed.
+- *Affichage* / *Légende & style* → :attr:`viewChanged` (redessin immédiat).
+- *Traitement* → :attr:`configChanged` (recalcul F5 ; cache par étapes).
 """
 
 from __future__ import annotations
@@ -13,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -26,6 +23,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -33,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from config import AnalysisConfig
+from gui.jobs import Debouncer
 from gui.widgets.view_params import AxisLimitRow
 from view_config import (
     LEGEND_LOCATIONS,
@@ -93,6 +92,10 @@ def _int_spin(
 
 def _choice(options: tuple[tuple[str, Any], ...], value: Any) -> QComboBox:
     box = QComboBox()
+    # Ne pas forcer la largeur min du dock sur le libellé le plus long.
+    box.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    box.setMinimumContentsLength(12)
+    box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     for label, key in options:
         box.addItem(label, key)
     index = box.findData(value)
@@ -108,34 +111,80 @@ def _scrollable(inner: QWidget) -> QScrollArea:
     return area
 
 
+def _collapsible_group(title: str, *, expanded: bool = False) -> tuple[QGroupBox, QWidget]:
+    """Groupe à cocher : décoché = contenu masqué (disclosure progressive)."""
+    box = QGroupBox(title)
+    box.setCheckable(True)
+    box.setChecked(expanded)
+    box.setObjectName("collapsibleGroup")
+    content = QWidget(box)
+    outer = QVBoxLayout(box)
+    outer.setContentsMargins(6, 14, 6, 6)
+    outer.setSpacing(4)
+    outer.addWidget(content)
+
+    def _on_toggled(checked: bool) -> None:
+        content.setVisible(checked)
+
+    box.toggled.connect(_on_toggled)
+    content.setVisible(expanded)
+    return box, content
+
+
 class ParamsPanel(QWidget):
-    """Live display settings and processing settings in one dock."""
+    """Réglages d’affichage et de traitement dans le dock Paramètres."""
 
     viewChanged = Signal()
     configChanged = Signal()
+    processRequested = Signal()
 
     def __init__(self, defaults: Mapping[str, Any] | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._defaults = dict(defaults or {})
         self._loading = True
+        # Dock librement redimensionnable (pas de plafond imposé par les combos).
+        self.setMinimumWidth(220)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
 
         self.tabs = QTabWidget(self)
         self.tabs.addTab(_scrollable(self._build_display_tab()), "Affichage")
         self.tabs.addTab(_scrollable(self._build_legend_tab()), "Légende && style")
         self.tabs.addTab(_scrollable(self._build_processing_tab()), "Traitement")
+        self.tabs.setTabToolTip(0, "Échelles, PSTH, montages — redessin immédiat")
+        self.tabs.setTabToolTip(1, "Légendes et style des panneaux — redessin immédiat")
+        self.tabs.setTabToolTip(2, "Déclencheurs, filtres, spikes — exige Traiter (F5)")
 
+        dirty_row = QWidget(self)
+        dirty_layout = QHBoxLayout(dirty_row)
+        dirty_layout.setContentsMargins(6, 4, 6, 6)
+        dirty_layout.setSpacing(6)
         self._dirty_label = QLabel("")
         self._dirty_label.setObjectName("warningLabel")
         self._dirty_label.setWordWrap(True)
-        self._dirty_label.setVisible(False)
+        self._btn_apply_process = QPushButton("Traiter (F5)", dirty_row)
+        self._btn_apply_process.setObjectName("primaryButton")
+        self._btn_apply_process.setToolTip("Recalculer avec les nouveaux paramètres de traitement")
+        self._btn_apply_process.clicked.connect(self.processRequested.emit)
+        dirty_layout.addWidget(self._dirty_label, 1)
+        dirty_layout.addWidget(self._btn_apply_process, 0)
+        dirty_row.setVisible(False)
+        self._dirty_row = dirty_row
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(0)
         layout.addWidget(self.tabs, 1)
-        layout.addWidget(self._dirty_label)
+        layout.addWidget(self._dirty_row)
 
+        self._view_debouncer = Debouncer(120, self)
+        self._view_debouncer.triggered.connect(self.viewChanged.emit)
         self._loading = False
+
+    def sizeHint(self) -> QSize:  # noqa: D102
+        return QSize(320, 640)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: D102
+        return QSize(220, 200)
 
     # ----------------------------------------------------------- display tab
 
@@ -190,8 +239,9 @@ class ParamsPanel(QWidget):
         axis_form.addRow("Panneaux RMS :", self._rms_ylim)
         axis_form.addRow("Panneaux de traces :", self._trace_ylim)
 
-        montage_group = QGroupBox("Panneaux montage")
-        montage_form = QFormLayout(montage_group)
+        montage_group, montage_inner = _collapsible_group("Panneaux montage (PDF)", expanded=False)
+        montage_form = QFormLayout(montage_inner)
+        montage_form.setContentsMargins(0, 0, 0, 0)
         self._montage_channels = _int_spin(2, 1024, 12)
         self._montage_channels.setToolTip(
             "Canaux empilés par page pour les montages moyenne / 2e stim "
@@ -229,6 +279,13 @@ class ParamsPanel(QWidget):
         self._legend_visible = QCheckBox("Afficher les légendes")
         self._legend_visible.setChecked(True)
         self._legend_location = QComboBox()
+        self._legend_location.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self._legend_location.setMinimumContentsLength(10)
+        self._legend_location.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         for location in LEGEND_LOCATIONS:
             self._legend_location.addItem(
                 "Sous le panneau" if location == "below" else location.capitalize(), location
@@ -261,7 +318,12 @@ class ParamsPanel(QWidget):
         self._show_borders = QCheckBox("Afficher les bordures du graphique")
         self._show_borders.setChecked(True)
         self._show_borders.setToolTip(
-            "Cadre (spines) autour de la zone de tracé de chaque panneau."
+            "Cadre avec graduations autour de la zone de tracé de chaque panneau."
+        )
+        self._ticks_inside = QCheckBox("Graduations à l’intérieur du cadre")
+        self._ticks_inside.setChecked(False)
+        self._ticks_inside.setToolTip(
+            "Oriente les graduations (ticks) vers l’intérieur du carré du graphique."
         )
         self._stim_markers = QCheckBox("Afficher les pointillés de stimulation")
         self._stim_markers.setChecked(True)
@@ -280,6 +342,7 @@ class ParamsPanel(QWidget):
         style_form.addRow(self._grid)
         style_form.addRow("Opacité de la grille :", self._grid_alpha)
         style_form.addRow(self._show_borders)
+        style_form.addRow(self._ticks_inside)
         style_form.addRow(self._stim_markers)
         style_form.addRow("Points max / courbe :", self._max_points)
 
@@ -294,6 +357,7 @@ class ParamsPanel(QWidget):
             self._legend_counts,
             self._grid,
             self._show_borders,
+            self._ticks_inside,
             self._stim_markers,
         ):
             box.toggled.connect(lambda _c: self._emit_view())
@@ -347,13 +411,20 @@ class ParamsPanel(QWidget):
         trigger_form.addRow("Seuil de déclenchement :", self._threshold)
         trigger_form.addRow("Fenêtre avant :", self._pre_s)
         trigger_form.addRow("Fenêtre après :", self._post_s)
-        trigger_form.addRow("Mode sans déclencheur :", self._section_spec)
-        trigger_form.addRow("Nombre de sections :", self._section_count)
-        trigger_form.addRow("Durée de section :", self._section_duration)
-        trigger_form.addRow("Début virtuel dans la section :", self._section_start)
-        trigger_form.addRow("Fin virtuelle dans la section :", self._section_end)
         self._section_spec.currentIndexChanged.connect(lambda _i: self._sync_section_rows())
         self._edge.currentIndexChanged.connect(lambda _i: self._sync_section_rows())
+
+        # Mode sans déclencheur : rarement utilisé → replié par défaut.
+        self._sections_box, sections_inner = _collapsible_group(
+            "Mode sans déclencheur (avancé)", expanded=False
+        )
+        sections_form = QFormLayout(sections_inner)
+        sections_form.setContentsMargins(0, 0, 0, 0)
+        sections_form.addRow("Découpage :", self._section_spec)
+        sections_form.addRow("Nombre de sections :", self._section_count)
+        sections_form.addRow("Durée de section :", self._section_duration)
+        sections_form.addRow("Début virtuel :", self._section_start)
+        sections_form.addRow("Fin virtuelle :", self._section_end)
 
         filter_group = QGroupBox("Filtres Intan (passe-haut et passe-bas)")
         filter_form = QFormLayout(filter_group)
@@ -440,24 +511,17 @@ class ParamsPanel(QWidget):
         spike_form.addRow("Après le spike :", self._overlay_post)
         self._threshold_mode.currentIndexChanged.connect(lambda _i: self._sync_threshold_rows())
 
-        resources_group = QGroupBox("Sonde et ressources")
-        resources_form = QFormLayout(resources_group)
+        # Mapping MEA : uniquement dans Session → Mapping (évite la double saisie).
+        # Champ masqué pour sync API / build_config.
         self._probe_edit = QLineEdit(str(defaults.get("default_probe_layout_json") or ""))
-        self._probe_edit.setPlaceholderText("Optionnel — géométrie des électrodes (.json)")
-        self._probe_edit.setToolTip(
-            "Même fichier que Session → Mapping → Charger…\n"
-            "JSON probeinterface ou mea_editor : positions des contacts sur la carte.\n"
-            "Utile pour naviguer par électrode et pour l’inset MEA du PDF. "
-            "Inutile si vous sélectionnez les canaux uniquement dans la liste."
-        )
-        probe_button = QPushButton("Parcourir…")
-        probe_button.clicked.connect(self._browse_probe)
-        probe_row = QWidget()
-        probe_layout = QHBoxLayout(probe_row)
-        probe_layout.setContentsMargins(0, 0, 0, 0)
-        probe_layout.setSpacing(4)
-        probe_layout.addWidget(self._probe_edit, 1)
-        probe_layout.addWidget(probe_button)
+        self._probe_edit.hide()
+
+        resources_box, resources_inner = _collapsible_group("Ressources", expanded=False)
+        resources_form = QFormLayout(resources_inner)
+        resources_form.setContentsMargins(0, 0, 0, 0)
+        map_hint = QLabel("Mapping MEA : Session → Mapping MEA (pas ici).")
+        map_hint.setObjectName("hintLabel")
+        map_hint.setWordWrap(True)
         self._work_edit = QLineEdit("")
         self._work_edit.setPlaceholderText("Par défaut : à côté du fichier .rhs")
         work_button = QPushButton("Parcourir…")
@@ -475,15 +539,15 @@ class ParamsPanel(QWidget):
         self._channel_workers.setToolTip(
             "Travailleurs parallèles pendant le filtrage (0 = automatique)."
         )
-        resources_form.addRow("Mapping MEA (JSON) :", probe_row)
-        resources_form.addRow("Dossier cache / travail :", work_row)
+        resources_form.addRow(map_hint)
+        resources_form.addRow("Dossier cache :", work_row)
         resources_form.addRow("Travailleurs canaux :", self._channel_workers)
 
-        for group in (trigger_group, filter_group, spike_group, resources_group):
+        for group in (trigger_group, self._sections_box, filter_group, spike_group, resources_box):
             page_layout.addWidget(group)
         hint = QLabel(
-            "Modifier un paramètre de traitement exige un retraitement (F5). "
-            "Grâce au cache par étapes, seules les étapes concernées sont recalculées."
+            "Tout changement ici exige Traiter (F5). "
+            "Le cache ne recalcule que les étapes touchées."
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
@@ -536,19 +600,14 @@ class ParamsPanel(QWidget):
         self._section_duration.setEnabled(no_trigger and not by_count)
         self._section_start.setEnabled(no_trigger)
         self._section_end.setEnabled(no_trigger)
+        # Ouvrir le groupe avancé si l’utilisateur choisit « sans déclencheur ».
+        if no_trigger and hasattr(self, "_sections_box") and not self._sections_box.isChecked():
+            self._sections_box.setChecked(True)
 
     def _sync_threshold_rows(self) -> None:
         fixed = str(self._threshold_mode.currentData()) == "fixed"
         self._spike_threshold.setEnabled(fixed)
         self._rms_multiplier.setEnabled(not fixed)
-
-    def _browse_probe(self) -> None:
-        start = self._probe_edit.text().strip() or str(Path.home())
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Choisir un JSON de sonde", start, "JSON (*.json);;Tous les fichiers (*)"
-        )
-        if path:
-            self._probe_edit.setText(path)
 
     def _browse_work_dir(self) -> None:
         start = self._work_edit.text().strip() or str(Path.home())
@@ -559,7 +618,7 @@ class ParamsPanel(QWidget):
     def _emit_view(self) -> None:
         if self._loading:
             return
-        self.viewChanged.emit()
+        self._view_debouncer.request()
 
     def _emit_config(self) -> None:
         if self._loading:
@@ -568,7 +627,7 @@ class ParamsPanel(QWidget):
 
     def set_dirty_message(self, message: str) -> None:
         self._dirty_label.setText(message)
-        self._dirty_label.setVisible(bool(message))
+        self._dirty_row.setVisible(bool(message))
 
     def focus_processing_tab(self) -> None:
         self.tabs.setCurrentIndex(2)
@@ -594,6 +653,7 @@ class ParamsPanel(QWidget):
             grid=self._grid.isChecked(),
             grid_alpha=float(self._grid_alpha.value()),
             show_borders=self._show_borders.isChecked(),
+            ticks_inside=self._ticks_inside.isChecked(),
             max_points_per_curve=int(self._max_points.value()),
         )
         d = self._defaults

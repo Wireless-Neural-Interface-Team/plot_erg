@@ -314,7 +314,11 @@ LAZY_FILTER_CACHE_MAX_CHANNELS = 8
 
 
 class LazyFilterBank:
-    """Filters individual amplifier channels on first access and caches the row."""
+    """Filters individual amplifier channels on first access and caches the row.
+
+    When ``notch_cache`` is shared between the HP and LP banks, the notch stage
+    runs once per channel and both filters reuse the notched buffer.
+    """
 
     def __init__(
         self,
@@ -323,6 +327,9 @@ class LazyFilterBank:
         kind: str,
         *,
         max_cached_channels: int = LAZY_FILTER_CACHE_MAX_CHANNELS,
+        notch_cache: OrderedDict[int, np.ndarray] | None = None,
+        filter_sos: np.ndarray | None = None,
+        notch_sos: np.ndarray | None = None,
     ) -> None:
         if kind not in ("hp", "lp"):
             raise ValueError(f"Unsupported filter bank kind: {kind}")
@@ -331,12 +338,22 @@ class LazyFilterBank:
         self._kind = kind
         self._max_cached = max(1, int(max_cached_channels))
         self._cache: OrderedDict[int, np.ndarray] = OrderedDict()
+        self._notch_cache = notch_cache
         self.shape = (int(amplifier.shape[0]), int(amplifier.shape[1]))
-        notch_sos, hp_sos, lp_sos = build_intan_filter_sos(dsp)
+        if notch_sos is None or filter_sos is None:
+            built_notch, hp_sos, lp_sos = build_intan_filter_sos(dsp)
+            notch_sos = built_notch if notch_sos is None else notch_sos
+            filter_sos = (hp_sos if kind == "hp" else lp_sos) if filter_sos is None else filter_sos
         self._notch_sos = notch_sos
-        self._sos = hp_sos if kind == "hp" else lp_sos
+        self._sos = filter_sos
 
-    def __getitem__(self, index: int) -> np.ndarray:
+    def __getitem__(self, index: int | tuple[Any, ...]) -> np.ndarray:
+        # Support ``bank[ch, start:end]`` like a 2D ndarray (filters the row, then slices).
+        if isinstance(index, tuple):
+            if not index:
+                raise IndexError("Empty index")
+            row = self[int(index[0])]
+            return row[index[1:]] if len(index) > 1 else row
         ch = int(index)
         cached = self._cache.get(ch)
         if cached is not None:
@@ -345,9 +362,20 @@ class LazyFilterBank:
         from scipy.signal import sosfilt
 
         check_analysis_cancelled()
-        signal = np.asarray(self._amplifier[ch], dtype=np.float64)
-        if self._notch_sos is not None:
-            signal = sosfilt(self._notch_sos, signal)
+        if self._notch_sos is not None and self._notch_cache is not None:
+            signal = self._notch_cache.get(ch)
+            if signal is None:
+                wide = np.asarray(self._amplifier[ch], dtype=np.float64)
+                signal = sosfilt(self._notch_sos, wide)
+                self._notch_cache[ch] = signal
+                while len(self._notch_cache) > self._max_cached:
+                    self._notch_cache.popitem(last=False)
+            else:
+                self._notch_cache.move_to_end(ch)
+        else:
+            signal = np.asarray(self._amplifier[ch], dtype=np.float64)
+            if self._notch_sos is not None:
+                signal = sosfilt(self._notch_sos, signal)
         filtered = np.asarray(sosfilt(self._sos, signal), dtype=np.float32)
         self._cache[ch] = filtered
         while len(self._cache) > self._max_cached:
@@ -448,8 +476,16 @@ def build_recording(
     triggers, t_rel, info = _segment(config, raw_meta, analog_in0, tracker)
     n_channels = int(raw_meta["n_channels"])
 
-    high = LazyFilterBank(amplifier, dsp, "hp")
-    low = LazyFilterBank(amplifier, dsp, "lp")
+    notch_sos, hp_sos, lp_sos = build_intan_filter_sos(dsp)
+    notch_cache: OrderedDict[int, np.ndarray] | None = (
+        OrderedDict() if notch_sos is not None else None
+    )
+    high = LazyFilterBank(
+        amplifier, dsp, "hp", notch_cache=notch_cache, filter_sos=hp_sos, notch_sos=notch_sos
+    )
+    low = LazyFilterBank(
+        amplifier, dsp, "lp", notch_cache=notch_cache, filter_sos=lp_sos, notch_sos=notch_sos
+    )
     source = AmplifierSpikeSource(
         amplifier=amplifier,
         highpass=high,  # type: ignore[arg-type]
@@ -869,11 +905,3 @@ def export_dataset(
         progress(f"Processed dataset written: {root}")
     return root
 
-
-def describe_spike_settings(config: AnalysisConfig) -> str:
-    params = spike_params(config)
-    overlay = overlay_params(config)
-    return (
-        f"{params['mode']} / {params['polarity']} / {params['threshold_uv']:g} µV, "
-        f"overlay [-{overlay['pre_ms']:g}, +{overlay['post_ms']:g}] ms"
-    )

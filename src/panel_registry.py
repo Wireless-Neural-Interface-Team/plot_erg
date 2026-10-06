@@ -226,6 +226,8 @@ class RenderRequest:
     # Zones de zoom à surligner sur la vue complète (définies par l’utilisateur).
     # Chaque entrée : (t0_s, t1_s, label). Vide = aucune bande de zoom.
     highlight_zooms: tuple[tuple[float, float, str], ...] = ()
+    # True = garder zoom/pan utilisateur après le redessin (ex. bascule Stim).
+    preserve_view: bool = False
 
     @property
     def panel(self) -> str:
@@ -263,10 +265,15 @@ class RenderRequest:
         if self.placement.has_custom_zoom:
             t0 = float(self.placement.zoom_t0_s)
             t1 = float(self.placement.zoom_t1_s)
-            # Les barres de plage sont posées en temps absolu (trace continue).
-            # Les panels d’analyse sont en t_rel → conversion via une stim de ref.
-            if str(self.panel).startswith("analysis_"):
-                converted = _absolute_range_to_relative(reference, t0, t1)
+            if t1 < t0:
+                t0, t1 = t1, t0
+            # Barres continues = temps absolu → convertir pour les panels d’analyse (t_rel).
+            # Zooms saisis « relatifs à la stim » = déjà en t_rel.
+            if str(self.panel).startswith("analysis_") and self.placement.zoom_absolute:
+                stim_index = self.settings.analysis.trigger_index()
+                converted = _absolute_range_to_relative(
+                    reference, t0, t1, stim_index=stim_index
+                )
                 if converted is not None:
                     return converted
                 t_rel = reference.t_rel
@@ -296,12 +303,16 @@ class RenderRequest:
         if (
             self.placement.has_custom_zoom
             and str(self.panel).startswith("analysis_")
+            and self.placement.zoom_absolute
         ):
             t0 = float(self.placement.zoom_t0_s)
             t1 = float(self.placement.zoom_t1_s)
+            stim_index = self.settings.analysis.trigger_index()
             out: list[tuple[float, float] | None] = []
             for recording in self.recordings:
-                converted = _absolute_range_to_relative(recording, t0, t1)
+                converted = _absolute_range_to_relative(
+                    recording, t0, t1, stim_index=stim_index
+                )
                 if converted is not None:
                     out.append(converted)
                     continue
@@ -325,11 +336,16 @@ class RenderRequest:
 
 
 def _absolute_range_to_relative(
-    recording: ProcessedRecording, t0_abs: float, t1_abs: float
+    recording: ProcessedRecording,
+    t0_abs: float,
+    t1_abs: float,
+    *,
+    stim_index: int | None = None,
 ) -> tuple[float, float] | None:
     """Convertit une plage absolue (barres) en fenêtre relative à une stimulation.
 
-    Référence = première stim dans la plage, sinon stim la plus proche du centre.
+    Si ``stim_index`` est fourni (mode « une stimulation »), cette stim est la
+    référence. Sinon : première stim dans la plage, ou stim la plus proche du centre.
     """
     stims = np.asarray(recording.stimulation_times_s(), dtype=np.float64).ravel()
     if stims.size == 0:
@@ -337,34 +353,23 @@ def _absolute_range_to_relative(
     lo, hi = float(t0_abs), float(t1_abs)
     if hi < lo:
         lo, hi = hi, lo
-    inside = stims[(stims >= lo) & (stims <= hi)]
-    if inside.size:
-        ref = float(inside[0])
+    if stim_index is not None and 0 <= int(stim_index) < stims.size:
+        ref = float(stims[int(stim_index)])
     else:
-        mid = 0.5 * (lo + hi)
-        ref = float(stims[int(np.argmin(np.abs(stims - mid)))])
+        inside = stims[(stims >= lo) & (stims <= hi)]
+        if inside.size:
+            ref = float(inside[0])
+        else:
+            mid = 0.5 * (lo + hi)
+            ref = float(stims[int(np.argmin(np.abs(stims - mid)))])
     return (lo - ref, hi - ref)
 
 
 def _decimate(x: np.ndarray, y: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
     """Min/max envelope decimation: keeps peaks while bounding the point count."""
-    n = int(np.asarray(x).size)
-    limit = max(16, int(max_points))
-    if n <= limit:
-        return x, y
-    n_bins = max(8, limit // 2)
-    edges = np.linspace(0, n, n_bins + 1).astype(np.int64)
-    starts = edges[:-1]
-    valid = starts < n
-    starts = starts[valid]
-    lows = np.minimum.reduceat(y, starts)
-    highs = np.maximum.reduceat(y, starts)
-    mids = np.add.reduceat(x, starts) / np.diff(np.append(starts, n))
-    out_x = np.repeat(mids, 2)
-    out_y = np.empty(out_x.size, dtype=np.float64)
-    out_y[0::2] = lows
-    out_y[1::2] = highs
-    return out_x, out_y
+    from plot_utils import decimate_envelope
+
+    return decimate_envelope(x, y, max_points)
 
 
 def _plot_curve(
@@ -421,7 +426,15 @@ def _apply_axis_style(ax: Any, style: PanelStyle) -> None:
     ax.title.set_fontsize(style.title_font_size)
     ax.xaxis.label.set_fontsize(style.label_font_size)
     ax.yaxis.label.set_fontsize(style.label_font_size)
-    ax.tick_params(axis="both", labelsize=style.tick_font_size)
+    inside = bool(style.ticks_inside)
+    ax.tick_params(
+        axis="both",
+        which="both",
+        labelsize=style.tick_font_size,
+        direction="in" if inside else "out",
+        top=inside,
+        right=inside,
+    )
     for text in ax.texts:
         if text.get_fontsize() > style.label_font_size * 1.6:
             text.set_fontsize(style.label_font_size)
@@ -484,11 +497,16 @@ _ZOOM_SPAN_COLORS = ("#22c55e", "#eab308", "#38bdf8", "#a78bfa", "#fb7185")
 def highlight_zooms_from_placements(
     placements: Sequence[PanelPlacement],
 ) -> tuple[tuple[float, float, str], ...]:
-    """Extraire les fenêtres de zoom personnalisées uniques (pour surlignage)."""
+    """Extraire les fenêtres de zoom relatives (surlignage sur graphs d’analyse)."""
     seen: set[tuple[float, float]] = set()
     out: list[tuple[float, float, str]] = []
     for placement in placements:
         if not placement.has_custom_zoom:
+            continue
+        # Surlignage en t_rel : ignorer les zooms absolus (trace continue).
+        if placement.zoom_absolute:
+            continue
+        if not str(placement.panel).startswith("analysis_"):
             continue
         key = (float(placement.zoom_t0_s), float(placement.zoom_t1_s))
         if key in seen:
@@ -1218,6 +1236,19 @@ def _montage_channel_slice(request: RenderRequest, n_channels: int) -> tuple[lis
     return visible[start : start + per_page], n_pages
 
 
+def _montage_files_caption(request: RenderRequest) -> str:
+    """Libellé court pour le titre : 1 fichier, ou superposition de N."""
+    labels = [str(label) for label in request.labels if str(label).strip()]
+    if not labels:
+        reference = request.reference
+        return reference.label if reference is not None else "—"
+    if len(labels) == 1:
+        return labels[0]
+    if len(labels) <= 3:
+        return " ⊕ ".join(labels)
+    return f"{labels[0]} ⊕ +{len(labels) - 1} fichiers"
+
+
 def _render_montage(figure: Any, request: RenderRequest) -> str:
     if request.panel == "montage_continuous_raw":
         return _render_montage_continuous(figure, request)
@@ -1226,7 +1257,8 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
     if not recordings:
         return _fail(figure.add_subplot(111), request, "No recording selected.")
     reference = recordings[0]
-    n_channels = reference.n_channels
+    multi_rec = len(recordings) > 1
+    n_channels = min(int(recording.n_channels) for recording in recordings)
     channel_indices, n_pages = _montage_channel_slice(request, n_channels)
     rows = max(1, len(channel_indices))
     window = request.section_window()
@@ -1234,18 +1266,43 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
         window = (float(reference.t_rel[0]), float(reference.t_rel[-1]))
 
     axes = figure.subplots(rows, 1, sharex=True, squeeze=False)[:, 0]
-    t = reference.t_rel
-    mask = _mask_window(t, window)
-    x = t[mask] if mask is not None else t
     drawn = 0
     for row, ch in enumerate(channel_indices):
         ax = axes[row]
-        if trigger_index is None:
-            curve = reference.mean(stream, ch)
-        else:
-            curve = reference.trigger_window(trigger_index, stream, ch)
         name = reference.channel_names[ch] if ch < len(reference.channel_names) else f"CH{ch}"
-        if curve is None:
+        channel_drawn = 0
+        for index, recording in enumerate(recordings):
+            if ch >= int(recording.n_channels):
+                continue
+            if trigger_index is None:
+                curve = recording.mean(stream, ch)
+            else:
+                if trigger_index >= recording.n_trials:
+                    continue
+                curve = recording.trigger_window(trigger_index, stream, ch)
+            if curve is None:
+                continue
+            t = recording.t_rel
+            mask = _mask_window(t, window)
+            x = t[mask] if mask is not None else t
+            y = curve[mask] if mask is not None else curve
+            line_color = request.colors[index] if multi_rec else color
+            # Légende uniquement sur la 1re ligne (évite N_axes copies).
+            series_label = (
+                _series_label(request, index, stream=stream) if row == 0 else None
+            )
+            _plot_curve(
+                ax,
+                x,
+                y,
+                style=request.style,
+                color=line_color,
+                label=series_label,
+                line_width=0.8,
+            )
+            channel_drawn += 1
+            drawn += 1
+        if channel_drawn == 0:
             ax.text(
                 0.5,
                 0.5,
@@ -1256,18 +1313,6 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
                 fontsize=request.style.tick_font_size,
                 color="#94a3b8",
             )
-        else:
-            y = curve[mask] if mask is not None else curve
-            _plot_curve(
-                ax,
-                x,
-                y,
-                style=request.style,
-                color=color,
-                label=None,
-                line_width=0.8,
-            )
-            drawn += 1
         ax.set_ylabel(
             name,
             rotation=0,
@@ -1275,8 +1320,16 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
             va="center",
             fontsize=max(5.0, request.style.tick_font_size - 1.0),
         )
-        ax.tick_params(axis="both", labelsize=max(5.0, request.style.tick_font_size - 1.5))
+        ax.tick_params(
+            axis="both",
+            labelsize=max(5.0, request.style.tick_font_size - 1.5),
+            direction="in" if request.style.ticks_inside else "out",
+            top=bool(request.style.ticks_inside),
+            right=bool(request.style.ticks_inside),
+        )
         ax.grid(request.style.grid, alpha=request.style.grid_alpha)
+        for spine in ax.spines.values():
+            spine.set_visible(bool(request.style.show_borders))
         ax.axvline(0.0, color="red", linestyle="--", linewidth=0.7, alpha=0.8)
         for marker in request.end_markers():
             ax.axvline(marker, color="#1d4ed8", linestyle="-.", linewidth=0.7, alpha=0.8)
@@ -1287,6 +1340,8 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
             _apply_ylim(ax, request.settings.trace_ylim)
         if ch == request.channel_index:
             ax.set_facecolor("#fff7ed")
+        if row == 0 and multi_rec:
+            _apply_legend(ax, request.legend)
         if row < rows - 1:
             ax.set_xticklabels([])
     axes[-1].set_xlabel("Time relative to stimulation (s)")
@@ -1298,7 +1353,7 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
     else:
         span = "no visible channels"
     figure.suptitle(
-        f"{panel_label(request.panel)} — {reference.label} — {span}"
+        f"{panel_label(request.panel)} — {_montage_files_caption(request)} — {span}"
         + (f" ({page_note})" if page_note else ""),
         fontsize=request.style.title_font_size,
     )
@@ -1306,18 +1361,19 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
 
 
 def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
-    """Traces continues empilées : tous les canaux × flux (WIDE / HIGH / LOW)."""
+    """Traces continues empilées : tous les canaux × flux, superposés par fichier."""
     recordings = request.recordings
     if not recordings:
         return _fail(figure.add_subplot(111), request, "No recording selected.")
     reference = recordings[0]
-    if not reference.has_streams:
+    if not any(recording.has_streams for recording in recordings):
         return _fail(
             figure.add_subplot(111),
             request,
             "Continuous streams unavailable.\nProcess a .rhs file (F5).",
         )
-    n_channels = int(reference.n_channels)
+    multi_rec = len(recordings) > 1
+    n_channels = min(int(recording.n_channels) for recording in recordings)
     # Revue montage : tous les canaux visibles (scrollable), sans pagination.
     channel_indices = _montage_visible_indices(request, n_channels)
     streams = list(request.settings.resolved_continuous_streams())
@@ -1341,29 +1397,75 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
     grid_alpha = float(request.style.grid_alpha)
     axes = figure.subplots(rows, 1, sharex=True, squeeze=False)[:, 0]
     drawn = 0
-    stim_times = np.empty(0, dtype=np.float64)
+    # Stims par fichier (cap global pour éviter N_axes × N_stims × N_fichiers).
+    stims_by_recording: list[np.ndarray] = []
     if request.settings.continuous_mark_stims:
-        stim_times = np.asarray(reference.stimulation_times_s(), dtype=np.float64)
-        # Cap pour éviter N_axes × N_stims axvline.
-        if stim_times.size > 40:
-            stim_times = stim_times[:40]
+        remaining = 40
+        for recording in recordings:
+            if remaining <= 0:
+                stims_by_recording.append(np.empty(0, dtype=np.float64))
+                continue
+            stims = np.asarray(recording.stimulation_times_s(), dtype=np.float64)
+            if stims.size > remaining:
+                stims = stims[:remaining]
+            remaining -= int(stims.size)
+            stims_by_recording.append(stims)
     range_bars = tuple(request.settings.range_bars)
     selected = int(request.channel_index)
     x_window = request.settings.x_limits.as_tuple()
+    legend_drawn = False
     row = 0
     for ch in channel_indices:
         name = reference.channel_names[ch] if ch < len(reference.channel_names) else f"CH{ch}"
         for stream in streams:
             ax = axes[row]
-            t, values = reference.continuous_trace(stream, ch, max_points=max_pts)
-            if x_window is not None and values.size:
-                mask = _mask_window(t, x_window)
-                if mask is not None:
-                    t = t[mask]
-                    values = values[mask]
             short = STREAM_SHORT_LABELS.get(stream, stream.upper())
             label = f"{name} {short}"
-            if values.size == 0:
+            channel_drawn = 0
+            for index, recording in enumerate(recordings):
+                if ch >= int(recording.n_channels) or not recording.has_streams:
+                    continue
+                t, values = recording.continuous_trace(stream, ch, max_points=max_pts)
+                if values.size == 0:
+                    continue
+                if x_window is not None:
+                    mask = _mask_window(t, x_window)
+                    if mask is not None:
+                        t = t[mask]
+                        values = values[mask]
+                color = (
+                    request.colors[index]
+                    if multi_rec
+                    else stream_colors.get(stream, "#334155")
+                )
+                series_label = "_nolegend_"
+                if multi_rec and not legend_drawn and request.legend_flags[index]:
+                    series_label = request.labels[index]
+                ax.plot(
+                    t,
+                    values,
+                    linewidth=line_w,
+                    color=color,
+                    label=series_label,
+                    solid_joinstyle="miter",
+                    antialiased=False,
+                )
+                channel_drawn += 1
+                drawn += 1
+                if index < len(stims_by_recording):
+                    for stim_t in stims_by_recording[index]:
+                        if x_window is not None and not (
+                            x_window[0] <= float(stim_t) <= x_window[1]
+                        ):
+                            continue
+                        ax.axvline(
+                            float(stim_t),
+                            color="#dc2626",
+                            linestyle="--",
+                            linewidth=0.5,
+                            alpha=0.4,
+                        )
+            if channel_drawn == 0:
                 ax.text(
                     0.5,
                     0.5,
@@ -1374,32 +1476,21 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
                     fontsize=request.style.tick_font_size,
                     color="#94a3b8",
                 )
-            else:
-                ax.plot(
-                    t,
-                    values,
-                    linewidth=line_w,
-                    color=stream_colors.get(stream, "#334155"),
-                    solid_joinstyle="miter",
-                    antialiased=False,
-                )
-                drawn += 1
-            if stim_times.size:
-                for stim_t in stim_times:
-                    if x_window is not None and not (
-                        x_window[0] <= float(stim_t) <= x_window[1]
-                    ):
-                        continue
-                    ax.axvline(
-                        float(stim_t), color="#dc2626", linestyle="--", linewidth=0.5, alpha=0.4
-                    )
             for bar in range_bars:
                 t0, t1 = bar.ordered()
                 ax.axvspan(t0, t1, alpha=0.10, color="#22c55e", zorder=0)
                 ax.axvline(t0, color="#16a34a", linestyle="-", linewidth=1.0, alpha=0.85)
                 ax.axvline(t1, color="#16a34a", linestyle="-", linewidth=1.0, alpha=0.85)
             ax.set_ylabel(label, rotation=0, ha="right", va="center", fontsize=label_fs)
-            ax.tick_params(axis="both", labelsize=tick_fs)
+            ax.tick_params(
+                axis="both",
+                labelsize=tick_fs,
+                direction="in" if request.style.ticks_inside else "out",
+                top=bool(request.style.ticks_inside),
+                right=bool(request.style.ticks_inside),
+            )
+            for spine in ax.spines.values():
+                spine.set_visible(bool(request.style.show_borders))
             if show_grid:
                 ax.grid(True, alpha=grid_alpha)
             if x_window is not None:
@@ -1407,6 +1498,9 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
             _apply_ylim(ax, request.settings.trace_ylim)
             if ch == selected:
                 ax.set_facecolor("#fff7ed")
+            if multi_rec and not legend_drawn and channel_drawn > 0:
+                _apply_legend(ax, request.legend)
+                legend_drawn = True
             if row < rows - 1:
                 ax.tick_params(labelbottom=False)
             row += 1
@@ -1418,7 +1512,7 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
     else:
         span = f"{n_visible}/{n_channels} canaux visibles"
     figure.suptitle(
-        f"Continuous {stream_note} — {reference.label} — {span}",
+        f"Continuous {stream_note} — {_montage_files_caption(request)} — {span}",
         fontsize=request.style.title_font_size,
     )
     return "ok" if drawn else "empty"

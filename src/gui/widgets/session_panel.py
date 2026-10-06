@@ -1,4 +1,4 @@
-"""Dock Session : enregistrements / canaux, puis zone Mapping en dessous."""
+"""Dock Session : enregistrements / canaux, puis zone Mapping MEA en dessous."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from gui.widgets.recordings_panel import RecordingsPanel
 
 
 class SessionPanel(QWidget):
-    """Recordings / Channels en haut ; Mapping MEA toujours visible en dessous."""
+    """Enregistrements / Canaux en haut ; Mapping MEA toujours visible en dessous."""
 
     probePathChanged = Signal(object)  # Path | None
 
@@ -40,20 +40,25 @@ class SessionPanel(QWidget):
 
         self.tabs = QTabWidget(self)
         self.tabs.setDocumentMode(True)
-        self.tabs.addTab(recordings, "Recordings")
-        self.tabs.addTab(channels, "Channels")
+        self.tabs.addTab(recordings, "Enregistrements")
+        self.tabs.addTab(channels, "Canaux")
+        self.tabs.setTabToolTip(
+            0, "Ajouter des .rhs, traiter, comparer couleurs / légendes."
+        )
+        self.tabs.setTabToolTip(
+            1, "Sélectionner un canal (aperçu) ; cases = visibilité en revue montage."
+        )
 
-        self.map_box = QGroupBox("Mapping", self)
+        self.map_box = QGroupBox("Mapping MEA", self)
         self.map_box.setObjectName("meaMapBox")
-        self.map_box.setMinimumHeight(300)
+        self.map_box.setMinimumHeight(280)
         self.map_box.setToolTip(
             "Carte des électrodes : clic = sélectionner, double-clic = inspecter."
         )
 
         self._help = QLabel(
-            "Fichier JSON de géométrie MEA (positions des électrodes). "
-            "Il relie chaque contact au canal Intan pour naviguer sur la carte. "
-            "Sans ce fichier, la carte reste vide — ce n’est pas obligatoire pour traiter un .rhs.",
+            "JSON de géométrie (optionnel) — sans lui la carte reste vide, "
+            "le traitement .rhs fonctionne quand même.",
             self.map_box,
         )
         self._help.setObjectName("hintLabel")

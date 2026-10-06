@@ -110,10 +110,6 @@ def title_block_in(fonts: LayoutFonts, *, mea: bool = False) -> float:
     return text_height_in(size, 1.2) + 0.16
 
 
-def header_block_in(fonts: LayoutFonts) -> float:
-    return text_height_in(fonts.section_header, 1.25) + 0.14
-
-
 def slot_below_in(slot: Slot, fonts: LayoutFonts, n_legend_rows: int) -> float:
     if slot.kind == "header":
         return HEADER_SLOT_GAP_IN
@@ -369,17 +365,6 @@ def place_legend_below(
         legend.set_in_layout(False)
         legend.set_clip_on(False)
     return legend
-
-
-def psth_table_bbox(ax: Any, fonts: LayoutFonts, n_data_rows: int) -> list[float]:
-    """Axes-fraction bbox for a PSTH table sitting under xlabel, in reserved space."""
-    fig_h = float(ax.figure.get_figheight())
-    ax_h_in = max(ax.get_position().height * fig_h, 1e-6)
-    table_in = table_block_in(fonts, n_data_rows)
-    gap_in = xlabel_block_in(fonts) + 0.04
-    height_frac = table_in / ax_h_in
-    y0 = -(gap_in / ax_h_in) - height_frac
-    return [0.0, y0, 1.0, height_frac]
 
 
 def rasterize_data_artists(fig: Any) -> None:

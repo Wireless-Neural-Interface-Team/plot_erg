@@ -144,12 +144,15 @@ class PanelGrid(QScrollArea):
 
         if not self._order:
             self._placeholder = QLabel(
-                "Aucun panneau.\n"
-                "Vue → Configurer les panneaux… ou chargez un enregistrement."
+                "Aperçu du canal sélectionné.\n\n"
+                "1. Session → Ajouter un .rhs\n"
+                "2. Traiter (F5)\n"
+                "3. Choisir un canal · Inspecter (Ctrl+I)\n\n"
+                "Revue montage : Ctrl+M"
             )
             self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._placeholder.setObjectName("hintLabel")
-            self._placeholder.setStyleSheet("color: #4b5563; background: #ffffff;")
+            self._placeholder.setObjectName("workflowHint")
+            self._placeholder.setWordWrap(True)
             self._layout.addWidget(self._placeholder, 0, 0)
             return
 

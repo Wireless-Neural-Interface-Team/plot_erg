@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import itertools
-import time
 import uuid
 from dataclasses import replace
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -26,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.jobs import Debouncer
+from gui.widgets.custom_zoom_dialog import ask_custom_zoom
 from gui.widgets.panel_grid import PanelGrid
 from gui.widgets.range_bars import RangeBarController, RangeBarToolbar
 from gui.widgets.view_params import LocalViewParams
@@ -34,6 +34,7 @@ from view_config import (
     AnalysisSettings,
     AnalysisStream,
     PanelPlacement,
+    TimeRangeBar,
     ViewerSettings,
 )
 
@@ -69,17 +70,24 @@ class ChannelAnalysisWindow(QMainWindow):
         self.settings = replace(base_settings, analysis=analysis)
         self._processed_applied = False
         self._stream_updating = False
+        self._stim_times_s: tuple[float, ...] = ()
+        self._relative_ranges: list[TimeRangeBar] = []
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.setWindowTitle(f"Inspecter {self.channel_name} — {self._mode_label}")
         self.resize(1400, 900)
 
-        self._status = QLabel("Cochez les graphs ; « Traiter la plage » ajoute les zooms.")
+        self._status = QLabel(
+            "Plages absolues sur le brut, ou « + Rel. stim » pour [t₀, t₁] "
+            "relatifs à la stimulation (moyenne / une stim)."
+        )
         self._status.setObjectName("panelStatus")
+        self._status.setWordWrap(True)
         self._n_trials = max(1, int(analysis.stim_index) + 1)
         self._title_label = QLabel(f"<b>{self.channel_name}</b><br>{self._mode_label}")
         self._title_label.setObjectName("sectionTitle")
         self._title_label.setTextFormat(Qt.TextFormat.RichText)
+        self._channel_ready = False
 
         # --- mode moyenne / stimulation ---
         mode_box = QGroupBox("Mode d’analyse", self)
@@ -94,7 +102,10 @@ class ChannelAnalysisWindow(QMainWindow):
         self._stim_spin.setMaximum(self._n_trials)
         self._stim_spin.setValue(max(1, int(analysis.stim_index) + 1))
         self._stim_spin.setKeyboardTracking(False)
-        self._stim_spin.setToolTip("Numéro de stimulation à afficher (1 … N).")
+        self._stim_spin.setToolTip(
+            "Numéro de stimulation à afficher (1 … N). "
+            "Référence aussi les plages relatives à la stim."
+        )
         mode_form.addRow("Mode", self._mode_combo)
         mode_form.addRow("Stimulation n°", self._stim_spin)
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
@@ -118,14 +129,12 @@ class ChannelAnalysisWindow(QMainWindow):
             self._cb_stream_wide.setChecked(True)
         self._cb_mark_stims = QCheckBox("Marqueurs de stimulation")
         self._cb_mark_stims.setChecked(bool(base_settings.continuous_mark_stims))
-        for box in (
-            self._cb_stream_wide,
-            self._cb_stream_high,
-            self._cb_stream_low,
-            self._cb_mark_stims,
-        ):
+        for box in (self._cb_stream_wide, self._cb_stream_high, self._cb_stream_low):
             streams_layout.addWidget(box)
             box.toggled.connect(self._on_streams_changed)
+        streams_layout.addWidget(self._cb_mark_stims)
+        self._cb_mark_stims.toggled.connect(self._on_stim_markers_changed)
+        self._preserve_view = False
 
         # --- contexte ---
         context_box = QGroupBox("Contexte", self)
@@ -136,7 +145,7 @@ class ChannelAnalysisWindow(QMainWindow):
             context_layout.addWidget(box)
             box.toggled.connect(self._on_extra_toggles_changed)
 
-        # --- graphs d’analyse (plein + zooms après « Traiter la plage ») ---
+        # --- graphs d’analyse (plein + zooms après « Appliquer les zooms ») ---
         toggles = QGroupBox("Graphs d’analyse", self)
         toggle_layout = QVBoxLayout(toggles)
         self._cb_raw = QCheckBox("WIDE (brut)")
@@ -172,9 +181,12 @@ class ChannelAnalysisWindow(QMainWindow):
         self._range_ctrl = RangeBarController(self)
         self._range_ctrl.barsChanged.connect(self._on_bars_changed)
         self._range_toolbar.addRequested.connect(self._add_bar)
+        self._range_toolbar.addRelativeRequested.connect(self._add_relative_range)
         self._range_toolbar.removeRequested.connect(self._remove_bar)
         self._range_toolbar.activeChanged.connect(self._on_active_changed)
         self._range_toolbar.processRequested.connect(self.apply_processing)
+        self._relative_label = QLabel("0 plage(s) relative(s) à la stim", self)
+        self._relative_label.setObjectName("hintLabel")
 
         self._btn_redraw = QPushButton("Redessiner", self)
         self._btn_redraw.clicked.connect(lambda: self.refreshRequested.emit(self))
@@ -195,6 +207,7 @@ class ChannelAnalysisWindow(QMainWindow):
         side_layout.addWidget(self._title_label)
         side_layout.addWidget(mode_box)
         side_layout.addWidget(self._range_toolbar)
+        side_layout.addWidget(self._relative_label)
         side_layout.addWidget(streams_box)
         side_layout.addWidget(context_box)
         side_layout.addWidget(toggles)
@@ -205,12 +218,14 @@ class ChannelAnalysisWindow(QMainWindow):
         self.grid = PanelGrid(self)
         self.grid.removeRequested.connect(self._on_panel_removed)
         self.grid.detachRequested.connect(lambda _p: None)
+        self.grid.renderFinished.connect(self._on_render_finished)
 
         header = QHBoxLayout()
         header.addWidget(
             QLabel(
                 "Traces continues + graphs cochés. "
-                "« Traiter la plage » ajoute les zooms sur chaque plage.",
+                "« Appliquer les zooms » crée un zoom par plage "
+                "(absolue ou relative à la stim).",
                 self,
             ),
             1,
@@ -223,11 +238,16 @@ class ChannelAnalysisWindow(QMainWindow):
         plot_layout.addWidget(self.grid, 1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
         splitter.addWidget(plot_side)
         splitter.addWidget(side)
-        splitter.setStretchFactor(0, 5)
+        plot_side.setMinimumWidth(360)
+        side.setMinimumWidth(260)
+        side.setMaximumWidth(16777215)
+        splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([1000, 340])
+        splitter.setSizes([900, 400])
         self.setCentralWidget(splitter)
 
         self._request_factory: RequestFactory | None = None
@@ -250,20 +270,30 @@ class ChannelAnalysisWindow(QMainWindow):
         self._stim_spin.blockSignals(False)
         self._sync_stim_enabled()
 
+    def set_stim_times(self, stim_times_s: Sequence[float]) -> None:
+        """Temps d’onset des stimulations (s, absolus) pour placer les plages relatives."""
+        self._stim_times_s = tuple(float(t) for t in stim_times_s)
+
     def set_time_span(self, t_min: float, t_max: float) -> None:
         self._range_ctrl.set_time_span(t_min, t_max)
         if not self._range_ctrl.bars:
             if self.settings.range_bars:
-                self._range_ctrl.set_bars(
-                    self.settings.range_bars,
-                    active_index=self.settings.active_range_index,
-                )
+                abs_bars = [
+                    b for b in self.settings.range_bars if not b.relative_to_stim
+                ]
+                rel_bars = [b for b in self.settings.range_bars if b.relative_to_stim]
+                if abs_bars:
+                    self._range_ctrl.set_bars(
+                        abs_bars,
+                        active_index=self.settings.active_range_index,
+                    )
+                else:
+                    self._range_ctrl.ensure_default_bar()
+                self._relative_ranges = [replace(b) for b in rel_bars]
             else:
                 self._range_ctrl.ensure_default_bar()
             self._sync_settings_from_bars()
-            self._range_toolbar.set_bar_count(
-                len(self._range_ctrl.bars), self._range_ctrl.active_index
-            )
+            self._update_range_counts()
 
     def _selected_streams(self) -> tuple[AnalysisStream, ...]:
         streams: list[AnalysisStream] = []
@@ -275,6 +305,9 @@ class ChannelAnalysisWindow(QMainWindow):
             streams.append("lp")
         return tuple(streams) or ("raw",)
 
+    def _all_range_bars(self) -> tuple[TimeRangeBar, ...]:
+        return tuple(self._range_ctrl.bars) + tuple(self._relative_ranges)
+
     def local_settings(self) -> ViewerSettings:
         streams = self._selected_streams()
         base = self.params.settings()
@@ -284,7 +317,7 @@ class ChannelAnalysisWindow(QMainWindow):
             continuous_stream=streams[0],
             continuous_streams=streams,
             continuous_mark_stims=self._cb_mark_stims.isChecked(),
-            range_bars=self._range_ctrl.bars,
+            range_bars=self._all_range_bars(),
             active_range_index=self._range_ctrl.active_index,
         )
 
@@ -302,14 +335,25 @@ class ChannelAnalysisWindow(QMainWindow):
             self._stream_updating = True
             self._cb_stream_wide.setChecked(True)
             self._stream_updating = False
+        self._preserve_view = False
         self.settings = self.local_settings()
         self.params.sync_base_settings(self.settings)
         # Recréer la grille : un axe par flux coché.
         self._rebuild_placements(apply_zooms=self._processed_applied)
         self.refreshRequested.emit(self)
 
+    def _on_stim_markers_changed(self, *_args: Any) -> None:
+        """Bascule des marqueurs stim : redessiner sans reset zoom/position."""
+        self._preserve_view = True
+        self.settings = self.local_settings()
+        self.params.sync_base_settings(self.settings)
+        self.refreshRequested.emit(self)
+
     def needs_channel_compute(self) -> bool:
-        return True
+        return not self._channel_ready
+
+    def set_channel_ready(self, ready: bool) -> None:
+        self._channel_ready = bool(ready)
 
     @property
     def placements(self) -> tuple[PanelPlacement, ...]:
@@ -349,6 +393,8 @@ class ChannelAnalysisWindow(QMainWindow):
         self.setWindowTitle(f"Inspecter {self.channel_name} — {self._mode_label}")
         self.settings = self.local_settings()
         self.params.sync_base_settings(self.settings)
+        if self._processed_applied:
+            self._rebuild_placements(apply_zooms=True)
         self.refreshRequested.emit(self)
 
     def _context_panels(self) -> tuple[str, ...]:
@@ -358,6 +404,62 @@ class ChannelAnalysisWindow(QMainWindow):
         if self._cb_impedance.isChecked():
             panels.append("impedance")
         return tuple(panels)
+
+    def _stim_reference_s(self) -> float | None:
+        """Onset de référence pour convertir une plage relative → absolue."""
+        if not self._stim_times_s:
+            return None
+        analysis = self._analysis_from_toggles()
+        index = analysis.trigger_index()
+        if index is None:
+            index = 0
+        if 0 <= int(index) < len(self._stim_times_s):
+            return float(self._stim_times_s[int(index)])
+        return float(self._stim_times_s[0])
+
+    def _append_zoom_panels(
+        self,
+        panels: list[PanelPlacement],
+        *,
+        analysis: AnalysisSettings,
+        t0: float,
+        t1: float,
+        label: str,
+        bar_id: str,
+        absolute: bool,
+    ) -> None:
+        if absolute:
+            panels.append(
+                PanelPlacement("full_recording").with_custom_zoom(
+                    t0,
+                    t1,
+                    label=f"Zoom brut {label}",
+                    instance_id=bar_id,
+                    absolute=True,
+                )
+            )
+        else:
+            stim_t = self._stim_reference_s()
+            if stim_t is not None:
+                panels.append(
+                    PanelPlacement("full_recording").with_custom_zoom(
+                        stim_t + t0,
+                        stim_t + t1,
+                        label=f"Zoom brut {label}",
+                        instance_id=bar_id,
+                        absolute=True,
+                    )
+                )
+        for key in analysis.selected_analysis_panels():
+            panels.append(
+                PanelPlacement(key).with_custom_zoom(
+                    t0,
+                    t1,
+                    label=label,
+                    instance_id=bar_id,
+                    absolute=absolute,
+                )
+            )
 
     def _rebuild_placements(self, *, apply_zooms: bool) -> None:
         panels: list[PanelPlacement] = [PanelPlacement("full_recording")]
@@ -369,23 +471,34 @@ class ChannelAnalysisWindow(QMainWindow):
         for key in analysis.selected_analysis_panels():
             panels.append(PanelPlacement(key, section="full"))
 
-        bars = self._range_ctrl.bars or self.settings.range_bars
-        if apply_zooms and bars:
-            for index, bar in enumerate(bars):
+        if apply_zooms:
+            abs_bars = self._range_ctrl.bars or ()
+            for index, bar in enumerate(abs_bars):
                 t0, t1 = bar.ordered()
                 label = bar.label.strip() or f"Plage {index + 1}"
                 bar_id = str(bar.bar_id or f"bar{index}")
-                panels.append(
-                    PanelPlacement("full_recording").with_custom_zoom(
-                        t0, t1, label=f"Zoom brut {label}", instance_id=bar_id
-                    )
+                self._append_zoom_panels(
+                    panels,
+                    analysis=analysis,
+                    t0=t0,
+                    t1=t1,
+                    label=label,
+                    bar_id=bar_id,
+                    absolute=True,
                 )
-                for key in analysis.selected_analysis_panels():
-                    panels.append(
-                        PanelPlacement(key).with_custom_zoom(
-                            t0, t1, label=label, instance_id=bar_id
-                        )
-                    )
+            for index, bar in enumerate(self._relative_ranges):
+                t0, t1 = bar.ordered()
+                label = bar.label.strip() or f"Rel. stim {index + 1}"
+                bar_id = str(bar.bar_id or f"rel{index}")
+                self._append_zoom_panels(
+                    panels,
+                    analysis=analysis,
+                    t0=t0,
+                    t1=t1,
+                    label=label,
+                    bar_id=bar_id,
+                    absolute=False,
+                )
 
         self._placements = tuple(panels)
         # Un sous-graphique par flux continu → hauteur proportionnelle.
@@ -400,38 +513,94 @@ class ChannelAnalysisWindow(QMainWindow):
         self.refreshRequested.emit(self)
 
     def apply_processing(self) -> None:
-        """Bouton « Traiter la plage » : ajouter les zooms sur chaque plage."""
-        if not self._range_ctrl.bars:
+        """Bouton « Appliquer les zooms » : ajouter les zooms sur chaque plage."""
+        if not self._range_ctrl.bars and not self._relative_ranges:
             self._range_ctrl.ensure_default_bar()
         self._processed_applied = True
         self._sync_settings_from_bars()
         self._rebuild_placements(apply_zooms=True)
-        n = len(self._range_ctrl.bars)
-        self._status.setText(f"{n} plage(s) — zooms ajoutés sur les graphs cochés.")
+        n_abs = len(self._range_ctrl.bars)
+        n_rel = len(self._relative_ranges)
+        self._status.setText(
+            f"{n_abs} plage(s) abs. + {n_rel} relative(s) — zooms ajoutés."
+        )
         self.refreshRequested.emit(self)
 
     # -------------------------------------------------------------- bars UI
 
-    def _add_bar(self) -> None:
-        self._range_ctrl.add_bar()
+    def _update_range_counts(self) -> None:
         self._range_toolbar.set_bar_count(
             len(self._range_ctrl.bars), self._range_ctrl.active_index
         )
+        n_rel = len(self._relative_ranges)
+        if n_rel == 0:
+            self._relative_label.setText("0 plage(s) relative(s) à la stim")
+        else:
+            parts = []
+            for bar in self._relative_ranges:
+                t0, t1 = bar.ordered()
+                name = bar.label.strip() or "rel"
+                parts.append(f"{name} [{t0:g}…{t1:g} s]")
+            self._relative_label.setText(
+                f"{n_rel} relative(s) : " + " · ".join(parts)
+            )
+
+    def _add_bar(self) -> None:
+        self._range_ctrl.add_bar()
+        self._update_range_counts()
         self._sync_settings_from_bars()
         if self._processed_applied:
             self._rebuild_placements(apply_zooms=True)
             self.refreshRequested.emit(self)
 
-    def _remove_bar(self) -> None:
-        if len(self._range_ctrl.bars) <= 1:
-            QMessageBox.information(
-                self, "Plages", "Il doit rester au moins une plage."
-            )
-            return
-        self._range_ctrl.remove_active_bar()
-        self._range_toolbar.set_bar_count(
-            len(self._range_ctrl.bars), self._range_ctrl.active_index
+    def _add_relative_range(self) -> None:
+        """Saisir une plage [t₀, t₁] relative au début de stimulation."""
+        settings = self.local_settings()
+        spec = ask_custom_zoom(
+            self,
+            default_t0=float(settings.zoom_onset_t0_s),
+            default_t1=float(settings.zoom_onset_t1_s),
         )
+        if spec is None:
+            return
+        n = len(self._relative_ranges) + 1
+        label = spec.label.strip() or f"Rel. stim {n}"
+        self._relative_ranges.append(
+            TimeRangeBar(
+                t0_s=float(spec.t0_s),
+                t1_s=float(spec.t1_s),
+                label=label,
+                bar_id=uuid.uuid4().hex[:8],
+                relative_to_stim=True,
+            )
+        )
+        self._update_range_counts()
+        self._sync_settings_from_bars()
+        self._processed_applied = True
+        self._rebuild_placements(apply_zooms=True)
+        self._status.setText(
+            f"Plage relative [{spec.t0_s:g} … {spec.t1_s:g}] s — zooms ajoutés."
+        )
+        self.refreshRequested.emit(self)
+
+    def _remove_bar(self) -> None:
+        # Priorité : supprimer la plage absolue active ; sinon la dernière relative.
+        if self._range_ctrl.bars:
+            if len(self._range_ctrl.bars) <= 1 and not self._relative_ranges:
+                QMessageBox.information(
+                    self, "Plages", "Il doit rester au moins une plage."
+                )
+                return
+            if len(self._range_ctrl.bars) > 1:
+                self._range_ctrl.remove_active_bar()
+            elif self._relative_ranges:
+                self._relative_ranges.pop()
+        elif self._relative_ranges:
+            self._relative_ranges.pop()
+        else:
+            QMessageBox.information(self, "Plages", "Aucune plage à supprimer.")
+            return
+        self._update_range_counts()
         self._sync_settings_from_bars()
         if self._processed_applied:
             self._rebuild_placements(apply_zooms=True)
@@ -442,9 +611,7 @@ class ChannelAnalysisWindow(QMainWindow):
         self._sync_settings_from_bars()
 
     def _on_bars_changed(self, _bars: object) -> None:
-        self._range_toolbar.set_bar_count(
-            len(self._range_ctrl.bars), self._range_ctrl.active_index
-        )
+        self._update_range_counts()
         self._sync_settings_from_bars()
         self._bars_debouncer.request()
 
@@ -490,10 +657,13 @@ class ChannelAnalysisWindow(QMainWindow):
         self.settings = self.local_settings()
         if self._request_factory is None:
             return
+        preserve_view = bool(self._preserve_view)
 
         def factory(placement: PanelPlacement) -> RenderRequest:
             request = self._request_factory(self, placement)  # type: ignore[misc]
             if request is not None:
+                if preserve_view:
+                    return replace(request, preserve_view=True)
                 return request
             return RenderRequest(
                 placement=placement,
@@ -506,13 +676,15 @@ class ChannelAnalysisWindow(QMainWindow):
                 settings=self.settings,
                 probe_layout=None,
                 impedance_sessions=[],
+                preserve_view=preserve_view,
             )
 
-        started = time.perf_counter()
-        self.grid.invalidate_all()
-        drawn = self.grid.render_dirty_now(factory)
-        elapsed = time.perf_counter() - started
-        self._status.setText(f"{drawn} panneau(x) · {elapsed * 1000:.0f} ms")
+        self._status.setText("Rendu…")
+        self.grid.schedule_render(factory, force=True)
+
+    def _on_render_finished(self, drawn: int, elapsed_s: float) -> None:
+        self._preserve_view = False
+        self._status.setText(f"{drawn} panneau(x) · {elapsed_s * 1000:.0f} ms")
         self._attach_range_bars_to_full_recording()
 
     def _attach_range_bars_to_full_recording(self) -> None:
@@ -539,7 +711,7 @@ class ChannelAnalysisWindow(QMainWindow):
             if not self._range_ctrl.bars:
                 self._range_ctrl.ensure_default_bar()
                 self._sync_settings_from_bars()
-                self._range_toolbar.set_bar_count(1, 0)
+                self._update_range_counts()
             self._range_ctrl.attach(canvas, axes)
             break
 

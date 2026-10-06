@@ -107,11 +107,16 @@ class ViewSessionWindow(QMainWindow):
         params_layout.addWidget(self.params, 1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
         splitter.addWidget(plot_side)
         splitter.addWidget(params_side)
-        splitter.setStretchFactor(0, 4)
+        plot_side.setMinimumWidth(320)
+        params_side.setMinimumWidth(240)
+        params_side.setMaximumWidth(16777215)
+        splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([920, 300])
+        splitter.setSizes([860, 380])
         self.setCentralWidget(splitter)
 
         self._request_factory: RequestFactory | None = None

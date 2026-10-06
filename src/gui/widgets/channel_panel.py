@@ -50,9 +50,9 @@ class ChannelPanel(QWidget):
         self.list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.setToolTip(
-            "Coche : visible dans le montage.\n"
+            "Coche : visible dans la revue montage (Ctrl+M).\n"
             "Clic : sélectionner (aperçu central).\n"
-            "Double-clic : inspecter le canal (barres de plage).\n"
+            "Double-clic : inspecter (barres de plage + graphs).\n"
             "Clic droit : masquer / afficher."
         )
         self.list.currentItemChanged.connect(self._on_list_changed)
@@ -96,13 +96,19 @@ class ChannelPanel(QWidget):
         next_button.clicked.connect(lambda: self.step(1))
 
         self._btn_show_all = QPushButton("Tout", self)
-        self._btn_show_all.setToolTip("Afficher tous les canaux dans le montage")
+        self._btn_show_all.setToolTip(
+            "Afficher tous les canaux dans la revue montage (Ctrl+M)"
+        )
         self._btn_show_all.clicked.connect(self.show_all)
         self._btn_hide_selected = QPushButton("Masquer", self)
-        self._btn_hide_selected.setToolTip("Masquer les canaux sélectionnés dans le montage")
+        self._btn_hide_selected.setToolTip(
+            "Masquer les canaux sélectionnés dans la revue montage"
+        )
         self._btn_hide_selected.clicked.connect(self.hide_selected)
         self._btn_solo = QPushButton("Seul", self)
-        self._btn_solo.setToolTip("N’afficher que les canaux sélectionnés dans le montage")
+        self._btn_solo.setToolTip(
+            "N’afficher que les canaux sélectionnés dans la revue montage"
+        )
         self._btn_solo.clicked.connect(self.solo_selected)
 
         self._title = QLabel("Aucun canal")
@@ -376,9 +382,9 @@ class ChannelPanel(QWidget):
         if total <= 0:
             self._visibility_label.setText("")
         elif hidden <= 0:
-            self._visibility_label.setText(f"{total} visibles")
+            self._visibility_label.setText(f"{total} visibles (montage)")
         else:
-            self._visibility_label.setText(f"{total - hidden}/{total} visibles")
+            self._visibility_label.setText(f"{total - hidden}/{total} au montage")
 
     def _emit_visibility(self) -> None:
         self.visibilityChanged.emit()

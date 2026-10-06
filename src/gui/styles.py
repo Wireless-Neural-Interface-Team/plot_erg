@@ -17,7 +17,6 @@ from gui.theme import (
     SCOPE_ACCENT,
     SCOPE_BG,
     SELECT_BG,
-    SELECT_BG_HOVER,
     SELECT_BORDER,
     TEXT,
     TEXT_INVERSE,
@@ -46,6 +45,15 @@ QWidget {{
 }}
 QMainWindow {{
     background-color: {CHROME_BG_ALT};
+}}
+/* Poignée entre docks / zone centrale — assez large pour élargir Paramètres. */
+QMainWindow::separator {{
+    background-color: {CHROME_BORDER};
+    width: 6px;
+    height: 6px;
+}}
+QMainWindow::separator:hover {{
+    background-color: {SCOPE_ACCENT};
 }}
 
 /* ---- Menu / toolbar ---- */
@@ -168,6 +176,32 @@ QLabel#controlChannel {{
     padding: 4px 10px;
     min-width: 120px;
 }}
+QLabel#viewModeBadge {{
+    font-weight: 800;
+    font-size: 11px;
+    letter-spacing: 0.4px;
+    color: {TEXT};
+    background-color: {CHROME_BG_LIGHT};
+    border: 1px solid {CHROME_BORDER};
+    border-radius: 2px;
+    padding: 4px 10px;
+    min-width: 72px;
+}}
+QLabel#viewModeBadge[mode="montage"] {{
+    background-color: #dbeafe;
+    color: #1e3a8a;
+    border-color: #93c5fd;
+}}
+QLabel#viewModeBadge[mode="preview"] {{
+    background-color: {CHROME_BG_LIGHT};
+    color: {TEXT};
+}}
+QGroupBox#collapsibleGroup {{
+    font-weight: 700;
+}}
+QGroupBox#collapsibleGroup::title {{
+    color: {TEXT};
+}}
 QPushButton#filterWide, QPushButton#filterLow, QPushButton#filterHigh, QPushButton#filterSpk {{
     min-width: 58px;
     padding: 6px 10px;
@@ -267,9 +301,11 @@ QLabel#warningLabel {{
 }}
 QLabel#workflowHint {{
     color: {TEXT};
-    background-color: {CHROME_BG_LIGHT};
-    border: 1px solid {CHROME_BORDER};
-    padding: 6px 8px;
+    background-color: {SCOPE_BG};
+    border: none;
+    padding: 24px 32px;
+    font-size: 13px;
+    font-weight: 500;
 }}
 QLabel#panelTitle {{
     font-weight: 700;
@@ -469,11 +505,14 @@ QHeaderView::section {{
 QSplitter::handle {{
     background-color: {CHROME_BORDER};
 }}
+QSplitter::handle:hover {{
+    background-color: {SCOPE_ACCENT};
+}}
 QSplitter::handle:horizontal {{
-    width: 4px;
+    width: 6px;
 }}
 QSplitter::handle:vertical {{
-    height: 4px;
+    height: 6px;
 }}
 QScrollArea {{
     border: none;

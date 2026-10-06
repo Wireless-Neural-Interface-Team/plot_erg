@@ -131,6 +131,9 @@ class PanelCanvas(QFrame):
         from gui.mpl_theme import apply_intan_scope_style
         from panel_registry import render_panel
 
+        saved_limits = (
+            self._plot.capture_view_limits() if request.preserve_view else None
+        )
         started = time.perf_counter()
         try:
             status = render_panel(self.figure, request)
@@ -167,6 +170,8 @@ class PanelCanvas(QFrame):
             axes.set_axis_off()
             apply_intan_scope_style(self.figure, grid=False, show_borders=False)
             status = "unavailable"
+        if saved_limits is not None:
+            self._plot.restore_view_limits(saved_limits)
         self._last_render_s = time.perf_counter() - started
         self._plot.draw_idle()
         # Laisser le clic gauche aux barres de plage (pan = clic droit / molette zoom).
@@ -252,11 +257,16 @@ class DetachedPanelWindow(QDialog):
         params_layout.addWidget(self.params, 1)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(6)
         splitter.addWidget(plot_side)
         splitter.addWidget(params_side)
-        splitter.setStretchFactor(0, 4)
+        plot_side.setMinimumWidth(320)
+        params_side.setMinimumWidth(240)
+        params_side.setMaximumWidth(16777215)
+        splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([780, 280])
+        splitter.setSizes([740, 360])
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -273,6 +283,9 @@ class DetachedPanelWindow(QDialog):
         from gui.mpl_theme import apply_intan_scope_style
         from panel_registry import render_panel
 
+        saved_limits = (
+            self._plot.capture_view_limits() if request.preserve_view else None
+        )
         started = time.perf_counter()
         try:
             status = render_panel(self.figure, request)
@@ -300,6 +313,8 @@ class DetachedPanelWindow(QDialog):
             axes.set_axis_off()
             apply_intan_scope_style(self.figure, grid=False, show_borders=False)
             status = "unavailable"
+        if saved_limits is not None:
+            self._plot.restore_view_limits(saved_limits)
         elapsed = time.perf_counter() - started
         self._plot.draw_idle()
         self._plot.enable_default_pan()

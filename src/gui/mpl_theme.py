@@ -12,7 +12,6 @@ from gui.theme import (
     SCOPE_GRID,
     SCOPE_SPINE,
     SCOPE_TITLE,
-    SCOPE_ZERO_LINE,
 )
 
 
@@ -58,9 +57,17 @@ def apply_intan_scope_style(
             if show_borders is not None:
                 spine.set_visible(bool(show_borders))
 
-        tick_kwargs: dict[str, Any] = {"colors": SCOPE_FG, "which": "both"}
+        tick_kwargs: dict[str, Any] = {
+            "axis": "both",
+            "which": "both",
+            "colors": SCOPE_FG,
+        }
         if ticks_inside is not None:
-            tick_kwargs["direction"] = "in" if ticks_inside else "out"
+            inside = bool(ticks_inside)
+            tick_kwargs["direction"] = "in" if inside else "out"
+            # Graduations sur les 4 côtés quand elles sont à l’intérieur.
+            tick_kwargs["top"] = inside
+            tick_kwargs["right"] = inside
         ax.tick_params(**tick_kwargs)
         try:
             ax.xaxis.label.set_color(SCOPE_FG)
@@ -99,22 +106,3 @@ def apply_intan_scope_style(
     except Exception:
         pass
 
-
-def style_empty_message(ax: Any, message: str) -> None:
-    ax.set_facecolor(SCOPE_AXES)
-    ax.set_axis_off()
-    ax.text(
-        0.5,
-        0.5,
-        message,
-        ha="center",
-        va="center",
-        transform=ax.transAxes,
-        color=SCOPE_FG,
-        fontsize=10,
-        wrap=True,
-    )
-
-
-def zero_line_color() -> str:
-    return SCOPE_ZERO_LINE

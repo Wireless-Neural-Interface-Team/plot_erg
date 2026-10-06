@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import replace
 from typing import Any, Sequence
@@ -24,6 +25,7 @@ class RangeBarToolbar(QWidget):
     """Boutons pour ajouter / supprimer / activer une plage et lancer le traitement."""
 
     addRequested = Signal()
+    addRelativeRequested = Signal()
     removeRequested = Signal()
     activeChanged = Signal(int)
     processRequested = Signal()
@@ -39,15 +41,24 @@ class RangeBarToolbar(QWidget):
         self._active.valueChanged.connect(lambda v: self.activeChanged.emit(int(v) - 1))
 
         btn_add = QPushButton("+ Plage", self)
-        btn_add.setToolTip("Ajouter une paire de barres aux extrémités visibles")
+        btn_add.setToolTip(
+            "Ajouter une paire de barres en temps absolu (sur la trace continue)"
+        )
         btn_add.clicked.connect(self.addRequested.emit)
+        btn_add_rel = QPushButton("+ Rel. stim", self)
+        btn_add_rel.setToolTip(
+            "Ajouter une plage [t₀, t₁] relative au début de stimulation "
+            "(mode moyenne / une stim)"
+        )
+        btn_add_rel.clicked.connect(self.addRelativeRequested.emit)
         btn_remove = QPushButton("− Plage", self)
         btn_remove.setToolTip("Supprimer la plage active")
         btn_remove.clicked.connect(self.removeRequested.emit)
-        btn_process = QPushButton("Traiter la plage", self)
+        btn_process = QPushButton("Appliquer les zooms", self)
         btn_process.setObjectName("primaryButton")
         btn_process.setToolTip(
-            "Appliquer toutes les plages : zooms brut + graphs cochés pour chacune"
+            "Créer un zoom (et les graphs cochés) pour chaque plage — "
+            "ne relance pas le traitement F5"
         )
         btn_process.clicked.connect(self.processRequested.emit)
 
@@ -58,6 +69,7 @@ class RangeBarToolbar(QWidget):
         layout.addWidget(QLabel("Active", self))
         layout.addWidget(self._active)
         layout.addWidget(btn_add)
+        layout.addWidget(btn_add_rel)
         layout.addWidget(btn_remove)
         layout.addWidget(btn_process)
         layout.addStretch(1)
@@ -97,6 +109,8 @@ class RangeBarController(QObject):
         self._t_min = 0.0
         self._t_max = 1.0
         self._pick_tol_frac = 0.012
+        self._last_draw_s = 0.0
+        self._motion_dirty = False
 
     @property
     def bars(self) -> tuple[TimeRangeBar, ...]:
@@ -263,6 +277,9 @@ class RangeBarController(QObject):
         if self._drag is None:
             return
         self._drag = None
+        if self._motion_dirty:
+            self._redraw_artists()
+            self._motion_dirty = False
         self.barsChanged.emit(self.bars)
 
     def _on_motion(self, event: Any) -> None:
@@ -287,4 +304,10 @@ class RangeBarController(QObject):
             if x <= other:
                 x = other + eps
             self._bars[index] = bar.with_bounds(other, x)
+        now = time.perf_counter()
+        if now - self._last_draw_s < 0.016:
+            self._motion_dirty = True
+            return
+        self._last_draw_s = now
+        self._motion_dirty = False
         self._redraw_artists()

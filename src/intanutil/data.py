@@ -6,13 +6,14 @@ blocks and at the Python level with dictionaries of NumPy arrays.
 
 
 import os
-import struct
 
 import numpy as np
 
 from intanutil.report import print_record_time_summary, print_progress
 
 LOAD_STIM_DATA = False
+# DC / DAC / digital channels are unused by plot_erg — skip allocation & parse.
+LOAD_AUXILIARY_SIGNALS = False
 
 
 def calculate_data_size(header, filename, fid):
@@ -79,7 +80,8 @@ def parse_data(header, data):
     like microVolts, degrees Celsius, or seconds.)
     """
     print('Parsing data...')
-    extract_digital_data(header, data)
+    if LOAD_AUXILIARY_SIGNALS:
+        extract_digital_data(header, data)
     if LOAD_STIM_DATA and 'stim_data_raw' in data:
         extract_stim_data(data)
     scale_analog_data(header, data)
@@ -95,7 +97,7 @@ def data_to_result(header, data, result):
     if 'stim_data' in data:
         result['stim_data'] = data['stim_data']
 
-    if header['dc_amplifier_data_saved']:
+    if header['dc_amplifier_data_saved'] and 'dc_amplifier_data' in data:
         result['dc_amplifier_data'] = data['dc_amplifier_data']
 
     if header['num_amplifier_channels'] > 0:
@@ -110,13 +112,13 @@ def data_to_result(header, data, result):
     if header['num_board_adc_channels'] > 0:
         result['board_adc_data'] = data['board_adc_data']
 
-    if header['num_board_dac_channels'] > 0:
+    if header['num_board_dac_channels'] > 0 and 'board_dac_data' in data:
         result['board_dac_data'] = data['board_dac_data']
 
-    if header['num_board_dig_in_channels'] > 0:
+    if header['num_board_dig_in_channels'] > 0 and 'board_dig_in_data' in data:
         result['board_dig_in_data'] = data['board_dig_in_data']
 
-    if header['num_board_dig_out_channels'] > 0:
+    if header['num_board_dig_out_channels'] > 0 and 'board_dig_out_data' in data:
         result['board_dig_out_data'] = data['board_dig_out_data']
 
     return result
@@ -224,11 +226,7 @@ def read_timestamps(fid, data, index, num_samples):
     """
     start = index
     end = start + num_samples
-    format_sign = 'i'
-    format_expression = '<' + format_sign * num_samples
-    read_length = 4 * num_samples
-    data['t'][start:end] = np.array(struct.unpack(
-        format_expression, fid.read(read_length)))
+    data['t'][start:end] = np.fromfile(fid, dtype='<i4', count=num_samples)
 
 
 def read_analog_signals(fid, data, index, samples_per_block, header):
@@ -244,11 +242,14 @@ def read_analog_signals(fid, data, index, samples_per_block, header):
                             header['num_amplifier_channels'])
 
     if header['dc_amplifier_data_saved']:
-        read_analog_signal_type(fid,
-                                data['dc_amplifier_data'],
-                                index,
-                                samples_per_block,
-                                header['num_amplifier_channels'])
+        if LOAD_AUXILIARY_SIGNALS and 'dc_amplifier_data' in data:
+            read_analog_signal_type(fid,
+                                    data['dc_amplifier_data'],
+                                    index,
+                                    samples_per_block,
+                                    header['num_amplifier_channels'])
+        else:
+            fid.seek(2 * samples_per_block * header['num_amplifier_channels'], 1)
 
     if LOAD_STIM_DATA and 'stim_data_raw' in data:
         read_analog_signal_type(fid,
@@ -266,29 +267,40 @@ def read_analog_signals(fid, data, index, samples_per_block, header):
                             samples_per_block,
                             header['num_board_adc_channels'])
 
-    read_analog_signal_type(fid,
-                            data['board_dac_data'],
-                            index,
-                            samples_per_block,
-                            header['num_board_dac_channels'])
+    n_dac = header['num_board_dac_channels']
+    if LOAD_AUXILIARY_SIGNALS and 'board_dac_data' in data:
+        read_analog_signal_type(fid,
+                                data['board_dac_data'],
+                                index,
+                                samples_per_block,
+                                n_dac)
+    elif n_dac > 0:
+        fid.seek(2 * samples_per_block * n_dac, 1)
 
 
 def read_digital_signals(fid, data, index, samples_per_block, header):
     """Reads all digital signal types present in RHD files: board_dig_in_raw
     and board_dig_out_raw, into 'data' dict.
     """
-
-    read_digital_signal_type(fid,
-                             data['board_dig_in_raw'],
-                             index,
-                             samples_per_block,
-                             header['num_board_dig_in_channels'])
-
-    read_digital_signal_type(fid,
-                             data['board_dig_out_raw'],
-                             index,
-                             samples_per_block,
-                             header['num_board_dig_out_channels'])
+    n_dig_in = header['num_board_dig_in_channels']
+    n_dig_out = header['num_board_dig_out_channels']
+    if LOAD_AUXILIARY_SIGNALS:
+        read_digital_signal_type(fid,
+                                 data['board_dig_in_raw'],
+                                 index,
+                                 samples_per_block,
+                                 n_dig_in)
+        read_digital_signal_type(fid,
+                                 data['board_dig_out_raw'],
+                                 index,
+                                 samples_per_block,
+                                 n_dig_out)
+        return
+    # Seek past packed digital words when auxiliary signals are unused.
+    if n_dig_in > 0:
+        fid.seek(2 * samples_per_block, 1)
+    if n_dig_out > 0:
+        fid.seek(2 * samples_per_block, 1)
 
 
 def read_analog_signal_type(fid, dest, start, num_samples, num_channels):
@@ -301,9 +313,8 @@ def read_analog_signal_type(fid, dest, start, num_samples, num_channels):
     if num_channels < 1:
         return
     end = start + num_samples
-    tmp = np.fromfile(fid, dtype='uint16', count=num_samples*num_channels)
-    dest[range(num_channels), start:end] = (
-        tmp.reshape(num_channels, num_samples))
+    tmp = np.fromfile(fid, dtype='uint16', count=num_samples * num_channels)
+    dest[:, start:end] = tmp.reshape(num_channels, num_samples)
 
 
 def read_digital_signal_type(fid, dest, start, num_samples, num_channels):
@@ -315,8 +326,7 @@ def read_digital_signal_type(fid, dest, start, num_samples, num_channels):
     if num_channels < 1:
         return
     end = start + num_samples
-    dest[start:end] = np.array(struct.unpack(
-        '<' + 'H' * num_samples, fid.read(2 * num_samples)))
+    dest[start:end] = np.fromfile(fid, dtype='<u2', count=num_samples)
 
 
 def calculate_num_samples(header, num_data_blocks):
@@ -340,7 +350,7 @@ def initialize_memory(header, num_samples):
         [header['num_amplifier_channels'], num_samples], dtype=np.uint16)
 
     # Create zero array for DC amplifier data.
-    if header['dc_amplifier_data_saved']:
+    if LOAD_AUXILIARY_SIGNALS and header['dc_amplifier_data_saved']:
         data['dc_amplifier_data'] = np.zeros(
             [header['num_amplifier_channels'], num_samples], dtype=np.uint16)
 
@@ -351,43 +361,21 @@ def initialize_memory(header, num_samples):
         data['stim_data'] = np.zeros(
             [header['num_amplifier_channels'], num_samples], dtype=np.int16)
 
-    # Create zero array for board ADC data.
+    # Create zero array for board ADC data (needed for ANALOG-IN-0 triggers).
     data['board_adc_data'] = np.zeros(
         [header['num_board_adc_channels'], num_samples], dtype=np.uint16)
 
-    # Create zero array for board DAC data.
-    data['board_dac_data'] = np.zeros(
-        [header['num_board_dac_channels'], num_samples], dtype=np.uint16)
-
-    # By default, this script interprets digital events (digital inputs
-    # and outputs) as booleans. if unsigned int values are preferred
-    # (0 for False, 1 for True), replace the 'dtype=np.bool_' argument
-    # with 'dtype=np.uint' as shown.
-    # The commented lines below illustrate this for digital input data;
-    # the same can be done for digital out.
-
-    # data['board_dig_in_data'] = np.zeros(
-    #     [header['num_board_dig_in_channels'], num_samples['board_dig_in']],
-    #     dtype=np.uint)
-    # Create 16-row zero array for digital in data, and 1-row zero array for
-    # raw digital in data (each bit of 16-bit entry represents a different
-    # digital input.)
-    data['board_dig_in_data'] = np.zeros(
-        [header['num_board_dig_in_channels'], num_samples],
-        dtype=np.bool_)
-    data['board_dig_in_raw'] = np.zeros(
-        num_samples,
-        dtype=np.uint16)
-
-    # Create 16-row zero array for digital out data, and 1-row zero array for
-    # raw digital out data (each bit of 16-bit entry represents a different
-    # digital output.)
-    data['board_dig_out_data'] = np.zeros(
-        [header['num_board_dig_out_channels'], num_samples],
-        dtype=np.bool_)
-    data['board_dig_out_raw'] = np.zeros(
-        num_samples,
-        dtype=np.uint16)
+    if LOAD_AUXILIARY_SIGNALS:
+        data['board_dac_data'] = np.zeros(
+            [header['num_board_dac_channels'], num_samples], dtype=np.uint16)
+        data['board_dig_in_data'] = np.zeros(
+            [header['num_board_dig_in_channels'], num_samples],
+            dtype=np.bool_)
+        data['board_dig_in_raw'] = np.zeros(num_samples, dtype=np.uint16)
+        data['board_dig_out_data'] = np.zeros(
+            [header['num_board_dig_out_channels'], num_samples],
+            dtype=np.bool_)
+        data['board_dig_out_raw'] = np.zeros(num_samples, dtype=np.uint16)
 
     # Set index representing position of data (shared across all signal types
     # for RHS file) to 0
@@ -430,7 +418,7 @@ def scale_analog_data(header, data):
             data['stim_data'] / 1.0e-6)
 
     # Scale DC amplifier data (units = Volts).
-    if header['dc_amplifier_data_saved']:
+    if header['dc_amplifier_data_saved'] and 'dc_amplifier_data' in data:
         dc = data['dc_amplifier_data'].astype(np.float32, copy=True)
         dc -= np.float32(512.0)
         dc *= np.float32(-0.01923)
@@ -441,6 +429,9 @@ def scale_analog_data(header, data):
     adc -= np.float32(32768.0)
     adc *= np.float32(312.5e-6)
     data['board_adc_data'] = adc
+
+    if 'board_dac_data' not in data:
+        return
 
     # Scale board DAC data (units = Volts).
     dac = data['board_dac_data'].astype(np.float32, copy=True)

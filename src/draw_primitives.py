@@ -145,11 +145,20 @@ def _psth_mean_hz(
     edges = np.arange(t0, t1 + dt, dt)
     if edges.size < 2:
         return np.array([]), np.array([])
-    counts = np.zeros(edges.size - 1, dtype=np.float64)
-    for st in spike_times_per_trial:
-        if st.size == 0:
-            continue
-        counts += np.histogram(st, bins=edges)[0]
+    if spike_times_per_trial:
+        all_spikes = [
+            np.asarray(st, dtype=np.float64)
+            for st in spike_times_per_trial
+            if getattr(st, "size", 0)
+        ]
+        if all_spikes:
+            counts = np.histogram(np.concatenate(all_spikes), bins=edges)[0].astype(
+                np.float64, copy=False
+            )
+        else:
+            counts = np.zeros(edges.size - 1, dtype=np.float64)
+    else:
+        counts = np.zeros(edges.size - 1, dtype=np.float64)
     window_bins = max(1, int(round(float(bin_width_s) / dt)))
     kernel = np.ones(window_bins, dtype=np.float64)
     sliding_counts = np.convolve(counts, kernel, mode="same")
@@ -219,16 +228,6 @@ def _isi_time_and_values_s(
     if not tx:
         return np.array([]), np.array([])
     return np.concatenate(tx), np.concatenate(dy)
-
-
-def _concat_isi_s(
-    spike_times_per_trial: list[np.ndarray],
-    *,
-    isi_window_s: Optional[Tuple[float, float]] = None,
-) -> np.ndarray:
-    """Within-trial ISI (s), concatenated intervals."""
-    _, isi = _isi_time_and_values_s(spike_times_per_trial, isi_window_s=isi_window_s)
-    return isi
 
 
 def _set_adaptive_x_limits(
@@ -382,14 +381,21 @@ def _draw_spike_panels_multi_channel(
     for rec_idx, st_per_trial in enumerate(spikes_per_recording):
         color = colors[rec_idx % len(colors)]
         show_leg = True if legend_visible is None else bool(legend_visible[rec_idx])
-        for tri, st in enumerate(st_per_trial):
-            st_plot = st
-            if t_range_s is not None:
-                st_plot = st[(st >= t_xlim_lo) & (st <= t_xlim_hi)]
-            if st_plot.size and show_raster:
-                y_pts = np.full(st_plot.shape, y_offset + tri)
-                st_ds, y_ds = downsample_points(st_plot, y_pts, sampling_percent)
-                leg = labels[rec_idx] if tri == 0 and show_leg else "_nolegend_"
+        if show_raster:
+            xs: list[np.ndarray] = []
+            ys: list[np.ndarray] = []
+            for tri, st in enumerate(st_per_trial):
+                st_plot = st
+                if t_range_s is not None:
+                    st_plot = st[(st >= t_xlim_lo) & (st <= t_xlim_hi)]
+                if not st_plot.size:
+                    continue
+                xs.append(np.asarray(st_plot, dtype=np.float64))
+                ys.append(np.full(st_plot.shape, y_offset + tri, dtype=np.float64))
+            if xs:
+                st_all = np.concatenate(xs)
+                y_all = np.concatenate(ys)
+                st_ds, y_ds = downsample_points(st_all, y_all, sampling_percent)
                 ax_raster.scatter(
                     st_ds,
                     y_ds,
@@ -397,7 +403,8 @@ def _draw_spike_panels_multi_channel(
                     c=color,
                     alpha=raster_alpha,
                     linewidths=0,
-                    label=leg,
+                    label=labels[rec_idx] if show_leg else "_nolegend_",
+                    rasterized=True,
                 )
         y_offset += len(st_per_trial)
         if rec_idx < len(spikes_per_recording) - 1 and show_raster:
@@ -714,7 +721,8 @@ def _draw_spike_overlay_panel(
         shown = _subsample_overlay_rows(waves_disp, sampling_percent)
         n_shown = int(shown.shape[0])
         shown_f = np.asarray(shown, dtype=np.float64)
-        mean_w = np.mean(np.asarray(waves_disp, dtype=np.float64), axis=0)
+        # Mean over all detections (not just the displayed subsample).
+        mean_w = np.asarray(waves_disp.mean(axis=0), dtype=np.float64)
         if shown_f.size:
             abs_peak = max(abs_peak, float(np.nanmax(np.abs(shown_f))))
         abs_peak = max(abs_peak, float(np.nanmax(np.abs(mean_w))))

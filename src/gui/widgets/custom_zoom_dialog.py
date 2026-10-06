@@ -38,9 +38,9 @@ class CustomZoomDialog(QDialog):
         self.setMinimumWidth(360)
 
         hint = QLabel(
-            "Définissez une fenêtre temporelle relative au début de stimulation "
-            "(valeurs en secondes). Les graphiques concernés seront ajoutés "
-            "dans cette fenêtre de vue."
+            "Fenêtre temporelle relative au début de stimulation (t = 0 s). "
+            "Exemple : t₀ = −0,1 s et t₁ = 0,4 s. Les graphs d’analyse "
+            "(moyenne / une stim) utiliseront cette plage telle quelle."
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)

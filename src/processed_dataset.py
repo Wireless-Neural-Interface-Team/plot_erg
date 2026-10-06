@@ -33,7 +33,6 @@ from impedance_tracking import ImpedanceSession
 from intan_rhx_dsp import IntanDspSettings
 
 STREAM_NAMES: tuple[str, ...] = ("raw", "hp", "lp")
-STREAM_LABELS: dict[str, str] = {"raw": "raw", "hp": "high-pass", "lp": "low-pass"}
 RMS_KINDS: tuple[str, ...] = ("mean", "first", "second")
 
 # Spike snippets kept per channel for the overlay panel (the exact mean waveform
@@ -647,10 +646,16 @@ class ProcessedRecording:
         post_n = int(self.meta.segmentation.post_n)
         start = int(triggers[trigger_index]) - pre_n
         end = int(triggers[trigger_index]) + post_n
-        row = np.asarray(array[ch], dtype=np.float64)
-        if start < 0 or end > int(row.shape[0]):
+        n_samples = int(array.shape[1])
+        if start < 0 or end > n_samples:
             return None
-        return np.array(row[start:end], dtype=np.float64)
+        # Prefer a direct 2D slice on memmaps/ndarrays. LazyFilterBank only
+        # supports integer channel indexing, so fall back to row-then-slice.
+        try:
+            window = array[ch, start:end]
+        except (IndexError, TypeError, ValueError):
+            window = array[ch][start:end]
+        return np.asarray(window, dtype=np.float64)
 
     def rms_profile(self, kind: str, ch: int) -> tuple[np.ndarray, np.ndarray]:
         """``(time_s, rms_uv)`` for ``kind`` in ``mean`` / ``first`` / ``second``."""

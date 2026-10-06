@@ -7,7 +7,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Optional, Sequence
 import math
 
 import matplotlib
@@ -23,24 +23,19 @@ from concurrent.futures import ThreadPoolExecutor
 from core import (
     AmplifierSpikeSource,
     check_analysis_cancelled,
-    detect_spikes_at_threshold,
     mean_triggered_windows_channelwise,
     resolve_channel_workers,
 )
 from intan_rhx_dsp import (
     IntanDspSettings,
-    detect_spikes_intan,
-    sliding_rms_intan_profile,
     sliding_rms_intan_profile_range,
 )
 from impedance_tracking import ImpedanceSession
 from display_config import (
-    PANEL_FIELD_NAMES,
     PlotDisplaySettings,
     RecordingStyle,
     SectionPanels,
     ZoomMode,
-    resolve_display_label,
     resolve_recording_plot_colors,
 )
 from pdf_layout import (
@@ -49,23 +44,19 @@ from pdf_layout import (
     build_stacked_pages,
     estimate_legend_rows,
     place_legend_below,
-    psth_table_bbox,
     save_figure_to_pdf,
 )
-from plot_utils import downsample_points, shorten_filename_for_windows
+from plot_utils import decimate_envelope, downsample_points, shorten_filename_for_windows
 
 from draw_primitives import (  # noqa: F401 — re-export for PDF + legacy callers
-    ISI_HALF_WINDOW_S,
     SPIKE_OVERLAY_DEFAULT_POST_MS,
     SPIKE_OVERLAY_DEFAULT_PRE_MS,
-    SPIKE_OVERLAY_MAX_TRACES,
     TIME_REL_XLABEL,
     _draw_impedance_evolution_panel,
     _draw_onset_offset_lines,
     _draw_spike_overlay_panel,
     _draw_spike_panels_multi_channel,
     _extract_spike_waveforms,
-    _spike_pipeline_captions,
 )
 
 from probe_layout import (
@@ -274,12 +265,13 @@ _FIELD_TO_PART_GROUP: dict[str, str] = {
     field: title for title, fields in _PANEL_PART_GROUPS for field in fields
 }
 _OVERLAY_AXIS_KEYS: tuple[str, ...] = ("ax_overlay_f", "ax_overlay_z", "ax_overlay_ze")
-_PROFILE_ENABLED = os.environ.get("PLOT_ERG_PROFILE", "1").strip().lower() in {
+_PROFILE_ENABLED = os.environ.get("PLOT_ERG_PROFILE", "0").strip().lower() in {
     "1",
     "true",
     "yes",
     "on",
 }
+_PDF_TRACE_MAX_POINTS = 8000
 _PROFILE_STATS: dict[str, tuple[float, int]] = {}
 
 
@@ -327,13 +319,6 @@ def _trace_panels_enabled(panels: SectionPanels) -> bool:
     )
 
 
-def _hide_axis(ax: Any) -> None:
-    if ax is None:
-        return
-    ax.set_visible(False)
-    ax.set_axis_off()
-
-
 def _section_included(zoom_mode: ZoomMode, section: str) -> bool:
     if section == "full":
         return True
@@ -344,19 +329,49 @@ def _section_included(zoom_mode: ZoomMode, section: str) -> bool:
     return False
 
 
-def _panel_axis_key(section: str, panel: str) -> str | None:
-    if section == "full":
-        return _FULL_PANEL_TO_AXIS.get(panel)
-    if section == "zoom_onset":
-        return _ZOOM_ONSET_PANEL_TO_AXIS.get(panel)
-    if section == "zoom_trigger_end":
-        return _ZOOM_END_PANEL_TO_AXIS.get(panel)
-    return None
+def _active_section_panels(
+    display: PlotDisplaySettings, zoom_mode: ZoomMode
+) -> list[SectionPanels]:
+    sections: list[SectionPanels] = []
+    if _section_included(zoom_mode, "full"):
+        sections.append(display.full_view)
+    if _section_included(zoom_mode, "zoom_onset"):
+        sections.append(display.zoom_onset)
+    if _section_included(zoom_mode, "zoom_trigger_end"):
+        sections.append(display.zoom_trigger_end)
+    return sections
 
 
-def _apply_panel_visibility(axes: dict[str, Any], display: PlotDisplaySettings, zoom_mode: ZoomMode) -> None:
-    """No-op: panel visibility is applied by building only enabled axes."""
-    del axes, display, zoom_mode
+def _display_stream_needs(
+    display: PlotDisplaySettings, zoom_mode: ZoomMode
+) -> tuple[bool, bool, bool, bool, bool]:
+    """Return (need_raw, need_hp, need_lp, need_rms, need_spikes)."""
+    sections = _active_section_panels(display, zoom_mode)
+    if not sections:
+        return False, False, False, False, False
+    need_raw = any(
+        s.mean_raw or s.first_trigger_raw or s.second_trigger_raw for s in sections
+    )
+    need_hp = any(
+        s.mean_hp or s.first_trigger_hp or s.second_trigger_hp for s in sections
+    )
+    need_lp = any(
+        s.mean_lp or s.first_trigger_lp or s.second_trigger_lp for s in sections
+    )
+    need_rms = any(s.rms or s.first_rms or s.second_rms for s in sections)
+    need_spikes = any(
+        s.raster
+        or s.psth
+        or s.first_psth
+        or s.second_psth
+        or s.isi
+        or s.first_isi
+        or s.second_isi
+        or s.trial_rate
+        or s.spike_overlay
+        for s in sections
+    )
+    return need_raw, need_hp, need_lp, need_rms, need_spikes
 
 
 def _legend_label(
@@ -810,38 +825,6 @@ def _finalize_and_save_three_part_page(
             apply_fonts=_apply_compact_axis_fonts,
         )
 
-def _mean_firing_rate_in_window_hz(
-    spike_times_per_trial: list[np.ndarray],
-    t_window: tuple[float, float],
-) -> float:
-    """Average firing rate (Hz) in a given time window."""
-    t0, t1 = float(t_window[0]), float(t_window[1])
-    if t1 <= t0:
-        return 0.0
-    n_trials = max(1, len(spike_times_per_trial))
-    n_spikes = 0
-    for st in spike_times_per_trial:
-        st_arr = np.asarray(st, dtype=np.float64)
-        n_spikes += int(np.sum((st_arr >= t0) & (st_arr <= t1)))
-    return float(n_spikes) / (float(n_trials) * (t1 - t0))
-
-
-def _add_psth_mean_table(ax_fr: Any, rows: list[tuple[str, float]]) -> None:
-    """Render a compact PSTH mean-rate table below FR axis."""
-    if not rows:
-        return
-    cell_text = [[name, f"{rate:.2f}"] for name, rate in rows]
-    tbl = ax_fr.table(
-        cellText=cell_text,
-        colLabels=["Signal", "FR (Hz)"],
-        cellLoc="left",
-        colLoc="left",
-        bbox=psth_table_bbox(ax_fr, _pdf_fonts(), len(rows)),
-    )
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(TABLE_FONT_SIZE)
-    tbl.scale(1.0, 1.75)
-
 def _default_filter_short_label(kind: str = "highpass") -> str:
     pass_label = "high-pass" if kind == "highpass" else "low-pass"
     return f"bessel {pass_label} order 2 @ 250 Hz"
@@ -929,19 +912,6 @@ def _nth_trigger_window(
     return curve
 
 
-def _first_trigger_window(
-    source: AmplifierSpikeSource,
-    ch: int,
-    n_expected: int,
-    *,
-    stream: str = "amplifier",
-) -> Optional[np.ndarray]:
-    """Extract the first-stimulation window (raw amplifier or Intan filtered)."""
-    return _nth_trigger_window(
-        source, ch, n_expected, trigger_index=0, stream=stream
-    )
-
-
 def _collect_nth_trigger_windows(
     spike_sources: Sequence[AmplifierSpikeSource],
     ch: int,
@@ -969,16 +939,6 @@ def _collect_nth_trigger_windows(
             )
         )
     return raw_curves, hp_curves, lp_curves
-
-
-def _collect_first_trigger_windows(
-    spike_sources: Sequence[AmplifierSpikeSource],
-    ch: int,
-    n_expected: int,
-) -> tuple[list[Optional[np.ndarray]], list[Optional[np.ndarray]], list[Optional[np.ndarray]]]:
-    return _collect_nth_trigger_windows(
-        spike_sources, ch, n_expected, trigger_index=0
-    )
 
 
 def _trigger_end_zoom_bounds(
@@ -1130,7 +1090,11 @@ def _plot_stim_event_panel(
             )
             if len(labels) <= 1 and show_leg:
                 label = single_legend
-        ax.plot(t_plot, slice_fn(curve), linewidth=first_lw, color=line_color, label=label)
+        y_plot = np.asarray(slice_fn(curve), dtype=np.float64)
+        t_ds, y_ds = decimate_envelope(
+            np.asarray(t_plot, dtype=np.float64), y_plot, _PDF_TRACE_MAX_POINTS
+        )
+        ax.plot(t_ds, y_ds, linewidth=first_lw, color=line_color, label=label)
     if show_reference:
         _add_trace_reference_overlays(ax, **overlay_kwargs)
     else:
@@ -1242,9 +1206,14 @@ def _plot_mean_section_trace_panels(
         label_i = labels[i] if i < len(labels) else f"Recording {i + 1}"
         raw_label = _legend_label(label_i, "raw trial-averaged", multi=multi, show_legend=show_leg)
         if ax_raw is not None and y_raw is not None:
+            t_ds, y_ds = decimate_envelope(
+                np.asarray(t_plot, dtype=np.float64),
+                np.asarray(_slice(y_raw), dtype=np.float64),
+                _PDF_TRACE_MAX_POINTS,
+            )
             ax_raw.plot(
-                t_plot,
-                _slice(y_raw),
+                t_ds,
+                y_ds,
                 linewidth=base_lw,
                 color=line_color,
                 label=raw_label,
@@ -1265,8 +1234,13 @@ def _plot_mean_section_trace_panels(
             )
             if not multi and show_leg:
                 hp_label = f"High-pass trial-averaged ({hp_legend})"
+            t_ds, y_ds = decimate_envelope(
+                np.asarray(t_plot, dtype=np.float64),
+                np.asarray(_slice(y_hp), dtype=np.float64),
+                _PDF_TRACE_MAX_POINTS,
+            )
             ax_filt_hp.plot(
-                t_plot, _slice(y_hp), linewidth=main_lw, color=line_color, label=hp_label
+                t_ds, y_ds, linewidth=main_lw, color=line_color, label=hp_label
             )
         if ax_filt_lp is not None and y_lp is not None:
             lp_label = _legend_label(
@@ -1274,8 +1248,13 @@ def _plot_mean_section_trace_panels(
             )
             if not multi and show_leg:
                 lp_label = f"Low-pass trial-averaged ({lp_legend})"
+            t_ds, y_ds = decimate_envelope(
+                np.asarray(t_plot, dtype=np.float64),
+                np.asarray(_slice(y_lp), dtype=np.float64),
+                _PDF_TRACE_MAX_POINTS,
+            )
             ax_filt_lp.plot(
-                t_plot, _slice(y_lp), linewidth=main_lw, color=line_color, label=lp_label
+                t_ds, y_ds, linewidth=main_lw, color=line_color, label=lp_label
             )
 
     if ax_raw is not None:
@@ -1523,47 +1502,60 @@ class _PlotRenderCache:
         spike_sources: Sequence[AmplifierSpikeSource],
         n_channels: int,
         channel_workers: int | None = None,
+        *,
+        need_raw: bool = True,
+        need_hp: bool = True,
+        need_lp: bool = True,
     ) -> None:
-        """Pre-compute all channel means in parallel (mmap-friendly, one pass per stack)."""
+        """Pre-compute channel means in parallel for the streams that are displayed."""
+        if not (need_raw or need_hp or need_lp):
+            return
         for src_idx, src in enumerate(spike_sources):
             n_ch = min(int(n_channels), int(src.amplifier.shape[0]))
             if n_ch <= 0:
                 continue
             workers = resolve_channel_workers(channel_workers, n_ch)
-            check_analysis_cancelled()
-            raw_all = mean_triggered_windows_channelwise(
-                src.amplifier,
-                src.valid_triggers,
-                self.pre_n,
-                self.post_n,
-                channel_workers=workers,
-            )
-            check_analysis_cancelled()
-            hp_all = mean_triggered_windows_channelwise(
-                src.highpass,
-                src.valid_triggers,
-                self.pre_n,
-                self.post_n,
-                channel_workers=workers,
-            )
-            check_analysis_cancelled()
-            lp_all = mean_triggered_windows_channelwise(
-                src.lowpass,
-                src.valid_triggers,
-                self.pre_n,
-                self.post_n,
-                channel_workers=workers,
-            )
+            raw_all = hp_all = lp_all = None
+            if need_raw:
+                check_analysis_cancelled()
+                raw_all = mean_triggered_windows_channelwise(
+                    src.amplifier,
+                    src.valid_triggers,
+                    self.pre_n,
+                    self.post_n,
+                    channel_workers=workers,
+                )
+            if need_hp:
+                check_analysis_cancelled()
+                hp_all = mean_triggered_windows_channelwise(
+                    src.highpass,
+                    src.valid_triggers,
+                    self.pre_n,
+                    self.post_n,
+                    channel_workers=workers,
+                )
+            if need_lp:
+                check_analysis_cancelled()
+                lp_all = mean_triggered_windows_channelwise(
+                    src.lowpass,
+                    src.valid_triggers,
+                    self.pre_n,
+                    self.post_n,
+                    channel_workers=workers,
+                )
             for ch in range(n_ch):
-                self._mean_raw[(src_idx, ch)] = self._normalize_mean_row(
-                    raw_all[ch], self.n_expected
-                )
-                self._mean_hp[(src_idx, ch)] = self._normalize_mean_row(
-                    hp_all[ch], self.n_expected
-                )
-                self._mean_lp[(src_idx, ch)] = self._normalize_mean_row(
-                    lp_all[ch], self.n_expected
-                )
+                if raw_all is not None:
+                    self._mean_raw[(src_idx, ch)] = self._normalize_mean_row(
+                        raw_all[ch], self.n_expected
+                    )
+                if hp_all is not None:
+                    self._mean_hp[(src_idx, ch)] = self._normalize_mean_row(
+                        hp_all[ch], self.n_expected
+                    )
+                if lp_all is not None:
+                    self._mean_lp[(src_idx, ch)] = self._normalize_mean_row(
+                        lp_all[ch], self.n_expected
+                    )
 
     def mean_raw(self, src_idx: int, source: AmplifierSpikeSource, ch: int) -> np.ndarray:
         key = (src_idx, ch)
@@ -3012,19 +3004,30 @@ def plot_channel_multi_comparison(
         t1_rms,
         rms_window_s,
     )
-    render_cache.prefill_means(spike_sources, n_channels, channel_workers=channel_workers)
-    print(
-        f"Pre-computing RMS and spikes for {n_channels} channel(s) × {n_records} recording(s)..."
+    need_raw, need_hp, need_lp, need_rms, need_spikes = _display_stream_needs(
+        display, zoom_mode
     )
-    render_cache.prefill_channel_metrics(
+    render_cache.prefill_means(
         spike_sources,
         n_channels,
-        channel_workers,
-        spike_threshold_mode=spike_threshold_mode,
-        spike_threshold_uv=spike_threshold_uv,
-        spike_threshold_polarity=spike_threshold_polarity,
-        spike_threshold_rms_multiplier=spike_threshold_rms_multiplier,
+        channel_workers=channel_workers,
+        need_raw=need_raw,
+        need_hp=need_hp,
+        need_lp=need_lp,
     )
+    if need_rms or need_spikes:
+        print(
+            f"Pre-computing RMS and spikes for {n_channels} channel(s) × {n_records} recording(s)..."
+        )
+        render_cache.prefill_channel_metrics(
+            spike_sources,
+            n_channels,
+            channel_workers,
+            spike_threshold_mode=spike_threshold_mode,
+            spike_threshold_uv=spike_threshold_uv,
+            spike_threshold_polarity=spike_threshold_polarity,
+            spike_threshold_rms_multiplier=spike_threshold_rms_multiplier,
+        )
     with PdfPages(pdf_path) as pdf:
         for ch in range(n_channels):
             check_analysis_cancelled()
@@ -3036,9 +3039,12 @@ def plot_channel_multi_comparison(
             intan_lp_legends: list[str] = []
             for src_idx in plot_indices:
                 src = spike_sources[src_idx]
-                means_raw_ch.append(render_cache.mean_raw(src_idx, src, ch))
-                means_ch_hp.append(render_cache.mean_hp(src_idx, src, ch))
-                means_ch_lp.append(render_cache.mean_lp(src_idx, src, ch))
+                if need_raw:
+                    means_raw_ch.append(render_cache.mean_raw(src_idx, src, ch))
+                if need_hp:
+                    means_ch_hp.append(render_cache.mean_hp(src_idx, src, ch))
+                if need_lp:
+                    means_ch_lp.append(render_cache.mean_lp(src_idx, src, ch))
                 _hp_note, hp_legend = _intan_hp_mean_filter_captions(src.intan_dsp)
                 _lp_note, lp_legend = _intan_lp_mean_filter_captions(src.intan_dsp)
                 intan_hp_legends.append(hp_legend)
@@ -3158,33 +3164,67 @@ def plot_channel_multi_comparison(
                         end_series.append((label, tx_end, rms_zoom_end_vals))
                 return full_series, zoom_series, end_series
 
-            rms_series_full_multi, rms_series_zoom_multi, rms_series_zoom_end_multi = (
-                _collect_rms_series(None)
+            empty_rms: list[tuple[str, np.ndarray, np.ndarray]] = []
+            active_panels = _active_section_panels(display, zoom_mode)
+            need_mean_rms = any(s.rms for s in active_panels)
+            need_first_rms = any(s.first_rms for s in active_panels)
+            need_second_rms = any(s.second_rms for s in active_panels)
+            need_first_trig = any(
+                s.first_trigger_raw or s.first_trigger_hp or s.first_trigger_lp
+                for s in active_panels
             )
-            rms_first_full, rms_first_zoom, rms_first_end = _collect_rms_series(0)
-            rms_second_full, rms_second_zoom, rms_second_end = _collect_rms_series(1)
-            first_trigger_raw_all, first_trigger_hp_all, first_trigger_lp_all = (
-                _collect_nth_trigger_windows(
-                    spike_sources,
-                    ch,
-                    int(t_rel.shape[0]),
-                    trigger_index=0,
+            need_second_trig = any(
+                s.second_trigger_raw or s.second_trigger_hp or s.second_trigger_lp
+                for s in active_panels
+            )
+            if need_mean_rms:
+                rms_series_full_multi, rms_series_zoom_multi, rms_series_zoom_end_multi = (
+                    _collect_rms_series(None)
                 )
-            )
-            second_trigger_raw_all, second_trigger_hp_all, second_trigger_lp_all = (
-                _collect_nth_trigger_windows(
-                    spike_sources,
-                    ch,
-                    int(t_rel.shape[0]),
-                    trigger_index=1,
+            else:
+                rms_series_full_multi = rms_series_zoom_multi = rms_series_zoom_end_multi = (
+                    empty_rms
                 )
-            )
-            first_trigger_raw = [first_trigger_raw_all[i] for i in plot_indices]
-            first_trigger_hp = [first_trigger_hp_all[i] for i in plot_indices]
-            first_trigger_lp = [first_trigger_lp_all[i] for i in plot_indices]
-            second_trigger_raw = [second_trigger_raw_all[i] for i in plot_indices]
-            second_trigger_hp = [second_trigger_hp_all[i] for i in plot_indices]
-            second_trigger_lp = [second_trigger_lp_all[i] for i in plot_indices]
+            if need_first_rms:
+                rms_first_full, rms_first_zoom, rms_first_end = _collect_rms_series(0)
+            else:
+                rms_first_full = rms_first_zoom = rms_first_end = empty_rms
+            if need_second_rms:
+                rms_second_full, rms_second_zoom, rms_second_end = _collect_rms_series(1)
+            else:
+                rms_second_full = rms_second_zoom = rms_second_end = empty_rms
+            if need_first_trig:
+                first_trigger_raw_all, first_trigger_hp_all, first_trigger_lp_all = (
+                    _collect_nth_trigger_windows(
+                        spike_sources,
+                        ch,
+                        int(t_rel.shape[0]),
+                        trigger_index=0,
+                    )
+                )
+                first_trigger_raw = [first_trigger_raw_all[i] for i in plot_indices]
+                first_trigger_hp = [first_trigger_hp_all[i] for i in plot_indices]
+                first_trigger_lp = [first_trigger_lp_all[i] for i in plot_indices]
+            else:
+                first_trigger_raw = first_trigger_hp = first_trigger_lp = [
+                    None for _ in plot_indices
+                ]
+            if need_second_trig:
+                second_trigger_raw_all, second_trigger_hp_all, second_trigger_lp_all = (
+                    _collect_nth_trigger_windows(
+                        spike_sources,
+                        ch,
+                        int(t_rel.shape[0]),
+                        trigger_index=1,
+                    )
+                )
+                second_trigger_raw = [second_trigger_raw_all[i] for i in plot_indices]
+                second_trigger_hp = [second_trigger_hp_all[i] for i in plot_indices]
+                second_trigger_lp = [second_trigger_lp_all[i] for i in plot_indices]
+            else:
+                second_trigger_raw = second_trigger_hp = second_trigger_lp = [
+                    None for _ in plot_indices
+                ]
             record_labels = [
                 labels[i] if i < len(labels) else f"Recording {i + 1}"
                 for i in plot_indices

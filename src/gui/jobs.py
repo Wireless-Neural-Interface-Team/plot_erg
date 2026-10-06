@@ -126,26 +126,143 @@ class ChannelEnsureRequest:
     need_overlay: bool = True
 
 
+@dataclass
+class _EnsureJob:
+    """Single-channel unit of work for the priority scheduler."""
+
+    recording: Any
+    config: Any
+    channel: int
+    label: str
+    force: bool = False
+    need_means: bool = True
+    need_rms: bool = True
+    need_spikes: bool = True
+    need_overlay: bool = True
+
+    def key(self) -> tuple[int, int]:
+        return (id(self.recording), int(self.channel))
+
+    def merge_needs(self, other: "_EnsureJob") -> "_EnsureJob":
+        return _EnsureJob(
+            recording=self.recording,
+            config=other.config,
+            channel=self.channel,
+            label=self.label,
+            force=self.force or other.force,
+            need_means=self.need_means or other.need_means,
+            need_rms=self.need_rms or other.need_rms,
+            need_spikes=self.need_spikes or other.need_spikes,
+            need_overlay=self.need_overlay or other.need_overlay,
+        )
+
+
+def _jobs_from_requests(requests: Sequence[ChannelEnsureRequest]) -> list[_EnsureJob]:
+    jobs: list[_EnsureJob] = []
+    for request in requests:
+        for channel in request.channels:
+            jobs.append(
+                _EnsureJob(
+                    recording=request.recording,
+                    config=request.config,
+                    channel=int(channel),
+                    label=request.label,
+                    force=bool(request.force),
+                    need_means=bool(request.need_means),
+                    need_rms=bool(request.need_rms),
+                    need_spikes=bool(request.need_spikes),
+                    need_overlay=bool(request.need_overlay),
+                )
+            )
+    return jobs
+
+
 class ChannelEnsureWorker(QThread):
-    """Computes the channels requested by the GUI, without touching the others."""
+    """Computes channels with a live priority queue.
+
+    High-priority jobs (the channel currently viewed) are always taken before
+    background prefetch. New jobs can be submitted while the worker is running;
+    the next channel after the one in flight will respect the updated order.
+    """
 
     progressed = Signal(object)
     logged = Signal(str)
     succeeded = Signal(object, list)  # recording, computed channel indices
     failed = Signal(str)
     finished_all = Signal(bool)
+    queue_changed = Signal(int, int)  # high remaining, low remaining
 
     def __init__(
         self,
-        requests: Sequence[ChannelEnsureRequest],
+        requests: Sequence[ChannelEnsureRequest] | None = None,
         parent: QObject | None = None,
+        *,
+        priority: bool = True,
     ) -> None:
         super().__init__(parent)
-        self._requests = list(requests)
+        self._lock = threading.Lock()
+        self._high: list[_EnsureJob] = []
+        self._low: list[_EnsureJob] = []
         self._cancel = threading.Event()
+        self._wake = threading.Event()
+        if requests:
+            self.submit(requests, priority=priority)
 
     def request_stop(self) -> None:
         self._cancel.set()
+        self._wake.set()
+
+    def pending_counts(self) -> tuple[int, int]:
+        with self._lock:
+            return len(self._high), len(self._low)
+
+    def submit(
+        self,
+        requests: Sequence[ChannelEnsureRequest],
+        *,
+        priority: bool = False,
+    ) -> None:
+        """Enqueue work; ``priority=True`` jumps ahead of background prefetch."""
+        jobs = _jobs_from_requests(requests)
+        if not jobs:
+            return
+        with self._lock:
+            if priority:
+                prepared: list[_EnsureJob] = []
+                for job in jobs:
+                    prepared.append(self._take_and_merge(job))
+                self._high = prepared + self._high
+            else:
+                for job in jobs:
+                    self._low.append(self._take_and_merge(job))
+            high, low = len(self._high), len(self._low)
+        self._wake.set()
+        self.queue_changed.emit(high, low)
+
+    def _take_and_merge(self, job: _EnsureJob) -> _EnsureJob:
+        key = job.key()
+        existing: _EnsureJob | None = None
+        for bucket in (self._high, self._low):
+            for index, current in enumerate(bucket):
+                if current.key() == key:
+                    existing = current
+                    del bucket[index]
+                    break
+            if existing is not None:
+                break
+        return existing.merge_needs(job) if existing is not None else job
+
+    def _pop_next(self) -> _EnsureJob | None:
+        with self._lock:
+            if self._high:
+                return self._high.pop(0)
+            if self._low:
+                return self._low.pop(0)
+            return None
+
+    def _has_pending(self) -> bool:
+        with self._lock:
+            return bool(self._high or self._low)
 
     def run(self) -> None:  # noqa: D102 - QThread entry point
         import core
@@ -153,23 +270,36 @@ class ChannelEnsureWorker(QThread):
 
         stream = _SignalStream(self.logged.emit)
         ok = True
+        idle_rounds = 0
         with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
             with core.analysis_cancel_scope(self._cancel):
-                for request in self._requests:
-                    if self._cancel.is_set():
-                        ok = False
-                        break
+                while not self._cancel.is_set():
+                    job = self._pop_next()
+                    if job is None:
+                        idle_rounds += 1
+                        # Brief wait so a prioritize() right after the last job is seen.
+                        if idle_rounds >= 4:
+                            if self._has_pending():
+                                idle_rounds = 0
+                                continue
+                            break
+                        self._wake.wait(0.05)
+                        self._wake.clear()
+                        continue
+                    idle_rounds = 0
+                    high, low = self.pending_counts()
+                    self.queue_changed.emit(high, low)
                     try:
                         computed = ensure_channels(
-                            request.recording,
-                            request.channels,
-                            request.config,
+                            job.recording,
+                            [job.channel],
+                            job.config,
                             progress=self.progressed.emit,
-                            force=request.force,
-                            need_means=request.need_means,
-                            need_rms=request.need_rms,
-                            need_spikes=request.need_spikes,
-                            need_overlay=request.need_overlay,
+                            force=job.force,
+                            need_means=job.need_means,
+                            need_rms=job.need_rms,
+                            need_spikes=job.need_spikes,
+                            need_overlay=job.need_overlay,
                         )
                     except InterruptedError:
                         ok = False
@@ -181,19 +311,16 @@ class ChannelEnsureWorker(QThread):
                         self.failed.emit(str(exc))
                         continue
                     if computed:
-                        names = [
-                            request.recording.channel_names[ch]
-                            if 0 <= ch < len(request.recording.channel_names)
-                            else str(ch)
-                            for ch in computed
-                        ]
-                        self.logged.emit(
-                            f"{request.label}: computed {len(computed)} channel(s) — "
-                            + ", ".join(names[:8])
-                            + ("…" if len(names) > 8 else "")
+                        name = (
+                            job.recording.channel_names[job.channel]
+                            if 0 <= job.channel < len(job.recording.channel_names)
+                            else str(job.channel)
                         )
-                    self.succeeded.emit(request.recording, computed)
+                        self.logged.emit(f"{job.label}: computed {name}")
+                    self.succeeded.emit(job.recording, computed or [job.channel])
             stream.flush()
+        high, low = self.pending_counts()
+        self.queue_changed.emit(high, low)
         self.finished_all.emit(ok and not self._cancel.is_set())
 
 

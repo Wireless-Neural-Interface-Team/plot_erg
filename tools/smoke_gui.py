@@ -226,7 +226,7 @@ def main() -> int:
         assert config.rhs_file.name == "control.rhs"
         assert config.probe_layout_json == probe_path
         assert config.spike_threshold_uv < 0, "negative polarity must give a signed threshold"
-        assert abs(config.psth_bin_window_s - 0.025) < 1e-9 or abs(config.psth_bin_window_s - 0.1) < 1e-9
+        assert abs(config.psth_bin_window_s - 0.025) < 1e-9 or abs(config.psth_bin_window_s - 0.05) < 1e-9 or abs(config.psth_bin_window_s - 0.1) < 1e-9
         assert window._workspace.zoom_mode() in {"none", "onset", "trigger_end", "both"}
         assert display.section_panels("full").any_enabled()
         print(f"PDF config OK — zoom mode {window._workspace.zoom_mode()}")

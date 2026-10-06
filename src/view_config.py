@@ -112,12 +112,17 @@ STREAM_SHORT_LABELS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class TimeRangeBar:
-    """Paire de barres temporelles [t0, t1] pour zoom / plage de traitement."""
+    """Paire de barres temporelles [t0, t1] pour zoom / plage de traitement.
+
+    Si ``relative_to_stim`` est True, ``t0_s`` / ``t1_s`` sont relatifs au début
+    de stimulation (t=0). Sinon ce sont des temps absolus sur l’enregistrement.
+    """
 
     t0_s: float
     t1_s: float
     label: str = ""
     bar_id: str = ""
+    relative_to_stim: bool = False
 
     def ordered(self) -> tuple[float, float]:
         a, b = float(self.t0_s), float(self.t1_s)
@@ -285,6 +290,8 @@ class PanelStyle:
     grid_alpha: float = 0.3
     # Cadre (spines) autour de la zone de tracé.
     show_borders: bool = True
+    # Graduations (ticks) orientées vers l’intérieur du cadre.
+    ticks_inside: bool = False
     # Max points drawn per curve (min/max envelope decimation above this).
     max_points_per_curve: int = 6000
     tight_layout: bool = True
@@ -400,11 +407,13 @@ class PanelPlacement:
 
     panel: str
     section: SectionKey = "full"
-    # Si définis, la fenêtre X est [zoom_t0_s, zoom_t1_s] relative à la stimulation
-    # (indépendamment de section). Utilisé pour les zooms ajoutés par l’utilisateur.
+    # Si définis, la fenêtre X est [zoom_t0_s, zoom_t1_s].
+    # Par défaut relative à la stimulation ; ``zoom_absolute=True`` = temps absolu
+    # (barres sur l’enregistrement continu). Indépendant de ``section``.
     zoom_t0_s: float | None = None
     zoom_t1_s: float | None = None
     zoom_label: str = ""
+    zoom_absolute: bool = False
     # Identifiant d’instance (ex. bar_id d’une plage) — clé stable, pas affiché.
     instance_id: str = ""
 
@@ -426,13 +435,20 @@ class PanelPlacement:
         label = panel_label(self.panel)
         if self.has_custom_zoom:
             name = self.zoom_label.strip() or "zoom"
-            return f"{label} — {name} [{self.zoom_t0_s:g} … {self.zoom_t1_s:g} s]"
+            unit = "s abs." if self.zoom_absolute else "s rel. stim"
+            return f"{label} — {name} [{self.zoom_t0_s:g} … {self.zoom_t1_s:g} {unit}]"
         if is_section_independent(self.panel):
             return label
         return f"{label} — {SECTION_LABELS.get(self.section, self.section)}"
 
     def with_custom_zoom(
-        self, t0_s: float, t1_s: float, *, label: str = "", instance_id: str = ""
+        self,
+        t0_s: float,
+        t1_s: float,
+        *,
+        label: str = "",
+        instance_id: str = "",
+        absolute: bool = False,
     ) -> PanelPlacement:
         return replace(
             self,
@@ -440,6 +456,7 @@ class PanelPlacement:
             zoom_t0_s=float(t0_s),
             zoom_t1_s=float(t1_s),
             zoom_label=str(label or ""),
+            zoom_absolute=bool(absolute),
             instance_id=str(instance_id or self.instance_id or ""),
         )
 
