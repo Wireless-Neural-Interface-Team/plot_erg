@@ -1,8 +1,8 @@
-"""Panneau de contrôle bas — canal actif, mode de vue et filtres d’aperçu."""
+"""Panneau de contrôle bas — canal actif, mode de vue et raccourci Analyse."""
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -12,21 +12,21 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
+    QWidget,
 )
-
-from view_config import AnalysisStream
 
 ViewMode = Literal["preview", "montage"]
 
 
 class ControlPanel(QFrame):
-    """Filtres WIDE/LOW/HIGH (multi), canal actif et indicateur de mode.
+    """Indicateur de mode / canal et bouton Analyse.
 
-    L’inspection se lance via la barre d’outils / menus / double-clic MEA.
+    Les flux WIDE / HIGH / LOW et les marqueurs stim se règlent dans
+    Paramètres → Affichage (Traces continues). Mode continuous / moyenne /
+    stimulation : Paramètres → Canal.
     """
 
-    filterChanged = Signal()
-    stimMarkersChanged = Signal()
+    analysisRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -34,7 +34,6 @@ class ControlPanel(QFrame):
         self.setFrameShape(QFrame.Shape.NoFrame)
         self._n_trials = 0
         self._channel = ""
-        self._updating = False
         self._view_mode: ViewMode = "preview"
 
         self._mode_badge = QLabel("Aperçu", self)
@@ -48,27 +47,13 @@ class ControlPanel(QFrame):
         self._channel_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._channel_label.setToolTip("Canal actuellement sélectionné")
 
-        self._show_wide = QPushButton("WIDE", self)
-        self._show_wide.setObjectName("filterWide")
-        self._show_wide.setCheckable(True)
-        self._show_wide.setChecked(True)
-        self._show_wide.setToolTip("Signal brut (wideband)")
-
-        self._show_high = QPushButton("HIGH", self)
-        self._show_high.setObjectName("filterHigh")
-        self._show_high.setCheckable(True)
-        self._show_high.setToolTip("Passe-haut (spikes)")
-
-        self._show_low = QPushButton("LOW", self)
-        self._show_low.setObjectName("filterLow")
-        self._show_low.setCheckable(True)
-        self._show_low.setToolTip("Passe-bas (LFP)")
-
-        self._mark_stims = QPushButton("Stim", self)
-        self._mark_stims.setObjectName("filterSpk")
-        self._mark_stims.setCheckable(True)
-        self._mark_stims.setChecked(True)
-        self._mark_stims.setToolTip("Marquer les stimulations sur l’aperçu / le montage")
+        self._analyse = QPushButton("Analyse", self)
+        self._analyse.setObjectName("filterAnalyse")
+        self._analyse.setToolTip(
+            "Afficher la moyenne d’essais dans l’aperçu "
+            "(Paramètres → Canal pour continuous / moyenne / stimulation). "
+            "Ctrl+I · aussi double-clic MEA / liste."
+        )
 
         row = QHBoxLayout()
         row.setSpacing(8)
@@ -77,12 +62,9 @@ class ControlPanel(QFrame):
         row.addWidget(QLabel("Canal", self))
         row.addWidget(self._channel_label)
         row.addSpacing(12)
-        row.addWidget(QLabel("Flux", self))
-        for box in (self._show_wide, self._show_high, self._show_low):
-            row.addWidget(box)
-        row.addSpacing(8)
-        row.addWidget(self._mark_stims)
+        row.addWidget(self._analyse)
         row.addStretch(1)
+
         self._hint = QLabel("Ajoutez un .rhs puis Traiter (F5).", self)
         self._hint.setObjectName("hintLabel")
         row.addWidget(self._hint)
@@ -95,28 +77,7 @@ class ControlPanel(QFrame):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setMinimumHeight(52)
 
-        for box in (self._show_wide, self._show_high, self._show_low):
-            box.toggled.connect(self._on_stream_toggled)
-        self._mark_stims.toggled.connect(self._on_stim_toggled)
-
-    # ---------------------------------------------------------------- values
-
-    def continuous_streams(self) -> tuple[AnalysisStream, ...]:
-        streams: list[AnalysisStream] = []
-        if self._show_wide.isChecked():
-            streams.append("raw")
-        if self._show_high.isChecked():
-            streams.append("hp")
-        if self._show_low.isChecked():
-            streams.append("lp")
-        return tuple(streams) or ("raw",)
-
-    def continuous_stream(self) -> str:
-        streams = self.continuous_streams()
-        return streams[0]
-
-    def mark_stimulations(self) -> bool:
-        return bool(self._mark_stims.isChecked())
+        self._analyse.clicked.connect(self.analysisRequested.emit)
 
     def set_channel(self, channel: str | None) -> None:
         self._channel = (channel or "").strip()
@@ -144,7 +105,7 @@ class ControlPanel(QFrame):
         self._refresh_ready()
 
     def set_busy(self, busy: bool) -> None:
-        """Pendant un build, l’inspection reste disponible si un canal est prêt."""
+        """Pendant un build, l’analyse reste disponible si un canal est prêt."""
         del busy
         self._refresh_ready()
 
@@ -157,26 +118,10 @@ class ControlPanel(QFrame):
             )
         elif ready and has_channel:
             self._hint.setText(
-                f"{self._n_trials} stim(s) · {self._channel} — Inspecter (Ctrl+I) ou double-clic"
+                f"{self._n_trials} stim(s) · {self._channel} — "
+                "mode : Paramètres → Canal"
             )
         elif has_channel:
-            self._hint.setText(f"Canal {self._channel} — Traiter (F5) puis inspecter")
+            self._hint.setText(f"Canal {self._channel} — Traiter (F5)")
         else:
-            self._hint.setText("Ajoutez un .rhs, Traiter (F5), puis Inspecter.")
-
-    def _on_stream_toggled(self, *_args: Any) -> None:
-        if self._updating:
-            return
-        # Toujours au moins un flux affiché.
-        if not any(
-            box.isChecked() for box in (self._show_wide, self._show_high, self._show_low)
-        ):
-            self._updating = True
-            self._show_wide.setChecked(True)
-            self._updating = False
-        self.filterChanged.emit()
-
-    def _on_stim_toggled(self, *_args: Any) -> None:
-        if self._updating:
-            return
-        self.stimMarkersChanged.emit()
+            self._hint.setText("Ajoutez un .rhs puis Traiter (F5).")

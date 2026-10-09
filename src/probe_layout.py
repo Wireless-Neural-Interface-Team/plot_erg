@@ -157,6 +157,48 @@ def match_contact_index(layout: ProbeLayout, channel_name: str) -> int | None:
     return None
 
 
+def neighboring_channel_indices(
+    layout: ProbeLayout,
+    channel_index: int,
+    *,
+    max_count: int = 6,
+) -> list[int]:
+    """Nearest device-channel indices by electrode distance (excluding ``channel_index``)."""
+    positions = np.asarray(layout.positions_um, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[0] == 0:
+        return []
+    device = list(layout.device_channel_indices)
+    # Prefer mapping by device channel index; fall back to contact ordinal.
+    contact_i: int | None = None
+    for i, dev in enumerate(device):
+        if dev is not None and int(dev) == int(channel_index):
+            contact_i = i
+            break
+    if contact_i is None and 0 <= int(channel_index) < positions.shape[0]:
+        contact_i = int(channel_index)
+    if contact_i is None:
+        return []
+    origin = positions[contact_i]
+    dists = np.linalg.norm(positions - origin, axis=1)
+    order = np.argsort(dists)
+    out: list[int] = []
+    for idx in order:
+        i = int(idx)
+        if i == contact_i:
+            continue
+        if _is_nc_contact(str(layout.contact_ids[i])):
+            continue
+        dev = device[i] if i < len(device) else None
+        ch = int(dev) if dev is not None else i
+        if ch == int(channel_index):
+            continue
+        if ch not in out:
+            out.append(ch)
+        if len(out) >= max(0, int(max_count)):
+            break
+    return out
+
+
 def draw_probe_inset_on_axes(
     parent_ax: Any,  # matplotlib.axes.Axes
     layout: ProbeLayout,

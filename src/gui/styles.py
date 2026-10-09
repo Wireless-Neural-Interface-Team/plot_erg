@@ -146,14 +146,28 @@ QDockWidget QTabBar::tab {{
     background-color: {CHROME_BG_ALT};
     border: 1px solid {CHROME_BORDER};
     border-bottom: none;
-    padding: 5px 12px;
+    padding: 4px 8px;
     margin-right: 1px;
-    min-width: 80px;
+    min-width: 0px;
 }}
 QDockWidget QTabBar::tab:selected {{
     background-color: {CHROME_BG_LIGHT};
     border-bottom: 2px solid {SCOPE_ACCENT};
     font-weight: 700;
+}}
+/* Dock Paramètres : 3 onglets compacts (Canal / Affichage / Style). */
+QTabWidget#paramsTabs QTabBar::tab {{
+    padding: 4px 6px;
+    font-size: 11px;
+}}
+QLabel#sectionLabel {{
+    font-weight: 700;
+    font-size: 12px;
+    color: {TEXT};
+    margin-top: 4px;
+}}
+QFrame#sectionSeparator {{
+    color: {CHROME_BORDER_DARK};
 }}
 
 /* ---- Zone centrale (viewport scope) ---- */
@@ -202,7 +216,7 @@ QGroupBox#collapsibleGroup {{
 QGroupBox#collapsibleGroup::title {{
     color: {TEXT};
 }}
-QPushButton#filterWide, QPushButton#filterLow, QPushButton#filterHigh, QPushButton#filterSpk {{
+QPushButton#filterWide, QPushButton#filterLow, QPushButton#filterHigh, QPushButton#filterSpk, QPushButton#filterAnalyse {{
     min-width: 58px;
     padding: 6px 10px;
     font-weight: 800;
@@ -248,6 +262,21 @@ QPushButton#filterSpk:checked {{
     background-color: #fed7aa;
     color: #7c2d12;
     border: 1px solid #ea580c;
+}}
+QPushButton#filterAnalyse {{
+    min-width: 78px;
+    background-color: #ffffff;
+    color: #1d4ed8;
+    border: 1px solid {CHROME_BORDER};
+}}
+QPushButton#filterAnalyse:hover {{
+    background-color: #dbeafe;
+    border-color: #93c5fd;
+}}
+QPushButton#filterAnalyse:pressed {{
+    background-color: #bfdbfe;
+    color: #1e3a8a;
+    border: 1px solid #2563eb;
 }}
 
 /* ---- Group boxes ---- */

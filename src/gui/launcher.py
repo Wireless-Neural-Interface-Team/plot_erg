@@ -1,69 +1,17 @@
-"""Fast GUI entry point — heavy analysis modules load only when a run starts."""
+"""Point d’entrée GUI — les modules d’analyse lourds ne chargent qu’au premier run."""
 
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 from typing import Any
 
-from config import AnalysisConfig
+from gui.defaults import app_defaults_from_config
 
 
-def _lazy_run(config: AnalysisConfig) -> None:
-    from cli import run
-
-    run(config)
-
-
-def _lazy_run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> None:
-    from cli import run_comparison
-
-    run_comparison(config_a, config_b)
-
-
-def _lazy_run_multi_comparison(configs: list[AnalysisConfig]) -> None:
+def _lazy_run_multi_comparison(configs: list) -> None:
     from cli import run_multi_comparison
 
     run_multi_comparison(configs)
-
-
-def _default_gui_kwargs() -> dict[str, Any]:
-    """GUI defaults (slightly tuned for typical lab use)."""
-    cfg = AnalysisConfig(rhs_file=Path("."))
-    return {
-        "default_threshold": cfg.threshold,
-        "default_edge": cfg.edge,
-        "default_pre_s": cfg.pre_s,
-        "default_post_s": cfg.post_s,
-        "default_section_count": cfg.section_count,
-        "default_section_duration_s": cfg.section_duration_s,
-        "default_section_spec": cfg.section_spec,
-        "default_section_trigger_start_s": cfg.section_trigger_start_s,
-        "default_section_trigger_end_s": cfg.section_trigger_end_s,
-        "default_spike_threshold_uv": cfg.spike_threshold_uv,
-        "default_spike_threshold_polarity": cfg.spike_threshold_polarity,
-        "default_spike_threshold_mode": cfg.spike_threshold_mode,
-        "default_spike_threshold_rms_multiplier": cfg.spike_threshold_rms_multiplier,
-        "default_psth_bin_window_s": cfg.psth_bin_window_s,
-        "default_spike_overlay_pre_ms": cfg.spike_overlay_pre_ms,
-        "default_spike_overlay_post_ms": cfg.spike_overlay_post_ms,
-        "default_rms_window_s": cfg.rms_window_s,
-        "default_zoom_mode": cfg.zoom_mode,
-        "default_zoom_onset_t0_s": cfg.zoom_onset_t0_s,
-        "default_zoom_onset_t1_s": cfg.zoom_onset_t1_s,
-        "default_zoom_end_t0_s": cfg.zoom_end_t0_s,
-        "default_zoom_end_t1_s": cfg.zoom_end_t1_s,
-        "default_intan_filter_order": cfg.intan_filter_order,
-        "default_intan_filter_type": cfg.intan_filter_type,
-        "default_intan_filter_cutoff_hz": cfg.intan_filter_cutoff_hz,
-        "default_software_notch_hz": int(getattr(cfg, "software_notch_hz", 0) or 0),
-        "default_channel_workers": cfg.channel_workers,
-        "default_sampling_percent": cfg.sampling_percent,
-        "default_probe_layout_json": cfg.probe_layout_json,
-        "default_first_trigger_hp_ylim_enabled": cfg.first_trigger_hp_ylim_enabled,
-        "default_first_trigger_hp_ylim_min_uv": cfg.first_trigger_hp_ylim_min_uv,
-        "default_first_trigger_hp_ylim_max_uv": cfg.first_trigger_hp_ylim_max_uv,
-    }
 
 
 def gui_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
@@ -90,14 +38,40 @@ def gui_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "default_spike_overlay_pre_ms": args.spike_overlay_pre_ms,
         "default_spike_overlay_post_ms": args.spike_overlay_post_ms,
         "default_rms_window_s": args.rms_window_s,
-        "default_zoom_mode": args.zoom_mode,
         "default_zoom_onset_t0_s": args.zoom_onset_t0_s,
         "default_zoom_onset_t1_s": args.zoom_onset_t1_s,
         "default_zoom_end_t0_s": args.zoom_end_t0_s,
         "default_zoom_end_t1_s": args.zoom_end_t1_s,
-        "default_intan_filter_order": args.intan_filter_order,
-        "default_intan_filter_type": args.intan_filter_type,
-        "default_intan_filter_cutoff_hz": args.intan_filter_cutoff_hz,
+        "default_intan_hp_filter_order": int(
+            args.intan_filter_order
+            if getattr(args, "intan_filter_order", None) is not None
+            else args.intan_hp_filter_order
+        ),
+        "default_intan_hp_filter_type": (
+            args.intan_filter_type
+            if getattr(args, "intan_filter_type", None) is not None
+            else args.intan_hp_filter_type
+        ),
+        "default_intan_hp_filter_cutoff_hz": float(
+            args.intan_filter_cutoff_hz
+            if getattr(args, "intan_filter_cutoff_hz", None) is not None
+            else args.intan_hp_filter_cutoff_hz
+        ),
+        "default_intan_lp_filter_order": int(
+            args.intan_filter_order
+            if getattr(args, "intan_filter_order", None) is not None
+            else args.intan_lp_filter_order
+        ),
+        "default_intan_lp_filter_type": (
+            args.intan_filter_type
+            if getattr(args, "intan_filter_type", None) is not None
+            else args.intan_lp_filter_type
+        ),
+        "default_intan_lp_filter_cutoff_hz": float(
+            args.intan_filter_cutoff_hz
+            if getattr(args, "intan_filter_cutoff_hz", None) is not None
+            else args.intan_lp_filter_cutoff_hz
+        ),
         "default_software_notch_hz": int(getattr(args, "software_notch_hz", 0) or 0),
         "default_channel_workers": args.channel_workers,
         "default_sampling_percent": args.sampling_percent,
@@ -111,11 +85,9 @@ def gui_kwargs_from_args(args: argparse.Namespace) -> dict[str, Any]:
 def launch_gui(**overrides: Any) -> int:
     from gui.main_window import launch_qt_gui
 
-    kwargs = _default_gui_kwargs()
+    kwargs = app_defaults_from_config()
     kwargs.update(overrides)
     return launch_qt_gui(
-        run_callback=_lazy_run,
-        run_comparison_callback=_lazy_run_comparison,
         run_multi_comparison_callback=_lazy_run_multi_comparison,
         **kwargs,
     )

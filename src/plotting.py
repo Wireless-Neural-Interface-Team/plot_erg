@@ -26,10 +26,7 @@ from core import (
     mean_triggered_windows_channelwise,
     resolve_channel_workers,
 )
-from intan_rhx_dsp import (
-    IntanDspSettings,
-    sliding_rms_intan_profile_range,
-)
+from intan_rhx_dsp import IntanDspSettings
 from impedance_tracking import ImpedanceSession
 from display_config import (
     PlotDisplaySettings,
@@ -68,7 +65,7 @@ from probe_layout import (
 
 # Zoom panel window (s), time relative to trigger (t=0)
 ZOOM_T0 = -0.1
-ZOOM_T1 = 0.2
+ZOOM_T1 = 0.4
 
 LEGEND_FONT_SIZE = 15
 AXIS_TITLE_FONT_SIZE = 16
@@ -952,16 +949,9 @@ def _trigger_end_zoom_bounds(
 
 
 def _mark_unavailable_axis(ax: Any, message: str) -> None:
-    ax.text(
-        0.5,
-        0.5,
-        message,
-        ha="center",
-        va="center",
-        transform=ax.transAxes,
-        fontsize=UNAVAILABLE_FONT_SIZE,
-    )
-    ax.set_axis_off()
+    from plot_utils import mark_unavailable_axis
+
+    mark_unavailable_axis(ax, message, fontsize=UNAVAILABLE_FONT_SIZE)
 
 
 def _add_trace_reference_overlays(
@@ -1411,47 +1401,12 @@ def _plot_mean_section_trace_panels(
             if ax is not None:
                 ax.set_xlim(float(x_limits[0]), float(x_limits[1]))
 
-def _spike_threshold_caption(
-    threshold_uv: float,
-    polarity: str | None = None,
-) -> str:
-    from intan_rhx_dsp import normalize_spike_threshold
-
-    mag, pol = normalize_spike_threshold(threshold_uv, polarity)  # type: ignore[arg-type]
-    if pol == "positive":
-        return f"threshold +{mag:g} µV (above, rising edge)"
-    return f"threshold −{mag:g} µV (below, falling edge)"
-
-
-def _resolve_channel_spike_threshold(
-    *,
-    mode: str,
-    fixed_threshold_uv: float,
-    spike_threshold_polarity: str = "negative",
-    rms_multiplier: float,
-    source: AmplifierSpikeSource | None,
-    channel_index: int,
-    mean_rms_uv: float | None = None,
-) -> tuple[float, str]:
-    """Resolve spike threshold value and caption for one channel."""
-    from intan_rhx_dsp import effective_spike_threshold_uv
-
-    pol = spike_threshold_polarity
-    if str(mode).strip().lower() != "rms_multiple":
-        eff = effective_spike_threshold_uv(fixed_threshold_uv, pol)  # type: ignore[arg-type]
-        return eff, _spike_threshold_caption(fixed_threshold_uv, pol)
-    if mean_rms_uv is None:
-        if source is None:
-            eff = effective_spike_threshold_uv(fixed_threshold_uv, pol)  # type: ignore[arg-type]
-            return eff, _spike_threshold_caption(fixed_threshold_uv, pol)
-        mean_rms_uv = source.mean_rms_for_channel(int(channel_index))
-    magnitude_uv = float(rms_multiplier) * float(mean_rms_uv)
-    eff = effective_spike_threshold_uv(magnitude_uv, pol)  # type: ignore[arg-type]
-    direction = "below" if pol == "negative" else "above"
-    return eff, (
-        f"{rms_multiplier:g}x RMS mean/channel "
-        f"({magnitude_uv:g} µV, {direction})"
-    )
+# Re-exports — implementations live in channel_metrics (no matplotlib).
+from channel_metrics import (  # noqa: E402
+    mean_rms_profile_from_source_window as _mean_rms_profile_from_source_window,
+    resolve_channel_spike_threshold as _resolve_channel_spike_threshold,
+    spike_threshold_caption as _spike_threshold_caption,
+)
 
 
 class _PlotRenderCache:
@@ -1913,76 +1868,6 @@ def _append_mean_impedance_summary_page(
         soften_linewidths=_soften_figure_linewidths,
         apply_fonts=_apply_compact_axis_fonts,
     )
-def _mean_rms_profile_from_source_window(
-    source: AmplifierSpikeSource,
-    t0_s: float,
-    t1_s: float,
-    rms_window_s: float,
-    channel_index: int | None = None,
-    trigger_index: int | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Mean RMS profile in [t0_s, t1_s], averaged over triggers (Intan Spike Scope, 1 s on HIGH).
-
-    When ``trigger_index`` is set, only that stimulation is used (no averaging).
-    """
-    del rms_window_s  # Intan uses source.intan_dsp.rms_window_s (1 s).
-    if source.valid_triggers.size == 0 or t1_s <= t0_s:
-        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-    fs = float(source.fs)
-    start_off = int(round(float(t0_s) * fs))
-    end_off = int(round(float(t1_s) * fs))
-    if end_off <= start_off:
-        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-    n_channels = int(source.highpass.shape[0])
-    n_samples = int(source.highpass.shape[1])
-    ch_idx = int(channel_index) if channel_index is not None else None
-    if ch_idx is not None and (ch_idx < 0 or ch_idx >= n_channels):
-        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-    n_win = int(end_off - start_off)
-    t_axis = np.arange(start_off, end_off, dtype=np.float64) / fs
-
-    all_triggers = np.asarray(source.valid_triggers, dtype=np.int64)
-    if trigger_index is not None:
-        sel = int(trigger_index)
-        if sel < 0 or sel >= int(all_triggers.size):
-            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-        candidate_trigs = [int(all_triggers[sel])]
-    else:
-        candidate_trigs = [int(trig) for trig in all_triggers]
-
-    valid_trigs: list[int] = []
-    for trig in candidate_trigs:
-        start = int(trig + start_off)
-        end = int(trig + end_off)
-        if start < 0 or end > n_samples:
-            continue
-        valid_trigs.append(int(trig))
-    if not valid_trigs:
-        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-
-    channel_indices = [ch_idx] if ch_idx is not None else list(range(n_channels))
-    pad = source.intan_dsp.rms_window_samples
-    acc = np.zeros(n_win, dtype=np.float64)
-    n_ok = 0
-    for trig in valid_trigs:
-        seg_stack = np.empty((len(channel_indices), n_win), dtype=np.float64)
-        for i, ch in enumerate(channel_indices):
-            row = source.highpass[ch]
-            seg_start = int(trig + start_off)
-            seg_end = int(trig + end_off)
-            r0 = max(0, seg_start - pad)
-            rms_seg = sliding_rms_intan_profile_range(
-                row, source.intan_dsp, r0, seg_end
-            )
-            seg_stack[i, :] = rms_seg[seg_start - r0 : seg_end - r0]
-        acc += np.mean(seg_stack, axis=0)
-        n_ok += 1
-    if n_ok == 0:
-        return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
-    return t_axis, acc / float(n_ok)
-
-
-
 def _slice_rms_profile_window(
     tx: np.ndarray,
     values: np.ndarray,

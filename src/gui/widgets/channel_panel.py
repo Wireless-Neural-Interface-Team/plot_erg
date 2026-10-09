@@ -221,7 +221,7 @@ class ChannelPanel(QWidget):
                     ready = bool(recording.is_channel_ready(int(index)))
             mark = "✓ " if ready else "○ "
             item.setText(f"{mark}{name}")
-            tip = "Canal calculé" if ready else "Canal non calculé (F6 / Inspecter)"
+            tip = "Canal calculé" if ready else "Canal non calculé (F6 / Analyse)"
             if name in self._hidden:
                 tip += " — masqué dans le montage"
             item.setToolTip(tip)

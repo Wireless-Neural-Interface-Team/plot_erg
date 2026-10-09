@@ -46,8 +46,10 @@ from display_config import RecordingStyle
 from erg_cache import (
     BundleLayout,
     CacheKeys,
+    FilteredStreamLayout,
     bundle_for,
     default_cache_root,
+    filtered_layout_for,
     raw_layout_for,
 )
 from impedance_tracking import collect_impedance_sessions
@@ -309,13 +311,100 @@ def _dsp_settings_from_raw_meta(raw_meta: dict[str, Any], config: AnalysisConfig
 # ------------------------------------------------------------- filtered stream
 
 # Cap in-RAM filtered rows per bank (HP and LP each). Beyond this, oldest rows
-# are evicted; they are recomputed on next access.
-LAZY_FILTER_CACHE_MAX_CHANNELS = 8
+# are evicted; disk memmap (when configured) remains the source of truth.
+LAZY_FILTER_CACHE_MAX_CHANNELS = 32
+
+
+class _FilteredDiskStore:
+    """Shared HP/LP/notch memmaps keyed by the filter content hash."""
+
+    def __init__(
+        self,
+        layout: FilteredStreamLayout,
+        n_channels: int,
+        n_samples: int,
+        *,
+        with_notch: bool,
+    ) -> None:
+        self.layout = layout
+        self.n_channels = int(n_channels)
+        self.n_samples = int(n_samples)
+        self.with_notch = bool(with_notch)
+        layout.ensure()
+        shape = (self.n_channels, self.n_samples)
+        mask_shape = (self.n_channels,)
+        if not layout.is_initialized():
+            for path in (layout.hp_path, layout.lp_path):
+                mm = open_writable_memmap(path, shape, np.dtype(np.float32))
+                del mm
+            np.save(layout.ready_hp_path, np.zeros(mask_shape, dtype=np.bool_))
+            np.save(layout.ready_lp_path, np.zeros(mask_shape, dtype=np.bool_))
+            if with_notch:
+                mm = open_writable_memmap(layout.notch_path, shape, np.dtype(np.float32))
+                del mm
+                np.save(layout.ready_notch_path, np.zeros(mask_shape, dtype=np.bool_))
+            layout.write_meta(
+                {
+                    "n_channels": self.n_channels,
+                    "n_samples": self.n_samples,
+                    "with_notch": self.with_notch,
+                }
+            )
+        # r+ so we can fill individual channels as they are computed.
+        self.hp = np.load(layout.hp_path, mmap_mode="r+")
+        self.lp = np.load(layout.lp_path, mmap_mode="r+")
+        self.ready_hp = np.load(layout.ready_hp_path, mmap_mode="r+")
+        self.ready_lp = np.load(layout.ready_lp_path, mmap_mode="r+")
+        if with_notch and layout.notch_path.exists():
+            self.notch = np.load(layout.notch_path, mmap_mode="r+")
+            self.ready_notch = np.load(layout.ready_notch_path, mmap_mode="r+")
+        else:
+            self.notch = None
+            self.ready_notch = None
+
+    def read_ready(self, kind: str, ch: int) -> np.ndarray | None:
+        if kind == "hp":
+            if not bool(self.ready_hp[ch]):
+                return None
+            return np.asarray(self.hp[ch], dtype=np.float32)
+        if kind == "lp":
+            if not bool(self.ready_lp[ch]):
+                return None
+            return np.asarray(self.lp[ch], dtype=np.float32)
+        if kind == "notch":
+            if self.notch is None or self.ready_notch is None:
+                return None
+            if not bool(self.ready_notch[ch]):
+                return None
+            return np.asarray(self.notch[ch], dtype=np.float64)
+        raise ValueError(kind)
+
+    def write(self, kind: str, ch: int, row: np.ndarray) -> None:
+        if kind == "hp":
+            self.hp[ch] = np.asarray(row, dtype=np.float32)
+            self.ready_hp[ch] = True
+            self.hp.flush()
+            self.ready_hp.flush()
+        elif kind == "lp":
+            self.lp[ch] = np.asarray(row, dtype=np.float32)
+            self.ready_lp[ch] = True
+            self.lp.flush()
+            self.ready_lp.flush()
+        elif kind == "notch":
+            if self.notch is None or self.ready_notch is None:
+                return
+            self.notch[ch] = np.asarray(row, dtype=np.float32)
+            self.ready_notch[ch] = True
+            self.notch.flush()
+            self.ready_notch.flush()
+        else:
+            raise ValueError(kind)
 
 
 class LazyFilterBank:
     """Filters individual amplifier channels on first access and caches the row.
 
+    Lookup order: RAM LRU → disk memmap (if configured) → ``sosfilt``.
     When ``notch_cache`` is shared between the HP and LP banks, the notch stage
     runs once per channel and both filters reuse the notched buffer.
     """
@@ -330,6 +419,7 @@ class LazyFilterBank:
         notch_cache: OrderedDict[int, np.ndarray] | None = None,
         filter_sos: np.ndarray | None = None,
         notch_sos: np.ndarray | None = None,
+        disk_store: _FilteredDiskStore | None = None,
     ) -> None:
         if kind not in ("hp", "lp"):
             raise ValueError(f"Unsupported filter bank kind: {kind}")
@@ -339,6 +429,7 @@ class LazyFilterBank:
         self._max_cached = max(1, int(max_cached_channels))
         self._cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self._notch_cache = notch_cache
+        self._disk = disk_store
         self.shape = (int(amplifier.shape[0]), int(amplifier.shape[1]))
         if notch_sos is None or filter_sos is None:
             built_notch, hp_sos, lp_sos = build_intan_filter_sos(dsp)
@@ -359,31 +450,63 @@ class LazyFilterBank:
         if cached is not None:
             self._cache.move_to_end(ch)
             return cached
+
+        if self._disk is not None:
+            from_disk = self._disk.read_ready(self._kind, ch)
+            if from_disk is not None:
+                self._cache[ch] = from_disk
+                while len(self._cache) > self._max_cached:
+                    self._cache.popitem(last=False)
+                return from_disk
+
         from scipy.signal import sosfilt
 
         check_analysis_cancelled()
-        if self._notch_sos is not None and self._notch_cache is not None:
-            signal = self._notch_cache.get(ch)
-            if signal is None:
-                wide = np.asarray(self._amplifier[ch], dtype=np.float64)
-                signal = sosfilt(self._notch_sos, wide)
-                self._notch_cache[ch] = signal
-                while len(self._notch_cache) > self._max_cached:
-                    self._notch_cache.popitem(last=False)
-            else:
-                self._notch_cache.move_to_end(ch)
-        else:
-            signal = np.asarray(self._amplifier[ch], dtype=np.float64)
-            if self._notch_sos is not None:
-                signal = sosfilt(self._notch_sos, signal)
+        signal = self._notched_signal(ch, sosfilt)
         filtered = np.asarray(sosfilt(self._sos, signal), dtype=np.float32)
+        if self._disk is not None:
+            self._disk.write(self._kind, ch, filtered)
         self._cache[ch] = filtered
         while len(self._cache) > self._max_cached:
             self._cache.popitem(last=False)
         return filtered
 
+    def _notched_signal(self, ch: int, sosfilt: Any) -> np.ndarray:
+        if self._notch_sos is None:
+            return np.asarray(self._amplifier[ch], dtype=np.float64)
+
+        if self._notch_cache is not None:
+            signal = self._notch_cache.get(ch)
+            if signal is not None:
+                self._notch_cache.move_to_end(ch)
+                return signal
+
+        if self._disk is not None:
+            from_disk = self._disk.read_ready("notch", ch)
+            if from_disk is not None:
+                if self._notch_cache is not None:
+                    self._notch_cache[ch] = from_disk
+                    while len(self._notch_cache) > self._max_cached:
+                        self._notch_cache.popitem(last=False)
+                return from_disk
+
+        wide = np.asarray(self._amplifier[ch], dtype=np.float64)
+        signal = sosfilt(self._notch_sos, wide)
+        if self._disk is not None:
+            self._disk.write("notch", ch, signal)
+        if self._notch_cache is not None:
+            self._notch_cache[ch] = signal
+            while len(self._notch_cache) > self._max_cached:
+                self._notch_cache.popitem(last=False)
+        return signal
+
     def clear(self) -> None:
         self._cache.clear()
+
+    def prefetch(self, channels: Sequence[int]) -> None:
+        """Warm RAM (and disk) cache for the given channel indices."""
+        for ch in channels:
+            _ = self[int(ch)]
 
 
 # ---------------------------------------------------------------- segmentation
@@ -480,11 +603,30 @@ def build_recording(
     notch_cache: OrderedDict[int, np.ndarray] | None = (
         OrderedDict() if notch_sos is not None else None
     )
+    filter_layout = filtered_layout_for(root, keys)
+    disk_store = _FilteredDiskStore(
+        filter_layout,
+        n_channels,
+        int(raw_meta["n_samples"]),
+        with_notch=notch_sos is not None,
+    )
     high = LazyFilterBank(
-        amplifier, dsp, "hp", notch_cache=notch_cache, filter_sos=hp_sos, notch_sos=notch_sos
+        amplifier,
+        dsp,
+        "hp",
+        notch_cache=notch_cache,
+        filter_sos=hp_sos,
+        notch_sos=notch_sos,
+        disk_store=disk_store,
     )
     low = LazyFilterBank(
-        amplifier, dsp, "lp", notch_cache=notch_cache, filter_sos=lp_sos, notch_sos=notch_sos
+        amplifier,
+        dsp,
+        "lp",
+        notch_cache=notch_cache,
+        filter_sos=lp_sos,
+        notch_sos=notch_sos,
+        disk_store=disk_store,
     )
     source = AmplifierSpikeSource(
         amplifier=amplifier,
@@ -667,15 +809,9 @@ def ensure_channels(
 def _mean_one_channel(
     row: np.ndarray, triggers: np.ndarray, pre_n: int, post_n: int
 ) -> np.ndarray:
-    win = int(pre_n + post_n)
-    if triggers.size == 0 or win <= 0:
-        return np.zeros(max(win, 0), dtype=np.float32)
-    acc = np.zeros(win, dtype=np.float64)
-    for trig in triggers:
-        start = int(trig) - pre_n
-        end = int(trig) + post_n
-        acc += np.asarray(row[start:end], dtype=np.float64)
-    return np.asarray(acc / float(triggers.size), dtype=np.float32)
+    from channel_metrics import mean_trial_windows
+
+    return mean_trial_windows(row, triggers, pre_n, post_n)
 
 
 def _compute_channel_data(
@@ -694,11 +830,12 @@ def _compute_channel_data(
     need_overlay: bool = True,
     existing: ChannelData | None = None,
 ) -> ChannelData:
-    from draw_primitives import _extract_spike_waveforms
-    from plotting import (
-        _mean_rms_profile_from_source_window,
-        _resolve_channel_spike_threshold,
+    from channel_metrics import (
+        mean_rms_profile_from_source_window,
+        resolve_channel_spike_threshold,
     )
+    from draw_primitives import _extract_spike_waveforms
+    from intan_rhx_dsp import mean_rms_intan_channel
 
     # Filter HP/LP once — shared by means, spikes and overlay.
     need_hp = need_means or need_spikes or need_overlay or need_rms
@@ -720,18 +857,19 @@ def _compute_channel_data(
 
     rms_profiles: dict[str, np.ndarray] = {}
     rms_time = np.empty(0, dtype=np.float64)
-    if need_rms:
+    if need_rms and hp_row is not None:
         t0 = float(t_rel[0]) if t_rel.size else 0.0
         t1 = float(t_rel[-1]) if t_rel.size else 0.0
         rms_kinds = {"mean": None, "first": 0, "second": 1}
         for kind, trigger_index in rms_kinds.items():
-            axis, values = _mean_rms_profile_from_source_window(
+            axis, values = mean_rms_profile_from_source_window(
                 source,
                 t0,
                 t1,
                 float(config.rms_window_s),
                 channel_index=ch,
                 trigger_index=trigger_index,
+                hp_row=hp_row,
             )
             if axis.size and rms_time.size == 0:
                 rms_time = np.asarray(axis, dtype=np.float64)
@@ -741,8 +879,11 @@ def _compute_channel_data(
         rms_time = np.asarray(existing.rms_time, dtype=np.float64)
 
     if need_spikes or need_overlay or need_rms:
-        channel_rms = float(source.mean_rms_for_channel(ch))
-        threshold, caption = _resolve_channel_spike_threshold(
+        if hp_row is not None:
+            channel_rms = float(mean_rms_intan_channel(hp_row, source.intan_dsp))
+        else:
+            channel_rms = float(source.mean_rms_for_channel(ch))
+        threshold, caption = resolve_channel_spike_threshold(
             mode=config.spike_threshold_mode,
             fixed_threshold_uv=config.spike_threshold_uv,
             spike_threshold_polarity=config.spike_threshold_polarity,

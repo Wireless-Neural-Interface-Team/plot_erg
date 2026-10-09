@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "intan-trigger-plotter"
-version = "0.1.0"
-description = "Moyennage de signaux Intan RHS sur fronts descendants d'ANALOG_IN 0"
+name = "plot-erg"
+version = "0.2.0"
+description = "Visionneuse et export PDF pour enregistrements Intan RHS / ERG"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -16,8 +16,33 @@ dependencies = [
 ]
 
 [project.scripts]
+plot-erg = "gui.launcher:launch_gui"
 intan-trigger-plotter = "cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["cli", "core", "gui", "plotting", "config", "load_intan_rhs_format", "impedance_tracking"]
+py-modules = [
+  "cli",
+  "config",
+  "core",
+  "dataset_builder",
+  "display_config",
+  "draw_primitives",
+  "erg_cache",
+  "impedance_tracking",
+  "intan_rhx_dsp",
+  "load_intan_rhs_format",
+  "memmap_io",
+  "panel_catalog",
+  "panel_registry",
+  "pdf_layout",
+  "plot_utils",
+  "plotting",
+  "probe_layout",
+  "processed_dataset",
+  "view_config",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["gui*", "intanutil*"]

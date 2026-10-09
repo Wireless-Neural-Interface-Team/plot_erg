@@ -120,35 +120,50 @@ class StatusPanel(QWidget):
     # ------------------------------------------------------------------ states
 
     def set_idle(self, message: str = "En attente.") -> None:
-        self._headline.setText(message)
-        self._stage_label.setText("")
-        self._overall.setValue(0)
-        self._stage.setValue(0)
+        self._set_label(self._headline, message)
+        self._set_label(self._stage_label, "")
+        self._set_bar(self._overall, 0)
+        self._set_bar(self._stage, 0)
 
     def set_progress_complete(self) -> None:
         """Afficher 100 % une fois le chargement / l’affichage prêt."""
-        self._overall.setValue(1000)
-        self._stage.setValue(1000)
+        self._set_bar(self._overall, 1000)
+        self._set_bar(self._stage, 1000)
 
     def set_headline(self, message: str) -> None:
-        self._headline.setText(message)
+        self._set_label(self._headline, message)
 
     def append_log(self, text: str) -> None:
         for line in str(text).splitlines():
             if line.strip():
                 self.log.appendPlainText(line)
 
+    @staticmethod
+    def _set_label(label: QLabel, text: str) -> None:
+        if label.text() != text:
+            label.setText(text)
+
+    @staticmethod
+    def _set_bar(bar: QProgressBar, value: int) -> None:
+        if bar.value() != value:
+            bar.setValue(value)
+
     def on_progress(self, event: Any) -> None:
         """Consommer un :class:`dataset_builder.ProgressEvent`."""
         cached = " (cache)" if getattr(event, "cached", False) else ""
-        self._headline.setText(f"{event.recording} — {event.stage_label}{cached}")
+        self._set_label(self._headline, f"{event.recording} — {event.stage_label}{cached}")
         message = getattr(event, "message", "") or ""
         elapsed = float(getattr(event, "elapsed_s", 0.0))
-        self._stage_label.setText(
-            f"{message}  ·  {elapsed:.1f} s" if message else f"{elapsed:.1f} s"
+        stage_text = f"{message}  ·  {elapsed:.1f} s" if message else f"{elapsed:.1f} s"
+        self._set_label(self._stage_label, stage_text)
+        self._set_bar(
+            self._overall,
+            int(max(0.0, min(1.0, float(event.overall_fraction))) * 1000),
         )
-        self._overall.setValue(int(max(0.0, min(1.0, float(event.overall_fraction))) * 1000))
-        self._stage.setValue(int(max(0.0, min(1.0, float(event.stage_fraction))) * 1000))
+        self._set_bar(
+            self._stage,
+            int(max(0.0, min(1.0, float(event.stage_fraction))) * 1000),
+        )
 
     def progress_fractions(self) -> tuple[float, float]:
         return self._overall.value() / 1000.0, self._stage.value() / 1000.0
@@ -199,8 +214,9 @@ class StatusPanel(QWidget):
         if panels <= 0:
             return
         where = f" « {tab} »" if tab else ""
-        self._stage_label.setText(
-            f"{panels} panneau(x){where} · {seconds * 1000:.0f} ms"
+        self._set_label(
+            self._stage_label,
+            f"{panels} panneau(x){where} · {seconds * 1000:.0f} ms",
         )
 
     def set_cache_summary(self, lines: Sequence[str]) -> None:

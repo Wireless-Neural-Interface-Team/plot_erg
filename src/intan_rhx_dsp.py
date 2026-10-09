@@ -79,8 +79,8 @@ _BUTTERWORTH_SPECS: dict[int, list[tuple[float, float]]] = {
 class IntanDspSettings:
     """Defaults match Intan RHX SystemState (v3.5.1) software filters.
 
-    High-pass and low-pass are always computed separately with the same
-    order / prototype / cutoff (never cascaded into a band-pass).
+    High-pass (HIGH) and low-pass (LOW) are computed as separate cascades
+    (never band-pass). Each path has its own order / prototype / cutoff.
     """
 
     fs: float
@@ -88,9 +88,12 @@ class IntanDspSettings:
     notch_filter_frequency_hz: float = 0.0
     # User-selected software notch (0 / 50 / 60). Applied even on RHX v3+ files.
     software_notch_hz: float = 0.0
-    filter_order: int = 2
-    filter_type: FilterType = "bessel"
-    filter_cutoff_hz: float = 250.0
+    hp_filter_order: int = 2
+    hp_filter_type: FilterType = "bessel"
+    hp_filter_cutoff_hz: float = 250.0
+    lp_filter_order: int = 2
+    lp_filter_type: FilterType = "bessel"
+    lp_filter_cutoff_hz: float = 250.0
     spike_threshold_uv: float = -70.0
     artifact_threshold_uv: float = 2500.0
     artifact_suppression_enabled: bool = True
@@ -116,20 +119,38 @@ class IntanDspSettings:
         """True when wideband must be notch-filtered before HP/LP."""
         return self.effective_notch_hz() > 0
 
-    def validate_filter(self) -> None:
-        fc = float(self.filter_cutoff_hz)
+    def filter_params(self, kind: SpikeFilterKind) -> tuple[int, FilterType, float]:
+        """Return (order, type, cutoff_hz) for HIGH or LOW."""
+        if kind == "highpass":
+            return (
+                int(self.hp_filter_order),
+                self.hp_filter_type,
+                float(self.hp_filter_cutoff_hz),
+            )
+        return (
+            int(self.lp_filter_order),
+            self.lp_filter_type,
+            float(self.lp_filter_cutoff_hz),
+        )
+
+    def _validate_one_filter(self, kind: SpikeFilterKind) -> None:
+        order, ftype, fc = self.filter_params(kind)
+        label = self.filter_pass_label(kind)
         if fc <= 0:
-            raise ValueError("Spike filter cutoff frequency must be > 0 Hz.")
-        order = int(self.filter_order)
+            raise ValueError(f"{label} cutoff frequency must be > 0 Hz.")
         if order < 1 or order > 8:
-            raise ValueError("Spike filter order must be between 1 and 8.")
-        if self.filter_type not in ("bessel", "butterworth"):
-            raise ValueError("Filter type must be bessel or butterworth.")
+            raise ValueError(f"{label} order must be between 1 and 8.")
+        if ftype not in ("bessel", "butterworth"):
+            raise ValueError(f"{label} type must be bessel or butterworth.")
         nyq = float(self.fs) / 2.0
         if fc >= nyq:
             raise ValueError(
-                f"Spike filter cutoff ({fc:g} Hz) must be below Nyquist ({nyq:g} Hz)."
+                f"{label} cutoff ({fc:g} Hz) must be below Nyquist ({nyq:g} Hz)."
             )
+
+    def validate_filter(self) -> None:
+        self._validate_one_filter("highpass")
+        self._validate_one_filter("lowpass")
 
     @staticmethod
     def filter_pass_label(kind: SpikeFilterKind) -> str:
@@ -137,15 +158,14 @@ class IntanDspSettings:
 
     def filter_title_label(self, kind: SpikeFilterKind = "highpass") -> str:
         """Compact filter description for plot titles (type, pass band, cutoff)."""
-        return (
-            f"{self.filter_type} {self.filter_pass_label(kind)} "
-            f"@ {self.filter_cutoff_hz:g} Hz"
-        )
+        order, ftype, fc = self.filter_params(kind)
+        del order
+        return f"{ftype} {self.filter_pass_label(kind)} @ {fc:g} Hz"
 
     def filter_short_label(self, kind: SpikeFilterKind = "highpass") -> str:
+        order, ftype, fc = self.filter_params(kind)
         return (
-            f"{self.filter_type} {self.filter_pass_label(kind)} order {self.filter_order} "
-            f"@ {self.filter_cutoff_hz:g} Hz"
+            f"{ftype} {self.filter_pass_label(kind)} order {order} @ {fc:g} Hz"
         )
 
     @classmethod
@@ -154,13 +174,20 @@ class IntanDspSettings:
         data: dict[str, Any],
         *,
         spike_threshold_uv: float = -70.0,
-        filter_order: int = 2,
-        filter_type: FilterType = "bessel",
-        filter_cutoff_hz: float = 250.0,
+        hp_filter_order: int = 2,
+        hp_filter_type: FilterType = "bessel",
+        hp_filter_cutoff_hz: float = 250.0,
+        lp_filter_order: int = 2,
+        lp_filter_type: FilterType = "bessel",
+        lp_filter_cutoff_hz: float = 250.0,
         artifact_threshold_uv: float = 2500.0,
         artifact_suppression_enabled: bool = True,
         rms_window_s: float = INTAN_RMS_WINDOW_S,
         software_notch_hz: float = 0.0,
+        # Legacy shared kwargs (apply to both HP and LP when provided alone).
+        filter_order: int | None = None,
+        filter_type: FilterType | None = None,
+        filter_cutoff_hz: float | None = None,
     ) -> IntanDspSettings:
         freq = data.get("frequency_parameters") or {}
         fs = float(freq.get("amplifier_sample_rate") or data.get("sample_rate") or 0.0)
@@ -172,14 +199,23 @@ class IntanDspSettings:
         soft = float(software_notch_hz or 0.0)
         if soft not in (0.0, 50.0, 60.0):
             soft = 0.0
+        if filter_order is not None:
+            hp_filter_order = lp_filter_order = int(filter_order)
+        if filter_type is not None:
+            hp_filter_type = lp_filter_type = filter_type
+        if filter_cutoff_hz is not None:
+            hp_filter_cutoff_hz = lp_filter_cutoff_hz = float(filter_cutoff_hz)
         settings = cls(
             fs=fs,
             rhs_version_major=major,
             notch_filter_frequency_hz=notch,
             software_notch_hz=soft,
-            filter_order=int(filter_order),
-            filter_type=filter_type,
-            filter_cutoff_hz=float(filter_cutoff_hz),
+            hp_filter_order=int(hp_filter_order),
+            hp_filter_type=hp_filter_type,
+            hp_filter_cutoff_hz=float(hp_filter_cutoff_hz),
+            lp_filter_order=int(lp_filter_order),
+            lp_filter_type=lp_filter_type,
+            lp_filter_cutoff_hz=float(lp_filter_cutoff_hz),
             spike_threshold_uv=float(spike_threshold_uv),
             artifact_threshold_uv=float(artifact_threshold_uv),
             artifact_suppression_enabled=bool(artifact_suppression_enabled),
@@ -193,14 +229,29 @@ class IntanDspSettings:
         path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
 
     @classmethod
-    def load_json(cls, path: Path) -> IntanDspSettings:
-        raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    def from_dict(cls, raw: dict[str, Any]) -> IntanDspSettings:
+        """Build settings from a dict, migrating legacy shared ``filter_*`` keys."""
+        data = dict(raw)
+        if "hp_filter_order" not in data and "filter_order" in data:
+            data["hp_filter_order"] = data["filter_order"]
+            data["lp_filter_order"] = data["filter_order"]
+        if "hp_filter_type" not in data and "filter_type" in data:
+            data["hp_filter_type"] = data["filter_type"]
+            data["lp_filter_type"] = data["filter_type"]
+        if "hp_filter_cutoff_hz" not in data and "filter_cutoff_hz" in data:
+            data["hp_filter_cutoff_hz"] = data["filter_cutoff_hz"]
+            data["lp_filter_cutoff_hz"] = data["filter_cutoff_hz"]
         field_names = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        # Ignore legacy spike_filter_kind (HP+LP are always both computed now).
-        filtered = {k: v for k, v in raw.items() if k in field_names}
+        # Ignore legacy spike_filter_kind / shared filter_* keys.
+        filtered = {k: v for k, v in data.items() if k in field_names}
         settings = cls(**filtered)
         settings.validate_filter()
         return settings
+
+    @classmethod
+    def load_json(cls, path: Path) -> IntanDspSettings:
+        raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+        return cls.from_dict(raw)
 
 
 @dataclass
@@ -339,7 +390,7 @@ def _cascade(signal: np.ndarray, coeffs: list[_BiquadCoeffs]) -> np.ndarray:
 def build_intan_filter_sos(
     settings: IntanDspSettings,
 ) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
-    """Precompute SOS: optional notch + separate high-pass and low-pass (same params)."""
+    """Precompute SOS: optional notch + independent high-pass and low-pass."""
     notch_sos: np.ndarray | None = None
     notch_hz = settings.effective_notch_hz()
     if notch_hz > 0:
@@ -352,14 +403,14 @@ def build_intan_filter_sos(
                 )
             ]
         )
-    common = (
-        settings.filter_order,
-        settings.filter_cutoff_hz,
-        settings.fs,
-        settings.filter_type,
+    hp_order, hp_type, hp_fc = settings.filter_params("highpass")
+    lp_order, lp_type, lp_fc = settings.filter_params("lowpass")
+    hp_sos = _coeffs_to_sos(
+        _filter_biquad_chain("highpass", hp_order, hp_fc, settings.fs, hp_type)
     )
-    hp_sos = _coeffs_to_sos(_filter_biquad_chain("highpass", *common))
-    lp_sos = _coeffs_to_sos(_filter_biquad_chain("lowpass", *common))
+    lp_sos = _coeffs_to_sos(
+        _filter_biquad_chain("lowpass", lp_order, lp_fc, settings.fs, lp_type)
+    )
     return notch_sos, hp_sos, lp_sos
 
 
@@ -404,7 +455,7 @@ def write_filtered_stack_channelwise(
     cancel_check: Any | None = None,
     progress_every: int = 0,
 ) -> tuple[Path, Path]:
-    """Filter wideband to HP + LP memmaps per channel (separate cascades, shared params)."""
+    """Filter wideband to HP + LP memmaps per channel (independent cascades)."""
     from concurrent.futures import ThreadPoolExecutor
 
     from memmap_io import open_writable_memmap

@@ -7,6 +7,7 @@ spike / impedance / marker rendering used by both.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Tuple
 
 import matplotlib.dates as mdates
@@ -17,6 +18,13 @@ from matplotlib.colors import to_rgba
 from matplotlib.lines import Line2D
 
 from core import AmplifierSpikeSource, detect_spikes_at_threshold
+from display_config import (
+    ARTIFACT_LINE_COLOR,
+    MUTED_AXIS_TEXT,
+    STIM_OFFSET_COLOR,
+    STIM_ONSET_COLOR,
+    ZERO_LINE_COLOR,
+)
 from impedance_tracking import ImpedanceSession
 from intan_rhx_dsp import IntanDspSettings, detect_spikes_intan
 from pdf_layout import LayoutFonts, place_legend_below
@@ -31,25 +39,86 @@ SPIKE_OVERLAY_DEFAULT_PRE_MS = 2.0
 SPIKE_OVERLAY_DEFAULT_POST_MS = 4.0
 
 TIME_REL_XLABEL = "Time relative to stimulation (s)"
+# Defaults PDF (grand format). La GUI passe un DrawAppearance plus compact.
 AXIS_LABEL_FONT_SIZE = 15
 TICK_LABEL_FONT_SIZE = 15
 ANNOTATION_FONT_SIZE = 13
 UNAVAILABLE_FONT_SIZE = 15
 LEGEND_FONT_SIZE = 15
+DEFAULT_STIM_LINEWIDTH = 1.15
+DEFAULT_GRID_ALPHA = 0.3
 
 
-def _legend_fonts() -> LayoutFonts:
-    return LayoutFonts(
-        legend=LEGEND_FONT_SIZE,
-        axis_title=16,
-        axis_label=AXIS_LABEL_FONT_SIZE,
-        tick=TICK_LABEL_FONT_SIZE,
-        section_header=20,
-        mea_title=16,
-        table=15,
-        unavailable=UNAVAILABLE_FONT_SIZE,
-    )
+@dataclass(frozen=True)
+class DrawAppearance:
+    """Typo / traits / grille — PDF garde les défauts module ; GUI injecte PanelStyle."""
 
+    axis_label_font_size: float = AXIS_LABEL_FONT_SIZE
+    tick_font_size: float = TICK_LABEL_FONT_SIZE
+    annotation_font_size: float = ANNOTATION_FONT_SIZE
+    unavailable_font_size: float = UNAVAILABLE_FONT_SIZE
+    legend_font_size: float = LEGEND_FONT_SIZE
+    line_width: float = 1.2
+    stim_linewidth: float = DEFAULT_STIM_LINEWIDTH
+    grid: bool = True
+    grid_alpha: float = DEFAULT_GRID_ALPHA
+    stim_onset_color: str = STIM_ONSET_COLOR
+    stim_offset_color: str = STIM_OFFSET_COLOR
+
+    @classmethod
+    def for_pdf(cls) -> DrawAppearance:
+        return cls()
+
+    @classmethod
+    def from_panel_style(
+        cls,
+        style: Any,
+        *,
+        legend_font_size: float | None = None,
+    ) -> DrawAppearance:
+        """Construire depuis ``view_config.PanelStyle`` (+ taille légende optionnelle)."""
+        lw = float(getattr(style, "line_width", 1.2))
+        return cls(
+            axis_label_font_size=float(getattr(style, "label_font_size", 9.0)),
+            tick_font_size=float(getattr(style, "tick_font_size", 8.0)),
+            annotation_font_size=float(getattr(style, "tick_font_size", 8.0)),
+            unavailable_font_size=float(getattr(style, "label_font_size", 9.0)),
+            legend_font_size=float(
+                legend_font_size
+                if legend_font_size is not None
+                else getattr(style, "label_font_size", 9.0)
+            ),
+            line_width=lw,
+            stim_linewidth=max(0.7, lw * 0.95),
+            grid=bool(getattr(style, "grid", True)),
+            grid_alpha=float(getattr(style, "grid_alpha", DEFAULT_GRID_ALPHA)),
+        )
+
+    def layout_fonts(self) -> LayoutFonts:
+        return LayoutFonts(
+            legend=self.legend_font_size,
+            axis_title=self.axis_label_font_size + 1.0,
+            axis_label=self.axis_label_font_size,
+            tick=self.tick_font_size,
+            section_header=self.axis_label_font_size + 5.0,
+            mea_title=self.axis_label_font_size + 1.0,
+            table=self.tick_font_size,
+            unavailable=self.unavailable_font_size,
+        )
+
+    def apply_grid(self, ax: Any, *, axis: str | None = None) -> None:
+        if self.grid:
+            kwargs: dict[str, Any] = {"alpha": self.grid_alpha}
+            if axis is not None:
+                kwargs["axis"] = axis
+            ax.grid(True, **kwargs)
+        else:
+            ax.grid(False)
+
+
+def _legend_fonts(appearance: DrawAppearance | None = None) -> LayoutFonts:
+    app = appearance or DrawAppearance.for_pdf()
+    return app.layout_fonts()
 
 
 def _draw_onset_offset_lines(
@@ -58,13 +127,16 @@ def _draw_onset_offset_lines(
     end_markers: Sequence[float],
     end_line_specs: Optional[Sequence[tuple[float, str]]] = None,
     label_in_legend: bool = False,
+    appearance: DrawAppearance | None = None,
 ) -> None:
     """Draw onset (t=0) and trigger-offset markers without zoom spans."""
+    app = appearance or DrawAppearance.for_pdf()
+    lw = float(app.stim_linewidth)
     ax.axvline(
         0.0,
         linestyle="--",
-        linewidth=1.15,
-        color="red",
+        linewidth=lw,
+        color=app.stim_onset_color,
         label=("Stimulation (onset)" if label_in_legend else "_nolegend_"),
     )
     if end_line_specs:
@@ -72,8 +144,8 @@ def _draw_onset_offset_lines(
             ax.axvline(
                 value,
                 linestyle="-.",
-                linewidth=1.15,
-                color="#1d4ed8",
+                linewidth=lw,
+                color=app.stim_offset_color,
                 label=(label if label_in_legend and idx == 0 else "_nolegend_"),
             )
         return
@@ -82,8 +154,8 @@ def _draw_onset_offset_lines(
         ax.axvline(
             float(value),
             linestyle="-.",
-            linewidth=1.15,
-            color="#1d4ed8",
+            linewidth=lw,
+            color=app.stim_offset_color,
             label=(
                 "Stimulation (offset)"
                 if label_in_legend and not labeled
@@ -91,6 +163,43 @@ def _draw_onset_offset_lines(
             ),
         )
         labeled = True
+
+
+def mark_stim_times(
+    ax: Any,
+    times: Sequence[float],
+    *,
+    appearance: DrawAppearance | None = None,
+    alpha: float = 0.55,
+    linewidth: float | None = None,
+    linestyle: str = "--",
+) -> None:
+    """Marqueurs d’onset (liste de temps) — continuous / montage."""
+    xs = [float(t) for t in times]
+    if not xs:
+        return
+    app = appearance or DrawAppearance.for_pdf()
+    lw = float(linewidth) if linewidth is not None else max(0.55, float(app.stim_linewidth) * 0.7)
+    if len(xs) == 1:
+        ax.axvline(
+            xs[0],
+            color=app.stim_onset_color,
+            linestyle=linestyle,
+            linewidth=lw,
+            alpha=alpha,
+        )
+        return
+    ax.vlines(
+        xs,
+        ymin=0.0,
+        ymax=1.0,
+        transform=ax.get_xaxis_transform(),
+        colors=app.stim_onset_color,
+        linestyles=linestyle,
+        linewidths=lw,
+        alpha=alpha,
+        zorder=1,
+    )
 
 
 def _spike_times_per_trial(
@@ -195,7 +304,7 @@ def _spike_pipeline_captions(
         )
     short = intan_dsp.filter_short_label("highpass")
     detail = (
-        f"{intan_dsp.filter_title_label('highpass')}, order {intan_dsp.filter_order}; "
+        f"{intan_dsp.filter_title_label('highpass')}, order {intan_dsp.hp_filter_order}; "
         f"RMS window {intan_dsp.rms_window_s:g} s; "
         f"spike thr. {intan_dsp.spike_threshold_uv:g} µV"
     )
@@ -256,8 +365,11 @@ def _add_raster_threshold_legend(
     ax_raster: Any,
     threshold_caption: str,
     threshold_entries: Sequence[tuple[str, str]] | None = None,
+    *,
+    appearance: DrawAppearance | None = None,
 ) -> None:
     """Place raster legend below the plot with threshold information."""
+    app = appearance or DrawAppearance.for_pdf()
     if threshold_entries:
         handles, labels = ax_raster.get_legend_handles_labels()
         color_by_label: dict[str, Any] = {}
@@ -289,15 +401,14 @@ def _add_raster_threshold_legend(
             )
             unique_labels.append(f"{rec_label}: {thr_text}")
     else:
-        unique_handles = [Line2D([0], [0], color="0.25", linestyle="--", linewidth=1.0)]
+        unique_handles = [
+            Line2D([0], [0], color="0.25", linestyle="--", linewidth=app.line_width)
+        ]
         unique_labels = [f"Threshold: {threshold_caption}"]
-    entry_count = len(unique_labels)
-    ncol = 1
-    del entry_count
     legend = place_legend_below(
         ax_raster,
-        _legend_fonts(),
-        ncol=ncol,
+        _legend_fonts(app),
+        ncol=1,
         handles=unique_handles,
         labels=unique_labels,
     )
@@ -331,6 +442,7 @@ def _draw_spike_panels_multi_channel(
     show_isi: bool = True,
     across_trials: bool = True,
     colors: Sequence[Any] | None = None,
+    appearance: DrawAppearance | None = None,
 ) -> None:
     """Overlaid raster / PSTH / ISI for N recordings.
 
@@ -338,6 +450,7 @@ def _draw_spike_panels_multi_channel(
     ``across_trials=False``: single stimulation (first or second); section_title
     should already name that stimulation.
     """
+    app = appearance or DrawAppearance.for_pdf()
     short, _ = _spike_pipeline_captions(intan_dsp=intan_dsp)
     show_raster = bool(show_raster and ax_raster is not None)
     show_psth = bool(show_psth and ax_fr is not None)
@@ -371,11 +484,14 @@ def _draw_spike_panels_multi_channel(
         colors = list(default_colors)
     n_rec = len(spikes_per_recording)
     dense_overlay = n_rec > 2
+    base_lw = float(app.line_width)
     raster_alpha = 0.75 if not dense_overlay else 0.55
-    psth_lw = 1.3 if not dense_overlay else 0.95
+    psth_lw = (base_lw * 1.08) if not dense_overlay else (base_lw * 0.8)
+    trial_lw = max(0.8, base_lw * 0.85)
     trial_marker = "o" if n_rec <= 3 else "None"
     trial_markersize = 2.2 if n_rec <= 3 else 0.0
     isi_alpha = 0.35 if not dense_overlay else 0.25
+    sep_lw = max(0.6, base_lw * 0.65)
     sec = f"{section_title} — " if section_title else ""
     y_offset = 0
     for rec_idx, st_per_trial in enumerate(spikes_per_recording):
@@ -408,7 +524,9 @@ def _draw_spike_panels_multi_channel(
                 )
         y_offset += len(st_per_trial)
         if rec_idx < len(spikes_per_recording) - 1 and show_raster:
-            ax_raster.axhline(y_offset - 0.5, color="0.55", linestyle="--", linewidth=0.8, alpha=0.7)
+            ax_raster.axhline(
+                y_offset - 0.5, color="0.55", linestyle="--", linewidth=sep_lw, alpha=0.7
+            )
     if threshold_caption is not None:
         cap = threshold_caption
     else:
@@ -423,7 +541,7 @@ def _draw_spike_panels_multi_channel(
             ax_raster.set_title(f"{sec}Raster — all stimulations — {short}")
         else:
             ax_raster.set_title(f"{sec}Raster — {short}")
-        ax_raster.grid(True, alpha=0.25, axis="x")
+        app.apply_grid(ax_raster, axis="x")
         ax_raster.set_ylim(-0.5, max(y_offset - 0.5, 0.5))
         ax_raster.set_xlim(t_xlim_lo, t_xlim_hi)
         ax_raster.set_xlabel(TIME_REL_XLABEL)
@@ -431,6 +549,7 @@ def _draw_spike_panels_multi_channel(
             ax_raster,
             cap,
             threshold_entries=threshold_entries,
+            appearance=app,
         )
 
     bin_w = max(float(psth_bin_window_s), 1.0 / fs)
@@ -464,7 +583,7 @@ def _draw_spike_panels_multi_channel(
                 f"{sec}PSTH — firing rate "
                 f"(window = {bin_w:g} s) — {short}"
             )
-        ax_fr.grid(True, alpha=0.3)
+        app.apply_grid(ax_fr)
         ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
         ax_fr.set_xlabel(TIME_REL_XLABEL)
     max_trials = 0
@@ -478,7 +597,7 @@ def _draw_spike_panels_multi_channel(
                 x,
                 fr_trials,
                 color=colors[rec_idx % len(colors)],
-                linewidth=1.0,
+                linewidth=trial_lw,
                 marker=trial_marker,
                 markersize=trial_markersize,
                 label=labels[rec_idx] if show_leg else "_nolegend_",
@@ -489,7 +608,7 @@ def _draw_spike_panels_multi_channel(
         )
         ax_trial_fr.set_xlabel("Trial index")
         ax_trial_fr.set_ylabel("Rate per trial (Hz, not averaged)")
-        ax_trial_fr.grid(True, alpha=0.25)
+        app.apply_grid(ax_trial_fr)
         if max_trials > 0:
             ax_trial_fr.set_xlim(1, max_trials)
 
@@ -525,7 +644,7 @@ def _draw_spike_panels_multi_channel(
                     f"{sec}ISI — {short} "
                     f"({isi_caption} ; x-axis = time of 2nd spike)"
                 )
-            ax_isi.grid(True, alpha=0.25)
+            app.apply_grid(ax_isi)
             isi_time_union = np.concatenate(isi_time_chunks) if isi_time_chunks else np.empty(0, dtype=np.float64)
             _set_adaptive_x_limits(ax_isi, isi_time_union, fallback_limits=(t_xlim_lo, t_xlim_hi))
             ax_isi.set_xlabel(TIME_REL_XLABEL)
@@ -537,6 +656,8 @@ def _draw_spike_panels_multi_channel(
                 ha="center",
                 va="center",
                 transform=ax_isi.transAxes,
+                fontsize=app.unavailable_font_size,
+                color=MUTED_AXIS_TEXT,
             )
             ax_isi.set_axis_off()
 
@@ -681,10 +802,12 @@ def _draw_spike_overlay_panel(
     post_ms: float = SPIKE_OVERLAY_DEFAULT_POST_MS,
     thresholds_uv: Sequence[float] | None = None,
     colors: Sequence[Any] | None = None,
+    appearance: DrawAppearance | None = None,
 ) -> None:
     """Overlay HIGH snippets aligned on threshold crossing."""
     if ax is None:
         return
+    app = appearance or DrawAppearance.for_pdf()
     short, _ = _spike_pipeline_captions(intan_dsp=intan_dsp)
     default_colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2", "C3"])
     colors = list(colors) if colors is not None else list(default_colors)
@@ -692,7 +815,10 @@ def _draw_spike_overlay_panel(
         colors = list(default_colors)
     n_rec = len(overlay_per_recording)
     dense = n_rec > 2
-    line_width = 0.45 if not dense else 0.35
+    base_lw = float(app.line_width)
+    line_width = (base_lw * 0.38) if not dense else (base_lw * 0.29)
+    mean_lw = max(1.0, base_lw * 1.3)
+    guide_lw = max(0.65, base_lw * 0.7)
     sec = f"{section_title} — " if section_title else ""
     t_min_ms = -max(0.0, float(pre_ms))
     t_max_ms = max(1e-6, float(post_ms))
@@ -750,7 +876,7 @@ def _draw_spike_overlay_panel(
             t_disp,
             mean_w,
             color=color,
-            linewidth=1.55,
+            linewidth=mean_lw,
             zorder=3,
             label=mean_label if show_leg else "_nolegend_",
         )
@@ -761,9 +887,9 @@ def _draw_spike_overlay_panel(
                 thr_label = f"Threshold ({thr:g} µV)" if show_leg else "_nolegend_"
             ax.axhline(
                 thr,
-                color="red",
+                color=app.stim_onset_color,
                 linestyle="--",
-                linewidth=0.85,
+                linewidth=max(0.7, guide_lw),
                 zorder=2,
                 alpha=0.85,
                 label=thr_label,
@@ -777,16 +903,21 @@ def _draw_spike_overlay_panel(
             ha="center",
             va="center",
             transform=ax.transAxes,
-            fontsize=UNAVAILABLE_FONT_SIZE,
+            fontsize=app.unavailable_font_size,
+            color=MUTED_AXIS_TEXT,
         )
         ax.set_axis_off()
         return
-    ax.axhline(0.0, color="0.35", linewidth=0.8, zorder=2)
-    ax.axvline(0.0, color="0.35", linestyle=":", linewidth=0.9, zorder=2)
+    ax.axhline(0.0, color=ZERO_LINE_COLOR, linewidth=guide_lw, zorder=2)
+    ax.axvline(0.0, color=ZERO_LINE_COLOR, linestyle=":", linewidth=guide_lw, zorder=2)
     if intan_dsp is not None and intan_dsp.artifact_suppression_enabled:
         art = float(intan_dsp.artifact_threshold_uv)
-        ax.axhline(art, color="#2563eb", linestyle=":", linewidth=0.8, zorder=2, alpha=0.7)
-        ax.axhline(-art, color="#2563eb", linestyle=":", linewidth=0.8, zorder=2, alpha=0.7)
+        ax.axhline(
+            art, color=ARTIFACT_LINE_COLOR, linestyle=":", linewidth=guide_lw, zorder=2, alpha=0.7
+        )
+        ax.axhline(
+            -art, color=ARTIFACT_LINE_COLOR, linestyle=":", linewidth=guide_lw, zorder=2, alpha=0.7
+        )
     ax.set_xlabel("Time relative to detection (ms)")
     ax.set_ylabel("Potential (µV)")
     ax.set_title(
@@ -799,15 +930,18 @@ def _draw_spike_overlay_panel(
     ticks = _spike_overlay_xticks(t_min_ms, t_max_ms)
     if ticks:
         ax.set_xticks(ticks)
-    ax.grid(True, alpha=0.3)
+    app.apply_grid(ax)
 
 
 def _draw_impedance_evolution_panel(
     ax_imp: Any,
     channel_name: str,
     sessions: Sequence[ImpedanceSession],
+    *,
+    appearance: DrawAppearance | None = None,
 ) -> None:
     """Semi-log evolution of |Z| @ 1 kHz for one channel vs session timestamps."""
+    app = appearance or DrawAppearance.for_pdf()
     times_num = np.array([mdates.date2num(s.when) for s in sessions], dtype=np.float64)
     ys = np.array([s.magnitudes_ohm.get(channel_name, float("nan")) for s in sessions], dtype=np.float64)
     valid = np.isfinite(ys) & (ys > 0)
@@ -819,7 +953,8 @@ def _draw_impedance_evolution_panel(
             ha="center",
             va="center",
             transform=ax_imp.transAxes,
-            fontsize=UNAVAILABLE_FONT_SIZE,
+            fontsize=app.unavailable_font_size,
+            color=MUTED_AXIS_TEXT,
         )
         ax_imp.set_axis_off()
         return
@@ -852,18 +987,18 @@ def _draw_impedance_evolution_panel(
             xytext=(0, 6),
             ha="center",
             va="bottom",
-            fontsize=ANNOTATION_FONT_SIZE,
+            fontsize=app.annotation_font_size,
             alpha=0.9,
             zorder=4,
         )
-    ax_imp.set_ylabel("|Z| @ 1 kHz (Ω)", fontsize=AXIS_LABEL_FONT_SIZE)
-    ax_imp.set_xlabel("Session time (_YYMMDD_HHMMSS)", fontsize=AXIS_LABEL_FONT_SIZE)
+    ax_imp.set_ylabel("|Z| @ 1 kHz (Ω)", fontsize=app.axis_label_font_size)
+    ax_imp.set_xlabel("Session time (_YYMMDD_HHMMSS)", fontsize=app.axis_label_font_size)
     ax_imp.margins(x=0.08)
     date_locator = mdates.AutoDateLocator()
     ax_imp.xaxis.set_major_locator(date_locator)
     ax_imp.xaxis.set_major_formatter(mdates.ConciseDateFormatter(date_locator))
-    ax_imp.tick_params(axis="both", labelsize=TICK_LABEL_FONT_SIZE)
-    ax_imp.grid(True, which="major", alpha=0.35)
+    ax_imp.tick_params(axis="both", labelsize=app.tick_font_size)
+    app.apply_grid(ax_imp)
     for label in ax_imp.get_xticklabels():
         label.set_rotation(18)
         label.set_ha("right")

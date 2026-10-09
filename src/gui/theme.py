@@ -23,8 +23,10 @@ SCOPE_GRID = "#e5e7eb"
 SCOPE_SPINE = "#9ca3af"
 SCOPE_TITLE = "#111827"
 SCOPE_ACCENT = "#2563eb"
+# Aligné sur display_config.STIM_ONSET_COLOR / ZERO_LINE_COLOR.
 SCOPE_STIM_MARKER = "#dc2626"
 SCOPE_ZERO_LINE = "#6b7280"
+SCOPE_STIM_OFFSET = "#1d4ed8"
 
 # ---- Sélection / actions -------------------------------------------------
 SELECT_BG = "#3b82f6"
@@ -40,18 +42,6 @@ FILTER_WIDE = "#ca8a04"
 FILTER_LOW = "#0284c7"
 FILTER_HIGH = "#16a34a"
 FILTER_SPK = "#ea580c"
-
-# ---- Couleurs de traces --------------------------------------------------
-TRACE_COLORS: tuple[str, ...] = (
-    "#2563eb",
-    "#dc2626",
-    "#16a34a",
-    "#ca8a04",
-    "#7c3aed",
-    "#0891b2",
-    "#ea580c",
-    "#4b5563",
-)
 
 # ---- MEA map -------------------------------------------------------------
 MEA_BG = "#f8fafc"

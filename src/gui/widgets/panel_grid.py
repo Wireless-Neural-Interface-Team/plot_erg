@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QGridLayout,
     QLabel,
     QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -32,11 +33,17 @@ class PanelGrid(QScrollArea):
     detachRequested = Signal(object)  # PanelPlacement
     renderFinished = Signal(int, float)  # panels drawn, total seconds
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        allow_zoom: bool = True,
+    ) -> None:
         super().__init__(parent)
         self.setWidgetResizable(True)
         self.setFrameShape(QScrollArea.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._allow_zoom = bool(allow_zoom)
 
         self._container = QWidget()
         self._layout = QGridLayout(self._container)
@@ -48,6 +55,10 @@ class PanelGrid(QScrollArea):
         self._order: list[PanelPlacement] = []
         self._columns = 2
         self._panel_height = 300
+        # True = même hauteur (et donc même largeur de cellule) pour tous les panels.
+        self._uniform = False
+        # True = panneaux Expanding qui se partagent le viewport (aperçu canal).
+        self._fill = False
         self._placeholder: QLabel | None = None
         self._pending: list[PanelPlacement] = []
         self._deferred: list[PanelPlacement] = []
@@ -63,6 +74,10 @@ class PanelGrid(QScrollArea):
         self._scroll_timer.setInterval(90)
         self._scroll_timer.timeout.connect(self._render_newly_visible)
         self.verticalScrollBar().valueChanged.connect(lambda _v: self._scroll_timer.start())
+        self._fill_timer = QTimer(self)
+        self._fill_timer.setSingleShot(True)
+        self._fill_timer.setInterval(50)
+        self._fill_timer.timeout.connect(self._reflow_fill_heights)
 
     # ------------------------------------------------------------------ layout
 
@@ -72,14 +87,25 @@ class PanelGrid(QScrollArea):
         *,
         columns: int,
         panel_height: int,
+        uniform: bool = False,
+        fill: bool = False,
     ) -> None:
         """Rebuild the grid for the given panels."""
         from .panel_canvas import PanelCanvas
+
+        # Ne pas faire sauter le viewport (ex. après déplacement de plages).
+        vbar = self.verticalScrollBar()
+        hbar = self.horizontalScrollBar()
+        scroll_v = int(vbar.value())
+        scroll_h = int(hbar.value())
 
         self._timer.stop()
         self._pending.clear()
         self._columns = max(1, int(columns))
         self._panel_height = max(140, int(panel_height))
+        self._uniform = bool(uniform)
+        # fill et uniform sont exclusifs : uniform = hauteur figée (montage).
+        self._fill = bool(fill) and not self._uniform
         # One widget per key: section-independent panels collapse to a single copy.
         wanted: dict[str, PanelPlacement] = {}
         for placement in placements:
@@ -95,7 +121,9 @@ class PanelGrid(QScrollArea):
 
         for placement in placements:
             if placement.key not in self._panels:
-                canvas = PanelCanvas(placement, self._container)
+                canvas = PanelCanvas(
+                    placement, self._container, allow_zoom=self._allow_zoom
+                )
                 canvas.removeRequested.connect(self.removeRequested.emit)
                 canvas.detachRequested.connect(self.detachRequested.emit)
                 self._panels[placement.key] = canvas
@@ -110,13 +138,41 @@ class PanelGrid(QScrollArea):
 
         self._order = list(placements)
         self._relayout()
+        self._restore_scroll(scroll_v, scroll_h)
 
+    def _restore_scroll(self, scroll_v: int, scroll_h: int) -> None:
+        """Rétablir la position de scroll après un relayout (immédiat + tick suivant)."""
+        vbar = self.verticalScrollBar()
+        hbar = self.horizontalScrollBar()
+
+        def _apply() -> None:
+            vbar.setValue(min(scroll_v, vbar.maximum()))
+            hbar.setValue(min(scroll_h, hbar.maximum()))
+
+        _apply()
+        QTimer.singleShot(0, _apply)
     def set_panel_height(
-        self, panel_height: int, *, panels: Sequence[str] | None = None
+        self,
+        panel_height: int,
+        *,
+        panels: Sequence[str] | None = None,
+        uniform: bool | None = None,
+        fill: bool | None = None,
     ) -> None:
         """Changer la hauteur min sans reconstruire la grille (rapide)."""
         height = max(140, int(panel_height))
-        if height == self._panel_height and panels is None:
+        if uniform is not None:
+            self._uniform = bool(uniform)
+            if self._uniform:
+                self._fill = False
+        if fill is not None:
+            self._fill = bool(fill) and not self._uniform
+        if (
+            height == self._panel_height
+            and panels is None
+            and uniform is None
+            and fill is None
+        ):
             return
         self._panel_height = height
         wanted = set(panels) if panels is not None else None
@@ -126,11 +182,63 @@ class PanelGrid(QScrollArea):
             widget = self._panels.get(placement.key)
             if widget is None:
                 continue
-            info = panel_info(placement.panel)
-            min_h = max(height, info.preferred_height_px)
-            if placement.panel == "montage_continuous_raw":
-                min_h = max(min_h, height)
-            widget.setMinimumHeight(min_h)  # type: ignore[attr-defined]
+            self._apply_panel_height(widget, placement)
+
+    def _panel_min_height(self, placement: PanelPlacement) -> int:
+        """Hauteur cible d’un panneau (uniforme, fill viewport, ou preferred_height)."""
+        if self._fill or self._uniform or placement.panel == "montage_continuous_raw":
+            # Fill : hauteur déjà calculée via preferred_height_px dans _reflow_fill_heights.
+            return self._panel_height
+        info = panel_info(placement.panel)
+        return max(self._panel_height, int(info.preferred_height_px))
+
+    def _apply_panel_height(self, widget: object, placement: PanelPlacement) -> None:
+        height = self._panel_min_height(placement)
+        widget.setMinimumHeight(height)  # type: ignore[attr-defined]
+        # Montage / uniform : hauteur fixe (= budget lignes) pour forcer le scroll.
+        # fill : Expanding pour occuper tout le viewport (continuous / moyenne / stim).
+        fix_height = bool(self._uniform or placement.panel == "montage_continuous_raw")
+        if fix_height:
+            widget.setMaximumHeight(height)  # type: ignore[attr-defined]
+            v_policy = QSizePolicy.Policy.Fixed
+        else:
+            widget.setMaximumHeight(16777215)  # type: ignore[attr-defined]
+            v_policy = (
+                QSizePolicy.Policy.Expanding if self._fill else QSizePolicy.Policy.Preferred
+            )
+        widget.setSizePolicy(QSizePolicy.Policy.Expanding, v_policy)  # type: ignore[attr-defined]
+
+    def resizeEvent(self, event: Any) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if self._fill and self._order:
+            self._fill_timer.start()
+
+    def _reflow_fill_heights(self) -> None:
+        """Recalculer la hauteur min pour coller au viewport (mode fill)."""
+        if not self._fill or not self._order:
+            return
+        n = max(1, len(self._order))
+        vp = int(self.viewport().height())
+        if vp <= 80:
+            return
+        margins = int(self._layout.contentsMargins().top()) + int(
+            self._layout.contentsMargins().bottom()
+        )
+        gaps = max(0, n - 1) * int(self._layout.spacing())
+        usable = max(140, vp - margins - gaps)
+        # Plancher = preferred_height_px du catalogue (paramètre hauteur de graph).
+        preferreds = [
+            int(panel_info(p.panel).preferred_height_px) for p in self._order
+        ]
+        if n == 1:
+            # Un graph : occupe tout le viewport, au moins sa hauteur catalogue.
+            height = max(max(preferreds, default=260), usable)
+        else:
+            # Plusieurs : parts égales ; plancher lisible (pas le preferred plein).
+            height = max(260, usable // n)
+        if height == self._panel_height:
+            return
+        self.set_panel_height(height)
 
     def _relayout(self) -> None:
         while self._layout.count():
@@ -144,10 +252,10 @@ class PanelGrid(QScrollArea):
 
         if not self._order:
             self._placeholder = QLabel(
-                "Aperçu du canal sélectionné.\n\n"
+                "Aucun panneau dans cette vue.\n\n"
                 "1. Session → Ajouter un .rhs\n"
                 "2. Traiter (F5)\n"
-                "3. Choisir un canal · Inspecter (Ctrl+I)\n\n"
+                "3. Choisir un canal (aperçu) · Analyse (Ctrl+I)\n\n"
                 "Revue montage : Ctrl+M"
             )
             self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -156,22 +264,27 @@ class PanelGrid(QScrollArea):
             self._layout.addWidget(self._placeholder, 0, 0)
             return
 
+        n_rows = 0
         for index, placement in enumerate(self._order):
             widget = self._panels[placement.key]
             info = panel_info(placement.panel)
-            height = max(self._panel_height, info.preferred_height_px)
-            # Montage continu : hauteur proportionnelle au nombre de lignes canal×flux.
-            if placement.panel == "montage_continuous_raw":
-                height = max(height, self._panel_height)
-            widget.setMinimumHeight(height)  # type: ignore[attr-defined]
+            self._apply_panel_height(widget, placement)
+            widget.setMinimumWidth(0)  # type: ignore[attr-defined]
             widget.setParent(self._container)  # type: ignore[attr-defined]
             row, column = divmod(index, self._columns)
+            n_rows = max(n_rows, row + 1)
             span = self._columns if info.is_global and info.key.startswith("montage_") else 1
             span = min(span, self._columns)
             self._layout.addWidget(widget, row, column, 1, span)  # type: ignore[arg-type]
             widget.show()  # type: ignore[attr-defined]
         for column in range(self._columns):
             self._layout.setColumnStretch(column, 1)
+            self._layout.setColumnMinimumWidth(column, 0)
+        # Mode fill : chaque ligne partage également l’espace vertical.
+        for row in range(max(n_rows, 1)):
+            self._layout.setRowStretch(row, 1 if self._fill else 0)
+        if self._fill:
+            QTimer.singleShot(0, self._reflow_fill_heights)
 
     @property
     def placements(self) -> list[PanelPlacement]:
@@ -292,7 +405,8 @@ class ViewTabPage(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.grid = PanelGrid(self)
+        # Fenêtre principale : pan / home seulement (pas de zoom molette / outil Zoom).
+        self.grid = PanelGrid(self, allow_zoom=False)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)

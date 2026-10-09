@@ -9,10 +9,14 @@ from typing import Any, Sequence
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (
+    QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -21,8 +25,20 @@ from view_config import TimeRangeBar
 _BAR_COLORS = ("#16a34a", "#2563eb", "#ca8a04", "#dc2626", "#7c3aed")
 
 
+def _full_width_button(text: str, parent: QWidget) -> QPushButton:
+    """Bouton qui occupe la largeur dispo sans écraser son libellé."""
+    btn = QPushButton(text, parent)
+    btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    btn.setMinimumWidth(0)
+    return btn
+
+
 class RangeBarToolbar(QWidget):
-    """Boutons pour ajouter / supprimer / activer une plage et lancer le traitement."""
+    """Boutons pour ajouter / supprimer / activer une plage et lancer le traitement.
+
+    Empilé verticalement dans un GroupBox pour rester lisible dans le panneau
+    latéral étroit (Inspecter / Analyse) — plus de texte coupé.
+    """
 
     addRequested = Signal()
     addRelativeRequested = Signal()
@@ -32,47 +48,79 @@ class RangeBarToolbar(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._count_label = QLabel("0 plage(s)", self)
-        self._active = QSpinBox(self)
+        self.setMinimumWidth(0)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+        box = QGroupBox("Plages", self)
+        box_layout = QVBoxLayout(box)
+        box_layout.setContentsMargins(8, 10, 8, 8)
+        box_layout.setSpacing(6)
+
+        self._count_label = QLabel("0 plage(s)", box)
+        self._count_label.setObjectName("hintLabel")
+        self._active = QSpinBox(box)
         self._active.setMinimum(1)
         self._active.setMaximum(1)
         self._active.setValue(1)
+        self._active.setFixedWidth(52)
         self._active.setToolTip("Plage active (utilisée pour le zoom / traitement)")
         self._active.valueChanged.connect(lambda v: self.activeChanged.emit(int(v) - 1))
 
-        btn_add = QPushButton("+ Plage", self)
+        active_label = QLabel("Active", box)
+        active_label.setBuddy(self._active)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(6)
+        header.addWidget(self._count_label, 1)
+        header.addWidget(active_label)
+        header.addWidget(self._active)
+
+        btn_add = _full_width_button("+ Absolue", box)
         btn_add.setToolTip(
-            "Ajouter une paire de barres en temps absolu (sur la trace continue)"
+            "Ajouter une paire de barres déplaçables sur le graph temporel "
+            "(clic gauche sur un bord pour glisser)"
         )
         btn_add.clicked.connect(self.addRequested.emit)
-        btn_add_rel = QPushButton("+ Rel. stim", self)
+
+        btn_add_rel = _full_width_button("+ Rel. stim", box)
         btn_add_rel.setToolTip(
-            "Ajouter une plage [t₀, t₁] relative au début de stimulation "
-            "(mode moyenne / une stim)"
+            "Ajouter une plage [t₀, t₁] relative au début de stimulation — "
+            "barres éditables sur le graph (clic gauche)"
         )
         btn_add_rel.clicked.connect(self.addRelativeRequested.emit)
-        btn_remove = QPushButton("− Plage", self)
+
+        btn_remove = _full_width_button("− Supprimer", box)
         btn_remove.setToolTip("Supprimer la plage active")
         btn_remove.clicked.connect(self.removeRequested.emit)
-        btn_process = QPushButton("Appliquer les zooms", self)
+
+        btn_process = _full_width_button("Appliquer les zooms", box)
         btn_process.setObjectName("primaryButton")
         btn_process.setToolTip(
-            "Créer un zoom (et les graphs cochés) pour chaque plage — "
+            "Créer un zoom continuous et les graphs d’analyse cochés "
+            "(moyenne / une stimulation) pour chaque plage — "
             "ne relance pas le traitement F5"
         )
         btn_process.clicked.connect(self.processRequested.emit)
 
-        layout = QHBoxLayout(self)
+        actions = QGridLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setHorizontalSpacing(4)
+        actions.setVerticalSpacing(4)
+        actions.addWidget(btn_add, 0, 0)
+        actions.addWidget(btn_add_rel, 0, 1)
+        actions.addWidget(btn_remove, 1, 0, 1, 2)
+        actions.setColumnStretch(0, 1)
+        actions.setColumnStretch(1, 1)
+
+        box_layout.addLayout(header)
+        box_layout.addLayout(actions)
+        box_layout.addWidget(btn_process)
+
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-        layout.addWidget(self._count_label)
-        layout.addWidget(QLabel("Active", self))
-        layout.addWidget(self._active)
-        layout.addWidget(btn_add)
-        layout.addWidget(btn_add_rel)
-        layout.addWidget(btn_remove)
-        layout.addWidget(btn_process)
-        layout.addStretch(1)
+        layout.setSpacing(0)
+        layout.addWidget(box)
 
     def set_bar_count(self, count: int, active_index: int = 0) -> None:
         n = max(0, int(count))
@@ -108,6 +156,8 @@ class RangeBarController(QObject):
         self._drag: tuple[int, str] | None = None  # (bar_index, "t0"|"t1")
         self._t_min = 0.0
         self._t_max = 1.0
+        # Décalage affichage (sync trigger) : stockage en temps absolu, dessin en t−offset.
+        self._display_offset = 0.0
         self._pick_tol_frac = 0.012
         self._last_draw_s = 0.0
         self._motion_dirty = False
@@ -120,6 +170,11 @@ class RangeBarController(QObject):
     def active_index(self) -> int:
         return self._active_index
 
+    @property
+    def is_dragging(self) -> bool:
+        """True pendant un glisser de barre (évite de réattacher / casser le drag)."""
+        return self._drag is not None
+
     def set_active_index(self, index: int) -> None:
         if not self._bars:
             self._active_index = 0
@@ -127,7 +182,16 @@ class RangeBarController(QObject):
         self._active_index = max(0, min(len(self._bars) - 1, int(index)))
         self._redraw_artists()
 
+    def set_display_offset(self, offset_s: float) -> None:
+        """Soustraire ``offset_s`` à l’affichage (t=0 sur le trigger si sync)."""
+        new_offset = float(offset_s)
+        if abs(new_offset - self._display_offset) < 1e-15:
+            return
+        self._display_offset = new_offset
+        self._redraw_artists()
+
     def set_time_span(self, t_min: float, t_max: float) -> None:
+        """Bornes en temps absolu (fichier), indépendantes du décalage d’affichage."""
         self._t_min = float(t_min)
         self._t_max = float(t_max)
         if self._t_max <= self._t_min:
@@ -230,15 +294,17 @@ class RangeBarController(QObject):
                 except Exception:
                     pass
             return
+        off = float(self._display_offset)
         for index, bar in enumerate(self._bars):
             t0, t1 = bar.ordered()
+            t0_d, t1_d = float(t0) - off, float(t1) - off
             color = _BAR_COLORS[index % len(_BAR_COLORS)]
             alpha_span = 0.18 if index == self._active_index else 0.08
             lw = 1.6 if index == self._active_index else 1.0
             for ax in self._axes:
-                span = ax.axvspan(t0, t1, alpha=alpha_span, color=color, zorder=2.5)
-                left = ax.axvline(t0, color=color, linewidth=lw, linestyle="-", zorder=3)
-                right = ax.axvline(t1, color=color, linewidth=lw, linestyle="-", zorder=3)
+                span = ax.axvspan(t0_d, t1_d, alpha=alpha_span, color=color, zorder=2.5)
+                left = ax.axvline(t0_d, color=color, linewidth=lw, linestyle="-", zorder=3)
+                right = ax.axvline(t1_d, color=color, linewidth=lw, linestyle="-", zorder=3)
                 self._artists.extend([span, left, right])
         if self._canvas is not None:
             try:
@@ -246,20 +312,34 @@ class RangeBarController(QObject):
             except Exception:
                 pass
 
-    def _pick_edge(self, xdata: float) -> tuple[int, str] | None:
+    def _pick_edge(self, xdata_display: float) -> tuple[int, str] | None:
+        """``xdata_display`` est en coords d’axe (déjà décalées si sync trigger)."""
         if not self._bars:
             return None
         span = max(1e-9, self._t_max - self._t_min)
         tol = span * self._pick_tol_frac
+        off = float(self._display_offset)
         best: tuple[float, int, str] | None = None
         for index, bar in enumerate(self._bars):
             for edge, value in (("t0", float(bar.t0_s)), ("t1", float(bar.t1_s))):
-                dist = abs(xdata - value)
+                dist = abs(xdata_display - (value - off))
                 if dist <= tol and (best is None or dist < best[0]):
                     best = (dist, index, edge)
         if best is None:
             return None
         return best[1], best[2]
+
+    def _suspend_nav_toolbar(self) -> None:
+        """Annuler un pan/zoom toolbar en cours (clic gauche = plages, pas la vue)."""
+        toolbar = getattr(self._canvas, "toolbar", None) if self._canvas else None
+        if toolbar is None:
+            return
+        for attr in ("_pan_info", "_zoom_info"):
+            if hasattr(toolbar, attr):
+                try:
+                    setattr(toolbar, attr, None)
+                except Exception:
+                    pass
 
     def _on_press(self, event: Any) -> None:
         if event.button != 1 or event.xdata is None or event.inaxes is None:
@@ -271,6 +351,8 @@ class RangeBarController(QObject):
             return
         self._drag = hit
         self._active_index = hit[0]
+        # Si la toolbar est en mode Pan/Zoom, ne pas laisser le glisser déplacer la vue.
+        self._suspend_nav_toolbar()
 
     def _on_release(self, event: Any) -> None:
         del event
@@ -285,25 +367,28 @@ class RangeBarController(QObject):
     def _on_motion(self, event: Any) -> None:
         if self._drag is None or event.xdata is None:
             return
+        # Empêcher le pan toolbar de reprendre pendant le glisser.
+        self._suspend_nav_toolbar()
         index, edge = self._drag
         if not (0 <= index < len(self._bars)):
             return
-        x = float(event.xdata)
-        x = max(self._t_min, min(self._t_max, x))
+        # Axe = affichage ; stockage = temps absolu.
+        x_abs = float(event.xdata) + float(self._display_offset)
+        x_abs = max(self._t_min, min(self._t_max, x_abs))
         bar = self._bars[index]
         if edge == "t0":
             # Empêcher croisement : laisser un epsilon.
             eps = max(1e-4, (self._t_max - self._t_min) * 1e-4)
             other = float(bar.t1_s)
-            if x >= other:
-                x = other - eps
-            self._bars[index] = bar.with_bounds(x, other)
+            if x_abs >= other:
+                x_abs = other - eps
+            self._bars[index] = bar.with_bounds(x_abs, other)
         else:
             eps = max(1e-4, (self._t_max - self._t_min) * 1e-4)
             other = float(bar.t0_s)
-            if x <= other:
-                x = other + eps
-            self._bars[index] = bar.with_bounds(other, x)
+            if x_abs <= other:
+                x_abs = other + eps
+            self._bars[index] = bar.with_bounds(other, x_abs)
         now = time.perf_counter()
         if now - self._last_draw_s < 0.016:
             self._motion_dirty = True
@@ -311,3 +396,5 @@ class RangeBarController(QObject):
         self._last_draw_s = now
         self._motion_dirty = False
         self._redraw_artists()
+        # Actualiser les fenêtres de zoom en direct (debouncé côté parent).
+        self.barsChanged.emit(self.bars)

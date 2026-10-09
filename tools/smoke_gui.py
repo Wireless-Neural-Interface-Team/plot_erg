@@ -22,7 +22,7 @@ sys.path.insert(0, str(_ROOT))
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from gui.launcher import _default_gui_kwargs  # noqa: E402
+from gui.defaults import app_defaults_from_config  # noqa: E402
 from gui.main_window import ViewerWindow  # noqa: E402
 from gui.widgets.panel_grid import ViewTabPage  # noqa: E402
 from gui.widgets.recordings_panel import RecordingEntry  # noqa: E402
@@ -31,8 +31,13 @@ from panel_registry import PANEL_CATALOG  # noqa: E402
 from view_config import PanelPlacement, ViewTab, WorkspaceLayout  # noqa: E402
 
 
-# The synthetic dataset has no companion impedance CSV, so these cannot draw.
-_EXPECTED_UNAVAILABLE = {"impedance", "summary_impedance"}
+# Synthetic dataset: pas de CSV d’impédance ni de flux continus (seulement essais).
+_EXPECTED_UNAVAILABLE = {
+    "impedance",
+    "summary_impedance",
+    "full_recording",
+    "montage_continuous_raw",
+}
 
 
 def _write_probe_json(directory: Path, channel_names: list[str]) -> Path:
@@ -101,7 +106,7 @@ def _scroll_through(app: QApplication, page: ViewTabPage, timeout_s: float = 300
 
 def main() -> int:
     app = QApplication.instance() or QApplication([])
-    window = ViewerWindow(_default_gui_kwargs())
+    window = ViewerWindow(app_defaults_from_config())
     window.show()
     app.processEvents()
 
@@ -186,37 +191,27 @@ def main() -> int:
         redraw_s = _wait_for_render(app, page)
         print(f"channel switch redraw: {redraw_s:.2f} s")
 
-        # Opening a view window applies local display parameters (not a global dock).
-        from gui.widgets.view_session_window import ViewSessionWindow
-        from view_config import PanelPlacement
+        # Aperçu canal embarqué : paramètres d’affichage locaux.
+        from dataclasses import replace as dc_replace
+        from gui.widgets.channel_analysis_window import ChannelAnalysisWindow
+        from view_config import AnalysisSettings
 
         channel = window.channel_panel.current_channel or mapped[0]
         resolved = recordings[0].channel_index(channel)
         assert resolved is not None
-        seed = window._seed_settings_for_window()
-        from dataclasses import replace as dc_replace
-
-        seed = dc_replace(seed, psth_bin_window_s=0.1)
-        session = ViewSessionWindow(
-            title="Smoke",
-            placements=(PanelPlacement("analysis_psth", "full"),),
+        seed = dc_replace(window._seed_settings_for_window(), psth_bin_window_s=0.1)
+        inspector = ChannelAnalysisWindow(
             channel_name=channel,
             channel_index=int(resolved),
+            analysis=AnalysisSettings(show_raw=True),
             base_settings=seed,
             parent=window,
+            embedded=False,
         )
-        session.set_request_factory(window._make_session_request)
-        session.closed.connect(window._on_view_session_closed)
-        window._view_sessions[session.window_id] = session
-        session.show()
+        assert abs(inspector.settings.psth_bin_window_s - 0.1) < 1e-9
+        print("local channel-inspector parameter OK")
+        inspector.close()
         app.processEvents()
-        session.redraw()
-        app.processEvents()
-        assert abs(session.local_settings().psth_bin_window_s - 0.1) < 1e-9
-        print("local view-window parameter OK")
-        session.close()
-        app.processEvents()
-        window._view_sessions.pop(session.window_id, None)
 
         # The PDF path must still receive a coherent configuration.
         from gui.defaults import build_config_from_defaults
@@ -228,22 +223,40 @@ def main() -> int:
         assert config.spike_threshold_uv < 0, "negative polarity must give a signed threshold"
         assert abs(config.psth_bin_window_s - 0.025) < 1e-9 or abs(config.psth_bin_window_s - 0.05) < 1e-9 or abs(config.psth_bin_window_s - 0.1) < 1e-9
         assert window._workspace.zoom_mode() in {"none", "onset", "trigger_end", "both"}
-        assert display.section_panels("full").any_enabled()
+        # Catalogue all-panels : au moins une section PDF doit avoir des panneaux.
+        assert (
+            display.section_panels("full").any_enabled()
+            or display.section_panels("zoom_onset").any_enabled()
+            or display.mea_layout
+            or any(
+                p.panel == "full_recording"
+                for tab in window._workspace.tabs
+                for p in tab.panels
+            )
+        )
         print(f"PDF config OK — zoom mode {window._workspace.zoom_mode()}")
 
-        # Realistic case: the default views, which is what a user actually sees.
+        # Vue par défaut (aperçu canal embarqué) — ce que voit vraiment l’utilisateur.
         window.reset_views()
         app.processEvents()
-        for index in range(window.tabs.count()):
-            window.tabs.setCurrentIndex(index)
-            default_page = window.tabs.currentWidget()
-            assert isinstance(default_page, ViewTabPage)
-            seconds = _wait_for_render(app, default_page)
-            print(
-                f"default view “{window.tabs.tabText(index)}”: "
-                f"{default_page.grid._drawn}/{default_page.grid.panel_count} panel(s) "
-                f"in {seconds:.2f} s"
-            )
+        window._sync_channel_inspect(redraw=True)
+        app.processEvents()
+        inspect = window._channel_inspect
+        assert inspect is not None, "aperçu canal embarqué attendu après reset_views"
+        # Attendre le rendu de la grille embarquée.
+        deadline = time.monotonic() + 180.0
+        while time.monotonic() < deadline:
+            app.processEvents()
+            if inspect.grid._drawn >= 1 or inspect.grid.panel_count == 0:
+                if not getattr(inspect.grid, "_pending", None):
+                    break
+            time.sleep(0.05)
+        print(
+            f"default channel preview: "
+            f"{inspect.grid._drawn}/{inspect.grid.panel_count} panel(s) "
+            f"channel={inspect.channel_name}"
+        )
+        assert inspect.grid.panel_count >= 1
 
         window.close()
         app.processEvents()

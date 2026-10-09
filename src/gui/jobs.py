@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import contextlib
 import threading
+import time
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from PySide6.QtCore import QObject, QTimer, QThread, Signal
+
+# Pause between channel jobs so the Qt event loop can reclaim the GIL.
+_GUI_YIELD_S = 0.008
 
 
 class _SignalStream:
@@ -80,6 +84,7 @@ class BuildWorker(QThread):
         import core
         from dataset_builder import build_recording
 
+        self.setPriority(QThread.Priority.LowPriority)
         stream = _SignalStream(self.logged.emit)
         ok = True
         with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
@@ -107,6 +112,8 @@ class BuildWorker(QThread):
                         continue
                     self.logged.emit(report.summary())
                     self.recording_ready.emit(request.row_id, recording, report)
+                    # Let the GUI process events between recordings.
+                    time.sleep(_GUI_YIELD_S)
             stream.flush()
         self.finished_all.emit(ok and not self._cancel.is_set())
 
@@ -266,11 +273,13 @@ class ChannelEnsureWorker(QThread):
 
     def run(self) -> None:  # noqa: D102 - QThread entry point
         import core
-        from dataset_builder import ensure_channels
+        from dataset_builder import ProgressEvent, ensure_channels
 
+        self.setPriority(QThread.Priority.LowPriority)
         stream = _SignalStream(self.logged.emit)
         ok = True
         idle_rounds = 0
+        done = 0
         with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
             with core.analysis_cancel_scope(self._cancel):
                 while not self._cancel.is_set():
@@ -288,13 +297,40 @@ class ChannelEnsureWorker(QThread):
                         continue
                     idle_rounds = 0
                     high, low = self.pending_counts()
+                    # Prefetch only → yield more aggressively to keep the UI snappy.
+                    if high == 0:
+                        self.setPriority(QThread.Priority.IdlePriority)
+                    else:
+                        self.setPriority(QThread.Priority.LowPriority)
                     self.queue_changed.emit(high, low)
+                    remaining_after = high + low
+                    total = max(1, done + 1 + remaining_after)
+
+                    def _progress(event: object, *, _done: int = done, _total: int = total) -> None:
+                        # Fraction globale : évite le reset 0 % à chaque canal (clignotement).
+                        stage = float(getattr(event, "stage_fraction", 0.0) or 0.0)
+                        overall = (_done + max(0.0, min(1.0, stage))) / _total
+                        self.progressed.emit(
+                            ProgressEvent(
+                                recording=getattr(event, "recording", job.label),
+                                stage=getattr(event, "stage", "channel"),
+                                stage_label=getattr(
+                                    event, "stage_label", "Computing selected channels"
+                                ),
+                                stage_fraction=stage,
+                                overall_fraction=overall,
+                                message=getattr(event, "message", "") or "",
+                                elapsed_s=float(getattr(event, "elapsed_s", 0.0) or 0.0),
+                                cached=bool(getattr(event, "cached", False)),
+                            )
+                        )
+
                     try:
                         computed = ensure_channels(
                             job.recording,
                             [job.channel],
                             job.config,
-                            progress=self.progressed.emit,
+                            progress=_progress,
                             force=job.force,
                             need_means=job.need_means,
                             need_rms=job.need_rms,
@@ -309,15 +345,18 @@ class ChannelEnsureWorker(QThread):
                         ok = False
                         self.logged.emit(traceback.format_exc(limit=4))
                         self.failed.emit(str(exc))
-                        continue
-                    if computed:
-                        name = (
-                            job.recording.channel_names[job.channel]
-                            if 0 <= job.channel < len(job.recording.channel_names)
-                            else str(job.channel)
-                        )
-                        self.logged.emit(f"{job.label}: computed {name}")
-                    self.succeeded.emit(job.recording, computed or [job.channel])
+                    else:
+                        done += 1
+                        if computed:
+                            name = (
+                                job.recording.channel_names[job.channel]
+                                if 0 <= job.channel < len(job.recording.channel_names)
+                                else str(job.channel)
+                            )
+                            self.logged.emit(f"{job.label}: computed {name}")
+                        self.succeeded.emit(job.recording, computed or [job.channel])
+                    # Yield the GIL so clicks / redraws are not starved.
+                    time.sleep(_GUI_YIELD_S if high > 0 else _GUI_YIELD_S * 2)
             stream.flush()
         high, low = self.pending_counts()
         self.queue_changed.emit(high, low)
@@ -342,6 +381,7 @@ class TaskWorker(QThread):
     def run(self) -> None:  # noqa: D102 - QThread entry point
         import core
 
+        self.setPriority(QThread.Priority.LowPriority)
         stream = _SignalStream(self.logged.emit)
         with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
             with core.analysis_cancel_scope(self._cancel):

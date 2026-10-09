@@ -29,9 +29,10 @@ without the original `.rhs` file.
 
 ### Display
 
+- `src/panel_catalog.py` — single catalogue of panel keys, labels and metadata
 - `src/view_config.py` — live display settings: legends, panel style, views and tabs
-- `src/panel_registry.py` — the catalogue of panels and how each one is drawn
-- `src/display_config.py` — panel visibility and legend settings for the PDF
+- `src/panel_registry.py` — how each panel is drawn on screen
+- `src/display_config.py` — PDF section visibility and recording styles
 - `src/gui/` — the Qt viewer (PySide6): `main_window.py`, `jobs.py`, `widgets/`
 - `src/cli.py` — command-line entry point
 - `run_gui.py` — GUI launcher
@@ -104,6 +105,13 @@ changing the filter reuses the cached wideband read. The cache lives in
 `.erg_cache/` next to the recording (or in the folder set in *Processing → Cache /
 work folder*) and can be inspected and trimmed from *Process → Cache manager*.
 
+Filtered HP/LP (and notch) channels are also persisted under
+`.erg_cache/_filter_<hash>/` as float32 memmaps, filled channel-by-channel on
+first access. That directory can grow to roughly
+`8 bytes × n_samples × n_channels` (HP + LP); it is invalidated automatically when
+filter settings change. An in-RAM LRU (32 channels) sits in front of the disk
+cache so switching between recently viewed MEA contacts stays responsive.
+
 *File → Export processed dataset* writes a self-contained `.ergproc` folder
 (optionally zipped for transport). Reopen it with *File → Open processed dataset*:
 every panel works, on any machine, without the `.rhs` file.
@@ -120,8 +128,10 @@ python src/cli.py "session01.rhs" --save-dir "plots"
 - `--threshold`, `--pre`, `--post`
 - `--zoom-mode`: `none`, `onset`, `trigger_end`, `both`
 - `--zoom-onset-t0-s` / `--zoom-onset-t1-s`, `--zoom-end-t0-s` / `--zoom-end-t1-s`
-- `--intan-filter-type`, `--intan-filter-order`, `--intan-filter-cutoff-hz`
-  (high-pass and low-pass are always both applied, separately)
+- `--intan-hp-filter-type`, `--intan-hp-filter-order`, `--intan-hp-filter-cutoff-hz`
+  (HIGH / passe-haut)
+- `--intan-lp-filter-type`, `--intan-lp-filter-order`, `--intan-lp-filter-cutoff-hz`
+  (LOW / passe-bas ; paramètres indépendants du HIGH)
 - `--spike-threshold-mode`, `--psth-bin-window-s`, `--rms-window-s`
 - `--spike-overlay-pre-ms`, `--spike-overlay-post-ms`
 
@@ -135,4 +145,5 @@ The scripts in `tools/` run without any recording, on synthetic data:
 python tools/smoke_render.py    # draw every panel of the catalogue
 python tools/smoke_dataset.py   # write, reopen and compare a processed dataset
 python tools/smoke_gui.py       # build the window offscreen and redraw every panel
+python tools/smoke_perf.py      # timings: means, incremental redraw, filter disk cache
 ```

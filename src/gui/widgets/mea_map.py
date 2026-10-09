@@ -18,6 +18,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QFontMetricsF,
+    QLinearGradient,
     QPainter,
     QPaintEvent,
     QPen,
@@ -151,7 +152,7 @@ class MeaMapWidget(QWidget):
     """Electrode map that emits the channel name of the contact being clicked."""
 
     channelSelected = Signal(str)
-    channelActivated = Signal(str)  # double-clic → inspecter le canal
+    channelActivated = Signal(str)  # double-clic → Analyse le canal
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -168,7 +169,7 @@ class MeaMapWidget(QWidget):
         self._cluster_bounds_um: list[tuple[float, float, float, float]] = []
         self._contact_radius_px = 8.0
         self._label_fit_cache: dict[tuple[int, int], tuple[str, float] | None] = {}
-        self.setMinimumHeight(260)
+        self.setMinimumHeight(280)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -261,11 +262,19 @@ class MeaMapWidget(QWidget):
         # Clusters séparés par > ~2.8 pas locaux.
         self._cluster_bounds_um = _cluster_bounds(self._contacts, self._pitch_um * 2.8)
 
+    def _legend_height(self) -> float:
+        """Espace réservé en bas pour la légende couleurs / nuances."""
+        if not self._contacts:
+            return 0.0
+        # Gradient + valeurs + pastilles d’état.
+        return 52.0 if self._metric_label else 28.0
+
     def _plot_rect(self) -> QRectF:
         margin = 8.0
+        legend_h = self._legend_height()
         rect = QRectF(self.rect()).adjusted(margin, margin, -margin, -margin)
-        if self._metric_label:
-            rect.setBottom(rect.bottom() - 18.0)
+        if legend_h > 0.0:
+            rect.setBottom(rect.bottom() - legend_h)
         x_min, x_max, y_min, y_max = self._bounds_um
         span_x = max(x_max - x_min, 1e-6)
         span_y = max(y_max - y_min, 1e-6)
@@ -453,20 +462,103 @@ class MeaMapWidget(QWidget):
             painter.setPen(QPen(_HIDDEN_LABEL if is_hidden else _LABEL_COLOR))
             painter.drawText(text_rect, int(Qt.AlignmentFlag.AlignCenter), label)
 
+        self._draw_legend(painter)
+        painter.end()
+
+    def _draw_legend(self, painter: QPainter) -> None:
+        """Légende : nuances de la métrique + signification des couleurs d’état."""
+        if not self._contacts:
+            return
+        legend_h = self._legend_height()
+        if legend_h <= 0.0:
+            return
+
+        left = 8.0
+        right = float(self.width()) - 8.0
+        width = max(right - left, 1.0)
+        top = float(self.height()) - legend_h
+        text_color = QColor("#475569")
+        legend_font = QFont(self.font())
+        legend_font.setPointSizeF(max(7.5, min(9.0, legend_font.pointSizeF())))
+        painter.setFont(legend_font)
+        metrics = QFontMetricsF(legend_font)
+        y = top + 2.0
+
         if self._metric_label:
-            painter.setPen(QPen(QColor("#475569")))
-            legend_font = QFont(self.font())
-            legend_font.setPointSizeF(max(8.0, legend_font.pointSizeF()))
-            painter.setFont(legend_font)
-            legend_rect = QRectF(
-                6.0, float(self.height()) - 18.0, float(self.width()) - 12.0, 16.0
+            low, high = self._metric_range
+            title = self._metric_label
+            painter.setPen(QPen(text_color))
+            painter.drawText(
+                QRectF(left, y, width, metrics.height()),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                title,
+            )
+            y += metrics.height() + 2.0
+            bar_h = 10.0
+            bar_rect = QRectF(left, y, width, bar_h)
+            gradient = QLinearGradient(bar_rect.topLeft(), bar_rect.topRight())
+            gradient.setColorAt(0.0, _METRIC_LOW)
+            gradient.setColorAt(1.0, _METRIC_HIGH)
+            painter.setBrush(gradient)
+            painter.setPen(QPen(QColor("#94a3b8"), 1.0))
+            painter.drawRoundedRect(bar_rect, 3.0, 3.0)
+            y += bar_h + 1.0
+            painter.setPen(QPen(text_color))
+            value_h = metrics.height()
+            painter.drawText(
+                QRectF(left, y, width * 0.5, value_h),
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                f"{low:.2f}",
             )
             painter.drawText(
-                legend_rect,
-                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
-                f"{self._metric_label}: {low:.2f} → {high:.2f}",
+                QRectF(left + width * 0.5, y, width * 0.5, value_h),
+                int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                f"{high:.2f}",
             )
-        painter.end()
+            y += value_h + 3.0
+        else:
+            y += 4.0
+
+        # Pastilles d’état (toujours visibles quand une sonde est chargée).
+        swatch_r = 4.5
+        gap = 10.0
+        items: list[tuple[QColor, QColor, float, str]] = []
+        if self._metric_label:
+            items.append((_METRIC_LOW, _MAPPED_EDGE, 1.1, "faible"))
+            items.append((_METRIC_HIGH, _MAPPED_EDGE, 1.1, "élevé"))
+        else:
+            items.append((_MAPPED_FILL, _MAPPED_EDGE, 1.1, "mappé"))
+        items.extend(
+            [
+                (_UNMAPPED_FILL, _UNMAPPED_EDGE, 1.1, "non mappé"),
+                (_HIDDEN_FILL, _HIDDEN_EDGE, 1.1, "masqué"),
+                (_MAPPED_FILL, _SELECTED_EDGE, 2.2, "sélectionné"),
+            ]
+        )
+
+        x = left + swatch_r
+        baseline = y + max(swatch_r, metrics.height() / 2.0)
+        for fill, edge, edge_w, label in items:
+            text_w = metrics.horizontalAdvance(label)
+            needed = swatch_r * 2.0 + 4.0 + text_w + gap
+            if x + needed - swatch_r > right and x > left + swatch_r + 1.0:
+                break
+            painter.setBrush(fill)
+            painter.setPen(QPen(edge, edge_w))
+            painter.drawEllipse(QPointF(x, baseline), swatch_r, swatch_r)
+            painter.setPen(QPen(text_color))
+            text_rect = QRectF(
+                x + swatch_r + 4.0,
+                baseline - metrics.height() / 2.0,
+                text_w + 2.0,
+                metrics.height(),
+            )
+            painter.drawText(
+                text_rect,
+                int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter),
+                label,
+            )
+            x = text_rect.right() + gap + swatch_r
 
     # ----------------------------------------------------------------- events
 
@@ -537,4 +629,5 @@ class MeaMapWidget(QWidget):
     def sizeHint(self):  # noqa: D102
         from PySide6.QtCore import QSize
 
-        return QSize(360, 300)
+        # Compact : un sizeHint trop large force le dock Session et mange la marge droite.
+        return QSize(220, 220)

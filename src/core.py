@@ -505,6 +505,18 @@ def resolve_channel_workers(channel_workers: int | None, n_channels: int) -> int
     return max(1, min(int(n_channels), int(MAX_PARALLEL_CHANNELS), n_cpu))
 
 
+def gui_channel_workers(channel_workers: int | None, n_channels: int = MAX_PARALLEL_CHANNELS) -> int:
+    """Cap parallelism so the Qt event loop keeps a free core.
+
+    Heavy ThreadPoolExecutor work otherwise saturates every CPU and starves the
+    GUI thread via the GIL, even when computation runs in a QThread.
+    """
+    n_cpu = int(os.cpu_count() or 2)
+    budget = max(1, min(4, n_cpu - 1))
+    resolved = resolve_channel_workers(channel_workers, max(1, int(n_channels)))
+    return max(1, min(resolved, budget))
+
+
 def intan_memmap_cache_valid(
     work_dir: Path,
     intan_dsp: IntanDspSettings,
@@ -628,66 +640,17 @@ def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> In
             config.spike_threshold_uv,
             config.spike_threshold_polarity,
         ),
-        filter_order=int(config.intan_filter_order),
-        filter_type=config.intan_filter_type,  # type: ignore[arg-type]
-        filter_cutoff_hz=float(config.intan_filter_cutoff_hz),
+        hp_filter_order=int(config.intan_hp_filter_order),
+        hp_filter_type=config.intan_hp_filter_type,  # type: ignore[arg-type]
+        hp_filter_cutoff_hz=float(config.intan_hp_filter_cutoff_hz),
+        lp_filter_order=int(config.intan_lp_filter_order),
+        lp_filter_type=config.intan_lp_filter_type,  # type: ignore[arg-type]
+        lp_filter_cutoff_hz=float(config.intan_lp_filter_cutoff_hz),
         artifact_threshold_uv=float(config.intan_artifact_threshold_uv),
         artifact_suppression_enabled=bool(config.intan_artifact_suppression_enabled),
         rms_window_s=float(config.rms_window_s),
         software_notch_hz=float(getattr(config, "software_notch_hz", 0) or 0),
     )
-
-
-def persist_intan_high_stack(
-    amplifier_2d: np.ndarray | None,
-    data: dict[str, Any] | None,
-    config: AnalysisConfig | None,
-    work_dir: Path,
-    *,
-    amplifier_memmap: np.memmap | None = None,
-    intan_dsp: IntanDspSettings | None = None,
-    channel_workers: int | None = None,
-) -> tuple[Path, Path, Path, IntanDspSettings]:
-    """Write wideband + HP + LP Intan stacks under work_dir (channel batches)."""
-    if intan_dsp is None:
-        if data is None or config is None:
-            raise ValueError("data and config are required when intan_dsp is not provided.")
-        intan_dsp = build_intan_dsp_settings(data, config)
-    amp_path = work_dir / "amplifier_raw.npy"
-    high_path = work_dir / "high_intan.npy"
-    low_path = work_dir / "low_intan.npy"
-    intan_dsp.save_json(work_dir / "intan_dsp.json")
-    check_analysis_cancelled()
-
-    n_ch, n_samp = 0, 0
-    if amplifier_memmap is not None:
-        n_ch, n_samp = int(amplifier_memmap.shape[0]), int(amplifier_memmap.shape[1])
-    elif amplifier_2d is not None:
-        n_ch, n_samp = int(np.asarray(amplifier_2d).shape[0]), int(np.asarray(amplifier_2d).shape[1])
-
-    workers = channel_workers
-    if workers is None and config is not None:
-        workers = config.channel_workers
-
-    if amplifier_2d is not None:
-        persist_amp_and_filtered_stacks(
-            work_dir,
-            intan_dsp,
-            (n_ch, n_samp),
-            amplifier_2d=amplifier_2d,
-            channel_workers=workers,
-        )
-    elif amplifier_memmap is not None:
-        persist_amp_and_filtered_stacks(
-            work_dir,
-            intan_dsp,
-            (n_ch, n_samp),
-            amplifier_memmap=amplifier_memmap,
-            channel_workers=workers,
-        )
-    else:
-        raise ValueError("amplifier_2d or amplifier_memmap is required.")
-    return amp_path, high_path, low_path, intan_dsp
 
 
 def extract_triggered_windows(

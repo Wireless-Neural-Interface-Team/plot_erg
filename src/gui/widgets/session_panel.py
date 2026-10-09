@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtWidgets import (
     QFileDialog,
     QGroupBox,
@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -37,6 +38,10 @@ class SessionPanel(QWidget):
         self.recordings = recordings
         self.channels = channels
         self._updating_path = False
+        # Ignored : la table Enregistrements a un sizeHint énorme (~900 px) qui
+        # sinon force le dock Session et écrase Paramètres au moindre resize.
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
+        self.setMinimumWidth(200)
 
         self.tabs = QTabWidget(self)
         self.tabs.setDocumentMode(True)
@@ -53,7 +58,7 @@ class SessionPanel(QWidget):
         self.map_box.setObjectName("meaMapBox")
         self.map_box.setMinimumHeight(280)
         self.map_box.setToolTip(
-            "Carte des électrodes : clic = sélectionner, double-clic = inspecter."
+            "Carte des électrodes : clic = aperçu, double-clic = moyenne."
         )
 
         self._help = QLabel(
@@ -106,6 +111,19 @@ class SessionPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(splitter)
+
+        self._help.setMinimumWidth(0)
+        self._help.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+
+    def sizeHint(self) -> QSize:  # noqa: D102
+        if self.isVisible() and self.width() > 0:
+            return QSize(self.width(), max(200, self.height()))
+        return QSize(320, 640)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: D102
+        return QSize(200, 200)
 
     # ------------------------------------------------------------------- API
 

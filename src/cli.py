@@ -239,22 +239,59 @@ def parse_args() -> argparse.Namespace:
         help="RMS computation window (s) for moving-RMS profile.",
     )
     parser.add_argument(
+        "--intan-hp-filter-order",
+        type=int,
+        default=defaults.intan_hp_filter_order,
+        help="HIGH (passe-haut) filter order 1–8 (default: 2).",
+    )
+    parser.add_argument(
+        "--intan-hp-filter-type",
+        choices=("bessel", "butterworth"),
+        default=defaults.intan_hp_filter_type,
+        help="HIGH filter prototype: bessel or butterworth (default: bessel).",
+    )
+    parser.add_argument(
+        "--intan-hp-filter-cutoff-hz",
+        type=float,
+        default=defaults.intan_hp_filter_cutoff_hz,
+        help="HIGH cutoff in Hz (default: 250).",
+    )
+    parser.add_argument(
+        "--intan-lp-filter-order",
+        type=int,
+        default=defaults.intan_lp_filter_order,
+        help="LOW (passe-bas) filter order 1–8 (default: 2).",
+    )
+    parser.add_argument(
+        "--intan-lp-filter-type",
+        choices=("bessel", "butterworth"),
+        default=defaults.intan_lp_filter_type,
+        help="LOW filter prototype: bessel or butterworth (default: bessel).",
+    )
+    parser.add_argument(
+        "--intan-lp-filter-cutoff-hz",
+        type=float,
+        default=defaults.intan_lp_filter_cutoff_hz,
+        help="LOW cutoff in Hz (default: 250).",
+    )
+    # Legacy aliases: set BOTH HP and LP when provided.
+    parser.add_argument(
         "--intan-filter-order",
         type=int,
-        default=defaults.intan_filter_order,
-        help="Intan software filter order 1–8 for both HP and LP (default: 2).",
+        default=None,
+        help="Deprecated: sets both HP and LP order (use --intan-hp/lp-filter-order).",
     )
     parser.add_argument(
         "--intan-filter-type",
         choices=("bessel", "butterworth"),
-        default=defaults.intan_filter_type,
-        help="Intan filter prototype for both HP and LP: bessel or butterworth (default: bessel).",
+        default=None,
+        help="Deprecated: sets both HP and LP type (use --intan-hp/lp-filter-type).",
     )
     parser.add_argument(
         "--intan-filter-cutoff-hz",
         type=float,
-        default=defaults.intan_filter_cutoff_hz,
-        help="Intan HP and LP cutoff in Hz (default: 250).",
+        default=None,
+        help="Deprecated: sets both HP and LP cutoff (use --intan-hp/lp-filter-cutoff-hz).",
     )
     parser.add_argument(
         "--software-notch-hz",
@@ -342,8 +379,10 @@ def run(config: AnalysisConfig) -> None:
         print("Segmentation: equal sections with imaginary stimulation window")
     print(
         "Mean traces in PDF: raw + separate Intan HP and LP "
-        f"({config.intan_filter_type} @ {config.intan_filter_cutoff_hz:g} Hz, "
-        f"order {config.intan_filter_order})"
+        f"(HP {config.intan_hp_filter_type} @ {config.intan_hp_filter_cutoff_hz:g} Hz "
+        f"order {config.intan_hp_filter_order}; "
+        f"LP {config.intan_lp_filter_type} @ {config.intan_lp_filter_cutoff_hz:g} Hz "
+        f"order {config.intan_lp_filter_order})"
     )
     print(f"PDF written: {pdf_path}")
     print(f"Compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
@@ -377,8 +416,10 @@ def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
     print(f"A/B PDF render time: {stats['t_render_s']:.2f} s")
     print(
         "Mean traces in PDF: raw + separate Intan HP and LP "
-        f"({config_a.intan_filter_type} @ {config_a.intan_filter_cutoff_hz:g} Hz, "
-        f"order {config_a.intan_filter_order})"
+        f"(HP {config_a.intan_hp_filter_type} @ {config_a.intan_hp_filter_cutoff_hz:g} Hz "
+        f"order {config_a.intan_hp_filter_order}; "
+        f"LP {config_a.intan_lp_filter_type} @ {config_a.intan_lp_filter_cutoff_hz:g} Hz "
+        f"order {config_a.intan_lp_filter_order})"
     )
     print(f"Comparison PDF written: {pdf_path}")
     print(f"Total time (comparison + PDF): {stats['t_total_s']:.2f} s")
@@ -651,9 +692,36 @@ def main() -> None:
         zoom_onset_t1_s=args.zoom_onset_t1_s,
         zoom_end_t0_s=args.zoom_end_t0_s,
         zoom_end_t1_s=args.zoom_end_t1_s,
-        intan_filter_order=args.intan_filter_order,
-        intan_filter_type=args.intan_filter_type,
-        intan_filter_cutoff_hz=args.intan_filter_cutoff_hz,
+        intan_hp_filter_order=int(
+            args.intan_filter_order
+            if args.intan_filter_order is not None
+            else args.intan_hp_filter_order
+        ),
+        intan_hp_filter_type=(
+            args.intan_filter_type
+            if args.intan_filter_type is not None
+            else args.intan_hp_filter_type
+        ),
+        intan_hp_filter_cutoff_hz=float(
+            args.intan_filter_cutoff_hz
+            if args.intan_filter_cutoff_hz is not None
+            else args.intan_hp_filter_cutoff_hz
+        ),
+        intan_lp_filter_order=int(
+            args.intan_filter_order
+            if args.intan_filter_order is not None
+            else args.intan_lp_filter_order
+        ),
+        intan_lp_filter_type=(
+            args.intan_filter_type
+            if args.intan_filter_type is not None
+            else args.intan_lp_filter_type
+        ),
+        intan_lp_filter_cutoff_hz=float(
+            args.intan_filter_cutoff_hz
+            if args.intan_filter_cutoff_hz is not None
+            else args.intan_lp_filter_cutoff_hz
+        ),
         software_notch_hz=int(args.software_notch_hz),  # type: ignore[arg-type]
         work_dir=args.work_dir,
         comparison_workers=args.workers,
@@ -687,12 +755,16 @@ def main() -> None:
             file=sys.stderr,
         )
         sys.exit(2)
-    if config.intan_filter_order < 1 or config.intan_filter_order > 8:
-        print("Error: --intan-filter-order must be between 1 and 8.", file=sys.stderr)
-        sys.exit(2)
-    if config.intan_filter_cutoff_hz <= 0:
-        print("Error: --intan-filter-cutoff-hz must be > 0.", file=sys.stderr)
-        sys.exit(2)
+    for label, order, cutoff in (
+        ("HP", config.intan_hp_filter_order, config.intan_hp_filter_cutoff_hz),
+        ("LP", config.intan_lp_filter_order, config.intan_lp_filter_cutoff_hz),
+    ):
+        if order < 1 or order > 8:
+            print(f"Error: {label} filter order must be between 1 and 8.", file=sys.stderr)
+            sys.exit(2)
+        if cutoff <= 0:
+            print(f"Error: {label} filter cutoff must be > 0.", file=sys.stderr)
+            sys.exit(2)
     if config.spike_threshold_mode == "rms_multiple" and config.spike_threshold_rms_multiplier <= 0:
         print(
             "Error: --spike-threshold-rms-multiplier must be > 0 when --spike-threshold-mode=rms_multiple.",

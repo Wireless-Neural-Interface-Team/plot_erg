@@ -47,9 +47,12 @@ def file_fingerprint(path: Path) -> dict[str, Any]:
 
 def filter_params(config: AnalysisConfig) -> dict[str, Any]:
     return {
-        "order": int(config.intan_filter_order),
-        "type": str(config.intan_filter_type),
-        "cutoff_hz": float(config.intan_filter_cutoff_hz),
+        "hp_order": int(config.intan_hp_filter_order),
+        "hp_type": str(config.intan_hp_filter_type),
+        "hp_cutoff_hz": float(config.intan_hp_filter_cutoff_hz),
+        "lp_order": int(config.intan_lp_filter_order),
+        "lp_type": str(config.intan_lp_filter_type),
+        "lp_cutoff_hz": float(config.intan_lp_filter_cutoff_hz),
         "software_notch_hz": int(getattr(config, "software_notch_hz", 0) or 0),
     }
 
@@ -181,6 +184,64 @@ class RawStreamLayout:
 
 def raw_layout_for(cache_root: Path, keys: CacheKeys) -> RawStreamLayout:
     return RawStreamLayout(root=Path(cache_root) / f"_raw_{keys.raw}")
+
+
+@dataclass(frozen=True)
+class FilteredStreamLayout:
+    """Per-filter-settings cache of HP / LP (and optional notch) channel rows.
+
+    Channels are written on first access; a boolean mask tracks which rows are
+    ready so cold starts never re-run ``sosfilt`` for a channel already on disk.
+    """
+
+    root: Path
+
+    @property
+    def meta_path(self) -> Path:
+        return self.root / "filter_meta.json"
+
+    @property
+    def hp_path(self) -> Path:
+        return self.root / "hp.npy"
+
+    @property
+    def lp_path(self) -> Path:
+        return self.root / "lp.npy"
+
+    @property
+    def notch_path(self) -> Path:
+        return self.root / "notch.npy"
+
+    @property
+    def ready_hp_path(self) -> Path:
+        return self.root / "ready_hp.npy"
+
+    @property
+    def ready_lp_path(self) -> Path:
+        return self.root / "ready_lp.npy"
+
+    @property
+    def ready_notch_path(self) -> Path:
+        return self.root / "ready_notch.npy"
+
+    def ensure(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def is_initialized(self) -> bool:
+        return self.meta_path.exists() and self.hp_path.exists() and self.lp_path.exists()
+
+    def read_meta(self) -> dict[str, Any]:
+        return json.loads(self.meta_path.read_text(encoding="utf-8"))
+
+    def write_meta(self, payload: dict[str, Any]) -> None:
+        self.ensure()
+        tmp = self.meta_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        tmp.replace(self.meta_path)
+
+
+def filtered_layout_for(cache_root: Path, keys: CacheKeys) -> FilteredStreamLayout:
+    return FilteredStreamLayout(root=Path(cache_root) / f"_filter_{keys.filtered}")
 
 
 @dataclass(frozen=True)

@@ -1,76 +1,22 @@
-"""Display and legend settings for PDF channel pages."""
+"""Réglages d’affichage PDF et styles d’enregistrement."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
+from panel_catalog import SECTION_PANEL_FIELD_NAMES, SECTION_PANEL_LABELS
+
+# Compat : anciens noms importés par plotting / config.
+PANEL_FIELD_NAMES = SECTION_PANEL_FIELD_NAMES
+PANEL_LABELS = SECTION_PANEL_LABELS
+
 ZoomMode = Literal["none", "onset", "trigger_end", "both"]
-
-PANEL_FIELD_NAMES: tuple[str, ...] = (
-    "mean_raw",
-    "first_trigger_raw",
-    "second_trigger_raw",
-    "mean_hp",
-    "first_trigger_hp",
-    "second_trigger_hp",
-    "mean_lp",
-    "first_trigger_lp",
-    "second_trigger_lp",
-    "rms",
-    "first_rms",
-    "second_rms",
-    "psth",
-    "first_psth",
-    "second_psth",
-    "isi",
-    "first_isi",
-    "second_isi",
-    "trial_rate",
-    "raster",
-    "spike_overlay",
-)
-
-PANEL_LABELS: dict[str, str] = {
-    "mean_raw": "Moyenne d’essais — brut",
-    "mean_hp": "Moyenne d’essais — passe-haut",
-    "mean_lp": "Moyenne d’essais — passe-bas",
-    "first_trigger_raw": "1re stimulation (brut)",
-    "first_trigger_hp": "1re stimulation (passe-haut)",
-    "first_trigger_lp": "1re stimulation (passe-bas)",
-    "second_trigger_raw": "2e stimulation (brut)",
-    "second_trigger_hp": "2e stimulation (passe-haut)",
-    "second_trigger_lp": "2e stimulation (passe-bas)",
-    "rms": "RMS (moyenne d’essais)",
-    "first_rms": "RMS (1re stimulation)",
-    "second_rms": "RMS (2e stimulation)",
-    "psth": "PSTH / FR moyenne",
-    "first_psth": "PSTH / FR (1re stimulation)",
-    "second_psth": "PSTH / FR (2e stimulation)",
-    "isi": "ISI (toutes stimulations)",
-    "first_isi": "ISI (1re stimulation)",
-    "second_isi": "ISI (2e stimulation)",
-    "trial_rate": "Taux par essai (non moyenné)",
-    "raster": "Raster (toutes stimulations)",
-    "spike_overlay": "Superposition de spikes",
-}
-
-# Panels that stay unchecked by default in the Display table.
-PANEL_DEFAULT_OFF: frozenset[str] = frozenset(
-    {
-        "second_trigger_raw",
-        "second_trigger_hp",
-        "second_trigger_lp",
-        "second_rms",
-        "second_psth",
-        "second_isi",
-    }
-)
 
 
 @dataclass(frozen=True)
 class SectionPanels:
-    """Visibility toggles for one temporal section (full view, zoom onset, zoom end)."""
+    """Visibilité des panneaux pour une section temporelle (vue complète / zooms)."""
 
     mean_raw: bool = True
     first_trigger_raw: bool = True
@@ -100,7 +46,7 @@ class SectionPanels:
 
 @dataclass(frozen=True)
 class PlotDisplaySettings:
-    """Global PDF layout and per-section panel visibility."""
+    """Mise en page PDF et visibilité par section."""
 
     mea_layout: bool = True
     impedance: bool = True
@@ -128,11 +74,10 @@ class PlotDisplaySettings:
 
 @dataclass(frozen=True)
 class RecordingStyle:
-    """Per-recording legend, visibility, and curve color."""
+    """Légende, visibilité et couleur d’un enregistrement."""
 
     plot_visible: bool = True
     legend_visible: bool = True
-    # Matplotlib color (name or #RRGGBB). Empty/None → default cycle.
     color: str | None = None
 
     @classmethod
@@ -140,7 +85,6 @@ class RecordingStyle:
         return cls(plot_visible=True, legend_visible=True)
 
 
-# Named presets for GUI recordings.
 RECORDING_COLOR_PRESETS: tuple[tuple[str, str], ...] = (
     ("Auto", ""),
     ("Blue", "#2563eb"),
@@ -153,6 +97,23 @@ RECORDING_COLOR_PRESETS: tuple[tuple[str, str], ...] = (
     ("Gray", "#4b5563"),
 )
 
+DEFAULT_TRACE_COLORS: tuple[str, ...] = tuple(
+    hex_ for _, hex_ in RECORDING_COLOR_PRESETS[1:] if hex_
+)
+
+# Couleurs / constantes de tracé partagées (GUI + PDF).
+STIM_ONSET_COLOR = "#dc2626"
+STIM_OFFSET_COLOR = "#1d4ed8"
+STREAM_PLOT_COLORS: dict[str, str] = {
+    "raw": "#334155",
+    "hp": "#15803d",
+    "lp": "#1e40af",
+}
+MUTED_AXIS_TEXT = "#64748b"
+CHANNEL_HIGHLIGHT_FACE = "#fff7ed"
+ZERO_LINE_COLOR = "#6b7280"
+ARTIFACT_LINE_COLOR = "#2563eb"
+
 
 def resolve_recording_plot_colors(
     styles: Sequence[RecordingStyle],
@@ -160,8 +121,8 @@ def resolve_recording_plot_colors(
     *,
     fallback: Sequence[str] | None = None,
 ) -> list[str]:
-    """Resolve one plot color per visible recording (custom or fallback cycle)."""
-    cycle = [str(c) for c in (fallback or [hex_ for _, hex_ in RECORDING_COLOR_PRESETS[1:] if hex_])]
+    """Une couleur par enregistrement visible (personnalisée ou cycle)."""
+    cycle = [str(c) for c in (fallback or DEFAULT_TRACE_COLORS)]
     if not cycle:
         cycle = ["#2563eb", "#dc2626", "#16a34a", "#ea580c"]
     out: list[str] = []

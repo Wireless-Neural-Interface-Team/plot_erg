@@ -10,9 +10,14 @@ from typing import Any
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg, NavigationToolbar2QT
 from matplotlib.figure import Figure
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
+
+# Pan = clic milieu ou droit (le clic gauche reste libre pour les barres de plage).
+INTERACTION_HINT = "Molette zoom · clic milieu/droit pan · double-clic reset"
+INTERACTION_HINT_NO_ZOOM = "Clic milieu/droit = pan (zoom désactivé sur cet aperçu)"
+_PAN_FALLBACK_MS = 16
 
 
 class CompactNavToolbar(NavigationToolbar2QT):
@@ -53,10 +58,14 @@ class InteractiveCanvas(QWidget):
         show_toolbar: bool = True,
         show_cursor: bool = True,
         min_height: int = 120,
+        # "constrained" coûte cher avec beaucoup d’axes (montage) — passer None.
+        layout: str | None = "constrained",
+        allow_zoom: bool = True,
     ) -> None:
         super().__init__(parent)
         self._did_zoom = False
-        self.figure = Figure(figsize=figsize, layout="constrained", facecolor="#ffffff")
+        self._allow_zoom = bool(allow_zoom)
+        self.figure = Figure(figsize=figsize, layout=layout, facecolor="#ffffff")
         self.canvas = _ScopeCanvas(self.figure, self)
         self.canvas.setStyleSheet("background-color: #ffffff;")
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -68,10 +77,18 @@ class InteractiveCanvas(QWidget):
         self.toolbar.setIconSize(self.toolbar.iconSize() * 0.75)
         self.toolbar.setVisible(bool(show_toolbar))
         self.toolbar.setMaximumHeight(28)
+        if not self._allow_zoom:
+            # Masquer Zoom toolbar ; pan / home restent utiles.
+            try:
+                for action in self.toolbar.actions():
+                    text = str(action.text() or action.iconText() or "")
+                    if "zoom" in text.lower():
+                        action.setVisible(False)
+            except Exception:
+                pass
 
-        self._cursor_label = QLabel(
-            "Molette zoom · clic droit pan · double-clic reset", self
-        )
+        hint = INTERACTION_HINT if self._allow_zoom else INTERACTION_HINT_NO_ZOOM
+        self._cursor_label = QLabel(hint, self)
         self._cursor_label.setObjectName("panelStatus")
         self._cursor_label.setAlignment(
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
@@ -90,6 +107,14 @@ class InteractiveCanvas(QWidget):
         self._xlim0: tuple[float, float] | None = None
         self._ylim0: tuple[float, float] | None = None
         self._pan_trans: Any | None = None
+        # Blit cache for interactive pan/zoom (axes bbox snapshot).
+        self._blit_bg: Any | None = None
+        self._blit_ax: Any | None = None
+        self._interaction_draw_pending = False
+        self._interaction_timer = QTimer(self)
+        self._interaction_timer.setSingleShot(True)
+        self._interaction_timer.setInterval(_PAN_FALLBACK_MS)
+        self._interaction_timer.timeout.connect(self._flush_interaction_draw)
 
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
         self.canvas.mpl_connect("button_press_event", self._on_press)
@@ -99,6 +124,47 @@ class InteractiveCanvas(QWidget):
     # ---------------------------------------------------------------- drawing
 
     def draw_idle(self) -> None:
+        self.invalidate_blit()
+        self.canvas.draw_idle()
+
+    def invalidate_blit(self) -> None:
+        """Drop cached background after a full panel redraw."""
+        self._blit_bg = None
+        self._blit_ax = None
+
+    def _try_blit(self, ax: Any) -> bool:
+        """Fast path: redraw one axes via blit. Falls back if the backend rejects it."""
+        try:
+            renderer = self.canvas.get_renderer()
+            if self._blit_bg is None or self._blit_ax is not ax:
+                # Snapshot current frame, then we'll redraw on the next call.
+                ax.figure.canvas.draw()
+                self._blit_bg = renderer.copy_from_bbox(ax.bbox)
+                self._blit_ax = ax
+            self.canvas.restore_region(self._blit_bg)
+            ax.draw_artist(ax)
+            self.canvas.blit(ax.bbox)
+            # Refresh cache for the next motion event (new view already drawn).
+            self._blit_bg = renderer.copy_from_bbox(ax.bbox)
+            self._blit_ax = ax
+            return True
+        except Exception:
+            self._blit_bg = None
+            self._blit_ax = None
+            return False
+
+    def _request_interaction_draw(self, ax: Any | None = None) -> None:
+        """Prefer blit; otherwise coalesce draw_idle to ~60 Hz during pan/zoom."""
+        if ax is not None and self._try_blit(ax):
+            return
+        self._interaction_draw_pending = True
+        if not self._interaction_timer.isActive():
+            self._interaction_timer.start()
+
+    def _flush_interaction_draw(self) -> None:
+        if not self._interaction_draw_pending:
+            return
+        self._interaction_draw_pending = False
         self.canvas.draw_idle()
 
     def capture_view_limits(
@@ -165,6 +231,9 @@ class InteractiveCanvas(QWidget):
     # ----------------------------------------------------------- interactions
 
     def _on_scroll(self, event: Any) -> None:
+        if not self._allow_zoom:
+            self._did_zoom = False
+            return
         ax = event.inaxes
         if ax is None or event.xdata is None or event.ydata is None:
             self._did_zoom = False
@@ -172,7 +241,7 @@ class InteractiveCanvas(QWidget):
         scale = 0.8 if getattr(event, "step", 0) > 0 else 1.25
         try:
             self._zoom_around(ax, float(event.xdata), float(event.ydata), scale)
-            self.canvas.draw_idle()
+            self._request_interaction_draw(ax)
             self._did_zoom = True
         except Exception:
             self._did_zoom = False
@@ -208,16 +277,22 @@ class InteractiveCanvas(QWidget):
         self._ylim0 = tuple(event.inaxes.get_ylim())
         # Figé : sinon chaque set_xlim change le mapping pixel→données et le pan décroche.
         self._pan_trans = event.inaxes.transData.frozen()
+        self.invalidate_blit()
         self.canvas.setCursor(QCursor(Qt.CursorShape.ClosedHandCursor))
 
     def _on_release(self, event: Any) -> None:
         del event
+        was_panning = self._press_ax is not None
         self._press_ax = None
         self._press_xy = None
         self._xlim0 = None
         self._ylim0 = None
         self._pan_trans = None
         self.canvas.unsetCursor()
+        if was_panning:
+            # Final crisp frame after the last coalesced/blit update.
+            self.invalidate_blit()
+            self.canvas.draw_idle()
 
     def _on_motion(self, event: Any) -> None:
         # Pendant un pan : suivre les pixels (pas besoin de xdata / inaxes).
@@ -238,17 +313,14 @@ class InteractiveCanvas(QWidget):
                 dy = float(y1 - y0)
                 self._press_ax.set_xlim(self._xlim0[0] - dx, self._xlim0[1] - dx)
                 self._press_ax.set_ylim(self._ylim0[0] - dy, self._ylim0[1] - dy)
-                self.canvas.draw_idle()
+                self._request_interaction_draw(self._press_ax)
             except Exception:
                 pass
             return
 
         if event.inaxes is not None and event.xdata is not None and event.ydata is not None:
             self._cursor_label.setText(
-                f"t = {event.xdata:.4g}   y = {event.ydata:.4g}   "
-                f"(molette zoom · clic droit pan · double-clic reset)"
+                f"t = {event.xdata:.4g}   y = {event.ydata:.4g}   ({INTERACTION_HINT})"
             )
         else:
-            self._cursor_label.setText(
-                "Molette zoom · clic droit pan · double-clic reset"
-            )
+            self._cursor_label.setText(INTERACTION_HINT)

@@ -46,10 +46,13 @@ class AnalysisConfig:
     first_trigger_hp_ylim_min_uv: float = -200.0
     first_trigger_hp_ylim_max_uv: float = 200.0
     rms_window_s: float = 1.0
-    # HP and LP are always both applied separately (same order/type/cutoff).
-    intan_filter_order: int = 2
-    intan_filter_type: IntanFilterType = "bessel"
-    intan_filter_cutoff_hz: float = 250.0
+    # HIGH (passe-haut) et LOW (passe-bas) : paramètres indépendants.
+    intan_hp_filter_order: int = 2
+    intan_hp_filter_type: IntanFilterType = "bessel"
+    intan_hp_filter_cutoff_hz: float = 250.0
+    intan_lp_filter_order: int = 2
+    intan_lp_filter_type: IntanFilterType = "bessel"
+    intan_lp_filter_cutoff_hz: float = 250.0
     # Optional software notch applied on wideband before HP/LP (0 = off).
     software_notch_hz: SoftwareNotchHz = 0
     intan_artifact_threshold_uv: float = 2500.0

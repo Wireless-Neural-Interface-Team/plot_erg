@@ -17,12 +17,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Literal, Sequence
 
-from display_config import (
-    PANEL_FIELD_NAMES,
-    PANEL_LABELS,
-    PlotDisplaySettings,
-    SectionPanels,
-    ZoomMode,
+from display_config import PlotDisplaySettings, SectionPanels, ZoomMode
+from panel_catalog import (
+    ANALYSIS_PANEL_FIELD_NAMES,
+    ANALYSIS_PANEL_LABELS,
+    EXTRA_CHANNEL_PANEL_FIELD_NAMES,
+    EXTRA_CHANNEL_PANEL_LABELS,
+    GLOBAL_PANEL_FIELD_NAMES,
+    GLOBAL_PANEL_LABELS,
+    SECTION_PANEL_FIELD_NAMES as PANEL_FIELD_NAMES,
+    SECTION_PANEL_LABELS as PANEL_LABELS,
+    is_global_panel,
+    is_section_independent,
+    is_section_panel,
+    panel_label,
+    panel_needs_spikes,
 )
 
 SectionKey = Literal["full", "zoom_onset", "zoom_trigger_end"]
@@ -39,43 +48,6 @@ SECTION_SHORT_LABELS: dict[str, str] = {
     "full": "complet",
     "zoom_onset": "début",
     "zoom_trigger_end": "fin",
-}
-
-# Panels that do not depend on the selected channel.
-GLOBAL_PANEL_FIELD_NAMES: tuple[str, ...] = (
-    "montage_continuous_raw",
-    "summary_rms",
-    "summary_rms_table",
-    "summary_impedance",
-    "montage_mean_raw",
-    "montage_mean_hp",
-    "montage_mean_lp",
-    "montage_second_raw",
-    "montage_second_hp",
-    "montage_second_lp",
-    "montage_second_to_third_lp",
-)
-
-GLOBAL_PANEL_LABELS: dict[str, str] = {
-    "montage_continuous_raw": "Montage — tous canaux, brut continu",
-    "summary_rms": "Résumé — RMS moyen par canal",
-    "summary_rms_table": "Résumé — table RMS moyen par canal",
-    "summary_impedance": "Résumé — impédance moyenne |Z| @ 1 kHz",
-    "montage_mean_raw": "Montage — tous canaux, moyenne brut",
-    "montage_mean_hp": "Montage — tous canaux, moyenne passe-haut",
-    "montage_mean_lp": "Montage — tous canaux, moyenne passe-bas",
-    "montage_second_raw": "Montage — tous canaux, 2e stim brut",
-    "montage_second_hp": "Montage — tous canaux, 2e stim passe-haut",
-    "montage_second_lp": "Montage — tous canaux, 2e stim passe-bas",
-    "montage_second_to_third_lp": "Montage — tous canaux, 2e→3e stim passe-bas",
-}
-
-# Channel-aware panels that are not part of the 21 togglable section panels.
-EXTRA_CHANNEL_PANEL_FIELD_NAMES: tuple[str, ...] = ("mea_layout", "impedance")
-
-EXTRA_CHANNEL_PANEL_LABELS: dict[str, str] = {
-    "mea_layout": "Carte MEA (canal sélectionné)",
-    "impedance": "Impédance |Z| @ 1 kHz (canal sélectionné)",
 }
 
 LegendLocation = Literal[
@@ -101,13 +73,55 @@ LEGEND_LOCATIONS: tuple[LegendLocation, ...] = (
 )
 
 AnalysisMode = Literal["average", "stimulation"]
+# Contenu de l’aperçu canal (fenêtre principale) : continuous ou graphs d’analyse.
+PreviewContentMode = Literal["continuous", "average", "stimulation"]
 AnalysisStream = Literal["raw", "hp", "lp"]
+TimeSyncMode = Literal["recording_start", "trigger"]
+TriggerPolarity = Literal["low", "high"]  # low = falling, high = rising
+
+PREVIEW_CONTENT_LABELS: dict[PreviewContentMode, str] = {
+    "continuous": "Continuous (traces)",
+    "average": "Moyenne d’essais",
+    "stimulation": "Une stimulation",
+}
 
 STREAM_SHORT_LABELS: dict[str, str] = {
     "raw": "WIDE",
     "hp": "HIGH",
     "lp": "LOW",
 }
+
+TIME_SYNC_LABELS: dict[TimeSyncMode, str] = {
+    "recording_start": "Début de l’enregistrement",
+    "trigger": "Trigger détecté",
+}
+
+TRIGGER_POLARITY_TO_EDGE: dict[TriggerPolarity, str] = {
+    "low": "falling",
+    "high": "rising",
+}
+
+EDGE_TO_TRIGGER_POLARITY: dict[str, TriggerPolarity] = {
+    "falling": "low",
+    "rising": "high",
+}
+
+
+def continuous_sync_offset_s(
+    stim_times_s: Sequence[float],
+    mode: TimeSyncMode,
+) -> float:
+    """Décalage à soustraire du temps absolu pour l’affichage continu.
+
+    - ``recording_start`` → 0 (t=0 au début du fichier)
+    - ``trigger`` → premier onset détecté (t=0 sur le trigger)
+    """
+    if mode != "trigger":
+        return 0.0
+    times = [float(t) for t in stim_times_s]
+    if not times:
+        return 0.0
+    return float(times[0])
 
 
 @dataclass(frozen=True)
@@ -132,94 +146,26 @@ class TimeRangeBar:
         return replace(self, t0_s=float(t0_s), t1_s=float(t1_s))
 
 
-# Progressive-analysis panels driven by :class:`AnalysisSettings`.
-ANALYSIS_PANEL_FIELD_NAMES: tuple[str, ...] = (
-    "full_recording",
-    "analysis_raw",
-    "analysis_hp",
-    "analysis_lp",
-    "analysis_rms",
-    "analysis_psth",
-    "analysis_isi",
-    "analysis_raster",
-    "analysis_overlay",
-)
-
-ANALYSIS_PANEL_LABELS: dict[str, str] = {
-    "full_recording": "Enregistrement complet (continu)",
-    "analysis_raw": "Analyse — brut",
-    "analysis_hp": "Analyse — passe-haut",
-    "analysis_lp": "Analyse — passe-bas",
-    "analysis_rms": "Analyse — RMS",
-    "analysis_psth": "Analyse — PSTH / FR",
-    "analysis_isi": "Analyse — ISI",
-    "analysis_raster": "Analyse — raster",
-    "analysis_overlay": "Analyse — superposition de spikes",
-}
-
-
-def panel_label(field_name: str) -> str:
-    """Human-readable label for any panel key (section, extra, or global)."""
-    if field_name in PANEL_LABELS:
-        return PANEL_LABELS[field_name]
-    if field_name in ANALYSIS_PANEL_LABELS:
-        return ANALYSIS_PANEL_LABELS[field_name]
-    if field_name in EXTRA_CHANNEL_PANEL_LABELS:
-        return EXTRA_CHANNEL_PANEL_LABELS[field_name]
-    return GLOBAL_PANEL_LABELS.get(field_name, field_name)
-
-
-def is_global_panel(field_name: str) -> bool:
-    return field_name in GLOBAL_PANEL_FIELD_NAMES
-
-
-def is_section_panel(field_name: str) -> bool:
-    return field_name in PANEL_FIELD_NAMES or field_name in {
-        key for key in ANALYSIS_PANEL_FIELD_NAMES if key != "full_recording"
-    }
-
-
-def is_section_independent(field_name: str) -> bool:
-    """True for panels whose content does not depend on the temporal section."""
-    return (
-        field_name in GLOBAL_PANEL_FIELD_NAMES
-        or field_name in EXTRA_CHANNEL_PANEL_FIELD_NAMES
-        or field_name == "full_recording"
-    )
-
-
-def panel_needs_spikes(field_name: str) -> bool:
-    return field_name in {
-        "psth",
-        "first_psth",
-        "second_psth",
-        "isi",
-        "first_isi",
-        "second_isi",
-        "trial_rate",
-        "raster",
-        "spike_overlay",
-        "analysis_psth",
-        "analysis_isi",
-        "analysis_raster",
-        "analysis_overlay",
-    }
-
-
 @dataclass(frozen=True)
 class AnalysisSettings:
-    """What the progressive Analysis dock is currently configured to show."""
+    """Courbes / mode affichés en moyenne ou stimulation (pas en continuous)."""
 
     mode: AnalysisMode = "average"
     stim_index: int = 0  # 0-based stimulation index when mode == stimulation
+    # Courbes : coches Paramètres → Canal (modes moyenne / stimulation).
     show_raw: bool = True
-    show_hp: bool = True
-    show_lp: bool = True
-    show_rms: bool = True
-    show_psth: bool = False
+    show_hp: bool = False
+    show_lp: bool = False
+    show_rms: bool = False
     show_isi: bool = False
+    show_overlay: bool = False  # spike scope
+    # Spikes : mêmes coches, visibles en mode moyenne / stimulation.
+    show_psth: bool = False
+    show_trial_rate: bool = False
     show_raster: bool = False
-    show_overlay: bool = False
+    # Résumés : aperçu canal (globale) uniquement.
+    show_summary_rms: bool = False  # mean RMS par enregistrement (profil)
+    show_summary_rms_table: bool = False  # mean RMS par canal (table)
 
     def trigger_index(self) -> int | None:
         """``None`` means average across trials; otherwise one stimulation index."""
@@ -227,7 +173,8 @@ class AnalysisSettings:
             return max(0, int(self.stim_index))
         return None
 
-    def selected_trace_panels(self) -> tuple[str, ...]:
+    def selected_curve_panels(self) -> tuple[str, ...]:
+        """Traces / ISI / spike scope — aperçu (mode moyenne / stim)."""
         panels: list[str] = []
         if self.show_raw:
             panels.append("analysis_raw")
@@ -237,22 +184,47 @@ class AnalysisSettings:
             panels.append("analysis_lp")
         if self.show_rms:
             panels.append("analysis_rms")
-        return tuple(panels)
-
-    def selected_spike_panels(self) -> tuple[str, ...]:
-        panels: list[str] = []
-        if self.show_raster:
-            panels.append("analysis_raster")
-        if self.show_psth:
-            panels.append("analysis_psth")
         if self.show_isi:
             panels.append("analysis_isi")
         if self.show_overlay:
             panels.append("analysis_overlay")
         return tuple(panels)
 
+    def selected_trace_panels(self) -> tuple[str, ...]:
+        """Compat : traces tension + RMS uniquement."""
+        return tuple(
+            key
+            for key in self.selected_curve_panels()
+            if key in {"analysis_raw", "analysis_hp", "analysis_lp", "analysis_rms"}
+        )
+
+    def selected_spike_panels(self) -> tuple[str, ...]:
+        """PSTH / FR par essai / raster — aperçu (mode moyenne / stim)."""
+        panels: list[str] = []
+        if self.show_psth:
+            panels.append("analysis_psth")
+        if self.show_trial_rate:
+            panels.append("analysis_trial_rate")
+        if self.show_raster:
+            panels.append("analysis_raster")
+        return tuple(panels)
+
+    def selected_summary_panels(self) -> tuple[str, ...]:
+        """Résumés RMS — aperçu canal uniquement."""
+        panels: list[str] = []
+        if self.show_summary_rms:
+            panels.append("summary_rms")
+        if self.show_summary_rms_table:
+            panels.append("summary_rms_table")
+        return tuple(panels)
+
     def selected_analysis_panels(self) -> tuple[str, ...]:
-        return self.selected_trace_panels() + self.selected_spike_panels()
+        """Courbes + spikes (sans résumés)."""
+        return self.selected_curve_panels() + self.selected_spike_panels()
+
+    def selected_global_panels(self) -> tuple[str, ...]:
+        """Panneaux additionnels d’aperçu (hors continuous) : résumés seulement."""
+        return self.selected_summary_panels()
 
     def describe(self) -> str:
         if self.mode == "stimulation":
@@ -268,6 +240,9 @@ class LegendSettings:
     location: LegendLocation = "below"
     font_size: float = 9.0
     columns: int = 1
+    # Distance légende ↔ graphique (fraction de la hauteur des axes si « below »,
+    # sinon padding borderaxespad matplotlib).
+    gap: float = 0.22
     frame: bool = True
     show_filter_details: bool = True
     show_sample_counts: bool = True
@@ -343,15 +318,27 @@ class ViewerSettings:
     # Noms de canaux exclus du montage (cases décochées dans Session → Channels).
     hidden_channels: tuple[str, ...] = ()
     analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
+    # Contenu de l’aperçu canal : continuous | moyenne | une stimulation.
+    preview_content: PreviewContentMode = "continuous"
     # Continuous recording view: primary stream (compat) + multi-stream montage.
     continuous_stream: AnalysisStream = "raw"
     continuous_streams: tuple[AnalysisStream, ...] = ("raw",)
     continuous_mark_stims: bool = True
+    # Origine temporelle des traces continues (immédiat, sans retraitement).
+    time_sync: TimeSyncMode = "recording_start"
+    # Polarité / seuil ANALOG-IN-0 (affichage + alimente le traitement F5).
+    trigger_polarity: TriggerPolarity = "low"
+    trigger_threshold: float = 1.0
     # Hauteur minimale d’une ligne canal×flux dans le montage continu (px).
-    montage_row_min_height_px: int = 72
+    # Plus bas = moins de pixels Agg (ouverture plus rapide).
+    montage_row_min_height_px: int = 52
     # Barres de plage (zoom / traitement). Vide = extrémités au premier rendu.
     range_bars: tuple[TimeRangeBar, ...] = ()
     active_range_index: int = 0
+
+    def trigger_edge(self) -> str:
+        """Edge de détection correspondant à la polarité d’affichage."""
+        return TRIGGER_POLARITY_TO_EDGE.get(self.trigger_polarity, "falling")
 
     def resolved_continuous_streams(self) -> tuple[AnalysisStream, ...]:
         streams = tuple(s for s in self.continuous_streams if s in {"raw", "hp", "lp"})
@@ -399,6 +386,36 @@ class ViewerSettings:
         if self.analysis.stim_index < 0:
             problems.append("L’indice de stimulation doit être ≥ 0.")
         return problems
+
+
+def apply_local_display_settings(
+    base: ViewerSettings,
+    local: ViewerSettings,
+    *,
+    include_analysis: bool = False,
+) -> ViewerSettings:
+    """Appliquer les réglages d’affichage d’*une* fenêtre sur une base partagée.
+
+    Chaque fenêtre avec panneau local (détachée, Analyse, …) contrôle légende,
+    style, axes et sync pour *ses* graphs. Sans ceci, un redraw réinjecte les
+    axes / la sync de la fenêtre parente et ignore le panneau local.
+    """
+    kwargs: dict[str, object] = {
+        "legend": local.legend,
+        "style": local.style,
+        "psth_bin_window_s": local.psth_bin_window_s,
+        "sampling_percent": local.sampling_percent,
+        "x_limits": local.x_limits,
+        "trace_ylim": local.trace_ylim,
+        "rms_ylim": local.rms_ylim,
+        "stim_hp_ylim": local.stim_hp_ylim,
+        "time_sync": local.time_sync,
+        "trigger_polarity": local.trigger_polarity,
+        "trigger_threshold": local.trigger_threshold,
+    }
+    if include_analysis:
+        kwargs["analysis"] = local.analysis
+    return replace(base, **kwargs)  # type: ignore[arg-type]
 
 
 @dataclass(frozen=True)
@@ -479,20 +496,13 @@ def _placements(section: SectionKey, panels: Sequence[str]) -> tuple[PanelPlacem
 
 
 def default_workspace_tabs() -> tuple[ViewTab, ...]:
-    """Vue de démarrage légère : aperçu du canal sélectionné uniquement.
+    """Onglets de démarrage (vides) : l’aperçu canal est embarqué hors onglets.
 
     Le montage multi-canaux reste disponible via *Revue montage*.
-    Les barres de plage et graphs d’analyse vivent dans Inspecter
-    (double-clic MEA / liste), pas sur la vue centrale.
+    Les barres de plage vivent dans l’aperçu central ; les graphs
+    d’analyse s’ouvrent via le bouton Analyse.
     """
-    return (
-        ViewTab(
-            name="Canal",
-            columns=1,
-            panel_height_px=520,
-            panels=(PanelPlacement("full_recording"),),
-        ),
-    )
+    return ()
 
 
 @dataclass(frozen=True)

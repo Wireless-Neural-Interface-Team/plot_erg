@@ -1,10 +1,31 @@
-"""Shared plotting helpers used by PDF rendering modules."""
+"""Helpers de tracé partagés (PDF + GUI)."""
 
 from __future__ import annotations
 
 import hashlib
 from pathlib import Path
+from typing import Any
+
 import numpy as np
+
+
+def mark_unavailable_axis(ax: Any, message: str, *, fontsize: float = 9.0) -> None:
+    """Remplace un axe par un message centré (données indisponibles)."""
+    from display_config import MUTED_AXIS_TEXT
+
+    ax.clear()
+    ax.text(
+        0.5,
+        0.5,
+        message,
+        ha="center",
+        va="center",
+        transform=ax.transAxes,
+        fontsize=fontsize,
+        color=MUTED_AXIS_TEXT,
+        wrap=True,
+    )
+    ax.set_axis_off()
 
 
 def shorten_filename_for_windows(output_dir: Path, filename: str, max_total_len: int = 240) -> str:

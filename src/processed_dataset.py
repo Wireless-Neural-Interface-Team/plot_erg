@@ -231,9 +231,7 @@ class RecordingMeta:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> RecordingMeta:
-        dsp_raw = dict(raw.get("dsp", {}))
-        field_names = {f.name for f in IntanDspSettings.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        dsp = IntanDspSettings(**{k: v for k, v in dsp_raw.items() if k in field_names})
+        dsp = IntanDspSettings.from_dict(dict(raw.get("dsp", {})))
         return cls(
             source_path=Path(str(raw.get("source_path", ""))),
             source_name=str(raw.get("source_name", "")),
@@ -474,6 +472,7 @@ class ProcessedRecording:
         self.threshold_captions = list(threshold_captions)
         self.build_timings = list(build_timings)
         self._channel_data: dict[int, ChannelData] = {}
+        self._data_generation = 0
         # Cache des enveloppes continues (stream, ch, max_points) → (t, y).
         self._continuous_cache: dict[tuple[str, int, int], tuple[np.ndarray, np.ndarray]] = {}
 
@@ -533,12 +532,19 @@ class ProcessedRecording:
 
     def store_channel(self, ch: int, data: ChannelData) -> None:
         self._channel_data[int(ch)] = data
+        self._data_generation = int(getattr(self, "_data_generation", 0)) + 1
         while len(self.threshold_captions) <= int(ch):
             self.threshold_captions.append("")
         self.threshold_captions[int(ch)] = data.threshold_caption
 
+    @property
+    def data_generation(self) -> int:
+        """Monotonic counter bumped when channel products change (redraw fingerprint)."""
+        return int(getattr(self, "_data_generation", 0))
+
     def clear_channel_cache(self) -> None:
         self._channel_data.clear()
+        self._data_generation = int(getattr(self, "_data_generation", 0)) + 1
 
     def spike_count(self, ch: int) -> int:
         data = self._channel_data.get(int(ch))
@@ -570,17 +576,18 @@ class ProcessedRecording:
         }.get(stream)
         if array is None or ch < 0 or ch >= int(array.shape[0]):
             return empty, empty
-        # Lecture memmap une seule fois ; garder float32 pour l’enveloppe (plus rapide).
-        row = np.asarray(array[ch])
-        if row.size == 0:
+        # Vue memmap (pas de copie tant qu’on reste en enveloppe float32).
+        row = array[ch]
+        n_samples = int(getattr(row, "shape", (0,))[0]) if row is not None else 0
+        if n_samples <= 0:
             return empty, empty
         fs = float(self.meta.fs)
         if fs <= 0:
             return empty, empty
-        if limit > 16 and row.size > limit:
+        if limit > 16 and n_samples > limit:
             # Enveloppe min/max vectorisée (pas de boucle Python par bin).
             n_bins = max(1, limit // 2)
-            bin_size = max(1, row.size // n_bins)
+            bin_size = max(1, n_samples // n_bins)
             usable = bin_size * n_bins
             reshaped = np.asarray(row[:usable], dtype=np.float32).reshape(n_bins, bin_size)
             lows = reshaped.min(axis=1)
@@ -592,8 +599,9 @@ class ProcessedRecording:
             out_y[1::2] = highs
             result = (out_t, out_y)
         else:
-            t = np.arange(row.size, dtype=np.float64) / fs
-            result = (t, np.asarray(row, dtype=np.float64))
+            data = np.asarray(row, dtype=np.float64)
+            t = np.arange(data.size, dtype=np.float64) / fs
+            result = (t, data)
         # Cap mémoire : garder les enveloppes les plus récentes.
         if len(self._continuous_cache) >= 512:
             self._continuous_cache.clear()
