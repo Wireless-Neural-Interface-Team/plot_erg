@@ -32,8 +32,9 @@ without the original `.rhs` file.
 
 - `src/panel_catalog.py` — single catalogue of panel keys, labels and metadata
 - `src/view_config.py` — live display settings: legends, panel style, views and tabs
-- `src/panel_prepare.py` — backend-neutral panel data specs (screen + future PDF reuse)
-- `src/panel_registry.py` — legacy matplotlib panel helpers (PDF / smokes)
+- `src/panel_prepare.py` — backend-neutral panel data specs (screen + PDF for supported panels)
+- `src/panel_draw_mpl.py` — matplotlib drawer for `PanelSpec` (PDF / CLI; includes triggered montages + full_recording)
+- `src/panel_registry.py` — PDF orchestration + legacy renderers (`montage_continuous_raw`, MEA, summaries)
 - `src/display_config.py` — PDF section visibility and recording styles
 - `src/gui/` — Qt viewer (PySide6 + **pyqtgraph** screen plots)
   - `services/` — redraw, pipeline, montage, preview, export, render-request factory
@@ -93,10 +94,11 @@ The centre holds the channel preview by default. Use *Vue → Revue montage*
 panneaux* (`Ctrl+Shift+P`) to customise its grid. In the channel inspector, use
 **+ Absolue** / **+ Rel. stim**, then *Appliquer les zooms* for analysis graphs.
 
-Each panel has its own header showing how long its last redraw took, a toolbar
-for matplotlib zoom/pan/save, and buttons to open it in its own window or remove
+Each panel has its own header showing how long its last redraw took, pyqtgraph
+zoom/pan/interaction controls, and buttons to open it in its own window or remove
 it from the view. Panels scrolled far from the viewport are drawn when they come
 into reach, which is what keeps a view with dozens of panels responsive.
+Matplotlib (Agg) remains the PDF / CLI export path.
 
 ### Available panels
 
@@ -159,11 +161,15 @@ Amplifier traces are in **microvolts (µV)**.
 
 ## Checks
 
-The scripts in `tools/` run without any recording, on synthetic data:
+The scripts in `tools/` run without any recording, on synthetic data.
+GitHub Actions runs the same suite on every push / pull request.
 
 ```bash
-python tools/smoke_render.py    # draw every panel of the catalogue
-python tools/smoke_dataset.py   # write, reopen and compare a processed dataset
-python tools/smoke_gui.py       # build the window offscreen and redraw every panel
-python tools/smoke_perf.py      # timings: means, incremental redraw, filter disk cache
+python tools/smoke_dataset.py         # write, reopen and compare a processed dataset
+python tools/smoke_render.py          # draw every panel (matplotlib / PDF path)
+python tools/smoke_gui.py             # build the window offscreen and redraw every panel
+python tools/smoke_perf.py            # timings: means, redraw, filter cache, PlotHost
+python tools/smoke_montage_ylim.py    # montage Y autoscale / preserve_view
+python tools/smoke_montage_kind.py    # montage kind visibility regression
+python tools/smoke_ylim_autoscale.py  # manual → auto Y scale regression
 ```

@@ -21,6 +21,7 @@ from display_config import (
     CHANNEL_HIGHLIGHT_FACE,
     MUTED_AXIS_TEXT,
     STREAM_PLOT_COLORS,
+    recording_trace_color,
 )
 from impedance_tracking import ImpedanceSession
 from panel_catalog import (
@@ -81,13 +82,15 @@ _UNAVAILABLE_FONT = 9.0
 # pixel de la zone de tracé, quel que soit le panneau (aperçu, montage, extras).
 _AXES_LEFT = 0.14
 _AXES_RIGHT = 0.98
-_AXES_RIGHT_SCALEBARS = 0.90
+# 0.88 : place pour bâton Y à x≈1.02 + libellé (~« 200µV ») hors cadre.
+_AXES_RIGHT_SCALEBARS = 0.88
 _AXES_TOP_SINGLE = 0.88
 _AXES_BOTTOM_SINGLE = 0.14
 _AXES_BOTTOM_SINGLE_SCALEBARS = 0.18
 _AXES_TOP_MONTAGE = 0.995
 _AXES_BOTTOM_MONTAGE = 0.035
-_AXES_BOTTOM_MONTAGE_SCALEBARS = 0.12
+# 0.14 : libellé temps à −28 pt sous les axes (figures basses / montage).
+_AXES_BOTTOM_MONTAGE_SCALEBARS = 0.14
 # Plancher de réserve légende « below » (fraction figure) si on ne connaît
 # pas encore le nombre d’entrées ; la vraie hauteur est estimée dynamiquement.
 _AXES_BOTTOM_LEGEND_PAD_MIN = 0.10
@@ -401,13 +404,19 @@ class RenderRequest:
                 t0, t1 = t1, t0
             # Barres continues = temps absolu → convertir pour les panels d’analyse (t_rel).
             # Zooms saisis « relatifs à la stim » = déjà en t_rel.
-            if str(self.panel).startswith("analysis_") and self.placement.zoom_absolute:
-                stim_index = self.settings.analysis.trigger_index()
-                converted = _absolute_range_to_relative(
-                    reference, t0, t1, stim_index=stim_index
-                )
-                if converted is not None:
-                    return converted
+            # Toujours borner à t_rel : sinon xlim trop large → courbes tronquées à droite.
+            if str(self.panel).startswith("analysis_"):
+                if self.placement.zoom_absolute:
+                    stim_index = self.settings.analysis.trigger_index()
+                    converted = _absolute_range_to_relative(
+                        reference, t0, t1, stim_index=stim_index
+                    )
+                    if converted is not None:
+                        return converted
+                else:
+                    clipped = _clip_to_t_rel(reference, t0, t1)
+                    if clipped is not None:
+                        return clipped
                 t_rel = reference.t_rel
                 if t_rel.size == 0:
                     return None
@@ -488,6 +497,26 @@ def _appearance(request: RenderRequest):
     )
 
 
+def _clip_to_t_rel(
+    recording: ProcessedRecording,
+    t0: float,
+    t1: float,
+) -> tuple[float, float] | None:
+    """Intersecte une fenêtre en temps relatif avec le support d’essai ``t_rel``."""
+    t_rel = np.asarray(recording.t_rel, dtype=np.float64)
+    if t_rel.size == 0:
+        return None
+    rel0, rel1 = float(t_rel[0]), float(t_rel[-1])
+    lo, hi = float(t0), float(t1)
+    if hi < lo:
+        lo, hi = hi, lo
+    lo = max(lo, rel0)
+    hi = min(hi, rel1)
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return None
+    return lo, hi
+
+
 def _absolute_range_to_relative(
     recording: ProcessedRecording,
     t0_abs: float,
@@ -499,6 +528,8 @@ def _absolute_range_to_relative(
 
     Si ``stim_index`` est fourni (mode « une stimulation »), cette stim est la
     référence. Sinon : première stim dans la plage, ou stim la plus proche du centre.
+    Le résultat est borné à ``t_rel`` (durée d’essai) pour éviter un xlim plus
+    large que les spikes / traces disponibles.
     """
     stims = np.asarray(recording.stimulation_times_s(), dtype=np.float64).ravel()
     if stims.size == 0:
@@ -515,7 +546,7 @@ def _absolute_range_to_relative(
         else:
             mid = 0.5 * (lo + hi)
             ref = float(stims[int(np.argmin(np.abs(stims - mid)))])
-    return (lo - ref, hi - ref)
+    return _clip_to_t_rel(recording, lo - ref, hi - ref)
 
 
 def _decimate(x: np.ndarray, y: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
@@ -650,7 +681,7 @@ def _scale_bar_units(panel: str) -> tuple[str | None, str | None]:
         return (None, None)
     if panel in {"impedance", "summary_impedance"}:
         return (None, "Ω")
-    if panel in {"analysis_overlay"}:
+    if panel in {"analysis_overlay", "spike_overlay"}:
         return ("ms", "µV")
     if panel in {
         "analysis_psth",
@@ -721,15 +752,29 @@ def _apply_scale_bars(
     style: PanelStyle,
     *,
     panel: str,
-    keep_ylabel: bool = False,
-    keep_xlabel: bool = False,
+    keep_ylabel: bool = True,
+    keep_xlabel: bool = True,
     draw_bars: bool = True,
 ) -> None:
-    """Masquer l’échelle des bords et, si demandé, tracer les barres flottantes."""
+    """Masquer les graduations et, si demandé, tracer les barres flottantes.
+
+    Les titres d’axes (xlabel / ylabel) sont conservés par défaut.
+    """
     from plot_utils import clear_floating_scale_bars, draw_floating_scale_bars, hide_edge_scale
 
     if not bool(getattr(style, "show_scale_bars", False)):
         clear_floating_scale_bars(ax)
+        # Restaurer graduations / cadres après décochage (style refresh).
+        ax.tick_params(
+            axis="both",
+            which="both",
+            bottom=True,
+            left=True,
+            labelbottom=True,
+            labelleft=True,
+        )
+        for spine in ax.spines.values():
+            spine.set_visible(bool(style.show_borders))
         return
     hide_edge_scale(ax, keep_ylabel=keep_ylabel, keep_xlabel=keep_xlabel)
     # Avec barres flottantes : pas de cadre (style montage EEG).
@@ -751,7 +796,35 @@ def _apply_scale_bars(
         y_size=y_size,
         fontsize=float(style.tick_font_size),
         linewidth=max(1.4, float(style.line_width) * 1.15),
+        # Même gouttière que le montage : la marge droite _AXES_RIGHT_SCALEBARS
+        # est réservée pour ça (sinon le libellé Y reste dans la zone de tracé).
+        gutter=True,
     )
+
+
+def _set_montage_row_ylabel(
+    ax: Any,
+    text: str,
+    *,
+    fontsize: float,
+    labelpad: float = 8.0,
+) -> None:
+    """Titre de ligne montage (canal / flux), aligné verticalement et entre lignes.
+
+    Les graduations Y numériques sont masquées : leur largeur dépend du ``ylim``
+    et décale sinon les libellés ``rotation=0`` d’une ligne à l’autre.
+    """
+    ax.set_ylabel(
+        text,
+        rotation=0,
+        ha="right",
+        va="center",
+        fontsize=fontsize,
+        labelpad=labelpad,
+    )
+    ax.tick_params(axis="y", which="both", labelleft=False)
+    # Ancrage fixe (coords axes) : indépendant de la largeur des ticks.
+    ax.yaxis.set_label_coords(-0.012, 0.5)
 
 
 def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
@@ -779,17 +852,38 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
     if not show_bars:
         for ax in axes:
             clear_floating_scale_bars(ax)
+            # Sans barres : garder les titres de ligne alignés (pas de ticks Y).
+            ax.tick_params(axis="y", which="both", labelleft=False)
         return
 
-    x_unit, y_unit = _scale_bar_units(request.panel)
+    panel_x, panel_y = _scale_bar_units(request.panel)
+    row_kinds = list(getattr(figure, "_erg_montage_row_kinds", None) or [])
     last = len(axes) - 1
     fontsize = float(style.tick_font_size)
     linewidth = max(1.4, float(style.line_width) * 1.15)
+
+    def _units_for_row(row: int) -> tuple[str | None, str | None]:
+        if row < len(row_kinds):
+            kind = str(row_kinds[row])
+            if kind == "overlay":
+                return ("ms", "µV")
+            if kind == "psth":
+                return ("s", "Hz")
+            if kind == "trial_rate":
+                return (None, "Hz")
+            if kind == "isi":
+                return ("s", "ms")
+            if kind == "raster":
+                return ("s", None)
+            if kind == "rms":
+                return ("s", "µV")
+        return (panel_x, panel_y)
 
     for row, ax in enumerate(axes):
         hide_edge_scale(ax, keep_ylabel=True)
         for spine in ax.spines.values():
             spine.set_visible(False)
+        x_unit, y_unit = _units_for_row(row)
         if x_unit is None and y_unit is None:
             clear_floating_scale_bars(ax)
             continue
@@ -808,7 +902,7 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
             )
         else:
             clear_floating_scale_bars(ax)
-        # Temps partagé : sous le dernier graph (hors zone de tracé).
+        # Temps : sous le dernier graph (unités de cette ligne — ms si overlay).
         if row == last and x_unit is not None:
             draw_floating_scale_bars(
                 ax,
@@ -852,8 +946,9 @@ def _apply_axis_style(
             text.set_fontsize(style.label_font_size)
     for spine in ax.spines.values():
         spine.set_visible(bool(style.show_borders))
-    if panel is not None and bool(getattr(style, "show_scale_bars", False)):
-        _apply_scale_bars(ax, style, panel=panel, keep_ylabel=keep_ylabel)
+    if panel is not None:
+        # Toujours appeler : si décoché, retire les barres et restaure les ticks.
+        _apply_scale_bars(ax, style, panel=panel)
     figure = getattr(ax, "figure", None)
     if figure is not None:
         _apply_figure_title_style(figure, style)
@@ -965,29 +1060,42 @@ def _apply_text_overrides(figure: Any, request: RenderRequest) -> None:
     if not axes:
         return
     multi = len(axes) > 1
+    style = request.style
     if title:
         sup = getattr(figure, "_suptitle", None)
         if multi and sup is not None:
             try:
                 sup.set_text(title)
             except Exception:
-                figure.suptitle(title, fontsize=request.style.title_font_size)
-            _apply_figure_title_style(figure, request.style)
+                figure.suptitle(title, fontsize=style.title_font_size)
+            _apply_figure_title_style(figure, style)
         elif multi:
-            figure.suptitle(title, fontsize=request.style.title_font_size)
-            _apply_figure_title_style(figure, request.style)
+            figure.suptitle(title, fontsize=style.title_font_size)
+            _apply_figure_title_style(figure, style)
         else:
             axes[0].set_title(title)
+            axes[0].title.set_fontsize(style.title_font_size)
+            apply_text_face(axes[0].title, style.title_face)
     if xlabel:
         axes[-1].set_xlabel(xlabel)
+        axes[-1].xaxis.label.set_fontsize(style.label_font_size)
+        apply_text_face(axes[-1].xaxis.label, style.label_face)
     if ylabel:
         if multi:
             for ax in axes:
                 current = str(ax.get_ylabel() or "").strip()
                 if current:
-                    ax.set_ylabel(ylabel)
+                    # Conserver l’alignement montage (rotation=0, coords fixes).
+                    _set_montage_row_ylabel(
+                        ax,
+                        ylabel,
+                        fontsize=float(ax.yaxis.label.get_fontsize() or 8.0),
+                    )
+                    apply_text_face(ax.yaxis.label, style.label_face)
         else:
             axes[0].set_ylabel(ylabel)
+            axes[0].yaxis.label.set_fontsize(style.label_font_size)
+            apply_text_face(axes[0].yaxis.label, style.label_face)
 
 
 _ZOOM_SPAN_COLORS = ("#22c55e", "#eab308", "#38bdf8", "#a78bfa", "#fb7185")
@@ -1166,7 +1274,7 @@ def _relative_stim_window(request: RenderRequest) -> tuple[float, float] | None:
         return None
     rel0, rel1 = float(t_rel[0]), float(t_rel[-1])
     if request.placement.has_custom_zoom:
-        # Zooms analyse absolus déjà convertis par ``section_window``.
+        # Zooms analyse absolus déjà convertis (+ clip t_rel) par ``section_window``.
         if str(request.panel).startswith("analysis_"):
             return request.section_window()
         t0 = float(request.placement.zoom_t0_s)
@@ -1179,14 +1287,16 @@ def _relative_stim_window(request: RenderRequest) -> tuple[float, float] | None:
                 reference, t0, t1, stim_index=stim_index
             )
             return converted if converted is not None else (rel0, rel1)
-        return t0, t1
+        clipped = _clip_to_t_rel(reference, t0, t1)
+        return clipped if clipped is not None else (rel0, rel1)
     manual_x = request.settings.x_limits.as_tuple()
     if manual_x is not None:
         lo, hi = float(manual_x[0]), float(manual_x[1])
         if hi < lo:
             lo, hi = hi, lo
-        if hi >= rel0 and lo <= rel1:
-            return lo, hi
+        clipped = _clip_to_t_rel(reference, lo, hi)
+        if clipped is not None:
+            return clipped
     return rel0, rel1
 
 
@@ -1327,7 +1437,6 @@ def _render_full_recording(figure: Any, request: RenderRequest) -> str:
         legend=request.legend,
     )
     max_pts = int(request.style.max_points_per_curve)
-    multi_rec = len(request.recordings) > 1
     drawn = 0
     sync_mode = request.settings.time_sync
     zoom_note = ""
@@ -1365,31 +1474,31 @@ def _render_full_recording(figure: Any, request: RenderRequest) -> str:
                 stream, request.channel_index
             ):
                 continue
+            stims = recording.stimulation_times_s()
+            offset = continuous_sync_offset_s(stims, sync_mode)
+            t_range = None
+            if window is not None:
+                if window_is_absolute:
+                    t_range = (float(window[0]), float(window[1]))
+                else:
+                    t_range = (
+                        float(window[0]) + offset,
+                        float(window[1]) + offset,
+                    )
             t, values = recording.continuous_trace(
                 stream,
                 request.channel_index,
                 max_points=max_pts,
                 require_ready=str(stream) in {"hp", "lp"},
+                t_range=t_range,
             )
             if values.size == 0:
                 continue
-            stims = recording.stimulation_times_s()
-            offset = continuous_sync_offset_s(stims, sync_mode)
-            if window is not None:
-                if window_is_absolute:
-                    mask = _mask_window(t, window)
-                else:
-                    mask = _mask_window(
-                        np.asarray(t, dtype=np.float64) - offset, window
-                    )
-                if mask is not None:
-                    t = t[mask]
-                    values = values[mask]
             t_plot = np.asarray(t, dtype=np.float64) - offset
-            color = (
-                request.colors[index]
-                if multi_rec
-                else STREAM_PLOT_COLORS.get(str(stream), request.colors[index])
+            color = recording_trace_color(
+                request.colors,
+                index,
+                fallback=STREAM_PLOT_COLORS.get(str(stream), "#334155"),
             )
             _plot_curve(
                 ax,
@@ -1762,14 +1871,12 @@ def _render_channel_raster_panel(ax: Any, request: RenderRequest) -> str:
         window = request.section_window()
     if window is None:
         return _fail(ax, request, "Section unavailable (no stimulation-end marker).")
-    multi_rec = len(request.recordings) > 1
     line_w = max(0.6, float(request.style.line_width) * 0.85)
     drawn = _montage_draw_extra_row(
         ax,
         request,
         ch=int(request.channel_index),
         kind="raster",
-        multi_rec=multi_rec,
         line_w=line_w,
         row_i=0,
         section_x=window,
@@ -2101,7 +2208,6 @@ def _iter_montage_triggered_xy(
     window: tuple[float, float],
 ) -> list[tuple[np.ndarray, np.ndarray, Any]]:
     """[(x, y, color), ...] for one montage row."""
-    multi_rec = len(request.recordings) > 1
     _, _, default_color = _MONTAGE_SPECS[request.panel]
     out: list[tuple[np.ndarray, np.ndarray, Any]] = []
     for index, recording in enumerate(request.recordings):
@@ -2119,7 +2225,9 @@ def _iter_montage_triggered_xy(
         mask = _mask_window(t, window)
         x = t[mask] if mask is not None else t
         y = curve[mask] if mask is not None else curve
-        line_color = request.colors[index] if multi_rec else default_color
+        line_color = recording_trace_color(
+            request.colors, index, fallback=default_color
+        )
         out.append((x, y, line_color))
     return out
 
@@ -2241,7 +2349,9 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
             mask = _mask_window(t, window)
             x = t[mask] if mask is not None else t
             y = curve[mask] if mask is not None else curve
-            line_color = request.colors[index] if multi_rec else color
+            line_color = recording_trace_color(
+                request.colors, index, fallback=color
+            )
             # Légende uniquement sur la 1re ligne (évite N_axes copies).
             series_label = (
                 _series_label(request, index, stream=stream) if row == 0 else None
@@ -2271,11 +2381,9 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
                 fontsize=request.style.tick_font_size,
                 color=MUTED_AXIS_TEXT,
             )
-        ax.set_ylabel(
+        _set_montage_row_ylabel(
+            ax,
             name,
-            rotation=0,
-            ha="right",
-            va="center",
             fontsize=max(5.0, request.style.tick_font_size - 1.0),
         )
         ax.tick_params(
@@ -2284,6 +2392,7 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
             direction="in" if request.style.ticks_inside else "out",
             top=bool(request.style.ticks_inside),
             right=bool(request.style.ticks_inside),
+            labelleft=False,
         )
         if request.style.grid:
             ax.grid(True, alpha=request.style.grid_alpha)
@@ -2387,13 +2496,18 @@ def _montage_review_curve(
     mode: str,
     stim_index: int,
     max_points: int,
+    t_range: tuple[float, float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """``(t, y)`` pour une ligne tension selon le mode aperçu."""
     if mode == "continuous":
         if str(stream) in {"hp", "lp"} and not recording.stream_ready(stream, ch):
             return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
         t, values = recording.continuous_trace(
-            stream, ch, max_points=max_points, require_ready=str(stream) in {"hp", "lp"}
+            stream,
+            ch,
+            max_points=max_points,
+            require_ready=str(stream) in {"hp", "lp"},
+            t_range=t_range,
         )
         return np.asarray(t, dtype=np.float64), np.asarray(values, dtype=np.float64)
     if mode == "stimulation":
@@ -2415,11 +2529,9 @@ def _montage_review_curve(
     return t, y
 
 
-def _montage_continuous_max_points(request: RenderRequest, n_channels: int, n_kinds: int) -> int:
-    """Budget de points stable (indépendant des canaux masqués → cache memmap hit)."""
-    style_cap = max(200, int(request.style.max_points_per_curve))
-    total_rows = max(1, int(n_channels) * max(1, int(n_kinds)))
-    return min(style_cap, max(240, 10000 // total_rows))
+def _montage_continuous_max_points(request: RenderRequest) -> int:
+    """Même plafond « Points max / courbe » que l’aperçu."""
+    return max(200, int(request.style.max_points_per_curve))
 
 
 def _montage_continuous_row_specs(
@@ -2449,7 +2561,7 @@ def _montage_continuous_row_specs(
             else:
                 short = _MONTAGE_EXTRA_LABELS.get(kind, kind.upper())
             row_specs.append((ch, kind, f"{name} {short}"))
-    max_pts = _montage_continuous_max_points(request, n_channels, len(kinds))
+    max_pts = _montage_continuous_max_points(request)
     return row_specs, reference, mode, kinds, max_pts
 
 
@@ -2476,10 +2588,7 @@ def _montage_continuous_base_geom(request: RenderRequest) -> tuple[Any, ...]:
             )
             for rec in request.recordings
         )
-    n_channels = 0
-    if request.recordings:
-        n_channels = min(int(rec.n_channels) for rec in request.recordings)
-    max_pts = _montage_continuous_max_points(request, n_channels, len(kinds) or 1)
+    max_pts = _montage_continuous_max_points(request)
     return (
         mode,
         int(request.settings.analysis.stim_index),
@@ -2592,6 +2701,7 @@ def _try_shrink_continuous_montage(figure: Any, request: RenderRequest) -> str |
             direction="in" if inside else "out",
             top=inside,
             right=inside,
+            labelleft=False,
             labelbottom=(row_i == rows - 1),
         )
         if row_i < rows - 1:
@@ -2646,7 +2756,6 @@ def _montage_draw_extra_row(
     *,
     ch: int,
     kind: str,
-    multi_rec: bool,
     line_w: float,
     row_i: int,
     section_x: tuple[float, float] | None,
@@ -2666,7 +2775,9 @@ def _montage_draw_extra_row(
     for index, recording in enumerate(recordings):
         if ch >= int(recording.n_channels):
             continue
-        color = request.colors[index] if multi_rec else color_default
+        color = recording_trace_color(
+            request.colors, index, fallback=color_default
+        )
         label = _series_label(request, index) if row_i == 0 else None
 
         if kind == "rms":
@@ -2831,9 +2942,8 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
     except Exception:
         pass
 
-    # Budget stable sur n_channels totaux (pas rows visibles) → cache memmap hit
-    # quand on coche/décoche des canaux.
-    max_pts = _montage_continuous_max_points(request, n_channels, len(kinds))
+    # Plafond UI (Points max / courbe) — indépendant du masquage → cache memmap hit.
+    max_pts = _montage_continuous_max_points(request)
     curve_cache: dict[tuple[Any, ...], tuple[np.ndarray, np.ndarray]] = {}
     prior_cache = getattr(figure, "_erg_montage_curve_cache", None)
     if isinstance(prior_cache, dict):
@@ -2893,12 +3003,35 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
     for row_i, (ch, kind, label) in enumerate(row_specs):
         ax = axes[row_i]
         channel_drawn = 0
+        row_pending = False
 
         if kind in _MONTAGE_STREAM_KINDS:
             for index, recording in enumerate(recordings):
                 if ch >= int(recording.n_channels) or not recording.has_streams:
                     continue
-                cache_key = (index, int(ch), str(kind), mode, int(stim_index), int(max_pts))
+                if (
+                    str(kind) in {"hp", "lp"}
+                    and mode == "continuous"
+                    and not recording.stream_ready(kind, ch)
+                ):
+                    row_pending = True
+                    continue
+                offset = float(offsets[index]) if index < len(offsets) else 0.0
+                abs_range = None
+                if mode == "continuous" and stream_x is not None:
+                    abs_range = (
+                        float(stream_x[0]) + offset,
+                        float(stream_x[1]) + offset,
+                    )
+                cache_key = (
+                    index,
+                    int(ch),
+                    str(kind),
+                    mode,
+                    int(stim_index),
+                    int(max_pts),
+                    abs_range,
+                )
                 cached = curve_cache.get(cache_key)
                 if cached is not None:
                     t_arr, y_arr = cached
@@ -2910,14 +3043,16 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
                         mode=mode,
                         stim_index=stim_index,
                         max_points=max_pts,
+                        t_range=abs_range,
                     )
                     curve_cache[cache_key] = (t_arr, y_arr)
                 if y_arr.size == 0:
+                    if str(kind) in {"hp", "lp"} and mode == "continuous":
+                        row_pending = True
                     continue
                 if mode == "continuous":
-                    offset = float(offsets[index]) if index < len(offsets) else 0.0
                     t_arr = t_arr - offset
-                if stream_x is not None:
+                elif stream_x is not None:
                     mask = _mask_window(t_arr, stream_x)
                     if mask is not None:
                         t_arr = t_arr[mask]
@@ -2927,10 +3062,10 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
                 t0, t1 = float(t_arr[0]), float(t_arr[-1])
                 data_x_min = t0 if data_x_min is None else min(data_x_min, t0)
                 data_x_max = t1 if data_x_max is None else max(data_x_max, t1)
-                color = (
-                    request.colors[index]
-                    if multi_rec
-                    else stream_colors.get(kind, "#334155")
+                color = recording_trace_color(
+                    request.colors,
+                    index,
+                    fallback=stream_colors.get(kind, "#334155"),
                 )
                 series_label = (
                     _series_label(request, index, stream=kind) if row_i == 0 else None
@@ -2973,7 +3108,6 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
                 request,
                 ch=ch,
                 kind=kind,
-                multi_rec=multi_rec,
                 line_w=line_w,
                 row_i=row_i,
                 section_x=section_x,
@@ -2998,7 +3132,7 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
             ax.text(
                 0.5,
                 0.5,
-                "unavailable",
+                "calcul…" if row_pending else "unavailable",
                 ha="center",
                 va="center",
                 transform=ax.transAxes,
@@ -3006,20 +3140,14 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
                 color=MUTED_AXIS_TEXT,
             )
 
-        ax.set_ylabel(
-            label,
-            rotation=0,
-            ha="right",
-            va="center",
-            fontsize=label_fs,
-            labelpad=8,
-        )
+        _set_montage_row_ylabel(ax, label, fontsize=label_fs)
         ax.tick_params(
             axis="both",
             labelsize=tick_fs,
             direction="in" if inside else "out",
             top=inside,
             right=inside,
+            labelleft=False,
             labelbottom=(row_i == rows - 1),
         )
         if request.style.grid:
@@ -3318,18 +3446,39 @@ def _refresh_panel_style(figure: Any, request: RenderRequest) -> str:
     return status
 
 
+def _render_panel_from_prepare(
+    figure: Any, request: RenderRequest, fingerprint: tuple[Any, ...]
+) -> str:
+    """PDF/CLI path shared with the screen: prepare_panel → matplotlib draw."""
+    from panel_draw_mpl import draw_panel_spec
+    from panel_prepare import prepare_panel
+
+    spec = prepare_panel(request)
+    status = draw_panel_spec(figure, spec, request)
+    figure._erg_structure_key = fingerprint
+    figure._erg_from_prepare = True
+    figure._erg_status = status
+    return status
+
+
 def render_panel(figure: Any, request: RenderRequest) -> str:
     """Draw one panel. Rebuilds only when data geometry changes."""
+    from panel_draw_mpl import uses_prepare_mpl
+
     fingerprint = _structure_fingerprint(request)
     previous = getattr(figure, "_erg_structure_key", None)
     panel = request.panel
     has_axes = bool(list(getattr(figure, "axes", []) or []))
+    prepare_path = uses_prepare_mpl(panel)
 
     if (
         previous == fingerprint
         and has_axes
         and panel not in {"mea_layout", "summary_rms_table", "summary_rms", "summary_impedance"}
     ):
+        # Prepare-backed panels: re-draw so Y-limits / style stay in sync with PanelSpec.
+        if prepare_path or getattr(figure, "_erg_from_prepare", False):
+            return _render_panel_from_prepare(figure, request, fingerprint)
         if panel in _MONTAGE_SPECS or panel == "montage_continuous_raw":
             expected = getattr(figure, "_erg_montage_rows", None)
             if expected is not None and expected == len(figure.axes):
@@ -3382,9 +3531,15 @@ def render_panel(figure: Any, request: RenderRequest) -> str:
     figure._erg_montage_row_channels = None
     figure._erg_montage_row_streams = None
     figure._erg_montage_curve_cache = curve_cache
+    figure._erg_from_prepare = False
     if not request.recordings:
         _unavailable(figure.add_subplot(111), "Load a recording to display this panel.")
         return "unavailable"
+
+    if prepare_path:
+        # full_recording + montage_continuous_raw + montages déclenchés :
+        # même PanelSpec que l’écran (extras Pipeline inclus).
+        return _render_panel_from_prepare(figure, request, fingerprint)
 
     if panel == "full_recording":
         status = _render_full_recording(figure, request)

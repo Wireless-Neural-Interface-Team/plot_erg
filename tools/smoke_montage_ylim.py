@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 from matplotlib.figure import Figure
@@ -14,13 +15,29 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tools"))
 
 from make_synthetic_dataset import build_synthetic  # noqa: E402
-from gui.widgets.interactive_canvas import (  # noqa: E402
-    _data_exceeds_ylim,
-    _is_mpl_default_ylim,
-)
 from gui.widgets.panel_canvas import _axis_keeps_rendered_ylim  # noqa: E402
 from panel_registry import RenderRequest, render_panel  # noqa: E402
 from view_config import AnalysisSettings, PanelPlacement, ViewerSettings  # noqa: E402
+
+
+def _is_mpl_default_ylim(ylim: tuple[float, float]) -> bool:
+    """True pour la plage Y par défaut de matplotlib ``(0, 1)``."""
+    try:
+        y0, y1 = float(ylim[0]), float(ylim[1])
+    except Exception:
+        return False
+    return abs(y0) < 1e-12 and abs(y1 - 1.0) < 1e-9
+
+
+def _data_exceeds_ylim(ax: Any, ylim: tuple[float, float]) -> bool:
+    """True si le dataLim de l’axe dépasse nettement ``ylim`` (courbes coupées)."""
+    try:
+        bbox = ax.dataLim
+        y0, y1 = float(ylim[0]), float(ylim[1])
+        pad = max(1e-9, 0.02 * abs(y1 - y0))
+        return float(bbox.y0) < y0 - pad or float(bbox.y1) > y1 + pad
+    except Exception:
+        return False
 
 
 def _ylim(ax) -> tuple[float, float]:

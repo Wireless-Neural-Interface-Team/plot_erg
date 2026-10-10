@@ -311,7 +311,8 @@ class PanelStyle:
     scale_bar_amplitude_manual: bool = False
     scale_bar_amplitude: float = 100.0
     # Max points drawn per curve (min/max envelope decimation above this).
-    max_points_per_curve: int = 6000
+    # UI range is 500…200000 ; défaut = milieu de la plage.
+    max_points_per_curve: int = 100_250
     tight_layout: bool = True
 
 
@@ -400,7 +401,7 @@ class ViewerSettings:
     # Hauteur minimale d’une ligne canal×flux dans le montage continu (px).
     # Plus bas = moins de pixels Agg (ouverture plus rapide).
     montage_row_min_height_px: int = 52
-    # Barres de plage (zoom / traitement). Vide = extrémités au premier rendu.
+    # Barres de plage (zoom / traitement). Vide = aucune plage (défaut).
     range_bars: tuple[TimeRangeBar, ...] = ()
     active_range_index: int = 0
 
@@ -467,11 +468,24 @@ class ViewerSettings:
         return problems
 
 
+def copy_scale_bar_style(target: PanelStyle, source: PanelStyle) -> PanelStyle:
+    """Recopier uniquement les champs d’échelle flottante de ``source`` vers ``target``."""
+    return replace(
+        target,
+        show_scale_bars=bool(source.show_scale_bars),
+        scale_bar_time_manual=bool(source.scale_bar_time_manual),
+        scale_bar_time_s=float(source.scale_bar_time_s),
+        scale_bar_amplitude_manual=bool(source.scale_bar_amplitude_manual),
+        scale_bar_amplitude=float(source.scale_bar_amplitude),
+    )
+
+
 def apply_local_display_settings(
     base: ViewerSettings,
     local: ViewerSettings,
     *,
     include_analysis: bool = False,
+    inherit_scale_bars: bool = False,
 ) -> ViewerSettings:
     """Appliquer les réglages d’affichage d’*une* fenêtre (ou d’un panneau) sur une base.
 
@@ -479,10 +493,17 @@ def apply_local_display_settings(
     avec overrides dédiés contrôle légende, style, axes et sync pour *ses*
     graphs. Sans ceci, un redraw réinjecte les axes / la sync de la fenêtre
     parente et ignore le panneau local.
+
+    ``inherit_scale_bars=True`` : l’échelle flottante vient de ``base`` (dock
+    Affichage), pas du style local figé — évite qu’une édition de texte / un
+    override partiel bloque le toggle global sur certains graphs.
     """
+    style = local.style
+    if inherit_scale_bars:
+        style = copy_scale_bar_style(style, base.style)
     kwargs: dict[str, object] = {
         "legend": local.legend,
-        "style": local.style,
+        "style": style,
         "texts": local.texts,
         "psth_bin_window_s": local.psth_bin_window_s,
         "sampling_percent": local.sampling_percent,
@@ -498,6 +519,9 @@ def apply_local_display_settings(
     }
     if include_analysis:
         kwargs["analysis"] = local.analysis
+        kwargs["continuous_streams"] = local.continuous_streams
+        kwargs["continuous_stream"] = local.continuous_stream
+        kwargs["continuous_mark_stims"] = local.continuous_mark_stims
     return replace(base, **kwargs)  # type: ignore[arg-type]
 
 

@@ -44,13 +44,25 @@ class RenderRequestFactory:
         if preserve_view is None:
             preserve_view = bool(getattr(host, "_preserve_view", False))
         entry_list = list(entries)
+        # Couleurs Auto stables : index dans la table complète, pas parmi les seuls visibles.
+        all_entries = list(getattr(getattr(host, "recordings_panel", None), "entries", []) or [])
+        if all_entries:
+            id_to_index = {
+                int(getattr(entry, "row_id", -1)): i for i, entry in enumerate(all_entries)
+            }
+            styles = [entry.style for entry in all_entries]
+            color_indices = [
+                id_to_index.get(int(getattr(entry, "row_id", -1)), i)
+                for i, entry in enumerate(entry_list)
+            ]
+        else:
+            styles = [entry.style for entry in entry_list]
+            color_indices = list(range(len(entry_list)))
         return RenderRequest(
             placement=placement,
             recordings=[entry.recording for entry in entry_list],
             labels=[entry.display_label for entry in entry_list],
-            colors=resolve_recording_plot_colors(
-                [entry.style for entry in entry_list], list(range(len(entry_list)))
-            ),
+            colors=resolve_recording_plot_colors(styles, color_indices),
             legend_flags=[entry.style.legend_visible for entry in entry_list],
             channel_index=channel_index,
             channel_name=channel_name,

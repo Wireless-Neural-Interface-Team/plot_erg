@@ -6,6 +6,7 @@ from gui.services.montage_controller import MontageController
 from gui.services.pipeline_controller import PipelineController
 from gui.services.redraw_scheduler import RedrawScheduler
 from gui.services.render_request_factory import RenderRequestFactory
+from gui.services.view_settings import merge_central_viewer_settings
 
 __all__ = [
     "ChannelPreviewController",
@@ -14,4 +15,5 @@ __all__ = [
     "PipelineController",
     "RedrawScheduler",
     "RenderRequestFactory",
+    "merge_central_viewer_settings",
 ]

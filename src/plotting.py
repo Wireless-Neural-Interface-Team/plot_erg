@@ -2293,7 +2293,13 @@ def _append_single_curve_stream_montage_pages(
                 va="center",
                 labelpad=10,
             )
-            ax.tick_params(axis="y", labelsize=max(7.0, TICK_LABEL_FONT_SIZE - 5))
+            # Masquer les ticks Y numériques (largeur variable → titres décalés).
+            ax.tick_params(
+                axis="y",
+                labelsize=max(7.0, TICK_LABEL_FONT_SIZE - 5),
+                labelleft=False,
+            )
+            ax.yaxis.set_label_coords(-0.012, 0.5)
             ax.tick_params(axis="x", labelbottom=(row_i == n_rows - 1))
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)
@@ -2622,7 +2628,13 @@ def _append_second_to_third_stim_span_lp_montage_pages(
                 va="center",
                 labelpad=10,
             )
-            ax.tick_params(axis="y", labelsize=max(7.0, TICK_LABEL_FONT_SIZE - 5))
+            # Masquer les ticks Y numériques (largeur variable → titres décalés).
+            ax.tick_params(
+                axis="y",
+                labelsize=max(7.0, TICK_LABEL_FONT_SIZE - 5),
+                labelleft=False,
+            )
+            ax.yaxis.set_label_coords(-0.012, 0.5)
             ax.tick_params(axis="x", labelbottom=(row_i == n_rows - 1))
             ax.spines["top"].set_visible(False)
             ax.spines["right"].set_visible(False)

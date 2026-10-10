@@ -258,7 +258,7 @@ def _bench_panel_prepare_pyqtgraph() -> None:
     print("panel_prepare + PlotHost (offscreen):")
     from PySide6.QtWidgets import QApplication
 
-    from panel_prepare import prepare_panel
+    from panel_prepare import prepare_panel, restyle_panel_spec, screen_prepare_key
     from gui.widgets.plot_host import PlotHost
 
     app = QApplication.instance() or QApplication([])
@@ -285,8 +285,43 @@ def _bench_panel_prepare_pyqtgraph() -> None:
         spec = prepare_panel(request)
         host.render_spec(spec)
 
+    def draw_incremental() -> None:
+        # Même géométrie → chemin _refresh_spec (pas de glw.clear).
+        spec = prepare_panel(request)
+        host.render_spec(spec)
+
+    def style_only_screen() -> None:
+        cached = host._cached_spec
+        assert cached is not None
+        tweaked = RenderRequest(
+            placement=request.placement,
+            recordings=request.recordings,
+            labels=request.labels,
+            colors=["#dc2626"],
+            legend_flags=request.legend_flags,
+            channel_index=request.channel_index,
+            channel_name=request.channel_name,
+            settings=replace(
+                settings,
+                style=replace(
+                    settings.style,
+                    line_width=float(settings.style.line_width) + 0.1,
+                    grid=not bool(settings.style.grid),
+                ),
+            ),
+        )
+        # Simule panel_canvas : restyle sans prepare_panel.
+        assert screen_prepare_key(tweaked) == screen_prepare_key(request)
+        spec = restyle_panel_spec(cached, tweaked)
+        host.render_spec(spec)
+        host._cached_spec = spec
+
     _time("prepare_panel mean_raw", prepare)
-    _time("PlotHost.render_spec mean_raw", draw)
+    _time("PlotHost.render_spec mean_raw (full)", draw)
+    _time("PlotHost.render_spec (incremental)", draw_incremental)
+    host._structure_key = screen_prepare_key(request)
+    host._cached_spec = prepare_panel(request)
+    _time("restyle + incremental (no prepare)", style_only_screen)
     host.deleteLater()
     del host
 

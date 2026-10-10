@@ -31,14 +31,61 @@ from gui.widgets.plot_host import (
     PlotHost,
 )
 from gui.widgets.view_params import LocalViewParams
-from panel_prepare import prepare_panel
+from panel_prepare import prepare_panel, restyle_panel_spec, screen_prepare_key
 from panel_registry import RenderRequest, panel_info
 from view_config import (
+    AnalysisSettings,
     PanelPlacement,
+    PanelStyle,
+    TextOverrides,
     ViewerSettings,
     apply_local_display_settings,
     continuous_sync_offset_s,
+    copy_scale_bar_style,
 )
+
+
+def x_scale_family(panel: str) -> str:
+    """Famille d’échelle X partageable au double-clic ('' = ne pas synchroniser)."""
+    key = str(panel or "")
+    if not key or key.startswith("summary_") or key in {"mea_layout", "impedance"}:
+        return ""
+    # Unités différentes du temps d’essai / fichier.
+    if any(token in key for token in ("overlay", "isi", "trial_rate", "waveform")):
+        return ""
+    try:
+        from panel_registry import _panel_expects_relative_x
+
+        if _panel_expects_relative_x(key):
+            return "relative"
+    except Exception:
+        pass
+    return "continuous"
+
+
+def _patch_text_overrides(texts: TextOverrides, result: dict[str, Any] | Any) -> TextOverrides:
+    """Appliquer une édition in-place aux overrides de textes persistés."""
+    if isinstance(result, dict):
+        role = str(result.get("role", "") or "")
+        value = str(result.get("text", "") or "")
+        item_index = int(result.get("item_index", 0) or 0)
+    else:
+        role = str(getattr(result, "role", "") or "")
+        value = str(getattr(result, "text", "") or "")
+        item_index = int(getattr(result, "item_index", 0) or 0)
+    if role == "title":
+        return replace(texts, title=value.strip())
+    if role == "xlabel":
+        return replace(texts, xlabel=value.strip())
+    if role == "ylabel":
+        return replace(texts, ylabel=value.strip())
+    if role == "legend":
+        labels = list(texts.legend_labels)
+        while len(labels) <= item_index:
+            labels.append("")
+        labels[item_index] = value
+        return replace(texts, legend_labels=tuple(labels))
+    return texts
 
 _STATUS_COLORS = {
     "ok": "#16a34a",
@@ -73,12 +120,21 @@ def _request_sync_offset(request: RenderRequest) -> float:
 
 
 def _shift_limits_for_sync_delta(
-    limits: list[tuple[tuple[float, float], tuple[float, float]]],
+    limits: list[tuple[tuple[float, float], tuple[float, float]]]
+    | dict[Any, tuple[tuple[float, float], tuple[float, float]]],
     delta_s: float,
-) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+) -> (
+    list[tuple[tuple[float, float], tuple[float, float]]]
+    | dict[Any, tuple[tuple[float, float], tuple[float, float]]]
+):
     """Décale les xlim d’affichage quand l’origine du temps change (même fenêtre physique)."""
     if not delta_s:
         return limits
+    if isinstance(limits, dict):
+        return {
+            key: ((xlim[0] - delta_s, xlim[1] - delta_s), ylim)
+            for key, (xlim, ylim) in limits.items()
+        }
     return [((x0 - delta_s, x1 - delta_s), ylim) for (x0, x1), ylim in limits]
 
 
@@ -158,6 +214,22 @@ def _axis_keeps_rendered_ylim(
     return False
 
 
+def _keeps_rendered_xlim(
+    request: RenderRequest,
+    *,
+    previous: RenderRequest | None = None,
+) -> bool:
+    """True → garder le xlim du rendu (manuel, ou manuel→auto)."""
+    current = request.settings.x_limits.as_tuple()
+    if current is not None:
+        return True
+    if previous is not None:
+        previous_x = previous.settings.x_limits.as_tuple()
+        if previous_x != current:
+            return True
+    return False
+
+
 def _finish_panel_render(
     plot: PlotHost,
     *,
@@ -170,8 +242,23 @@ def _finish_panel_render(
     """Prepare PanelSpec → PlotHost.render; restore view; coalesce draw."""
     del panel  # status comes from spec; panel kept for call-site compatibility
     try:
-        spec = prepare_panel(request)
+        key = screen_prepare_key(request)
+        cached_key = getattr(plot, "_structure_key", None)
+        cached_spec = getattr(plot, "_cached_spec", None)
+        # Même géométrie données → restyle (pas de relecture memmap / filtres).
+        if (
+            cached_key == key
+            and cached_spec is not None
+            and cached_spec.layout_kind != "placeholder"
+            and cached_spec.series
+            and plot.plot_items()
+        ):
+            spec = restyle_panel_spec(cached_spec, request)
+        else:
+            spec = prepare_panel(request)
         status = plot.render_spec(spec)
+        plot._structure_key = key
+        plot._cached_spec = spec
     except Exception as exc:
         from panel_prepare import PanelSpec
 
@@ -183,9 +270,11 @@ def _finish_panel_render(
                 layout_kind="placeholder",
             )
         )
+        plot._structure_key = None
+        plot._cached_spec = None
         status = "unavailable"
     if preserve_limits is not None:
-        restore_x = request.settings.x_limits.as_tuple() is None
+        restore_x = not _keeps_rendered_xlim(request, previous=previous_request)
         n_axes = len(list(getattr(figure, "axes", []) or []))
         restore_y = [
             not _axis_keeps_rendered_ylim(
@@ -294,6 +383,8 @@ class PanelCanvas(QFrame):
     removeRequested = Signal(object)  # PanelPlacement
     detachRequested = Signal(object)  # PanelPlacement
     styleChanged = Signal(object)  # PanelPlacement — overrides d’affichage modifiés
+    # Famille d’échelle X + (x0, x1) après double-clic / ⌂ — sync grille.
+    xScaleSyncRequested = Signal(str, object)
 
     def __init__(
         self,
@@ -317,6 +408,7 @@ class PanelCanvas(QFrame):
         self._last_base_settings: ViewerSettings | None = None
         self._last_request: RenderRequest | None = None
         self._style_dialog: PanelStyleDialog | None = None
+        self._x_sync_guard = False
 
         self._plot = PlotHost(
             parent=self,
@@ -329,6 +421,8 @@ class PanelCanvas(QFrame):
         self.canvas = self._plot  # QWidget for grab() / range-bar attach
         self.toolbar = self._plot.toolbar
         self.plot_host = self._plot
+        self._plot.textEdited.connect(self._on_canvas_text_edited)
+        self._plot.xAutoscaleRequested.connect(self._on_host_x_autoscale)
 
         interact_hint = (
             _TITLE_INTERACT_HINT if self._allow_zoom else _TITLE_INTERACT_HINT_NO_ZOOM
@@ -455,8 +549,71 @@ class PanelCanvas(QFrame):
         if self._style_dialog is None:
             return
         self._style_overrides = self._style_dialog.params.settings()
+        # Propager l’échelle flottante locale dans la requête de base, sinon
+        # ``_with_style_overrides`` (inherit) la réécraserait avec le dock.
+        if self._last_request is not None and self._style_overrides is not None:
+            merged = copy_scale_bar_style(
+                self._last_request.settings.style,
+                self._style_overrides.style,
+            )
+            self._last_request = replace(
+                self._last_request,
+                settings=replace(self._last_request.settings, style=merged),
+            )
         self._refresh_style_button()
         self._rerender_with_overrides()
+        self.styleChanged.emit(self.placement)
+
+    def sync_scale_bars_from(self, style: PanelStyle | Any) -> None:
+        """Aligner un override local sur l’échelle flottante globale (dock)."""
+        if self._style_overrides is None:
+            return
+        self._style_overrides = replace(
+            self._style_overrides,
+            style=copy_scale_bar_style(self._style_overrides.style, style),
+        )
+
+    def _on_host_x_autoscale(self, xlim: object) -> None:
+        """Relayer l’échelle X du double-clic vers la grille (même famille)."""
+        if self._x_sync_guard:
+            return
+        family = x_scale_family(str(self.placement.panel))
+        if not family or xlim is None:
+            return
+        try:
+            x0, x1 = float(xlim[0]), float(xlim[1])  # type: ignore[index]
+        except Exception:
+            return
+        if not (x1 > x0):
+            return
+        self.xScaleSyncRequested.emit(family, (x0, x1))
+
+    def apply_shared_x_scale(self, xlim: tuple[float, float]) -> None:
+        """Recevoir une échelle X synchronisée depuis un autre panneau."""
+        if self._x_sync_guard:
+            return
+        self._x_sync_guard = True
+        try:
+            self._plot.apply_shared_xlim(xlim)
+        finally:
+            self._x_sync_guard = False
+
+    def _on_canvas_text_edited(self, result: object) -> None:
+        """Persister une édition de texte faite directement sur le graphique."""
+        role = (
+            str(result.get("role", "") or "")
+            if isinstance(result, dict)
+            else str(getattr(result, "role", "") or "")
+        )
+        if role in {"", "annotation"}:
+            return
+        seed = self._style_overrides or self._last_base_settings or ViewerSettings()
+        texts = _patch_text_overrides(seed.texts, result)
+        self._style_overrides = replace(seed, texts=texts)
+        self._refresh_style_button()
+        if self._style_dialog is not None:
+            self._style_dialog.params.apply_texts(texts)
+        # Pins locaux déjà appliqués ; pas de re-render (évite flash + perte focus).
         self.styleChanged.emit(self.placement)
 
     def _reset_style_overrides(self) -> None:
@@ -484,7 +641,19 @@ class PanelCanvas(QFrame):
         self._last_request = request
         if self._style_overrides is None:
             return request
-        settings = apply_local_display_settings(request.settings, self._style_overrides)
+        # Échelle flottante = réglage Affichage global (pas un freeze d’override).
+        settings = apply_local_display_settings(
+            request.settings,
+            self._style_overrides,
+            inherit_scale_bars=True,
+        )
+        # Garder l’override aligné pour les prochains rendus / le dialogue Style.
+        self._style_overrides = replace(
+            self._style_overrides,
+            style=copy_scale_bar_style(
+                self._style_overrides.style, request.settings.style
+            ),
+        )
         return replace(request, settings=settings)
 
     # ----------------------------------------------------------------- drawing
@@ -525,10 +694,7 @@ class PanelCanvas(QFrame):
         elif isinstance(saved_limits, dict) and prev_request is not None:
             delta = _request_sync_offset(request) - old_offset
             if delta:
-                saved_limits = {
-                    key: ((xlim[0] + delta, xlim[1] + delta), ylim)
-                    for key, (xlim, ylim) in saved_limits.items()
-                }
+                saved_limits = _shift_limits_for_sync_delta(saved_limits, delta)
         started = time.perf_counter()
         status = _finish_panel_render(
             self._plot,
@@ -595,6 +761,7 @@ class DetachedPanelWindow(QDialog):
         self.figure = self._plot.figure
         self.canvas = self._plot
         self.plot_host = self._plot
+        self._plot.textEdited.connect(self._on_detached_text_edited)
 
         self._status = QLabel("—")
         self._status.setObjectName("panelStatus")
@@ -659,6 +826,19 @@ class DetachedPanelWindow(QDialog):
         self.settings = self.local_settings()
         self.refreshRequested.emit(self)
 
+    def _on_detached_text_edited(self, result: object) -> None:
+        """Sync édition in-place → panneau Style local de la fenêtre détachée."""
+        role = (
+            str(result.get("role", "") or "")
+            if isinstance(result, dict)
+            else str(getattr(result, "role", "") or "")
+        )
+        if role in {"", "annotation"}:
+            return
+        texts = _patch_text_overrides(self.params.settings().texts, result)
+        self.params.apply_texts(texts)
+        self.settings = self.local_settings()
+
     def render(self, request: RenderRequest) -> str:
         prev_request = self._last_request
         old_offset = _request_sync_offset(prev_request) if prev_request else 0.0
@@ -677,10 +857,7 @@ class DetachedPanelWindow(QDialog):
         elif isinstance(saved_limits, dict) and prev_request is not None:
             delta = _request_sync_offset(request) - old_offset
             if delta:
-                saved_limits = {
-                    key: ((xlim[0] + delta, xlim[1] + delta), ylim)
-                    for key, (xlim, ylim) in saved_limits.items()
-                }
+                saved_limits = _shift_limits_for_sync_delta(saved_limits, delta)
         started = time.perf_counter()
         status = _finish_panel_render(
             self._plot,
@@ -704,8 +881,46 @@ class DetachedPanelWindow(QDialog):
         super().closeEvent(event)
 
 
+def _zoom_placement_visible(
+    placement: PanelPlacement, analysis: AnalysisSettings
+) -> bool:
+    """Filtrer un panneau zoom selon les coches Canal locales de la fenêtre."""
+    panel = str(placement.panel)
+    stream = str(getattr(placement, "stream", "") or "")
+
+    if panel == "full_recording":
+        if stream == "raw":
+            return bool(analysis.show_raw)
+        if stream == "hp":
+            return bool(analysis.show_hp)
+        if stream == "lp":
+            return bool(analysis.show_lp)
+        return True
+
+    curve_flags = {
+        "analysis_raw": analysis.show_raw,
+        "mean_raw": analysis.show_raw,
+        "analysis_hp": analysis.show_hp,
+        "mean_hp": analysis.show_hp,
+        "analysis_lp": analysis.show_lp,
+        "mean_lp": analysis.show_lp,
+        "analysis_rms": analysis.show_rms,
+        "mean_rms": analysis.show_rms,
+        "analysis_isi": analysis.show_isi,
+        "analysis_overlay": analysis.show_overlay,
+        "analysis_psth": analysis.show_psth,
+        "analysis_trial_rate": analysis.show_trial_rate,
+        "analysis_raster": analysis.show_raster,
+        "analysis_raster_channel": analysis.show_raster,
+    }
+    if panel in curve_flags:
+        return bool(curve_flags[panel])
+    # Impédance / résumés éventuels : toujours visibles s’ils sont dans la liste.
+    return True
+
+
 class DetachedZoomWindow(QDialog):
-    """Zooms continuous d’un canal regroupés dans une seule fenêtre."""
+    """Zooms d’un canal regroupés : grille + Paramètres locaux (Canal / Affichage)."""
 
     closed = Signal()
     refreshRequested = Signal(object)  # DetachedZoomWindow
@@ -722,7 +937,9 @@ class DetachedZoomWindow(QDialog):
         super().__init__(parent)
         self.channel_name = str(channel_name)
         self.settings = settings
-        self._placements: tuple[PanelPlacement, ...] = tuple(placements)
+        # Liste complète fournie par l’aperçu ; le filtrage Canal est local.
+        self._all_placements: tuple[PanelPlacement, ...] = tuple(placements)
+        self._placements: tuple[PanelPlacement, ...] = ()
         self._panel_height = max(160, int(panel_height))
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self.setWindowTitle(f"{self.channel_name} — Zooms")
@@ -734,10 +951,21 @@ class DetachedZoomWindow(QDialog):
         self.grid = PanelGrid(self, allow_zoom=True)
         self._status = QLabel("—")
         self._status.setObjectName("panelStatus")
+
+        self._tabs = QTabWidget(self)
+        self._tabs.setObjectName("paramsTabs")
+        self._tabs.setDocumentMode(True)
+        self._tabs.setUsesScrollButtons(False)
+        tab_bar = self._tabs.tabBar()
+        tab_bar.setElideMode(Qt.TextElideMode.ElideRight)
+        tab_bar.setExpanding(True)
+
         self.params = LocalViewParams(
             settings,
             show_sync=True,
             show_display_extras=True,
+            show_canal_tab=True,
+            host_tabs=self._tabs,
             parent=self,
         )
         self.params.changed.connect(self._on_local_params_changed)
@@ -754,16 +982,12 @@ class DetachedZoomWindow(QDialog):
         plot_layout.addLayout(header)
         plot_layout.addWidget(self.grid, 1)
 
-        from gui.form_widgets import FitWidthScrollArea
-
-        params_inner = QWidget(self)
-        params_layout = QVBoxLayout(params_inner)
-        params_layout.setContentsMargins(6, 6, 6, 6)
-        params_layout.addWidget(self.params, 1)
-
-        params_side = FitWidthScrollArea(self)
-        params_side.setWidget(params_inner)
-        params_side.setMinimumWidth(220)
+        params_side = QWidget(self)
+        params_layout = QVBoxLayout(params_side)
+        params_layout.setContentsMargins(0, 0, 0, 0)
+        params_layout.setSpacing(0)
+        params_layout.addWidget(self._tabs, 1)
+        params_side.setMinimumWidth(240)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.setChildrenCollapsible(False)
@@ -786,7 +1010,27 @@ class DetachedZoomWindow(QDialog):
         n = len(self._placements)
         return f"{self.channel_name} — {n} zoom(s)"
 
+    def _visible_placements(self) -> tuple[PanelPlacement, ...]:
+        analysis = self.params.settings().analysis
+        visible = tuple(
+            p
+            for p in self._all_placements
+            if _zoom_placement_visible(p, analysis)
+        )
+        if visible:
+            return visible
+        # Repli : au moins les WIDE de la liste complète.
+        fallback = tuple(
+            p
+            for p in self._all_placements
+            if _zoom_placement_visible(
+                p, replace(analysis, show_raw=True, show_hp=False, show_lp=False)
+            )
+        )
+        return fallback or self._all_placements
+
     def _configure_grid(self) -> None:
+        self._placements = self._visible_placements()
         self.grid.configure(
             self._placements,
             columns=1,
@@ -794,6 +1038,7 @@ class DetachedZoomWindow(QDialog):
             uniform=True,
             fill=False,
         )
+        self._title_label.setText(self._header_text())
 
     def local_settings(self) -> ViewerSettings:
         return self.params.settings()
@@ -805,11 +1050,10 @@ class DetachedZoomWindow(QDialog):
         panel_height: int | None = None,
     ) -> None:
         """Mettre à jour la grille sans recréer la fenêtre."""
-        self._placements = tuple(placements)
+        self._all_placements = tuple(placements)
         if panel_height is not None:
             self._panel_height = max(160, int(panel_height))
         self.setWindowTitle(f"{self.channel_name} — Zooms")
-        self._title_label.setText(self._header_text())
         self._configure_grid()
 
     @property
@@ -820,7 +1064,10 @@ class DetachedZoomWindow(QDialog):
         return any(p.key == key for p in self._placements)
 
     def _on_local_params_changed(self) -> None:
+        # Le parent (ChannelAnalysisWindow) recatalogue les placements, assure
+        # les produits HIGH/RMS/spikes, puis redraw → schedule_render ici.
         self.settings = self.local_settings()
+        self._panel_height = max(160, int(self.settings.graph_height_px))
         self.refreshRequested.emit(self)
 
     def schedule_render(self, factory: Any, *, force: bool = True) -> None:

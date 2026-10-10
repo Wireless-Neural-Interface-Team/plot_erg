@@ -395,8 +395,8 @@ class ParamsPanel(QWidget):
         self._show_scale_bars = QCheckBox("Échelle flottante (barres temps / amplitude)")
         self._show_scale_bars.setChecked(False)
         self._show_scale_bars.setToolTip(
-            "Masque les graduations numériques sur les bords et affiche une barre "
-            "d’échelle flottante (ex. 100 ms · 200 µV)."
+            "Masque les graduations numériques sur les bords (les titres d’axes "
+            "restent) et affiche une barre d’échelle flottante (ex. 100 ms · 200 µV)."
         )
         self._scale_bar_amp_manual = QCheckBox("Manuel")
         self._scale_bar_amp_manual.setChecked(False)
@@ -432,16 +432,37 @@ class ParamsPanel(QWidget):
         self._scale_bar_time_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._show_scale_bars.toggled.connect(self._sync_scale_bar_inputs)
         self._sync_scale_bar_inputs()
-        self._max_points = _int_spin(500, 200000, 6000, step=500)
-        self._max_points.setToolTip(
-            "Points dessinés par courbe. Au-delà, une enveloppe min/max conserve "
-            "tous les pics tout en restant rapide."
+        _max_pts_lo, _max_pts_hi = 500, 200_000
+        _max_pts_mid = (_max_pts_lo + _max_pts_hi) // 2
+        self._max_points = _int_spin(
+            _max_pts_lo, _max_pts_hi, _max_pts_mid, step=500
         )
+        self._max_points.setToolTip(
+            "Points dessinés par courbe (aperçu, montage et fenêtres zoom). "
+            "Au-delà, une enveloppe min/max conserve tous les pics tout en restant rapide."
+        )
+        max_pts_row = QWidget()
+        max_pts_lay = QHBoxLayout(max_pts_row)
+        max_pts_lay.setContentsMargins(0, 0, 0, 0)
+        max_pts_lay.setSpacing(6)
+        max_pts_min_btn = QPushButton("Min")
+        max_pts_max_btn = QPushButton("Max")
+        max_pts_min_btn.setToolTip(f"Mettre le minimum ({_max_pts_lo})")
+        max_pts_max_btn.setToolTip(f"Mettre le maximum ({_max_pts_hi})")
+        max_pts_min_btn.clicked.connect(
+            lambda: self._max_points.setValue(_max_pts_lo)
+        )
+        max_pts_max_btn.clicked.connect(
+            lambda: self._max_points.setValue(_max_pts_hi)
+        )
+        max_pts_lay.addWidget(self._max_points, 1)
+        max_pts_lay.addWidget(max_pts_min_btn)
+        max_pts_lay.addWidget(max_pts_max_btn)
         self._layout_form.addRow("Hauteur des graphs :", self._graph_height)
         self._layout_form.addRow(self._show_scale_bars)
         self._layout_form.addRow("Amplitude barre :", amp_row)
         self._layout_form.addRow("Temps barre :", time_row)
-        self._layout_form.addRow("Points max / courbe :", self._max_points)
+        self._layout_form.addRow("Points max / courbe :", max_pts_row)
 
         # Revue montage continue uniquement.
         self._montage_review_group = QGroupBox("Revue montage")
@@ -937,13 +958,15 @@ class ParamsPanel(QWidget):
             suffix=" s",
         )
         self._psth_bin.setToolTip(
-            "Largeur des bins du PSTH / firing rate. Modifier → Traiter (F5)."
+            "Largeur des bins du PSTH / firing rate à l’écran (redessin immédiat). "
+            "L’export PDF / le cache utilisent aussi cette valeur au prochain Traiter (F5)."
         )
         self._sampling = _int_spin(
             1, 100, int(defaults.get("default_sampling_percent", 100) or 100)
         )
         self._sampling.setToolTip(
-            "Pourcentage d’essais utilisés pour les graphs spikes (sous-échantillon)."
+            "Pourcentage d’essais / spikes dessinés (sous-échantillon). "
+            "Redessin immédiat à l’écran ; pris en compte aussi au prochain Traiter (F5)."
         )
         spike_form.addRow("Avant le spike :", self._overlay_pre)
         spike_form.addRow("Après le spike :", self._overlay_post)
@@ -1065,18 +1088,19 @@ class ParamsPanel(QWidget):
             self._rms_multiplier,
             self._overlay_pre,
             self._overlay_post,
-            self._psth_bin,
         ):
             spin.valueChanged.connect(lambda _v: self._emit_config())
+        # Bin PSTH / sampling : display (redraw) + config (PDF / F5).
+        self._psth_bin.valueChanged.connect(lambda _v: self._emit_display_and_config())
         self._threshold.valueChanged.connect(lambda _v: self._on_processing_threshold_changed())
         for int_spin in (
             self._section_count,
             self._hp_filter_order,
             self._lp_filter_order,
             self._channel_workers,
-            self._sampling,
         ):
             int_spin.valueChanged.connect(lambda _v: self._emit_config())
+        self._sampling.valueChanged.connect(lambda _v: self._emit_display_and_config())
         for box in (
             self._section_spec,
             self._hp_filter_type,
@@ -1211,6 +1235,13 @@ class ParamsPanel(QWidget):
         if self._loading:
             return
         self._view_debouncer.request()
+
+    def _emit_display_and_config(self) -> None:
+        """Réglages mixtes : redessin immédiat + marquage dirty pour F5 / PDF."""
+        if self._loading:
+            return
+        self._emit_config()
+        self._emit_view()
 
     def montage_review_channels(self) -> int:
         """Canaux par page dans la revue montage."""
@@ -1413,8 +1444,11 @@ class ParamsPanel(QWidget):
             self._montage_pdf_group.setVisible(True)
             self._montage_pdf_group.setEnabled(True)
             base = getattr(self, "_montage_pdf_tooltip", "")
+            # Pagination PDF (export) — sans effet sur la revue continue à l’écran.
             self._montage_pdf_group.setToolTip(
-                base if montage else f"{base} {montage_only_tip}".strip()
+                f"{base} Sans effet sur la revue continue à l’écran."
+                if montage
+                else base
             )
         if hasattr(self, "_montage_row_height"):
             base = getattr(self, "_montage_row_tooltip", "")
@@ -1427,17 +1461,14 @@ class ParamsPanel(QWidget):
                 base if montage else f"{base} {montage_only_tip}".strip()
             )
         if hasattr(self, "_montage_channels"):
-            self._montage_channels.setEnabled(montage)
+            # Toujours éditables : pagination des montages PDF (export), pas la revue.
+            self._montage_channels.setEnabled(True)
             base = getattr(self, "_montage_channels_tooltip", "")
-            self._montage_channels.setToolTip(
-                base if montage else f"{base} {montage_only_tip}".strip()
-            )
+            self._montage_channels.setToolTip(base)
         if hasattr(self, "_montage_page"):
-            self._montage_page.setEnabled(montage)
+            self._montage_page.setEnabled(True)
             base = getattr(self, "_montage_page_tooltip", "")
-            self._montage_page.setToolTip(
-                base if montage else f"{base} {montage_only_tip}".strip()
-            )
+            self._montage_page.setToolTip(base)
 
         # Hauteur des graphs : aperçu uniquement (le montage utilise la hauteur de ligne).
         if hasattr(self, "_layout_form") and hasattr(self, "_graph_height"):

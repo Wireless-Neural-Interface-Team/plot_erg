@@ -138,10 +138,10 @@ def clear_floating_scale_bars(ax: Any) -> None:
 def hide_edge_scale(
     ax: Any,
     *,
-    keep_ylabel: bool = False,
-    keep_xlabel: bool = False,
+    keep_ylabel: bool = True,
+    keep_xlabel: bool = True,
 ) -> None:
-    """Masquer graduations / libellés d’unités sur les bords (pas le cadre)."""
+    """Masquer les graduations numériques sur les bords (titres d’axes conservés)."""
     ax.tick_params(
         axis="both",
         which="both",
@@ -180,8 +180,20 @@ def resolve_scale_bar_length(
     manual: bool,
     value: float,
 ) -> float:
-    """Longueur de barre : valeur manuelle si demandée, sinon auto."""
-    if manual and math.isfinite(float(value)) and float(value) > 0:
+    """Longueur de barre : valeur manuelle si demandée, sinon auto.
+
+    Si la valeur manuelle dépasse ~90 % du span visible (ex. 100 ms sur un
+    spike scope de 6 ms), on repasse en auto pour que bâton et libellé
+    restent cohérents avec la vue.
+    """
+    span = abs(float(span))
+    if (
+        manual
+        and math.isfinite(float(value))
+        and float(value) > 0
+        and span > 0
+        and float(value) <= span * 0.9
+    ):
         return float(value)
     return _nice_bar_length(span)
 

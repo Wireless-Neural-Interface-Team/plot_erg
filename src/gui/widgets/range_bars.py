@@ -1,4 +1,4 @@
-"""Barres de plage temporelle déplaçables sur un canvas matplotlib."""
+"""Barres de plage temporelle déplaçables (toolbar + contrôleur pyqtgraph)."""
 
 from __future__ import annotations
 
@@ -23,6 +23,41 @@ from PySide6.QtWidgets import (
 from view_config import TimeRangeBar
 
 _BAR_COLORS = ("#16a34a", "#2563eb", "#ca8a04", "#dc2626", "#7c3aed")
+
+
+def _qt_alive(obj: Any) -> bool:
+    """True si le wrapper Python pointe encore vers un objet C++ valide."""
+    if obj is None:
+        return False
+    try:
+        from shiboken6 import isValid
+
+        return bool(isValid(obj))
+    except Exception:
+        try:
+            obj.objectName()  # type: ignore[attr-defined]
+            return True
+        except RuntimeError:
+            return False
+
+
+def _plot_alive(plot: Any) -> bool:
+    """True si le PlotItem et sa ViewBox sont encore utilisables."""
+    if not _qt_alive(plot):
+        return False
+    try:
+        vb = getattr(plot, "vb", None)
+        if vb is None:
+            getter = getattr(plot, "getViewBox", None)
+            vb = getter() if callable(getter) else None
+        if vb is None or not _qt_alive(vb):
+            return False
+        # Accès léger : échoue si le C++ a déjà été détruit.
+        plot.zValue()
+        vb.zValue()
+        return True
+    except RuntimeError:
+        return False
 
 
 def _full_width_button(text: str, parent: QWidget) -> QPushButton:
@@ -78,15 +113,15 @@ class RangeBarToolbar(QWidget):
 
         btn_add = _full_width_button("+ Absolue", box)
         btn_add.setToolTip(
-            "Ajouter une paire de barres déplaçables sur le graph temporel "
-            "(clic gauche sur un bord pour glisser)"
+            "Ajouter une plage centrée (10 % du graph visible), "
+            "déplaçable au clic gauche — puis « Appliquer les zooms »"
         )
         btn_add.clicked.connect(self.addRequested.emit)
 
         btn_add_rel = _full_width_button("+ Rel. stim", box)
         btn_add_rel.setToolTip(
             "Ajouter une plage [t₀, t₁] relative au début de stimulation — "
-            "barres éditables sur le graph (clic gauche)"
+            "puis « Appliquer les zooms » pour ouvrir la fenêtre"
         )
         btn_add_rel.clicked.connect(self.addRelativeRequested.emit)
 
@@ -131,273 +166,6 @@ class RangeBarToolbar(QWidget):
         if n > 0:
             self._active.setValue(max(1, min(n, int(active_index) + 1)))
         self._active.blockSignals(False)
-
-
-class RangeBarController(QObject):
-    """Gère des paires de barres verticales déplaçables sur une figure matplotlib.
-
-    - Clic gauche près d’une barre + glisser : déplace cette barre
-    - Les deux barres d’une plage définissent [t0, t1]
-    - ``barsChanged`` émis pendant le glisser (debouncé côté parent si besoin)
-    """
-
-    barsChanged = Signal(object)  # tuple[TimeRangeBar, ...]
-
-    def __init__(self, parent: QObject | None = None) -> None:
-        super().__init__(parent)
-        self._bars: list[TimeRangeBar] = []
-        self._active_index = 0
-        self._canvas: Any | None = None
-        self._axes: list[Any] = []
-        self._artists: list[Any] = []
-        self._cid_press: int | None = None
-        self._cid_release: int | None = None
-        self._cid_motion: int | None = None
-        self._drag: tuple[int, str] | None = None  # (bar_index, "t0"|"t1")
-        self._t_min = 0.0
-        self._t_max = 1.0
-        # Décalage affichage (sync trigger) : stockage en temps absolu, dessin en t−offset.
-        self._display_offset = 0.0
-        self._pick_tol_frac = 0.012
-        self._last_draw_s = 0.0
-        self._motion_dirty = False
-
-    @property
-    def bars(self) -> tuple[TimeRangeBar, ...]:
-        return tuple(self._bars)
-
-    @property
-    def active_index(self) -> int:
-        return self._active_index
-
-    @property
-    def is_dragging(self) -> bool:
-        """True pendant un glisser de barre (évite de réattacher / casser le drag)."""
-        return self._drag is not None
-
-    def set_active_index(self, index: int) -> None:
-        if not self._bars:
-            self._active_index = 0
-            return
-        self._active_index = max(0, min(len(self._bars) - 1, int(index)))
-        self._redraw_artists()
-
-    def set_display_offset(self, offset_s: float) -> None:
-        """Soustraire ``offset_s`` à l’affichage (t=0 sur le trigger si sync)."""
-        new_offset = float(offset_s)
-        if abs(new_offset - self._display_offset) < 1e-15:
-            return
-        self._display_offset = new_offset
-        self._redraw_artists()
-
-    def set_time_span(self, t_min: float, t_max: float) -> None:
-        """Bornes en temps absolu (fichier), indépendantes du décalage d’affichage."""
-        self._t_min = float(t_min)
-        self._t_max = float(t_max)
-        if self._t_max <= self._t_min:
-            self._t_max = self._t_min + 1.0
-
-    def ensure_default_bar(self) -> None:
-        if self._bars:
-            return
-        self._bars = [
-            TimeRangeBar(
-                t0_s=self._t_min,
-                t1_s=self._t_max,
-                label="Plage 1",
-                bar_id=uuid.uuid4().hex[:8],
-            )
-        ]
-        self._active_index = 0
-        self.barsChanged.emit(self.bars)
-
-    def set_bars(self, bars: Sequence[TimeRangeBar], *, active_index: int = 0) -> None:
-        self._bars = [replace(b) for b in bars]
-        self._active_index = max(0, min(max(0, len(self._bars) - 1), int(active_index)))
-        self._redraw_artists()
-
-    def add_bar(self, *, t0: float | None = None, t1: float | None = None) -> None:
-        a = self._t_min if t0 is None else float(t0)
-        b = self._t_max if t1 is None else float(t1)
-        if b <= a:
-            b = a + max(0.01, (self._t_max - self._t_min) * 0.1)
-        n = len(self._bars) + 1
-        self._bars.append(
-            TimeRangeBar(
-                t0_s=a,
-                t1_s=b,
-                label=f"Plage {n}",
-                bar_id=uuid.uuid4().hex[:8],
-            )
-        )
-        self._active_index = len(self._bars) - 1
-        self._redraw_artists()
-        self.barsChanged.emit(self.bars)
-
-    def remove_active_bar(self) -> None:
-        if not self._bars:
-            return
-        self._bars.pop(self._active_index)
-        self._active_index = max(0, min(len(self._bars) - 1, self._active_index))
-        self._redraw_artists()
-        self.barsChanged.emit(self.bars)
-
-    def attach(self, canvas: Any, axes: Sequence[Any] | Any) -> None:
-        """Attacher aux axes d’une figure (après un render)."""
-        self.detach()
-        self._canvas = canvas
-        if axes is None:
-            self._axes = []
-        elif isinstance(axes, (list, tuple)):
-            self._axes = [ax for ax in axes if ax is not None]
-        else:
-            # Figure.axes or single Axes
-            try:
-                self._axes = list(axes) if hasattr(axes, "__iter__") else [axes]
-            except TypeError:
-                self._axes = [axes]
-        if self._canvas is None or not self._axes:
-            return
-        self._cid_press = self._canvas.mpl_connect("button_press_event", self._on_press)
-        self._cid_release = self._canvas.mpl_connect("button_release_event", self._on_release)
-        self._cid_motion = self._canvas.mpl_connect("motion_notify_event", self._on_motion)
-        self._redraw_artists()
-
-    def detach(self) -> None:
-        if self._canvas is not None:
-            for cid in (self._cid_press, self._cid_release, self._cid_motion):
-                if cid is not None:
-                    try:
-                        self._canvas.mpl_disconnect(cid)
-                    except Exception:
-                        pass
-        self._clear_artists()
-        self._canvas = None
-        self._axes = []
-        self._cid_press = self._cid_release = self._cid_motion = None
-        self._drag = None
-
-    def _clear_artists(self) -> None:
-        for artist in self._artists:
-            try:
-                artist.remove()
-            except Exception:
-                pass
-        self._artists.clear()
-
-    def _redraw_artists(self) -> None:
-        self._clear_artists()
-        if not self._axes or not self._bars:
-            if self._canvas is not None:
-                try:
-                    self._canvas.draw_idle()
-                except Exception:
-                    pass
-            return
-        off = float(self._display_offset)
-        for index, bar in enumerate(self._bars):
-            t0, t1 = bar.ordered()
-            t0_d, t1_d = float(t0) - off, float(t1) - off
-            color = _BAR_COLORS[index % len(_BAR_COLORS)]
-            alpha_span = 0.18 if index == self._active_index else 0.08
-            lw = 1.6 if index == self._active_index else 1.0
-            for ax in self._axes:
-                span = ax.axvspan(t0_d, t1_d, alpha=alpha_span, color=color, zorder=2.5)
-                left = ax.axvline(t0_d, color=color, linewidth=lw, linestyle="-", zorder=3)
-                right = ax.axvline(t1_d, color=color, linewidth=lw, linestyle="-", zorder=3)
-                self._artists.extend([span, left, right])
-        if self._canvas is not None:
-            try:
-                self._canvas.draw_idle()
-            except Exception:
-                pass
-
-    def _pick_edge(self, xdata_display: float) -> tuple[int, str] | None:
-        """``xdata_display`` est en coords d’axe (déjà décalées si sync trigger)."""
-        if not self._bars:
-            return None
-        span = max(1e-9, self._t_max - self._t_min)
-        tol = span * self._pick_tol_frac
-        off = float(self._display_offset)
-        best: tuple[float, int, str] | None = None
-        for index, bar in enumerate(self._bars):
-            for edge, value in (("t0", float(bar.t0_s)), ("t1", float(bar.t1_s))):
-                dist = abs(xdata_display - (value - off))
-                if dist <= tol and (best is None or dist < best[0]):
-                    best = (dist, index, edge)
-        if best is None:
-            return None
-        return best[1], best[2]
-
-    def _suspend_nav_toolbar(self) -> None:
-        """Annuler un pan/zoom toolbar en cours (clic gauche = plages, pas la vue)."""
-        toolbar = getattr(self._canvas, "toolbar", None) if self._canvas else None
-        if toolbar is None:
-            return
-        for attr in ("_pan_info", "_zoom_info"):
-            if hasattr(toolbar, attr):
-                try:
-                    setattr(toolbar, attr, None)
-                except Exception:
-                    pass
-
-    def _on_press(self, event: Any) -> None:
-        if event.button != 1 or event.xdata is None or event.inaxes is None:
-            return
-        if event.inaxes not in self._axes:
-            return
-        hit = self._pick_edge(float(event.xdata))
-        if hit is None:
-            return
-        self._drag = hit
-        self._active_index = hit[0]
-        # Si la toolbar est en mode Pan/Zoom, ne pas laisser le glisser déplacer la vue.
-        self._suspend_nav_toolbar()
-
-    def _on_release(self, event: Any) -> None:
-        del event
-        if self._drag is None:
-            return
-        self._drag = None
-        if self._motion_dirty:
-            self._redraw_artists()
-            self._motion_dirty = False
-        self.barsChanged.emit(self.bars)
-
-    def _on_motion(self, event: Any) -> None:
-        if self._drag is None or event.xdata is None:
-            return
-        # Empêcher le pan toolbar de reprendre pendant le glisser.
-        self._suspend_nav_toolbar()
-        index, edge = self._drag
-        if not (0 <= index < len(self._bars)):
-            return
-        # Axe = affichage ; stockage = temps absolu.
-        x_abs = float(event.xdata) + float(self._display_offset)
-        x_abs = max(self._t_min, min(self._t_max, x_abs))
-        bar = self._bars[index]
-        if edge == "t0":
-            # Empêcher croisement : laisser un epsilon.
-            eps = max(1e-4, (self._t_max - self._t_min) * 1e-4)
-            other = float(bar.t1_s)
-            if x_abs >= other:
-                x_abs = other - eps
-            self._bars[index] = bar.with_bounds(x_abs, other)
-        else:
-            eps = max(1e-4, (self._t_max - self._t_min) * 1e-4)
-            other = float(bar.t0_s)
-            if x_abs <= other:
-                x_abs = other + eps
-            self._bars[index] = bar.with_bounds(other, x_abs)
-        now = time.perf_counter()
-        if now - self._last_draw_s < 0.016:
-            self._motion_dirty = True
-            return
-        self._last_draw_s = now
-        self._motion_dirty = False
-        self._redraw_artists()
-        # Actualiser les fenêtres de zoom en direct (debouncé côté parent).
-        self.barsChanged.emit(self.bars)
 
 
 class RangeBarControllerPg(QObject):
@@ -459,18 +227,8 @@ class RangeBarControllerPg(QObject):
             self._t_max = self._t_min + 1.0
 
     def ensure_default_bar(self) -> None:
-        if self._bars:
-            return
-        self._bars = [
-            TimeRangeBar(
-                t0_s=self._t_min,
-                t1_s=self._t_max,
-                label="Plage 1",
-                bar_id=uuid.uuid4().hex[:8],
-            )
-        ]
-        self._active_index = 0
-        self.barsChanged.emit(self.bars)
+        """Compat : ne crée plus de plage — l’UI démarre vide."""
+        return
 
     def set_bars(self, bars: Sequence[TimeRangeBar], *, active_index: int = 0) -> None:
         self._bars = [replace(b) for b in bars]
@@ -478,10 +236,21 @@ class RangeBarControllerPg(QObject):
         self._redraw_items()
 
     def add_bar(self, *, t0: float | None = None, t1: float | None = None) -> None:
-        a = self._t_min if t0 is None else float(t0)
-        b = self._t_max if t1 is None else float(t1)
+        """Ajouter une plage. Sans bornes → 10 % de la span, centrée sur le graph."""
+        span = max(1e-6, self._t_max - self._t_min)
+        if t0 is None or t1 is None:
+            width = span * 0.1
+            mid = (self._t_min + self._t_max) * 0.5
+            a = mid - width * 0.5 if t0 is None else float(t0)
+            b = mid + width * 0.5 if t1 is None else float(t1)
+        else:
+            a, b = float(t0), float(t1)
         if b <= a:
-            b = a + max(0.01, (self._t_max - self._t_min) * 0.1)
+            b = a + max(0.01, span * 0.1)
+        a = max(self._t_min, min(self._t_max, a))
+        b = max(self._t_min, min(self._t_max, b))
+        if b <= a:
+            b = min(self._t_max, a + max(0.01, span * 0.1))
         n = len(self._bars) + 1
         self._bars.append(
             TimeRangeBar(
@@ -507,6 +276,8 @@ class RangeBarControllerPg(QObject):
         """Attach to a PlotHost (``axes`` ignored — kept for API parity)."""
         del axes
         self.detach()
+        if host is not None and not _qt_alive(host):
+            return
         self._host = host
         self._redraw_items()
 
@@ -515,31 +286,54 @@ class RangeBarControllerPg(QObject):
         self._host = None
         self._drag = None
 
-    def _plot_items(self) -> list[Any]:
+    def _ensure_host(self) -> Any | None:
         host = self._host
         if host is None:
+            return None
+        if not _qt_alive(host):
+            self._regions.clear()
+            self._lines.clear()
+            self._host = None
+            self._drag = None
+            return None
+        return host
+
+    def _plot_items(self) -> list[Any]:
+        host = self._ensure_host()
+        if host is None:
             return []
-        getter = getattr(host, "plot_items", None)
-        if callable(getter):
-            return list(getter() or [])
-        figure = getattr(host, "figure", None)
-        axes = list(getattr(figure, "axes", []) or []) if figure is not None else []
-        # AxisShim wraps PlotItem
-        out = []
-        for ax in axes:
-            plot = getattr(ax, "_plot", None)
-            if plot is not None:
-                out.append(plot)
-        return out
+        try:
+            getter = getattr(host, "plot_items", None)
+            if callable(getter):
+                raw = list(getter() or [])
+            else:
+                figure = getattr(host, "figure", None)
+                axes = (
+                    list(getattr(figure, "axes", []) or [])
+                    if figure is not None
+                    else []
+                )
+                raw = []
+                for ax in axes:
+                    plot = getattr(ax, "_plot", None)
+                    if plot is not None:
+                        raw.append(plot)
+        except RuntimeError:
+            self._host = None
+            return []
+        return [plot for plot in raw if _plot_alive(plot)]
 
     def _clear_items(self) -> None:
+        plots = self._plot_items()
         for item in self._regions + self._lines:
             try:
+                if not _qt_alive(item):
+                    continue
                 parent = item.parentItem()
                 if parent is not None and hasattr(parent, "removeItem"):
                     parent.removeItem(item)
                 else:
-                    for plot in self._plot_items():
+                    for plot in plots:
                         try:
                             plot.removeItem(item)
                         except Exception:
@@ -551,11 +345,12 @@ class RangeBarControllerPg(QObject):
 
     def _redraw_items(self) -> None:
         self._clear_items()
+        host = self._ensure_host()
         plots = self._plot_items()
         if not plots or not self._bars:
-            if self._host is not None:
+            if host is not None:
                 try:
-                    self._host.draw_idle()
+                    host.draw_idle()
                 except Exception:
                     pass
             return
@@ -575,6 +370,8 @@ class RangeBarControllerPg(QObject):
                 brush = pg.mkBrush(brush_color)
                 pen = pg.mkPen(color, width=1.6 if active else 1.0)
                 for plot in plots:
+                    if not _plot_alive(plot):
+                        continue
                     region = pg.LinearRegionItem(
                         values=(t0_d, t1_d),
                         brush=brush,
@@ -587,7 +384,11 @@ class RangeBarControllerPg(QObject):
                         region.setAcceptedMouseButtons(_Qt.MouseButton.LeftButton)
                     except Exception:
                         pass
-                    plot.addItem(region)
+                    try:
+                        plot.addItem(region)
+                    except RuntimeError:
+                        # PlotHost / ViewBox détruit entre-temps (rebuild grille).
+                        continue
                     self._regions.append(region)
                     region.sigRegionChanged.connect(
                         lambda _r=region, i=index: self._on_region_changed(i, _r)
@@ -597,9 +398,10 @@ class RangeBarControllerPg(QObject):
                     )
         finally:
             self._updating = False
-        if self._host is not None:
+        host = self._ensure_host()
+        if host is not None:
             try:
-                self._host.draw_idle()
+                host.draw_idle()
             except Exception:
                 pass
 

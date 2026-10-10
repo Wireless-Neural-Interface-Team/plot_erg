@@ -9,15 +9,17 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QPlainTextEdit,
+    QPushButton,
     QSizePolicy,
     QTabWidget,
     QVBoxLayout,
@@ -36,6 +38,7 @@ from gui.jobs import Debouncer
 from view_config import (
     LEGEND_LOCATIONS,
     TIME_SYNC_LABELS,
+    AnalysisSettings,
     LegendSettings,
     PanelStyle,
     TextOverrides,
@@ -52,16 +55,39 @@ def _scrollable(inner: QWidget) -> FitWidthScrollArea:
     return area
 
 
+def _collapsible_group(title: str, *, expanded: bool = False) -> tuple[QGroupBox, QWidget]:
+    """Groupe à cocher : décoché = contenu masqué."""
+    box = QGroupBox(title)
+    box.setCheckable(True)
+    box.setChecked(expanded)
+    box.setObjectName("collapsibleGroup")
+    content = QWidget(box)
+    outer = QVBoxLayout(box)
+    outer.setContentsMargins(6, 14, 6, 6)
+    outer.setSpacing(4)
+    outer.addWidget(content)
+
+    def _on_toggled(checked: bool) -> None:
+        content.setVisible(checked)
+
+    box.toggled.connect(_on_toggled)
+    content.setVisible(expanded)
+    return box, content
+
+
 class LocalViewParams(QWidget):
     """Contrôles légende / style / axes propres à une fenêtre.
 
-    Si ``host_tabs`` est fourni, la page Affichage (échelles + style) est
-    ajoutée à ce ``QTabWidget`` (comme le dock Paramètres de la fenêtre
-    principale). Sinon, tout est empilé dans un scroll unique.
+    Si ``host_tabs`` est fourni, les pages sont ajoutées à ce ``QTabWidget``
+    (comme le dock Paramètres de la fenêtre principale). Sinon, tout est
+    empilé dans un scroll unique — ou dans des onglets locaux si
+    ``show_canal_tab`` est actif.
 
-    Mode / courbes / spikes → Paramètres → Canal → Traitement
-    (mêmes cases pour continuous / moyenne / stimulation).
-    Sync / style → Affichage ; détection trigger → Canal (fenêtre principale).
+    Avec ``show_canal_tab`` (fenêtre zoom) :
+    - *Canal* — courbes + échelles Y (+ spikes d’affichage)
+    - *Affichage* — axe X, sync, disposition, légendes, apparence
+
+    Sans onglet Canal : Y restent dans Affichage (fenêtres détachées simples).
     """
 
     changed = Signal()
@@ -73,6 +99,7 @@ class LocalViewParams(QWidget):
         show_sync: bool = True,
         show_display_extras: bool = True,
         show_graph_height: bool = True,
+        show_canal_tab: bool = False,
         host_tabs: QTabWidget | None = None,
         parent: QWidget | None = None,
     ) -> None:
@@ -82,7 +109,24 @@ class LocalViewParams(QWidget):
         self._show_sync = bool(show_sync)
         self._show_display_extras = bool(show_display_extras)
         self._show_graph_height = bool(show_graph_height)
+        self._show_canal_tab = bool(show_canal_tab)
 
+        # Widgets Canal (créés seulement si show_canal_tab).
+        self._curve_wide_box: QGroupBox | None = None
+        self._curve_high_box: QGroupBox | None = None
+        self._curve_low_box: QGroupBox | None = None
+        self._curve_rms_box: QGroupBox | None = None
+        self._curve_spikes_box: QGroupBox | None = None
+        self._cb_psth: QCheckBox | None = None
+        self._cb_trial_rate: QCheckBox | None = None
+        self._cb_raster: QCheckBox | None = None
+        self._cb_isi: QCheckBox | None = None
+        self._cb_overlay: QCheckBox | None = None
+        self._cb_mark_stims: QCheckBox | None = None
+
+        canal_page = (
+            self._build_canal_page(settings) if self._show_canal_tab else None
+        )
         display_page = self._build_display_page(settings)
 
         root = QVBoxLayout(self)
@@ -90,12 +134,40 @@ class LocalViewParams(QWidget):
         root.setSpacing(0)
 
         if host_tabs is not None:
+            if canal_page is not None:
+                host_tabs.addTab(_scrollable(canal_page), "Canal")
+                host_tabs.setTabToolTip(
+                    host_tabs.count() - 1,
+                    "Courbes et échelles Y de cette fenêtre — "
+                    "redessin immédiat (indépendant de l’aperçu)",
+                )
             host_tabs.addTab(_scrollable(display_page), "Affichage")
             host_tabs.setTabToolTip(
                 host_tabs.count() - 1,
-                "Échelles, sync, disposition, légendes et apparence — "
+                "Axe X, sync, disposition, légendes et apparence — "
                 "redessin immédiat (cette fenêtre)",
             )
+        elif canal_page is not None:
+            tabs = QTabWidget(self)
+            tabs.setObjectName("paramsTabs")
+            tabs.setDocumentMode(True)
+            tabs.setUsesScrollButtons(False)
+            tab_bar = tabs.tabBar()
+            tab_bar.setElideMode(Qt.TextElideMode.ElideRight)
+            tab_bar.setExpanding(True)
+            tabs.addTab(_scrollable(canal_page), "Canal")
+            tabs.setTabToolTip(
+                0,
+                "Courbes et échelles Y de cette fenêtre — "
+                "redessin immédiat (indépendant de l’aperçu)",
+            )
+            tabs.addTab(_scrollable(display_page), "Affichage")
+            tabs.setTabToolTip(
+                1,
+                "Axe X, sync, disposition, légendes et apparence — "
+                "redessin immédiat (cette fenêtre)",
+            )
+            root.addWidget(tabs, 1)
         else:
             scroll = FitWidthScrollArea(self)
             inner = QWidget()
@@ -127,6 +199,139 @@ class LocalViewParams(QWidget):
 
         self._updating = False
 
+    def _build_canal_page(self, settings: ViewerSettings) -> QWidget:
+        """Courbes + échelles Y (et spikes d’affichage) — scope fenêtre locale."""
+        analysis = settings.analysis
+        page = QWidget()
+        form_layout = QVBoxLayout(page)
+        form_layout.setContentsMargins(8, 8, 8, 8)
+        form_layout.setSpacing(8)
+
+        hint = QLabel(
+            "Cochez les courbes à afficher dans cette fenêtre. "
+            "Les échelles Y se règlent dans chaque section. "
+            "Indépendant de l’aperçu / du dock Paramètres."
+        )
+        hint.setObjectName("hintLabel")
+        hint.setWordWrap(True)
+        form_layout.addWidget(hint)
+
+        self._curve_wide_box, wide_inner = _collapsible_group(
+            "WIDE (brut)", expanded=bool(analysis.show_raw)
+        )
+        wide_form = configure_narrow_form(QFormLayout(wide_inner))
+        wide_form.setContentsMargins(0, 0, 0, 0)
+        self._raw_ylim = AxisLimitRow(settings.raw_ylim, unit=" µV")
+        self._raw_ylim.setToolTip("Échelle Y des panneaux WIDE de cette fenêtre.")
+        wide_form.addRow("Échelle Y :", self._raw_ylim)
+        self._curve_wide_box.setToolTip(
+            "Afficher WIDE dans cette fenêtre (continuous / moyenne / stim)."
+        )
+
+        self._curve_high_box, high_inner = _collapsible_group(
+            "HIGH (passe-haut)", expanded=bool(analysis.show_hp)
+        )
+        high_form = configure_narrow_form(QFormLayout(high_inner))
+        high_form.setContentsMargins(0, 0, 0, 0)
+        self._hp_ylim = AxisLimitRow(settings.hp_ylim, unit=" µV")
+        self._hp_ylim.setToolTip("Échelle Y des panneaux HIGH de cette fenêtre.")
+        high_form.addRow("Échelle Y :", self._hp_ylim)
+
+        self._curve_low_box, low_inner = _collapsible_group(
+            "LOW (passe-bas)", expanded=bool(analysis.show_lp)
+        )
+        low_form = configure_narrow_form(QFormLayout(low_inner))
+        low_form.setContentsMargins(0, 0, 0, 0)
+        self._lp_ylim = AxisLimitRow(settings.lp_ylim, unit=" µV")
+        self._lp_ylim.setToolTip("Échelle Y des panneaux LOW de cette fenêtre.")
+        low_form.addRow("Échelle Y :", self._lp_ylim)
+
+        self._curve_rms_box, rms_inner = _collapsible_group(
+            "RMS", expanded=bool(analysis.show_rms)
+        )
+        rms_form = configure_narrow_form(QFormLayout(rms_inner))
+        rms_form.setContentsMargins(0, 0, 0, 0)
+        self._rms_ylim = AxisLimitRow(settings.rms_ylim, unit=" µV", step=1.0)
+        self._rms_ylim.setToolTip("Échelle Y des panneaux RMS de cette fenêtre.")
+        rms_form.addRow("Échelle Y :", self._rms_ylim)
+
+        self._curve_spikes_box, spikes_inner = _collapsible_group(
+            "Spikes",
+            expanded=bool(
+                analysis.show_psth
+                or analysis.show_trial_rate
+                or analysis.show_raster
+                or analysis.show_isi
+                or analysis.show_overlay
+            ),
+        )
+        spikes_layout = QVBoxLayout(spikes_inner)
+        spikes_layout.setContentsMargins(0, 0, 0, 0)
+        spikes_layout.setSpacing(6)
+        self._cb_psth = QCheckBox("PSTH")
+        self._cb_trial_rate = QCheckBox("Firing rate / essai")
+        self._cb_raster = QCheckBox("Raster")
+        self._cb_isi = QCheckBox("ISI")
+        self._cb_overlay = QCheckBox("Spike scope")
+        self._cb_psth.setChecked(bool(analysis.show_psth))
+        self._cb_trial_rate.setChecked(bool(analysis.show_trial_rate))
+        self._cb_raster.setChecked(bool(analysis.show_raster))
+        self._cb_isi.setChecked(bool(analysis.show_isi))
+        self._cb_overlay.setChecked(bool(analysis.show_overlay))
+        for box in (
+            self._cb_psth,
+            self._cb_trial_rate,
+            self._cb_raster,
+            self._cb_isi,
+            self._cb_overlay,
+        ):
+            spikes_layout.addWidget(box)
+
+        if self._show_display_extras:
+            spike_form_host = QWidget(spikes_inner)
+            spike_form = configure_narrow_form(QFormLayout(spike_form_host))
+            spike_form.setContentsMargins(0, 0, 0, 0)
+            self._psth_bin = _spin(
+                0.001, 10.0, settings.psth_bin_window_s, suffix=" s"
+            )
+            self._sampling = _int_spin(1, 100, settings.sampling_percent)
+            self._sampling.setSuffix(" %")
+            spike_form.addRow("Bin PSTH :", self._psth_bin)
+            spike_form.addRow("Spikes dessinés :", self._sampling)
+            spikes_layout.addWidget(spike_form_host)
+        else:
+            self._psth_bin = None
+            self._sampling = None
+
+        if not any(
+            box.isChecked()
+            for box in (
+                self._curve_wide_box,
+                self._curve_high_box,
+                self._curve_low_box,
+            )
+        ):
+            self._curve_wide_box.setChecked(True)
+
+        for group in (
+            self._curve_wide_box,
+            self._curve_high_box,
+            self._curve_low_box,
+            self._curve_rms_box,
+            self._curve_spikes_box,
+        ):
+            form_layout.addWidget(group)
+
+        foot = QLabel(
+            "Filtres / détection → dock Paramètres → Canal → Traitement (F5). "
+            "Ici : affichage local de la fenêtre uniquement."
+        )
+        foot.setObjectName("hintLabel")
+        foot.setWordWrap(True)
+        form_layout.addWidget(foot)
+        form_layout.addStretch(1)
+        return page
+
     def _build_display_page(self, settings: ViewerSettings) -> QWidget:
         page = QWidget()
         form_layout = QVBoxLayout(page)
@@ -145,19 +350,30 @@ class LocalViewParams(QWidget):
             "Limites X manuelles (temps en secondes), appliquées à tous les "
             "graphs temporels de cette fenêtre."
         )
-        self._raw_ylim = AxisLimitRow(settings.raw_ylim, unit=" µV")
-        self._raw_ylim.setToolTip("Échelle Y des panneaux WIDE.")
-        self._hp_ylim = AxisLimitRow(settings.hp_ylim, unit=" µV")
-        self._hp_ylim.setToolTip("Échelle Y des panneaux HIGH.")
-        self._lp_ylim = AxisLimitRow(settings.lp_ylim, unit=" µV")
-        self._lp_ylim.setToolTip("Échelle Y des panneaux LOW.")
-        self._rms_ylim = AxisLimitRow(settings.rms_ylim, unit=" µV", step=1.0)
-        self._rms_ylim.setToolTip("Échelle Y des panneaux et résumés RMS.")
         axis_form.addRow("Axe X (temps) :", self._x_limits)
-        axis_form.addRow("WIDE (µV) :", self._raw_ylim)
-        axis_form.addRow("HIGH (µV) :", self._hp_ylim)
-        axis_form.addRow("LOW (µV) :", self._lp_ylim)
-        axis_form.addRow("RMS (µV) :", self._rms_ylim)
+
+        if self._show_canal_tab:
+            # Y déjà dans Canal — comme le dock Paramètres principal.
+            axis_hint = QLabel(
+                "Échelles verticales (WIDE / HIGH / LOW / RMS) → Canal, "
+                "dans la section de la courbe cochée."
+            )
+            axis_hint.setObjectName("hintLabel")
+            axis_hint.setWordWrap(True)
+            axis_form.addRow(axis_hint)
+        else:
+            self._raw_ylim = AxisLimitRow(settings.raw_ylim, unit=" µV")
+            self._raw_ylim.setToolTip("Échelle Y des panneaux WIDE.")
+            self._hp_ylim = AxisLimitRow(settings.hp_ylim, unit=" µV")
+            self._hp_ylim.setToolTip("Échelle Y des panneaux HIGH.")
+            self._lp_ylim = AxisLimitRow(settings.lp_ylim, unit=" µV")
+            self._lp_ylim.setToolTip("Échelle Y des panneaux LOW.")
+            self._rms_ylim = AxisLimitRow(settings.rms_ylim, unit=" µV", step=1.0)
+            self._rms_ylim.setToolTip("Échelle Y des panneaux et résumés RMS.")
+            axis_form.addRow("WIDE (µV) :", self._raw_ylim)
+            axis_form.addRow("HIGH (µV) :", self._hp_ylim)
+            axis_form.addRow("LOW (µV) :", self._lp_ylim)
+            axis_form.addRow("RMS (µV) :", self._rms_ylim)
         form_layout.addWidget(axis_group)
 
         layout_group = QGroupBox("Disposition", page)
@@ -172,8 +388,8 @@ class LocalViewParams(QWidget):
         self._show_scale_bars = QCheckBox("Échelle flottante (barres temps / amplitude)")
         self._show_scale_bars.setChecked(bool(getattr(settings.style, "show_scale_bars", False)))
         self._show_scale_bars.setToolTip(
-            "Masque les graduations numériques sur les bords et affiche une barre "
-            "d’échelle flottante (ex. 100 ms · 200 µV)."
+            "Masque les graduations numériques sur les bords (les titres d’axes "
+            "restent) et affiche une barre d’échelle flottante (ex. 100 ms · 200 µV)."
         )
         style = settings.style
         self._scale_bar_amp_manual = QCheckBox("Manuel")
@@ -226,13 +442,34 @@ class LocalViewParams(QWidget):
         self._scale_bar_time_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._show_scale_bars.toggled.connect(self._sync_scale_bar_inputs)
         self._sync_scale_bar_inputs()
+        _max_pts_lo, _max_pts_hi = 500, 200_000
+        _max_pts_mid = (_max_pts_lo + _max_pts_hi) // 2
+        _max_pts_default = int(settings.style.max_points_per_curve) or _max_pts_mid
+        _max_pts_default = max(_max_pts_lo, min(_max_pts_hi, _max_pts_default))
         self._max_points = _int_spin(
-            500, 200000, settings.style.max_points_per_curve, step=500
+            _max_pts_lo, _max_pts_hi, _max_pts_default, step=500
         )
         self._max_points.setToolTip(
-            "Points dessinés par courbe. Au-delà, une enveloppe min/max conserve "
-            "les pics tout en restant rapide."
+            "Points dessinés par courbe (aperçu, montage et fenêtres zoom). "
+            "Au-delà, une enveloppe min/max conserve les pics tout en restant rapide."
         )
+        max_pts_row = QWidget(page)
+        max_pts_lay = QHBoxLayout(max_pts_row)
+        max_pts_lay.setContentsMargins(0, 0, 0, 0)
+        max_pts_lay.setSpacing(6)
+        max_pts_min_btn = QPushButton("Min", max_pts_row)
+        max_pts_max_btn = QPushButton("Max", max_pts_row)
+        max_pts_min_btn.setToolTip(f"Mettre le minimum ({_max_pts_lo})")
+        max_pts_max_btn.setToolTip(f"Mettre le maximum ({_max_pts_hi})")
+        max_pts_min_btn.clicked.connect(
+            lambda: self._max_points.setValue(_max_pts_lo)
+        )
+        max_pts_max_btn.clicked.connect(
+            lambda: self._max_points.setValue(_max_pts_hi)
+        )
+        max_pts_lay.addWidget(self._max_points, 1)
+        max_pts_lay.addWidget(max_pts_min_btn)
+        max_pts_lay.addWidget(max_pts_max_btn)
         if self._show_graph_height:
             layout_form.addRow("Hauteur des graphs :", self._graph_height)
         else:
@@ -240,10 +477,10 @@ class LocalViewParams(QWidget):
         layout_form.addRow(self._show_scale_bars)
         layout_form.addRow("Amplitude barre :", amp_row)
         layout_form.addRow("Temps barre :", time_row)
-        layout_form.addRow("Points max / courbe :", self._max_points)
+        layout_form.addRow("Points max / courbe :", max_pts_row)
         form_layout.addWidget(layout_group)
 
-        if self._show_display_extras:
+        if self._show_display_extras and not self._show_canal_tab:
             display = QGroupBox("Affichage spikes", page)
             display_form = configure_narrow_form(QFormLayout(display))
             self._psth_bin = _spin(
@@ -254,7 +491,7 @@ class LocalViewParams(QWidget):
             display_form.addRow("Bin PSTH", self._psth_bin)
             display_form.addRow("Spikes dessinés", self._sampling)
             form_layout.addWidget(display)
-        else:
+        elif not self._show_canal_tab:
             self._psth_bin = None
             self._sampling = None
 
@@ -268,24 +505,40 @@ class LocalViewParams(QWidget):
             self._time_sync.setCurrentIndex(sync_idx if sync_idx >= 0 else 0)
             self._time_sync.setToolTip(
                 "Origine de l’axe temps des traces continues : début du fichier "
-                "ou premier trigger détecté. Polarité / seuil ci-dessous "
-                "modifient aussi le traitement (F5) de la fenêtre principale."
+                "ou premier trigger détecté (redessin immédiat)."
             )
-            self._trigger_polarity = QComboBox()
-            self._trigger_polarity.addItem("Low (front descendant)", "low")
-            self._trigger_polarity.addItem("High (front montant)", "high")
-            pol_idx = self._trigger_polarity.findData(settings.trigger_polarity)
-            self._trigger_polarity.setCurrentIndex(pol_idx if pol_idx >= 0 else 0)
-            self._trigger_threshold = _spin(
-                -100.0, 100.0, settings.trigger_threshold, decimals=3, suffix=" V"
-            )
-            self._trigger_threshold.setToolTip(
-                "Seuil de détection du trigger (V). Pour recalculer la segmentation, "
-                "utilisez aussi Traiter (F5) dans la fenêtre principale."
-            )
-            sync_form.addRow("Origine du temps :", self._time_sync)
-            sync_form.addRow("Trigger :", self._trigger_polarity)
-            sync_form.addRow("Limite de détection :", self._trigger_threshold)
+            if self._show_canal_tab:
+                self._cb_mark_stims = QCheckBox(
+                    "Marqueurs de stimulation sur les traces"
+                )
+                self._cb_mark_stims.setChecked(bool(settings.continuous_mark_stims))
+                self._cb_mark_stims.setToolTip(
+                    "Marquer les stimulations sur les zooms de cette fenêtre."
+                )
+                sync_form.addRow("Origine du temps :", self._time_sync)
+                sync_form.addRow(self._cb_mark_stims)
+                self._trigger_polarity = None
+                self._trigger_threshold = None
+            else:
+                self._trigger_polarity = QComboBox()
+                self._trigger_polarity.addItem("Low (front descendant)", "low")
+                self._trigger_polarity.addItem("High (front montant)", "high")
+                pol_idx = self._trigger_polarity.findData(settings.trigger_polarity)
+                self._trigger_polarity.setCurrentIndex(pol_idx if pol_idx >= 0 else 0)
+                self._trigger_polarity.setToolTip(
+                    "Mémorisé avec le style local. Le front réel de détection se règle "
+                    "dans Paramètres → Canal → Traitement (puis Traiter / F5)."
+                )
+                self._trigger_threshold = _spin(
+                    -100.0, 100.0, settings.trigger_threshold, decimals=3, suffix=" V"
+                )
+                self._trigger_threshold.setToolTip(
+                    "Mémorisé avec le style local. Le seuil réel de détection se règle "
+                    "dans Paramètres → Canal → Traitement (puis Traiter / F5)."
+                )
+                sync_form.addRow("Origine du temps :", self._time_sync)
+                sync_form.addRow("Trigger :", self._trigger_polarity)
+                sync_form.addRow("Limite de détection :", self._trigger_threshold)
             form_layout.addWidget(sync_group)
         else:
             self._time_sync = None
@@ -477,6 +730,17 @@ class LocalViewParams(QWidget):
             self._time_sync,
             self._trigger_polarity,
             self._trigger_threshold,
+            self._cb_mark_stims,
+            self._curve_wide_box,
+            self._curve_high_box,
+            self._curve_low_box,
+            self._curve_rms_box,
+            self._curve_spikes_box,
+            self._cb_psth,
+            self._cb_trial_rate,
+            self._cb_raster,
+            self._cb_isi,
+            self._cb_overlay,
         ):
             if optional is not None:
                 widgets.append(optional)
@@ -485,7 +749,87 @@ class LocalViewParams(QWidget):
     def _emit_changed(self, *_args: Any) -> None:
         if self._updating:
             return
+        if self._show_canal_tab:
+            self._ensure_stream_checked()
+            self._ensure_spike_child_checked()
         self._debouncer.request()
+
+    def _ensure_stream_checked(self) -> None:
+        """Au moins un flux WIDE/HIGH/LOW doit rester coché."""
+        boxes = (
+            self._curve_wide_box,
+            self._curve_high_box,
+            self._curve_low_box,
+        )
+        if any(b is not None and b.isChecked() for b in boxes):
+            return
+        if self._curve_wide_box is not None:
+            self._updating = True
+            try:
+                self._curve_wide_box.setChecked(True)
+            finally:
+                self._updating = False
+
+    def _ensure_spike_child_checked(self) -> None:
+        """Si Spikes est coché sans sous-case, activer PSTH (sinon aucun panneau)."""
+        if self._curve_spikes_box is None or not self._curve_spikes_box.isChecked():
+            return
+        children = (
+            self._cb_psth,
+            self._cb_trial_rate,
+            self._cb_raster,
+            self._cb_isi,
+            self._cb_overlay,
+        )
+        if any(c is not None and c.isChecked() for c in children):
+            return
+        if self._cb_psth is not None:
+            self._updating = True
+            try:
+                self._cb_psth.setChecked(True)
+            finally:
+                self._updating = False
+
+    def _analysis_from_ui(self) -> AnalysisSettings:
+        if not self._show_canal_tab or self._curve_wide_box is None:
+            return self._settings.analysis
+        show_spikes = bool(
+            self._curve_spikes_box.isChecked() if self._curve_spikes_box else False
+        )
+        return replace(
+            self._settings.analysis,
+            show_raw=bool(self._curve_wide_box.isChecked()),
+            show_hp=bool(
+                self._curve_high_box.isChecked() if self._curve_high_box else False
+            ),
+            show_lp=bool(
+                self._curve_low_box.isChecked() if self._curve_low_box else False
+            ),
+            show_rms=bool(
+                self._curve_rms_box.isChecked() if self._curve_rms_box else False
+            ),
+            show_psth=bool(
+                show_spikes and self._cb_psth is not None and self._cb_psth.isChecked()
+            ),
+            show_trial_rate=bool(
+                show_spikes
+                and self._cb_trial_rate is not None
+                and self._cb_trial_rate.isChecked()
+            ),
+            show_raster=bool(
+                show_spikes
+                and self._cb_raster is not None
+                and self._cb_raster.isChecked()
+            ),
+            show_isi=bool(
+                show_spikes and self._cb_isi is not None and self._cb_isi.isChecked()
+            ),
+            show_overlay=bool(
+                show_spikes
+                and self._cb_overlay is not None
+                and self._cb_overlay.isChecked()
+            ),
+        )
 
     def apply_texts(self, texts: TextOverrides) -> None:
         """Mettre à jour les champs texte (édition in-place sur le graphique)."""
@@ -549,11 +893,12 @@ class LocalViewParams(QWidget):
             legend_labels=legend_lines,
             show_series_suffix=bool(self._text_series_suffix.isChecked()),
         )
+        analysis = self._analysis_from_ui()
         kwargs: dict[str, Any] = {
             "legend": legend,
             "style": style,
             "texts": texts,
-            "analysis": self._settings.analysis,
+            "analysis": analysis,
             "x_limits": self._x_limits.value(),
             "raw_ylim": self._raw_ylim.value(),
             "hp_ylim": self._hp_ylim.value(),
@@ -561,6 +906,22 @@ class LocalViewParams(QWidget):
             "rms_ylim": self._rms_ylim.value(),
             "graph_height_px": int(self._graph_height.value()),
         }
+        if self._show_canal_tab:
+            streams: list[str] = []
+            if analysis.show_raw:
+                streams.append("raw")
+            if analysis.show_hp:
+                streams.append("hp")
+            if analysis.show_lp:
+                streams.append("lp")
+            if not streams:
+                streams = ["raw"]
+            kwargs["continuous_streams"] = tuple(streams)
+            kwargs["continuous_stream"] = streams[0]
+            if self._cb_mark_stims is not None:
+                kwargs["continuous_mark_stims"] = bool(
+                    self._cb_mark_stims.isChecked()
+                )
         if self._psth_bin is not None and self._sampling is not None:
             kwargs["psth_bin_window_s"] = float(self._psth_bin.value())
             kwargs["sampling_percent"] = int(self._sampling.value())
@@ -576,6 +937,10 @@ class LocalViewParams(QWidget):
                 self._trigger_polarity.currentData() or "low"
             )
             kwargs["trigger_threshold"] = float(self._trigger_threshold.value())
+        elif self._time_sync is not None:
+            kwargs["time_sync"] = str(
+                self._time_sync.currentData() or "recording_start"
+            )
         return replace(self._settings, **kwargs)
 
     def sync_base_settings(self, settings: ViewerSettings) -> None:
@@ -594,8 +959,14 @@ class LocalViewParams(QWidget):
             "rms_ylim": current.rms_ylim,
             "graph_height_px": current.graph_height_px,
         }
+        if self._show_canal_tab:
+            keep["analysis"] = current.analysis
+            keep["continuous_streams"] = current.continuous_streams
+            keep["continuous_stream"] = current.continuous_stream
+            keep["continuous_mark_stims"] = current.continuous_mark_stims
         if self._show_sync:
             keep["time_sync"] = current.time_sync
-            keep["trigger_polarity"] = current.trigger_polarity
-            keep["trigger_threshold"] = current.trigger_threshold
+            if not self._show_canal_tab:
+                keep["trigger_polarity"] = current.trigger_polarity
+                keep["trigger_threshold"] = current.trigger_threshold
         self._settings = replace(settings, **keep)

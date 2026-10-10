@@ -121,17 +121,38 @@ def resolve_recording_plot_colors(
     *,
     fallback: Sequence[str] | None = None,
 ) -> list[str]:
-    """Une couleur par enregistrement visible (personnalisée ou cycle)."""
+    """Une couleur par enregistrement visible (personnalisée ou cycle).
+
+    En mode Auto, la couleur suit l’index absolu dans ``styles`` (pas la
+    position parmi les seuls visibles), pour rester stable d’un graphique à
+    l’autre et quand on masque un enregistrement.
+    """
     cycle = [str(c) for c in (fallback or DEFAULT_TRACE_COLORS)]
     if not cycle:
         cycle = ["#2563eb", "#dc2626", "#16a34a", "#ea580c"]
     out: list[str] = []
-    for k, idx in enumerate(indices):
-        style = styles[int(idx)] if 0 <= int(idx) < len(styles) else None
+    for idx in indices:
+        i = int(idx)
+        style = styles[i] if 0 <= i < len(styles) else None
         custom = (style.color if style is not None else None) or ""
         custom = str(custom).strip()
-        out.append(custom if custom else cycle[k % len(cycle)])
+        out.append(custom if custom else cycle[i % len(cycle)])
     return out
+
+
+def recording_trace_color(
+    colors: Sequence[str],
+    index: int,
+    *,
+    fallback: str = "#334155",
+) -> str:
+    """Couleur d’un enregistrement ; ignore les fallbacks « type de flux »."""
+    i = int(index)
+    if 0 <= i < len(colors):
+        value = str(colors[i] or "").strip()
+        if value:
+            return value
+    return str(fallback)
 
 
 def resolve_display_label(stem: str, custom: str | None) -> str:

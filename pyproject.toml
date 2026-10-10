@@ -9,11 +9,11 @@ description = "Visionneuse et export PDF pour enregistrements Intan RHS / ERG"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-  "numpy",
-  "matplotlib",
-  "PySide6",
-  "scipy",
-  "pyqtgraph",
+  "numpy>=1.24,<3",
+  "matplotlib>=3.7,<4",
+  "PySide6>=6.5,<7",
+  "scipy>=1.10,<2",
+  "pyqtgraph>=0.13,<1",
 ]
 
 [project.scripts]
@@ -23,6 +23,7 @@ intan-trigger-plotter = "cli:main"
 [tool.setuptools]
 package-dir = {"" = "src"}
 py-modules = [
+  "channel_metrics",
   "cli",
   "config",
   "core",
@@ -35,6 +36,7 @@ py-modules = [
   "load_intan_rhs_format",
   "memmap_io",
   "panel_catalog",
+  "panel_draw_mpl",
   "panel_prepare",
   "panel_registry",
   "pdf_layout",

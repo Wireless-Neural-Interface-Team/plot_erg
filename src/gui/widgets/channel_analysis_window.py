@@ -446,6 +446,11 @@ class ChannelAnalysisWindow(QWidget):
             active_range_index=active,
             rms_ylim=rms_ylim,
         )
+        # Overrides locaux (édition texte / Style) : ne pas bloquer le toggle global.
+        try:
+            self.grid.sync_scale_bars_from(self.settings.style)
+        except Exception:
+            pass
         self._sync_params_base()
 
     def _sync_params_base(self) -> None:
@@ -478,7 +483,6 @@ class ChannelAnalysisWindow(QWidget):
             self._range_ctrl.set_bars(())
             self._relative_ranges.clear()
             self._active_range_index = 0
-            self._range_ctrl.ensure_default_bar()
             self._sync_settings_from_bars()
             self._update_range_counts()
         self._rebuild_placements()
@@ -496,11 +500,8 @@ class ChannelAnalysisWindow(QWidget):
                         abs_bars,
                         active_index=self.settings.active_range_index,
                     )
-                else:
-                    self._range_ctrl.ensure_default_bar()
                 self._relative_ranges = [replace(b) for b in rel_bars]
-            else:
-                self._range_ctrl.ensure_default_bar()
+            # Sinon : aucune plage par défaut (l’utilisateur en ajoute une).
             self._sync_settings_from_bars()
             self._update_range_counts()
 
@@ -838,8 +839,9 @@ class ChannelAnalysisWindow(QWidget):
         for_analysis: bool,
     ) -> None:
         # Zooms continuous → fenêtre détachée (tous flux / plages).
+        # Toujours raw/hp/lp : le filtrage Canal est local à la fenêtre zoom.
         if for_continuous:
-            streams = self._selected_streams()
+            streams: tuple[AnalysisStream, ...] = ("raw", "hp", "lp")
             for stream in streams:
                 short = STREAM_SHORT_LABELS.get(stream, str(stream).upper())
                 zoom_label = f"Zoom {short} {label}"
@@ -867,15 +869,44 @@ class ChannelAnalysisWindow(QWidget):
                                 absolute=True,
                             )
                         )
-        # Zooms d’analyse → même fenêtre détachée (pas la grille principale).
+        # Zooms d’analyse / extras → fenêtre détachée ; filtrage Canal local.
         if for_analysis:
-            for key in analysis.selected_analysis_panels():
+            if for_continuous:
+                # Continuous : WIDE/HIGH/LOW déjà en full_recording — ici RMS / spikes…
+                extras = replace(
+                    analysis,
+                    show_raw=False,
+                    show_hp=False,
+                    show_lp=False,
+                    show_rms=True,
+                    show_isi=True,
+                    show_overlay=True,
+                    show_psth=True,
+                    show_trial_rate=True,
+                    show_raster=True,
+                )
+                panel_keys = extras.selected_continuous_extra_panels()
+            else:
+                full_analysis = replace(
+                    analysis,
+                    show_raw=True,
+                    show_hp=True,
+                    show_lp=True,
+                    show_rms=True,
+                    show_isi=True,
+                    show_overlay=True,
+                    show_psth=True,
+                    show_trial_rate=True,
+                    show_raster=True,
+                )
+                panel_keys = full_analysis.selected_analysis_panels()
+            for key in panel_keys:
                 zoom_panels.append(
                     PanelPlacement(key).with_custom_zoom(
                         t0,
                         t1,
                         label=label,
-                        instance_id=bar_id,
+                        instance_id=f"{key}:{bar_id}",
                         absolute=absolute,
                     )
                 )
@@ -940,7 +971,7 @@ class ChannelAnalysisWindow(QWidget):
 
         if self._zooms_applied:
             _unused_analysis, zoom_panels = self._continuous_zoom_panel_lists(
-                for_analysis=False
+                for_analysis=True
             )
 
         self._placements = tuple(panels)
@@ -990,8 +1021,47 @@ class ChannelAnalysisWindow(QWidget):
         self._zoom_window = None
         self._user_closed_zoom_window = True
 
+    def _refresh_zoom_placement_catalog(self) -> tuple[PanelPlacement, ...]:
+        """Recataloguer tous les zooms possibles (filtrage Canal = fenêtre zoom)."""
+        if not self._zooms_applied:
+            self._zoom_placements = ()
+            return ()
+        if self.is_analysis_view():
+            analysis = self._ensure_analysis_curves()
+            zoom_panels: list[PanelPlacement] = []
+            for index, bar in enumerate(self._all_range_bars()):
+                t0, t1 = bar.ordered()
+                label = bar.label.strip() or f"Plage {index + 1}"
+                bar_id = str(bar.bar_id or f"an{index}")
+                self._append_zoom_panels(
+                    [],
+                    zoom_panels,
+                    analysis=analysis,
+                    t0=t0,
+                    t1=t1,
+                    label=label,
+                    bar_id=bar_id,
+                    absolute=not bool(bar.relative_to_stim),
+                    for_continuous=False,
+                    for_analysis=True,
+                )
+            self._zoom_placements = tuple(zoom_panels)
+        else:
+            _unused, zoom_panels = self._continuous_zoom_panel_lists(
+                for_analysis=True
+            )
+            self._zoom_placements = tuple(zoom_panels)
+        return self._zoom_placements
+
     def _on_zoom_window_refresh(self, window: DetachedZoomWindow) -> None:
-        self._render_zoom_window(window)
+        # Recataloguer (tous flux / RMS / spikes), puis MainWindow assure les
+        # produits manquants et redraw (re-rend aussi la fenêtre zoom).
+        placements = self._refresh_zoom_placement_catalog()
+        if placements:
+            window.update_placements(
+                placements, panel_height=self._panel_height()
+            )
+        self.refreshRequested.emit(self)
 
     def _render_zoom_window(self, window: DetachedZoomWindow | DetachedPanelWindow) -> None:
         if self._request_factory is None:
@@ -1017,7 +1087,9 @@ class ChannelAnalysisWindow(QWidget):
                         impedance_sessions=[],
                         preserve_view=preserve,
                     )
-                settings = apply_local_display_settings(request.settings, local)
+                settings = apply_local_display_settings(
+                    request.settings, local, include_analysis=True
+                )
                 return replace(
                     request, settings=settings, preserve_view=preserve
                 )
@@ -1076,14 +1148,19 @@ class ChannelAnalysisWindow(QWidget):
     ) -> None:
         """« Appliquer les zooms » — mêmes plages pour les 3 modes."""
         del scope  # Plus de scope séparé : une seule liste de plages.
+        bars = self._all_range_bars()
+        if not bars:
+            self._zooms_applied = False
+            self._close_all_zoom_windows()
+            self._status.setText("Aucune plage — ajoutez-en une avant d’appliquer.")
+            return
         self._preserve_view = True
         self._ensure_analysis_curves()
-        self._zooms_applied = bool(self._range_ctrl.bars or self._relative_ranges)
+        self._zooms_applied = True
         self._sync_settings_from_bars()
         self._sync_analysis_range_ctrl_from_list()
         self._update_range_counts()
         self._rebuild_placements(reopen_zooms=True)
-        bars = self._all_range_bars()
         n_zoom = len(self._zoom_placements)
         kind = "analyse" if self.is_analysis_view() else "continuous"
         self._status.setText(f"{len(bars)} plage(s) — {n_zoom} zoom(s) {kind}.")
@@ -1109,25 +1186,83 @@ class ChannelAnalysisWindow(QWidget):
             parts.append(f"{name} ({kind}) [{t0:g}…{t1:g} s]")
         self._relative_label.setText(f"{n} plage(s) : " + " · ".join(parts))
 
+    def _visible_graph_time_span(self) -> tuple[float, float] | None:
+        """Bornes X du graph temporel courant (coords stockées des plages)."""
+        if self.is_analysis_view():
+            for placement in self._placements:
+                if placement.panel not in _ANALYSIS_TEMPORAL_PANELS:
+                    continue
+                if placement.has_custom_zoom:
+                    continue
+                widget = self.grid.panel_widget(placement)
+                if widget is None:
+                    continue
+                host = getattr(widget, "plot_host", None) or getattr(
+                    widget, "_plot", None
+                )
+                if host is None:
+                    continue
+                try:
+                    axes = list(
+                        getattr(getattr(host, "figure", None), "axes", []) or []
+                    )
+                    if axes:
+                        xlim = axes[0].get_xlim()
+                        return float(xlim[0]), float(xlim[1])
+                except Exception:
+                    pass
+            return None
+        for placement in self._placements:
+            if placement.panel != "full_recording" or placement.has_custom_zoom:
+                continue
+            widget = self.grid.panel_widget(placement)
+            if widget is None:
+                continue
+            host = getattr(widget, "plot_host", None) or getattr(widget, "_plot", None)
+            if host is None:
+                continue
+            offset = continuous_sync_offset_s(
+                self._stim_times_s, self.settings.time_sync
+            )
+            try:
+                axes = list(getattr(getattr(host, "figure", None), "axes", []) or [])
+                if axes:
+                    xlim = axes[0].get_xlim()
+                    return float(xlim[0]) + offset, float(xlim[1]) + offset
+            except Exception:
+                pass
+            break
+        return None
+
     def _add_bar(self) -> None:
-        """+ Absolue : plage sur le temps absolu de l’enregistrement."""
+        """+ Absolue : barre centrée (10 % du graph) — n’ouvre pas les zooms."""
+        span = self._visible_graph_time_span()
+        if span is not None:
+            self._range_ctrl.set_time_span(span[0], span[1])
         before = len(self._range_ctrl.bars or ())
         self._range_ctrl.add_bar()
         bars = self._range_ctrl.bars or ()
         if len(bars) <= before:
             return
         self._active_range_index = len(self._all_range_bars()) - 1
-        self._zooms_applied = True
         self._update_range_counts()
         self._sync_settings_from_bars()
         self._sync_analysis_range_ctrl_from_list()
-        self._rebuild_placements(reopen_zooms=True)
+        # Réattacher sur un host vivant (évite un redraw sur ViewBox détruite).
+        if self.is_analysis_view():
+            self._attach_range_bars_to_analysis()
+        else:
+            self._attach_range_bars_to_full_recording()
+        if self._zooms_applied:
+            self._rebuild_placements(reopen_zooms=True)
+            self.refreshRequested.emit(self)
         t0, t1 = bars[-1].ordered()
-        self._status.setText(f"Plage absolue [{t0:g} … {t1:g}] s.")
-        self.refreshRequested.emit(self)
+        self._status.setText(
+            f"Plage absolue [{t0:g} … {t1:g}] s — « Appliquer les zooms » pour ouvrir."
+        )
 
     def _add_relative_range(self) -> None:
-        """+ Rel. stim : dialogue custom (tous modes)."""
+        """+ Rel. stim : dialogue custom — n’ouvre pas les zooms."""
         settings = self.local_settings()
         spec = ask_custom_zoom(
             self,
@@ -1148,13 +1283,18 @@ class ChannelAnalysisWindow(QWidget):
             )
         )
         self._active_range_index = len(self._all_range_bars()) - 1
-        self._zooms_applied = True
         self._update_range_counts()
         self._sync_settings_from_bars()
         self._sync_analysis_range_ctrl_from_list()
-        self._rebuild_placements(reopen_zooms=True)
-        self._status.setText(f"Plage relative [{spec.t0_s:g} … {spec.t1_s:g}] s.")
-        self.refreshRequested.emit(self)
+        if self.is_analysis_view():
+            self._attach_range_bars_to_analysis()
+        if self._zooms_applied:
+            self._rebuild_placements(reopen_zooms=True)
+            self.refreshRequested.emit(self)
+        self._status.setText(
+            f"Plage relative [{spec.t0_s:g} … {spec.t1_s:g}] s — "
+            "« Appliquer les zooms » pour ouvrir."
+        )
 
     def _remove_bar(self) -> None:
         bars = list(self._all_range_bars())
@@ -1231,7 +1371,7 @@ class ChannelAnalysisWindow(QWidget):
         if self.is_analysis_view():
             self._after_analysis_bars_moved()
             return
-        _unused, zoom_panels = self._continuous_zoom_panel_lists(for_analysis=False)
+        _unused, zoom_panels = self._continuous_zoom_panel_lists(for_analysis=True)
         self._zoom_placements = tuple(zoom_panels)
         # Conserver les panels RMS/spikes déjà dans la grille (prefetch).
         analysis = self._analysis_from_toggles()
@@ -1548,6 +1688,10 @@ class ChannelAnalysisWindow(QWidget):
     def redraw(self, *, preserve_view: bool = False) -> None:
         """Redessiner. ``preserve_view=True`` conserve zoom / pan (ex. après Traiter)."""
         self.settings = self.local_settings()
+        try:
+            self.grid.sync_scale_bars_from(self.settings.style)
+        except Exception:
+            pass
         if self._placements:
             # Appliquer la hauteur fixe sans reconstruire la grille.
             self.grid.set_panel_height(
@@ -1599,10 +1743,13 @@ class ChannelAnalysisWindow(QWidget):
         suffix = (" · " + " · ".join(parts)) if parts else ""
         self._status.setText(f"{drawn} panneau(x) · {elapsed_s * 1000:.0f} ms{suffix}")
         if self.is_analysis_view():
+            # Le host continuous peut avoir été détruit au changement de mode.
+            self._range_ctrl.detach()
             # Ne pas réattacher pendant un glisser (sinon le drag est annulé).
             if not self._analysis_range_ctrl.is_dragging:
                 self._attach_range_bars_to_analysis()
         else:
+            self._analysis_range_ctrl.detach()
             if not self._range_ctrl.is_dragging:
                 self._attach_range_bars_to_full_recording()
 

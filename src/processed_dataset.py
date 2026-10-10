@@ -582,11 +582,15 @@ class ProcessedRecording:
         *,
         max_points: int | None = None,
         require_ready: bool = False,
+        t_range: tuple[float, float] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Absolute-time continuous trace ``(t_s, values_uv)`` for one channel.
 
         When ``max_points`` is set and the row is denser, returns a min/max
         envelope so callers avoid building a full-rate time axis.
+
+        When ``t_range`` is set ``(t0, t1)`` in absolute seconds, the envelope
+        budget applies to that window only — so zooms keep the chosen density.
 
         When ``require_ready`` is True and the HP/LP row is not cached yet,
         returns empty arrays instead of running ``sosfilt`` (UI-safe).
@@ -597,7 +601,13 @@ class ProcessedRecording:
             # Guardrail: never build a full-rate axis unless explicitly requested
             # with max_points=0 from a worker / offline path.
             limit = 0
-        cache_key = (str(stream), int(ch), limit, bool(require_ready))
+        range_key: tuple[float, float] | None = None
+        if t_range is not None:
+            r0, r1 = float(t_range[0]), float(t_range[1])
+            if r1 < r0:
+                r0, r1 = r1, r0
+            range_key = (round(r0, 6), round(r1, 6))
+        cache_key = (str(stream), int(ch), limit, bool(require_ready), range_key)
         cached = self._continuous_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -615,12 +625,22 @@ class ProcessedRecording:
             return empty, empty
         # Vue memmap (pas de copie tant qu’on reste en enveloppe float32).
         row = array[ch]
-        n_samples = int(getattr(row, "shape", (0,))[0]) if row is not None else 0
-        if n_samples <= 0:
+        n_total = int(getattr(row, "shape", (0,))[0]) if row is not None else 0
+        if n_total <= 0:
             return empty, empty
         fs = float(self.meta.fs)
         if fs <= 0:
             return empty, empty
+        i0 = 0
+        i1 = n_total
+        if range_key is not None:
+            i0 = max(0, int(np.floor(range_key[0] * fs)))
+            i1 = min(n_total, int(np.ceil(range_key[1] * fs)) + 1)
+            if i1 <= i0:
+                return empty, empty
+            row = row[i0:i1]
+        n_samples = int(i1 - i0)
+        t_origin = float(i0) / fs
         if limit > 16 and n_samples > limit:
             # Enveloppe min/max vectorisée (pas de boucle Python par bin).
             n_bins = max(1, limit // 2)
@@ -629,7 +649,9 @@ class ProcessedRecording:
             reshaped = np.asarray(row[:usable], dtype=np.float32).reshape(n_bins, bin_size)
             lows = reshaped.min(axis=1)
             highs = reshaped.max(axis=1)
-            mids = (np.arange(n_bins, dtype=np.float64) + 0.5) * (bin_size / fs)
+            mids = t_origin + (np.arange(n_bins, dtype=np.float64) + 0.5) * (
+                bin_size / fs
+            )
             out_t = np.repeat(mids, 2)
             out_y = np.empty(n_bins * 2, dtype=np.float64)
             out_y[0::2] = lows
@@ -637,7 +659,7 @@ class ProcessedRecording:
             result = (out_t, out_y)
         else:
             data = np.asarray(row, dtype=np.float64)
-            t = np.arange(data.size, dtype=np.float64) / fs
+            t = t_origin + np.arange(data.size, dtype=np.float64) / fs
             result = (t, data)
         # Cap mémoire : garder les enveloppes les plus récentes.
         if len(self._continuous_cache) >= 512:

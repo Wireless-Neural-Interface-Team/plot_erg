@@ -69,15 +69,22 @@ class PanelGrid(QScrollArea):
         self._factory: RequestFactory | None = None
         self._elapsed = 0.0
         self._drawn = 0
+        # Pendant un défilement actif : pas de paint / render lourd (évite les freezes).
+        self._scroll_active = False
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.setInterval(0)
         self._timer.timeout.connect(self._render_next)
         self._scroll_timer = QTimer(self)
         self._scroll_timer.setSingleShot(True)
-        self._scroll_timer.setInterval(90)
-        self._scroll_timer.timeout.connect(self._render_newly_visible)
-        self.verticalScrollBar().valueChanged.connect(lambda _v: self._scroll_timer.start())
+        self._scroll_timer.setInterval(140)
+        self._scroll_timer.timeout.connect(self._on_scroll_settled)
+        self._cull_timer = QTimer(self)
+        self._cull_timer.setSingleShot(True)
+        self._cull_timer.setInterval(16)
+        self._cull_timer.timeout.connect(self._cull_montage_rows)
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll_moved)
+        self.horizontalScrollBar().valueChanged.connect(self._on_scroll_moved)
         self._fill_timer = QTimer(self)
         self._fill_timer.setSingleShot(True)
         self._fill_timer.setInterval(50)
@@ -139,6 +146,7 @@ class PanelGrid(QScrollArea):
                 canvas.removeRequested.connect(self.removeRequested.emit)
                 canvas.detachRequested.connect(self.detachRequested.emit)
                 canvas.styleChanged.connect(self._on_panel_style_changed)
+                canvas.xScaleSyncRequested.connect(self._on_x_scale_sync)
                 self._panels[placement.key] = canvas
             else:
                 widget = self._panels[placement.key]
@@ -256,6 +264,45 @@ class PanelGrid(QScrollArea):
             return
         self._apply_panel_height(widget, placement)
 
+    def _on_x_scale_sync(self, family: str, xlim: object) -> None:
+        """Double-clic : même échelle X pour tous les panels de la même famille."""
+        from .panel_canvas import x_scale_family
+
+        fam = str(family or "")
+        if not fam:
+            return
+        try:
+            x0, x1 = float(xlim[0]), float(xlim[1])  # type: ignore[index]
+        except Exception:
+            return
+        peers: list[Any] = []
+        for widget in self._panels.values():
+            placement = getattr(widget, "placement", None)
+            if placement is None:
+                continue
+            if x_scale_family(str(placement.panel)) != fam:
+                continue
+            peers.append(widget)
+        if not peers:
+            return
+        # Union des étendues de données → résultat stable si on reclique.
+        for widget in peers:
+            host = getattr(widget, "plot_host", None)
+            if host is None:
+                continue
+            span = host.data_xlim()
+            if span is None:
+                continue
+            x0 = min(x0, float(span[0]))
+            x1 = max(x1, float(span[1]))
+        if not (x1 > x0):
+            return
+        shared = (x0, x1)
+        for widget in peers:
+            apply = getattr(widget, "apply_shared_x_scale", None)
+            if callable(apply):
+                apply(shared)
+
     def resizeEvent(self, event: Any) -> None:  # noqa: N802
         super().resizeEvent(event)
         if self._fill and self._order:
@@ -353,6 +400,17 @@ class PanelGrid(QScrollArea):
             widget.invalidate()  # type: ignore[attr-defined]
             widget.mark_pending()  # type: ignore[attr-defined]
 
+    def sync_scale_bars_from(self, style: Any) -> None:
+        """Propager l’échelle flottante globale vers les overrides locaux."""
+        for widget in self._panels.values():
+            sync = getattr(widget, "sync_scale_bars_from", None)
+            if callable(sync):
+                try:
+                    sync(style)
+                except Exception:
+                    pass
+
+
     def invalidate_matching(self, predicate: Callable[[PanelPlacement], bool]) -> None:
         """Marquer dirty uniquement les panneaux qui matchent ``predicate``."""
         for placement in self._order:
@@ -362,16 +420,50 @@ class PanelGrid(QScrollArea):
             if widget is not None:
                 widget.invalidate()  # type: ignore[attr-defined]
 
-    def _near_viewport(self, widget: QWidget) -> bool:
-        """True when the panel is on screen, or within half a screen of it."""
+    def _near_viewport(self, widget: QWidget, *, margin_factor: float = 0.5) -> bool:
+        """True when the panel is on screen, or within ``margin_factor`` screens of it."""
         viewport = self.viewport()
         height = viewport.height()
         if height <= 0 or widget.height() <= 0:
             return True
-        margin = height // 2
+        margin = max(1, int(height * float(margin_factor)))
         top_left = widget.mapTo(viewport, widget.rect().topLeft())
         rect = QRect(top_left, widget.size())
         return viewport.rect().adjusted(0, -margin, 0, margin).intersects(rect)
+
+    def _on_scroll_moved(self, *_args: Any) -> None:
+        """Pendant le scroll : suspendre les rendus lourds (prepare/draw) pour rester fluide."""
+        if not self._scroll_active:
+            self._scroll_active = True
+            self._timer.stop()
+        if not self._cull_timer.isActive():
+            self._cull_timer.start()
+        self._scroll_timer.start()
+
+    def _on_scroll_settled(self) -> None:
+        """Fin de scroll : dessiner les panneaux entrés en vue, reprendre la file."""
+        self._scroll_active = False
+        self._cull_timer.stop()
+        self._cull_montage_rows()
+        self._render_newly_visible()
+        if self._pending and self._factory is not None and not self._timer.isActive():
+            self._timer.start()
+
+    def _cull_montage_rows(self) -> None:
+        """Sur les montages hauts : ne peindre que les lignes proches du viewport."""
+        for placement in self._order:
+            if not str(placement.panel).startswith("montage_"):
+                continue
+            widget = self._panels.get(placement.key)
+            if widget is None:
+                continue
+            host = getattr(widget, "plot_host", None)
+            cull = getattr(host, "cull_rows_outside_scroll_viewport", None)
+            if callable(cull):
+                try:
+                    cull(margin_px=200)
+                except Exception:
+                    pass
 
     def schedule_render(self, factory: RequestFactory, *, force: bool = False) -> None:
         """Queue a redraw of the dirty panels, nearest to the viewport first."""
@@ -400,6 +492,9 @@ class PanelGrid(QScrollArea):
         if not self._pending:
             self.renderFinished.emit(0, 0.0)
             return
+        # Ne pas démarrer un rendu lourd au milieu d’un scroll.
+        if self._scroll_active:
+            return
         self._timer.start()
 
     def render_dirty_now(self, factory: RequestFactory) -> int:
@@ -419,21 +514,36 @@ class PanelGrid(QScrollArea):
     def cancel_render(self) -> None:
         self._timer.stop()
         self._scroll_timer.stop()
+        self._cull_timer.stop()
+        self._scroll_active = False
         self._pending.clear()
 
     def _render_next(self) -> None:
+        if self._scroll_active:
+            return
         if not self._pending or self._factory is None:
             self.renderFinished.emit(self._drawn, self._elapsed)
             return
         placement = self._pending.pop(0)
         widget = self._panels.get(placement.key)
+        render_s = 0.0
         if widget is not None:
-            widget.render(self._factory(placement))  # type: ignore[attr-defined]
-            self._elapsed += widget.last_render_s  # type: ignore[attr-defined]
-            self._drawn += 1
+            # Ne pas bloquer le thread UI sur un panneau déjà hors vue.
+            if not self._near_viewport(widget):  # type: ignore[arg-type]
+                self._deferred.append(placement)
+                widget.mark_offscreen()  # type: ignore[attr-defined]
+            else:
+                widget.render(self._factory(placement))  # type: ignore[attr-defined]
+                render_s = float(widget.last_render_s)  # type: ignore[attr-defined]
+                self._elapsed += render_s
+                self._drawn += 1
         if self._pending:
+            # Budget : laisser la molette / le layout respirer après un rendu lourd.
+            delay_ms = 16 if render_s > 0.025 else 0
+            self._timer.setInterval(delay_ms)
             self._timer.start()
         else:
+            self._timer.setInterval(0)
             self.renderFinished.emit(self._drawn, self._elapsed)
 
     def _render_newly_visible(self) -> None:
@@ -447,11 +557,12 @@ class PanelGrid(QScrollArea):
         ]
         if not ready:
             return
-        self._deferred = [p for p in self._deferred if p not in ready]
+        ready_set = set(ready)
+        self._deferred = [p for p in self._deferred if p not in ready_set]
         self._pending.extend(ready)
         for placement in ready:
             self._panels[placement.key].mark_pending()  # type: ignore[attr-defined]
-        if not self._timer.isActive():
+        if not self._timer.isActive() and not self._scroll_active:
             self._elapsed = 0.0
             self._drawn = 0
             self._timer.start()

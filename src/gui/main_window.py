@@ -49,6 +49,7 @@ from gui.services import (
     PipelineController,
     RedrawScheduler,
     RenderRequestFactory,
+    merge_central_viewer_settings,
 )
 from gui.styles import APP_STYLESHEET
 from gui.widgets.channel_panel import ChannelPanel
@@ -640,6 +641,10 @@ class ViewerWindow(QMainWindow):
                         other = self.tabs.widget(index)
                         if isinstance(other, ViewTabPage) and other is not page:
                             other.grid.invalidate_all()
+                try:
+                    page.grid.sync_scale_bars_from(self._settings.style)
+                except Exception:
+                    pass
                 page.grid.schedule_render(self._make_request_or_blank, force=force)
             self._redraw_detached_windows()
             if redraw_inspectors:
@@ -735,22 +740,9 @@ class ViewerWindow(QMainWindow):
 
     def _neighbor_channel_indices(self, center: int, n_channels: int) -> list[int]:
         """Canaux proches (±2 en index, plus voisins MEA si la sonde est chargée)."""
-        neighbors: set[int] = set()
-        for delta in (-2, -1, 1, 2):
-            ch = int(center) + delta
-            if 0 <= ch < n_channels:
-                neighbors.add(ch)
-        probe = self._probe_layout
-        if probe is not None:
-            try:
-                from probe_layout import neighboring_channel_indices
-
-                for ch in neighboring_channel_indices(probe, int(center), max_count=6):
-                    if 0 <= int(ch) < n_channels and int(ch) != int(center):
-                        neighbors.add(int(ch))
-            except Exception:
-                pass
-        return sorted(neighbors)
+        return self._pipeline.neighbor_channel_indices(
+            center, n_channels, probe=self._probe_layout
+        )
 
     def _prefetch_neighbor_channels(self) -> None:
         """Chauffer filtre / moyennes des voisins hors thread UI (basse priorité)."""
@@ -795,8 +787,7 @@ class ViewerWindow(QMainWindow):
 
     @staticmethod
     def _is_montage_placement(placement: Any) -> bool:
-        panel = str(getattr(placement, "panel", "") or "")
-        return panel == "montage_continuous_raw" or panel.startswith("montage_")
+        return MontageController.is_montage_placement(placement)
 
     def _redraw_channel_visibility(self) -> None:
         """Redraw ciblé après coches Canaux — sans invalidate_all ni 2ᵉ debounce."""
@@ -818,16 +809,9 @@ class ViewerWindow(QMainWindow):
 
     def _montage_visible_indices(self, recording: Any) -> list[int]:
         """Indices des canaux non masqués (ordre d’origine)."""
-        n_channels = int(getattr(recording, "n_channels", 0) or 0)
-        if n_channels <= 0:
-            return []
-        hidden = set(self.channel_panel.hidden_channels)
-        names = list(getattr(recording, "channel_names", ()) or ())
-        return [
-            index
-            for index in range(n_channels)
-            if (names[index] if index < len(names) else f"CH{index}") not in hidden
-        ]
+        return self._montage.visible_indices(
+            recording, set(self.channel_panel.hidden_channels)
+        )
 
     def _montage_visible_count(self, recording: Any) -> int:
         """Nombre de canaux non masqués pour la revue montage."""
@@ -835,19 +819,17 @@ class ViewerWindow(QMainWindow):
 
     def _montage_review_per_page(self) -> int:
         """Canaux par page (Paramètres → Affichage → Revue montage)."""
-        return max(1, int(getattr(self._settings, "montage_review_channels", 10) or 10))
+        return self._montage.per_page(self._settings)
 
     def _montage_review_page_info(
         self, recording: Any
     ) -> tuple[list[int], int, int, int]:
         """``(indices page, page, n_pages, n_visible)`` pour la revue montage."""
-        visible = self._montage_visible_indices(recording)
-        per_page = self._montage_review_per_page()
-        n_visible = len(visible)
-        n_pages = max(1, (n_visible + per_page - 1) // per_page) if n_visible else 1
-        page = max(0, min(n_pages - 1, int(getattr(self._settings, "montage_review_page", 0) or 0)))
-        start = page * per_page
-        return visible[start : start + per_page], page, n_pages, n_visible
+        return self._montage.page_info(
+            self._montage_visible_indices(recording),
+            per_page=self._montage_review_per_page(),
+            page=int(getattr(self._settings, "montage_review_page", 0) or 0),
+        )
 
     def _montage_page_channel_count(self, recording: Any) -> int:
         """Nombre de canaux sur la page courante (hauteur du montage)."""
@@ -873,7 +855,8 @@ class ViewerWindow(QMainWindow):
         new_page = max(0, min(n_pages - 1, page + int(delta)))
         if new_page == page:
             return
-        # Changement de structure (autres canaux) : rebuild, pas style-only.
+        # Même grille PlotItem (PlotHost) : refresh données, pas reset de vue forcé.
+        # Le host conserve le zoom X ; les Y sont re-autoscalés par canal.
         self.params_panel.set_montage_review_page(new_page, emit=False)
         self._settings = self._default_viewer_settings()
         self._adapt_montage_height()
@@ -881,7 +864,7 @@ class ViewerWindow(QMainWindow):
         page_widget = self._current_page()
         if page_widget is not None:
             page_widget.grid.invalidate_matching(self._is_montage_placement)
-        self._schedule_redraw(force=True, reset_view=True)
+        self._schedule_redraw(force=True, preserve_view=True)
 
     def _sync_montage_page_controls(self) -> None:
         """Rafraîchir le libellé / boutons de pagination du bandeau."""
@@ -911,33 +894,15 @@ class ViewerWindow(QMainWindow):
 
     def _montage_review_placements(self) -> tuple[PanelPlacement, ...]:
         """Un seul panneau : tous les graphs Pipeline intégrés en lignes multi-canaux."""
-        return (PanelPlacement("montage_continuous_raw"),)
+        return self._montage.review_placements()
 
     def _montage_review_kind_count(self) -> int:
         """Nombre de lignes par canal (flux + extras Pipeline)."""
-        streams = self._settings.resolved_continuous_streams() or ("raw",)
-        analysis = self._settings.analysis
-        extras = sum(
-            1
-            for flag in (
-                analysis.show_rms,
-                analysis.show_psth,
-                analysis.show_trial_rate,
-                analysis.show_raster,
-                analysis.show_isi,
-                analysis.show_overlay,
-            )
-            if flag
-        )
-        return max(1, len(streams) + extras)
+        return self._montage.kind_count(self._settings)
 
     def _montage_total_height_px(self, n_visible: int) -> int:
         """Hauteur du montage (canaux×kinds × ligne + chrome panneau)."""
-        rows = max(1, int(n_visible)) * self._montage_review_kind_count()
-        min_row = max(36, int(self._settings.montage_row_min_height_px))
-        # Chrome : en-tête + toolbar PlotHost + curseur + marges.
-        chrome = 96
-        return max(220, rows * min_row + chrome)
+        return self._montage.total_height_px(n_visible, self._settings)
 
     def _sync_montage_review_panels(self) -> None:
         """Resynchroniser la grille montage sur Mode / Pipeline / contexte."""
@@ -1008,31 +973,10 @@ class ViewerWindow(QMainWindow):
 
     def _default_viewer_settings(self) -> ViewerSettings:
         """Réglages d’affichage de la vue centrale (ParamsPanel)."""
-        settings = self.params_panel.viewer_settings()
-        streams = settings.resolved_continuous_streams()
-        # Pipeline (cases Paramètres) = source de vérité des courbes affichées.
-        # L’aperçu canal ne sert qu’au mode / stim_index / résumés locaux.
-        analysis = settings.analysis
-        preview_content = settings.preview_content
-        if self._channel_inspect is not None:
-            local = self._channel_inspect.local_settings()
-            preview_content = self._channel_inspect.preview_mode()
-            analysis = replace(
-                analysis,
-                mode=local.analysis.mode,
-                stim_index=local.analysis.stim_index,
-                show_summary_rms=local.analysis.show_summary_rms,
-                show_summary_rms_table=local.analysis.show_summary_rms_table,
-            )
-        return replace(
-            settings,
-            analysis=analysis,
-            preview_content=preview_content,  # type: ignore[arg-type]
-            continuous_stream=streams[0] if streams else "raw",  # type: ignore[arg-type]
-            continuous_streams=streams,
+        return merge_central_viewer_settings(
+            self.params_panel.viewer_settings(),
             hidden_channels=self.channel_panel.hidden_channels,
-            range_bars=(),
-            active_range_index=0,
+            channel_inspect=self._channel_inspect,
         )
 
     def _seed_settings_for_window(self) -> ViewerSettings:
@@ -1060,11 +1004,9 @@ class ViewerWindow(QMainWindow):
         background: bool = False,
     ) -> None:
         """Lancer le calcul des canaux manquants (vue active ou fenêtre détachée)."""
-        if then_redraw_window is not None:
-            self._pending_window_id = then_redraw_window
-        self._start_channel_ensure(
+        self._pipeline.ensure_channels_for_indices(
             channels,
-            allow_empty_redraw=then_redraw_window is None,
+            then_redraw_window=then_redraw_window,
             need_means=need_means,
             need_rms=need_rms,
             need_spikes=need_spikes,
@@ -1102,6 +1044,9 @@ class ViewerWindow(QMainWindow):
             page = self._current_page()
             if page is not None:
                 page.grid.invalidate_matching(self._is_montage_placement)
+            # HIGH/LOW : chauffer aussi le reste des canaux en arrière-plan.
+            if self._montage_needs_filters():
+                self._start_background_prefetch()
         self._schedule_redraw(force=True, reset_view=True)
 
     @staticmethod
@@ -1199,6 +1144,8 @@ class ViewerWindow(QMainWindow):
         self._adapt_montage_height()
         self._sync_montage_page_controls()
         self._ensure_montage_review_data()
+        if self._montage_needs_filters():
+            self._start_background_prefetch()
         mode = str(self._settings.preview_content or "continuous")
         streams = self._settings.resolved_continuous_streams()
         stream_txt = "+".join(
@@ -1266,34 +1213,16 @@ class ViewerWindow(QMainWindow):
 
     def _montage_review_needs_means(self) -> bool:
         """True si la revue montage lit des moyennes / fenêtres de stim."""
-        if not self._in_montage:
-            return False
-        return str(self._settings.preview_content or "continuous") in {
-            "average",
-            "stimulation",
-        }
+        return self._montage.needs_means(self._settings)
 
     def _montage_extra_flags(self) -> tuple[bool, bool, bool]:
         """``(need_rms, need_spikes, need_overlay)`` pour les graphs hors traces."""
-        return self._analysis_extra_flags(self._settings.analysis)
+        return self._montage.extra_flags(self._settings)
 
     @staticmethod
     def _analysis_extra_flags(analysis: Any) -> tuple[bool, bool, bool]:
         """``(need_rms, need_spikes, need_overlay)`` depuis les flags Pipeline / Analyse."""
-        need_rms = bool(
-            getattr(analysis, "show_rms", False)
-            or getattr(analysis, "show_summary_rms", False)
-            or getattr(analysis, "show_summary_rms_table", False)
-        )
-        need_spikes = bool(
-            getattr(analysis, "show_isi", False)
-            or getattr(analysis, "show_overlay", False)
-            or getattr(analysis, "show_psth", False)
-            or getattr(analysis, "show_trial_rate", False)
-            or getattr(analysis, "show_raster", False)
-        )
-        need_overlay = bool(getattr(analysis, "show_overlay", False))
-        return need_rms, need_spikes, need_overlay
+        return MontageController.analysis_extra_flags(analysis)
 
     def _preview_product_needs(
         self, window: ChannelAnalysisWindow | None = None
@@ -1318,6 +1247,24 @@ class ViewerWindow(QMainWindow):
             need_rms = need_rms or rms
             need_spikes = need_spikes or spikes
             need_overlay = need_overlay or overlay
+        # Fenêtre zoom : coches Canal locales (indépendantes de l’aperçu).
+        zoom = getattr(win, "_zoom_window", None)
+        if zoom is not None:
+            z_analysis = zoom.local_settings().analysis
+            z_rms, z_spikes, z_overlay = self._analysis_extra_flags(z_analysis)
+            need_rms = need_rms or z_rms
+            need_spikes = need_spikes or z_spikes
+            need_overlay = need_overlay or z_overlay
+            if win.is_analysis_view():
+                need_means = True
+            for placement in getattr(zoom, "placements", ()) or ():
+                means, rms, spikes, overlay = panel_product_needs(
+                    getattr(placement, "panel", "")
+                )
+                need_means = need_means or means
+                need_rms = need_rms or rms
+                need_spikes = need_spikes or spikes
+                need_overlay = need_overlay or overlay
         return need_means, need_rms, need_spikes, need_overlay
 
     def _view_product_needs(self) -> tuple[bool, bool, bool, bool]:
@@ -1340,23 +1287,37 @@ class ViewerWindow(QMainWindow):
             return workspace_needs
         return self._preview_product_needs(None)
 
+    def _montage_needs_filters(self) -> bool:
+        """True si le montage affiche HIGH et/ou LOW (filtres à préchauffer)."""
+        streams = self._settings.resolved_continuous_streams()
+        return any(str(stream) in {"hp", "lp"} for stream in streams)
+
     def _view_needs_all_channels(self) -> bool:
         """True si la vue courante lit tous les canaux (montage / résumés)."""
         if self._in_montage:
             need_means, need_rms, need_spikes, need_overlay = self._view_product_needs()
-            return bool(need_means or need_rms or need_spikes or need_overlay)
+            if need_means or need_rms or need_spikes or need_overlay:
+                return True
+            # HIGH/LOW continuous : chauffer les filtres de tous les canaux visibles.
+            return self._montage_needs_filters()
         return bool(self._workspace.needs_all_channels())
 
     def _ensure_montage_review_data(self) -> None:
-        """Précharger moyennes / RMS / spikes pour tous les canaux visibles."""
+        """Précharger filtres HIGH/LOW + moyennes / RMS / spikes (page visible)."""
         plotted = self._plotted()
         if not plotted:
             return
         need_means = self._montage_review_needs_means()
         need_rms, need_spikes, need_overlay = self._montage_extra_flags()
-        if not (need_means or need_rms or need_spikes or need_overlay):
+        need_filters = self._montage_needs_filters()
+        if not (need_means or need_rms or need_spikes or need_overlay or need_filters):
             return
-        indices = self._montage_visible_indices(plotted[0].recording)
+        # Page courante d’abord (affichage) ; le prefetch all-channels suit via
+        # ``_view_needs_all_channels`` si HIGH/LOW ou produits globaux.
+        page_indices, _page, _n_pages, _n_vis = self._montage_review_page_info(
+            plotted[0].recording
+        )
+        indices = page_indices or self._montage_visible_indices(plotted[0].recording)
         if not indices:
             return
         self._ensure_channels_for_indices(
@@ -1365,6 +1326,7 @@ class ViewerWindow(QMainWindow):
             need_rms=need_rms,
             need_spikes=need_spikes,
             need_overlay=need_overlay,
+            need_filters=need_filters,
             priority=True,
             background=True,
         )
@@ -1970,6 +1932,17 @@ class ViewerWindow(QMainWindow):
         if all_channels or self._pending_ensure_all:
             return list(range(n_channels))
 
+        # Revue montage : la page affichée (pas seulement le canal sélectionné).
+        if self._in_montage:
+            page_indices, _page, _n_pages, _n_vis = self._montage_review_page_info(
+                recording
+            )
+            if page_indices:
+                return list(page_indices)
+            visible = self._montage_visible_indices(recording)
+            if visible:
+                return list(visible)
+
         tab = self._current_tab()
         wants_global = False
         if tab is not None:
@@ -2236,14 +2209,19 @@ class ViewerWindow(QMainWindow):
         """Un canal vient d’être calculé — rafraîchir s’il est visible."""
         ready_set = {int(ch) for ch in channels}
         viewed = set(self._channels_for_current_view(all_channels=False))
-        will_redraw_preview = bool(ready_set & viewed) and not self._is_continuous_montage_view()
+        # Montage continuous + HIGH/LOW : les filtres nourrissent bien le panneau.
+        montage_needs_filter_redraw = (
+            self._is_continuous_montage_view() and self._montage_needs_filters()
+        )
+        will_redraw = bool(ready_set & viewed) and (
+            not self._is_continuous_montage_view() or montage_needs_filter_redraw
+        )
         if ready_set & viewed:
             self._mark_display_loaded()
-            # Montage continu = memmap ; means/spikes n’y changent rien.
-            if will_redraw_preview:
+            if will_redraw:
                 self._schedule_redraw(force=True, preserve_view=True)
             window_id = self._pending_window_id
-            if window_id and not will_redraw_preview:
+            if window_id and not will_redraw:
                 self._redraw_pending_window(window_id)
             self._pending_window_id = None
 
@@ -2252,7 +2230,7 @@ class ViewerWindow(QMainWindow):
         ) in ready_set:
             self._channel_inspect.set_channel_ready(True)
             # Aperçu : déjà redessiné via _schedule_redraw — éviter le double paint.
-            if not (will_redraw_preview and self._showing_channel_preview()):
+            if not (will_redraw and self._showing_channel_preview()):
                 self._channel_inspect.redraw(preserve_view=True)
 
         # Badges / carte MEA : coalescer pendant le prefetch (évite un freeze/liste).
@@ -2299,8 +2277,8 @@ class ViewerWindow(QMainWindow):
         plotted = self._plotted()
         self.channel_panel.set_reference_recording(plotted[0].recording if plotted else None)
         self._redraw_pending_window(window_id)
-        if self._is_continuous_montage_view():
-            # Pas de rebuild montage : les produits canal ne nourrissent pas ce panneau.
+        if self._is_continuous_montage_view() and not self._montage_needs_filters():
+            # Continuous pur (WIDE seul) : pas de rebuild — memmap déjà prêt.
             return
         self._schedule_redraw(
             force=True,

@@ -15,6 +15,7 @@ class PipelineHost(Protocol):
     _build_worker: Any
     _channel_compute_active: bool
     _ensure_background: bool
+    _pending_window_id: str | None
 
     def _set_channel_compute_active(
         self, active: bool, *, background: bool = False
@@ -26,7 +27,7 @@ class PipelineHost(Protocol):
 
 
 class PipelineController:
-    """Délègue au host ; encapsule l’arrêt ensure et les helpers busy."""
+    """Ensure/busy helpers + voisinage de canaux pour le prefetch."""
 
     def __init__(self, host: Any) -> None:
         self._host = host
@@ -53,6 +54,22 @@ class PipelineController:
         """Façade vers ``host._start_channel_ensure``."""
         self._host._start_channel_ensure(channels, **kwargs)
 
+    def ensure_channels_for_indices(
+        self,
+        channels: list[int],
+        *,
+        then_redraw_window: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Lancer le calcul des canaux manquants (vue active ou fenêtre détachée)."""
+        if then_redraw_window is not None:
+            self._host._pending_window_id = then_redraw_window
+        self._host._start_channel_ensure(
+            channels,
+            allow_empty_redraw=then_redraw_window is None,
+            **kwargs,
+        )
+
     def set_busy(self, busy: bool) -> None:
         self._host._set_busy(busy)
 
@@ -78,3 +95,24 @@ class PipelineController:
         if host._build_worker is not None and host._build_worker.isRunning():
             return True
         return bool(host._channel_compute_active)
+
+    @staticmethod
+    def neighbor_channel_indices(
+        center: int, n_channels: int, *, probe: Any | None = None
+    ) -> list[int]:
+        """Canaux proches (±2 en index, plus voisins MEA si la sonde est chargée)."""
+        neighbors: set[int] = set()
+        for delta in (-2, -1, 1, 2):
+            ch = int(center) + delta
+            if 0 <= ch < n_channels:
+                neighbors.add(ch)
+        if probe is not None:
+            try:
+                from probe_layout import neighboring_channel_indices
+
+                for ch in neighboring_channel_indices(probe, int(center), max_count=6):
+                    if 0 <= int(ch) < n_channels and int(ch) != int(center):
+                        neighbors.add(int(ch))
+            except Exception:
+                pass
+        return sorted(neighbors)

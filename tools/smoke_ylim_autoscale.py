@@ -70,18 +70,18 @@ def _assert_manual_to_auto(
     status = render_panel(figure, req_m)
     if status != "ok":
         raise AssertionError(f"{placement.key}: rendu manuel status={status}")
-    ax = figure.axes[0]
-    y_manual = _ylim(ax)
+    y_manual = _ylim(figure.axes[0])
     if abs(y_manual[0] + 5.0) > 1e-6 or abs(y_manual[1] - 5.0) > 1e-6:
         raise AssertionError(
             f"{placement.key}: ylim manuel attendu (-5, 5), got {y_manual}"
         )
 
-    # Même fingerprint structure → chemin refresh style (pas de rebuild).
+    # Même fingerprint structure → refresh (prepare re-draw ou style-only).
+    # Reprendre figure.axes[0] : un clear() invalide l’ancienne référence.
     status = render_panel(figure, req_a)
     if status != "ok":
         raise AssertionError(f"{placement.key}: rendu auto status={status}")
-    y_auto = _ylim(ax)
+    y_auto = _ylim(figure.axes[0])
     if _span(y_auto) <= 10.0 + 1e-6:
         raise AssertionError(
             f"{placement.key}: autoscale attendu après manuel→auto, "
