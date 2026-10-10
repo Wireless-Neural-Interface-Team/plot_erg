@@ -12,63 +12,100 @@ from display_config import resolve_display_label
 
 
 def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple:
-    """Lightweight payload for multi-recording streaming (no global means)."""
-    import gc
+    """Build via ``build_recording`` (same as GUI), warm filters, materialize stacks.
 
+    Returns the picklable 10-tuple expected by ``_run_streaming_comparison``:
+    t_rel, names, n_valid, n_total, fs, end_rising_s, triggers, pre_n, post_n, amp_path.
+    HP/LP are written next to ``amp_path`` as ``high_intan.npy`` / ``low_intan.npy``.
+    """
     import numpy as np
 
-    from core import (
-        build_intan_dsp_settings,
-        get_analog_in0_signal,
-        get_channel_names,
-        get_sampling_rate,
-        load_rhs_file,
-        persist_amp_and_filtered_stacks,
-        resolve_recording_windows,
-        resolve_work_dir,
-        uses_analog_trigger,
-    )
+    from core import resolve_work_dir
+    from dataset_builder import build_recording
+    from erg_cache import CacheKeys, default_cache_root, raw_layout_for
+    from memmap_io import open_writable_memmap
 
     if not config.rhs_file.exists():
         raise FileNotFoundError(f"File not found: {config.rhs_file}")
-    data = load_rhs_file(config.rhs_file)
-    fs = get_sampling_rate(data)
-    analog_in0 = get_analog_in0_signal(data) if uses_analog_trigger(config) else np.array([], dtype=np.float64)
-    amplifier_raw = np.asarray(data.get("amplifier_data"))
-    if amplifier_raw.size == 0:
-        raise RuntimeError("RHS file does not contain amplifier_data.")
-    _, n_samples = amplifier_raw.shape
-    valid_triggers, t_rel, pre_n, post_n, n_valid, n_total, end_rising_s = resolve_recording_windows(
-        config=config,
-        n_samples=n_samples,
-        fs=fs,
-        analog_in0=analog_in0,
+
+    recording, _report = build_recording(
+        config,
+        cache_root=default_cache_root(config),
+        label=resolve_display_label(config.rhs_file.stem, config.recording_label),
+        style=config.recording_style,
     )
-    channel_names = get_channel_names(data, amplifier_raw.shape[0])
+    source = recording.source
+    if source is None:
+        raise RuntimeError("build_recording returned no live streams.")
+
+    n_channels = int(recording.n_channels)
+    n_samples = int(recording.meta.n_samples)
+    channels = list(range(n_channels))
+    for bank_name in ("highpass", "lowpass"):
+        bank = getattr(source, bank_name, None)
+        prefetch = getattr(bank, "prefetch", None)
+        if callable(prefetch):
+            prefetch(channels)
+
+    # Materialize dense stacks side-by-side for the matplotlib PDF / ProcessPool path.
     work_dir = resolve_work_dir(config)
-    intan_dsp = build_intan_dsp_settings(data, config)
-    stack_shape = (int(amplifier_raw.shape[0]), int(amplifier_raw.shape[1]))
-    amp_path, _, _ = persist_amp_and_filtered_stacks(
-        work_dir,
-        intan_dsp,
-        stack_shape,
-        amplifier_2d=amplifier_raw,
-        channel_workers=config.channel_workers,
-    )
-    del amplifier_raw
-    if isinstance(data, dict):
-        data.pop("amplifier_data", None)
-    gc.collect()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    keys = CacheKeys.from_config(config)
+    cache_amp = raw_layout_for(default_cache_root(config), keys).amplifier_path
+    dsp = recording.meta.dsp
+    if dsp is not None:
+        dsp.save_json(work_dir / "intan_dsp.json")
+
+    amp_out = work_dir / "amplifier.npy"
+    amp_mm = open_writable_memmap(amp_out, (n_channels, n_samples), np.dtype(np.float32))
+    try:
+        src_amp = np.asarray(source.amplifier)
+        for start in range(0, n_channels, 8):
+            end = min(n_channels, start + 8)
+            amp_mm[start:end] = np.asarray(src_amp[start:end], dtype=np.float32)
+        amp_mm.flush()
+    finally:
+        del amp_mm
+
+    high = source.highpass
+    low = source.lowpass
+    for name, bank in (("high_intan.npy", high), ("low_intan.npy", low)):
+        out = work_dir / name
+        mm = open_writable_memmap(out, (n_channels, n_samples), np.dtype(np.float32))
+        try:
+            for ch in channels:
+                mm[ch] = np.asarray(bank[ch], dtype=np.float32)
+            mm.flush()
+        finally:
+            del mm
+    amp_path = amp_out
+    del cache_amp
+
+    triggers = np.asarray(recording.derived.triggers, dtype=np.int64)
+    t_rel = np.asarray(recording.derived.t_rel, dtype=np.float64)
+    seg = recording.meta.segmentation
+    names = list(recording.channel_names)
+    fs = float(recording.meta.fs)
+    end_rising = seg.end_rising_s
+    n_valid = int(seg.n_trials)
+    n_total = int(seg.n_triggers_detected)
+    pre_n = int(seg.pre_n)
+    post_n = int(seg.post_n)
+    # Drop live handles before ProcessPool pickling of the return tuple.
+    close = getattr(recording, "close", None)
+    if callable(close):
+        close()
+
     return (
         t_rel,
-        channel_names,
+        names,
         n_valid,
         n_total,
         fs,
-        end_rising_s,
-        valid_triggers.copy(),
-        int(pre_n),
-        int(post_n),
+        end_rising,
+        triggers.copy(),
+        pre_n,
+        post_n,
         str(amp_path),
     )
 
@@ -81,7 +118,12 @@ def parse_args() -> argparse.Namespace:
             "and compute per-channel averages on [-pre, +post] seconds."
         )
     )
-    parser.add_argument("rhs_file", nargs="?", type=Path, help="Path to the .rhs file")
+    parser.add_argument(
+        "rhs_file",
+        nargs="*",
+        type=Path,
+        help="One or more .rhs files (omit to open the GUI; several → multi comparison PDF)",
+    )
     parser.add_argument("--gui", action="store_true", help="Launch the Qt GUI")
     parser.add_argument(
         "--edge",
@@ -579,14 +621,19 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
             post_vals.append(int(post_n))
 
         if max(fs_values) - min(fs_values) > 1e-3:
-            print("Warning: different sampling rates detected.")
-        fs_ref = fs_values[0]
-        t_min = min(len(t) for t in t_arrays)
+            print(
+                "Warning: different sampling rates detected — "
+                "aligning on the first recording's fs with a common pre/post window."
+            )
+        fs_ref = float(fs_values[0])
         n_ch = min(src.amplifier.shape[0] for src in spike_sources)
-        t_ref = np.asarray(t_arrays[0][:t_min])
         channel_names = names_per_rec[0][:n_ch]
         pre_n_common = min(pre_vals)
         post_n_common = min(post_vals)
+        # Rebuild a shared time axis from the common window (not a truncated t_rel[0]).
+        t_ref = (
+            np.arange(-int(pre_n_common), int(post_n_common), dtype=np.float64) / fs_ref
+        )
         out_dir = tuned[0].save_dir if tuned[0].save_dir is not None else tuned[0].rhs_file.parent
         imp_sessions = collect_impedance_sessions([cfg.rhs_file for cfg in tuned])
         if imp_sessions:
@@ -651,8 +698,8 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
 
 def main() -> None:
     args = parse_args()
-    rhs_path = args.rhs_file
-    if args.gui or rhs_path is None:
+    rhs_paths = list(args.rhs_file or [])
+    if args.gui or not rhs_paths:
         from gui.launcher import launch_gui_from_args
 
         exit_code = launch_gui_from_args(args)
@@ -663,7 +710,7 @@ def main() -> None:
     from intan_rhx_dsp import normalize_spike_threshold
 
     config = AnalysisConfig(
-        rhs_file=rhs_path,
+        rhs_file=rhs_paths[0],
         threshold=args.threshold,
         edge=args.edge,
         pre_s=args.pre,
@@ -778,7 +825,11 @@ def main() -> None:
         print("Error: --spike-overlay-post-ms must be > 0.", file=sys.stderr)
         sys.exit(2)
     try:
-        run(config)
+        if len(rhs_paths) == 1:
+            run(config)
+        else:
+            configs = [replace(config, rhs_file=path) for path in rhs_paths]
+            run_multi_comparison(configs)
     except Exception as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)

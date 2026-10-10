@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Sequence
 
-from PySide6.QtCore import QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QGridLayout,
     QLabel,
@@ -43,6 +43,8 @@ class PanelGrid(QScrollArea):
         self.setWidgetResizable(True)
         self.setFrameShape(QScrollArea.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumWidth(0)
         self._allow_zoom = bool(allow_zoom)
 
         self._container = QWidget()
@@ -55,6 +57,8 @@ class PanelGrid(QScrollArea):
         self._order: list[PanelPlacement] = []
         self._columns = 2
         self._panel_height = 300
+        # Hauteur des graphs non-montage (ex. RMS / spikes à côté du montage).
+        self._graph_height = 400
         # True = même hauteur (et donc même largeur de cellule) pour tous les panels.
         self._uniform = False
         # True = panneaux Expanding qui se partagent le viewport (aperçu canal).
@@ -78,6 +82,14 @@ class PanelGrid(QScrollArea):
         self._fill_timer.setSingleShot(True)
         self._fill_timer.setInterval(50)
         self._fill_timer.timeout.connect(self._reflow_fill_heights)
+
+    def sizeHint(self) -> QSize:  # noqa: D102
+        if self.isVisible() and self.width() > 0:
+            return QSize(self.width(), max(120, self.height()))
+        return QSize(320, 400)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: D102
+        return QSize(0, 80)
 
     # ------------------------------------------------------------------ layout
 
@@ -126,6 +138,7 @@ class PanelGrid(QScrollArea):
                 )
                 canvas.removeRequested.connect(self.removeRequested.emit)
                 canvas.detachRequested.connect(self.detachRequested.emit)
+                canvas.styleChanged.connect(self._on_panel_style_changed)
                 self._panels[placement.key] = canvas
             else:
                 widget = self._panels[placement.key]
@@ -184,29 +197,64 @@ class PanelGrid(QScrollArea):
                 continue
             self._apply_panel_height(widget, placement)
 
+    def set_graph_height(self, graph_height: int) -> None:
+        """Hauteur des panneaux hors montage (RMS, spikes, résumés…)."""
+        height = max(140, int(graph_height))
+        if height == self._graph_height:
+            return
+        self._graph_height = height
+        for placement in self._order:
+            if str(placement.panel).startswith("montage_"):
+                continue
+            widget = self._panels.get(placement.key)
+            if widget is None:
+                continue
+            self._apply_panel_height(widget, placement)
+
     def _panel_min_height(self, placement: PanelPlacement) -> int:
-        """Hauteur cible d’un panneau (uniforme, fill viewport, ou preferred_height)."""
-        if self._fill or self._uniform or placement.panel == "montage_continuous_raw":
-            # Fill : hauteur déjà calculée via preferred_height_px dans _reflow_fill_heights.
+        """Hauteur cible — override par panneau si style dédié, sinon hauteur de grille.
+
+        Montage : jamais ``graph_height_px`` — hauteur imposée par la grille
+        (dérivée de la hauteur de ligne). Autres graphs : ``_graph_height``.
+        """
+        if str(placement.panel).startswith("montage_"):
             return self._panel_height
-        info = panel_info(placement.panel)
-        return max(self._panel_height, int(info.preferred_height_px))
+        widget = self._panels.get(placement.key)
+        override = getattr(widget, "style_height_px", None) if widget is not None else None
+        if override is not None:
+            return max(140, int(override))
+        # Revue montage mixte : ne pas étirer RMS/spikes à la hauteur du montage.
+        if any(str(p.panel).startswith("montage_") for p in self._order):
+            return max(140, int(self._graph_height))
+        return self._panel_height
 
     def _apply_panel_height(self, widget: object, placement: PanelPlacement) -> None:
         height = self._panel_min_height(placement)
         widget.setMinimumHeight(height)  # type: ignore[attr-defined]
-        # Montage / uniform : hauteur fixe (= budget lignes) pour forcer le scroll.
-        # fill : Expanding pour occuper tout le viewport (continuous / moyenne / stim).
-        fix_height = bool(self._uniform or placement.panel == "montage_continuous_raw")
+        # Hauteur fixe pour tous les graphs (scroll si la fenêtre est plus petite).
+        # fill (legacy) : Expanding pour occuper le viewport.
+        # Un override de style par panneau impose aussi une hauteur fixe.
+        has_style_height = getattr(widget, "style_height_px", None) is not None
+        fix_height = bool(
+            self._uniform
+            or not self._fill
+            or has_style_height
+            or placement.panel == "montage_continuous_raw"
+        )
         if fix_height:
             widget.setMaximumHeight(height)  # type: ignore[attr-defined]
             v_policy = QSizePolicy.Policy.Fixed
         else:
             widget.setMaximumHeight(16777215)  # type: ignore[attr-defined]
-            v_policy = (
-                QSizePolicy.Policy.Expanding if self._fill else QSizePolicy.Policy.Preferred
-            )
+            v_policy = QSizePolicy.Policy.Expanding
         widget.setSizePolicy(QSizePolicy.Policy.Expanding, v_policy)  # type: ignore[attr-defined]
+
+    def _on_panel_style_changed(self, placement: PanelPlacement) -> None:
+        """Recaler la hauteur après un override d’affichage / style local."""
+        widget = self._panels.get(placement.key)
+        if widget is None:
+            return
+        self._apply_panel_height(widget, placement)
 
     def resizeEvent(self, event: Any) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -304,6 +352,15 @@ class PanelGrid(QScrollArea):
         for widget in self._panels.values():
             widget.invalidate()  # type: ignore[attr-defined]
             widget.mark_pending()  # type: ignore[attr-defined]
+
+    def invalidate_matching(self, predicate: Callable[[PanelPlacement], bool]) -> None:
+        """Marquer dirty uniquement les panneaux qui matchent ``predicate``."""
+        for placement in self._order:
+            if not predicate(placement):
+                continue
+            widget = self._panels.get(placement.key)
+            if widget is not None:
+                widget.invalidate()  # type: ignore[attr-defined]
 
     def _near_viewport(self, widget: QWidget) -> bool:
         """True when the panel is on screen, or within half a screen of it."""
@@ -405,8 +462,8 @@ class ViewTabPage(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        # Fenêtre principale : pan / home seulement (pas de zoom molette / outil Zoom).
-        self.grid = PanelGrid(self, allow_zoom=False)
+        # Ctrl+molette = zoom ; molette seule = scroll de la grille.
+        self.grid = PanelGrid(self, allow_zoom=True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)

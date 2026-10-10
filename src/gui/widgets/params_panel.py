@@ -1,7 +1,12 @@
 """Paramètres d’affichage et de traitement, selon le coût d’un changement.
 
-- *Affichage* / *Légende & style* → :attr:`viewChanged` (redessin immédiat).
-- *Canal* (section Pipeline) → :attr:`configChanged` (recalcul F5 ; cache par étapes).
+Répartition des onglets (modèle mental) :
+
+- *Canal* — contenu du canal (mode, plages, contexte) + Pipeline de traitement
+  (filtres, spikes, RMS, détection) → :attr:`configChanged` / Traiter (F5).
+- *Affichage* — axe X, sync, disposition, légendes, textes, apparence →
+  :attr:`viewChanged` (redessin immédiat, pas de recalcul).
+  Les échelles Y vivent dans Canal → section de chaque courbe cochée.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -35,18 +41,21 @@ from config import AnalysisConfig
 from gui.form_widgets import (
     AxisLimitRow,
     FitWidthScrollArea,
+    FontSizeFaceRow,
     configure_narrow_form,
     make_double_spin as _spin,
     make_int_spin as _int_spin,
 )
+from gui.defaults import DEFAULT_PSTH_BIN_S, DEFAULT_ZOOM_T0_S, DEFAULT_ZOOM_T1_S
 from gui.jobs import Debouncer
 from view_config import (
     EDGE_TO_TRIGGER_POLARITY,
     LEGEND_LOCATIONS,
     TIME_SYNC_LABELS,
-    TRIGGER_POLARITY_TO_EDGE,
+    AnalysisSettings,
     AnalysisStream,
     AxisLimits,
+    TextOverrides,
     LegendSettings,
     PanelStyle,
     ViewerSettings,
@@ -60,10 +69,6 @@ _EDGE_CHOICES = (
 _TIME_SYNC_CHOICES = (
     (TIME_SYNC_LABELS["recording_start"], "recording_start"),
     (TIME_SYNC_LABELS["trigger"], "trigger"),
-)
-_TRIGGER_POLARITY_CHOICES = (
-    ("Low (front descendant)", "low"),
-    ("High (front montant)", "high"),
 )
 _FILTER_TYPES = (("Bessel", "bessel"), ("Butterworth", "butterworth"))
 _NOTCH_CHOICES = (
@@ -124,14 +129,23 @@ def _set_form_row_visible(form: QFormLayout, field: QWidget, visible: bool) -> N
         label.setVisible(visible)
 
 
+def _set_form_row_enabled(form: QFormLayout, field: QWidget, enabled: bool) -> None:
+    """Active / grise une ligne QFormLayout (libellé + champ)."""
+    field.setEnabled(enabled)
+    label = form.labelForField(field)
+    if label is not None:
+        label.setEnabled(enabled)
+
+
 class ParamsPanel(QWidget):
     """Réglages d’affichage et de traitement dans le dock Paramètres."""
 
     viewChanged = Signal()
     configChanged = Signal()
     processRequested = Signal()
-    # Flux WIDE/HIGH/LOW cochés ou décochés (pour déplier le Pipeline dans Canal).
-    streamsChanged = Signal(object)
+    # Visibilité Pipeline (WIDE/HIGH/LOW/RMS/Spikes) — même signal pour
+    # continuous, moyenne et stimulation.
+    pipelineVisibilityChanged = Signal()
 
     def __init__(self, defaults: Mapping[str, Any] | None = None, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -148,7 +162,7 @@ class ParamsPanel(QWidget):
         self.tabs.setDocumentMode(True)
         self.tabs.setUsesScrollButtons(False)
         tab_bar = self.tabs.tabBar()
-        # Partage équitable + élision : 3 onglets lisibles dès ~220 px.
+        # Partage équitable + élision : 2 onglets lisibles dès ~220 px.
         tab_bar.setElideMode(Qt.TextElideMode.ElideRight)
         tab_bar.setExpanding(True)
         self._channel_tab_index: int | None = None
@@ -171,16 +185,18 @@ class ParamsPanel(QWidget):
         self._channel_host_layout.setSpacing(0)
         self._channel_host_layout.addWidget(self._channel_placeholder)
 
-        self._pipeline_header = QLabel("Pipeline (Traiter F5)")
+        self._pipeline_header = QLabel("Traitement (Traiter F5)")
         self._pipeline_header.setObjectName("sectionLabel")
         self._pipeline_header.setWordWrap(True)
+        self._pipeline_header.setToolTip(
+            "Paramètres qui recalculent les données. "
+            "Cochez WIDE / HIGH / LOW / RMS / Spikes pour afficher les courbes."
+        )
         self._pipeline_sep = QFrame()
         self._pipeline_sep.setFrameShape(QFrame.Shape.HLine)
         self._pipeline_sep.setObjectName("sectionSeparator")
 
-        # Affichage avant Pipeline : _sync_section_rows lie trigger Affichage ↔ edge.
         display_page = self._build_display_tab()
-        legend_page = self._build_legend_tab()
         self._processing_content = self._build_processing_tab()
         canal_inner = QWidget()
         canal_layout = QVBoxLayout(canal_inner)
@@ -196,15 +212,16 @@ class ParamsPanel(QWidget):
         self.tabs.addTab(self._canal_scroll, "Canal")
         self._channel_tab_index = 0
         self.tabs.addTab(_scrollable(display_page), "Affichage")
-        self.tabs.addTab(_scrollable(legend_page), "Style")
         self.tabs.setTabToolTip(
             0,
-            "Mode aperçu, courbes, plages — et Pipeline (filtres, spikes, RMS) → Traiter (F5)",
+            "Contenu du canal (mode, plages, résumés) et traitement "
+            "(filtres, spikes, RMS) → Traiter (F5)",
         )
         self.tabs.setTabToolTip(
-            1, "Flux WIDE/HIGH/LOW, échelles, sync, montages — redessin immédiat"
+            1,
+            "Axe X, sync, disposition, légendes et apparence — "
+            "redessin immédiat (échelles Y → Canal, par type de courbe)",
         )
-        self.tabs.setTabToolTip(2, "Légendes et style des panneaux — redessin immédiat")
 
         dirty_row = QWidget(self)
         dirty_layout = QHBoxLayout(dirty_row)
@@ -245,84 +262,32 @@ class ParamsPanel(QWidget):
     # ----------------------------------------------------------- display tab
 
     def _build_display_tab(self) -> QWidget:
+        """Échelles, sync, disposition, légendes, apparence — redessin immédiat."""
         defaults = self._defaults
         page = QWidget()
         page_layout = QVBoxLayout(page)
         page_layout.setContentsMargins(8, 8, 8, 8)
         page_layout.setSpacing(8)
 
-        # Flux visibles sur l’aperçu continuous et la revue montage.
-        streams_group = QGroupBox("Traces continues")
-        streams_layout = QVBoxLayout(streams_group)
-        streams_layout.setContentsMargins(8, 8, 8, 8)
-        streams_layout.setSpacing(4)
-        self._cb_stream_wide = QCheckBox("WIDE (brut)")
-        self._cb_stream_high = QCheckBox("HIGH (passe-haut)")
-        self._cb_stream_low = QCheckBox("LOW (passe-bas)")
-        self._cb_stream_wide.setChecked(True)
-        self._cb_stream_wide.setToolTip(
-            "Signal brut (wideband) dans l’aperçu continuous. "
-            "Coche → Canal / Pipeline : notch / artefacts."
-        )
-        self._cb_stream_high.setToolTip(
-            "Passe-haut dans l’aperçu continuous. "
-            "Coche → Canal / Pipeline : type / ordre / coupure (propre au HIGH)."
-        )
-        self._cb_stream_low.setToolTip(
-            "Passe-bas dans l’aperçu continuous. "
-            "Coche → Canal / Pipeline : type / ordre / coupure (propre au LOW)."
-        )
-        self._cb_mark_stims = QCheckBox("Marqueurs de stimulation")
-        self._cb_mark_stims.setChecked(True)
-        self._cb_mark_stims.setToolTip(
-            "Marquer les stimulations sur l’aperçu continuous et la revue montage."
-        )
-        for box in (
-            self._cb_stream_wide,
-            self._cb_stream_high,
-            self._cb_stream_low,
-            self._cb_mark_stims,
-        ):
-            streams_layout.addWidget(box)
-        for box in (self._cb_stream_wide, self._cb_stream_high, self._cb_stream_low):
-            box.toggled.connect(self._on_streams_toggled)
-        self._cb_mark_stims.toggled.connect(self._emit_view)
-
-        sync_group = QGroupBox("Synchronisation / déclencheur")
+        sync_group = QGroupBox("Temps & marqueurs")
         sync_form = configure_narrow_form(QFormLayout(sync_group))
-        default_edge = str(defaults.get("default_edge", "falling"))
-        default_polarity = EDGE_TO_TRIGGER_POLARITY.get(default_edge, "low")
         self._time_sync = _choice(
             _TIME_SYNC_CHOICES,
             str(defaults.get("default_time_sync", "recording_start")),
         )
         self._time_sync.setToolTip(
             "Origine de l’axe temps des traces continues : début du fichier "
-            "ou premier trigger détecté (t=0)."
+            "ou premier trigger détecté (t=0). La détection du trigger se règle "
+            "dans Canal → Traitement."
         )
-        self._trigger_polarity = _choice(_TRIGGER_POLARITY_CHOICES, default_polarity)
-        self._trigger_polarity.setToolTip(
-            "Polarité TTL sur ANALOG-IN-0. Low = front descendant, "
-            "High = front montant. Modifie aussi le traitement (F5)."
+        self._cb_mark_stims = QCheckBox("Marqueurs de stimulation sur les traces")
+        self._cb_mark_stims.setChecked(True)
+        self._cb_mark_stims.setToolTip(
+            "Marquer les stimulations sur l’aperçu continuous et la revue montage."
         )
-        self._display_trigger_threshold = _spin(
-            -100.0,
-            100.0,
-            defaults.get("default_threshold", 1.0),
-            decimals=3,
-            suffix=" V",
-        )
-        self._display_trigger_threshold.setToolTip(
-            "Seuil de détection du trigger sur ANALOG-IN-0 (V). "
-            "Modifie aussi le traitement (F5)."
-        )
-        sync_form.addRow("Synchroniser sur :", self._time_sync)
-        sync_form.addRow("Trigger :", self._trigger_polarity)
-        sync_form.addRow("Limite de détection :", self._display_trigger_threshold)
-
-        # Bin PSTH / échantillonnage spikes : défauts (réglables dans Analyse).
-        self._psth_bin_s = float(defaults.get("default_psth_bin_window_s", 0.025))
-        self._sampling_percent = int(defaults.get("default_sampling_percent", 100) or 100)
+        sync_form.addRow("Origine du temps :", self._time_sync)
+        sync_form.addRow(self._cb_mark_stims)
+        self._cb_mark_stims.toggled.connect(self._emit_view)
 
         axis_group = QGroupBox("Échelles des axes")
         self._axis_form = configure_narrow_form(QFormLayout(axis_group))
@@ -334,106 +299,265 @@ class ParamsPanel(QWidget):
         )
         self._x_limits.setToolTip(
             "Limites X manuelles (temps, s) pour tous les graphs temporels. "
-            "Prioritaire sur la section / le zoom par défaut."
-        )
-        self._stim_hp_ylim = AxisLimitRow(
-            AxisLimits(
-                enabled=bool(defaults.get("default_first_trigger_hp_ylim_enabled", False)),
-                minimum=float(defaults.get("default_first_trigger_hp_ylim_min_uv", -200.0)),
-                maximum=float(defaults.get("default_first_trigger_hp_ylim_max_uv", 200.0)),
-            )
-        )
-        self._stim_hp_ylim.setToolTip(
-            "Échelle Y des panneaux passe-haut autour d’une stimulation "
-            "(aperçu / Analyse). Sans effet sur la revue montage continue."
-        )
-        # Échelle Y RMS : sous la case RMS (onglet Canal), pas ici.
-        self._rms_ylim = AxisLimits(enabled=True, minimum=0.0, maximum=20.0)
-        self._trace_ylim = AxisLimitRow(AxisLimits())
-        self._trace_ylim.setToolTip(
-            "Échelle Y des traces continues (aperçu canal et revue montage)."
+            "Prioritaire sur la section / le zoom par défaut. "
+            "Les échelles Y se règlent dans Canal → section de chaque courbe."
         )
         self._axis_form.addRow("Axe X (temps) :", self._x_limits)
-        self._axis_form.addRow("Panneaux de traces :", self._trace_ylim)
-        self._axis_form.addRow("Passe-haut stimulation :", self._stim_hp_ylim)
+        axis_hint = QLabel(
+            "Échelles verticales (WIDE / HIGH / LOW / RMS) → Canal, "
+            "dans la section de la courbe cochée."
+        )
+        axis_hint.setObjectName("hintLabel")
+        axis_hint.setWordWrap(True)
+        self._axis_form.addRow(axis_hint)
+
+        zoom_group, zoom_inner = _collapsible_group(
+            "Fenêtres de zoom (PDF / sections)", expanded=False
+        )
+        zoom_form = configure_narrow_form(QFormLayout(zoom_inner))
+        zoom_form.setContentsMargins(0, 0, 0, 0)
+        self._zoom_onset_t0 = _spin(
+            -60.0,
+            60.0,
+            float(defaults.get("default_zoom_onset_t0_s", DEFAULT_ZOOM_T0_S)),
+            decimals=3,
+            step=0.01,
+            suffix=" s",
+        )
+        self._zoom_onset_t1 = _spin(
+            -60.0,
+            60.0,
+            float(defaults.get("default_zoom_onset_t1_s", DEFAULT_ZOOM_T1_S)),
+            decimals=3,
+            step=0.01,
+            suffix=" s",
+        )
+        self._zoom_end_t0 = _spin(
+            -60.0,
+            60.0,
+            float(defaults.get("default_zoom_end_t0_s", DEFAULT_ZOOM_T0_S)),
+            decimals=3,
+            step=0.01,
+            suffix=" s",
+        )
+        self._zoom_end_t1 = _spin(
+            -60.0,
+            60.0,
+            float(defaults.get("default_zoom_end_t1_s", DEFAULT_ZOOM_T1_S)),
+            decimals=3,
+            step=0.01,
+            suffix=" s",
+        )
+        for widget, tip in (
+            (
+                self._zoom_onset_t0,
+                "Début de la fenêtre relative au début de stimulation (PDF / panneaux zoom début).",
+            ),
+            (
+                self._zoom_onset_t1,
+                "Fin de la fenêtre relative au début de stimulation.",
+            ),
+            (
+                self._zoom_end_t0,
+                "Début de la fenêtre relative à la fin de stimulation (PDF / panneaux zoom fin).",
+            ),
+            (
+                self._zoom_end_t1,
+                "Fin de la fenêtre relative à la fin de stimulation.",
+            ),
+        ):
+            widget.setToolTip(tip)
+        zoom_hint = QLabel(
+            "Temps relatifs à la stim (t=0). Utilisés pour les sections PDF "
+            "« zoom début / fin » et comme valeurs par défaut des plages Rel. stim."
+        )
+        zoom_hint.setObjectName("hintLabel")
+        zoom_hint.setWordWrap(True)
+        zoom_form.addRow("Zoom début — de :", self._zoom_onset_t0)
+        zoom_form.addRow("Zoom début — à :", self._zoom_onset_t1)
+        zoom_form.addRow("Zoom fin — de :", self._zoom_end_t0)
+        zoom_form.addRow("Zoom fin — à :", self._zoom_end_t1)
+        zoom_form.addRow(zoom_hint)
+
+        layout_group = QGroupBox("Disposition")
+        self._layout_form = configure_narrow_form(QFormLayout(layout_group))
+        self._graph_height = _int_spin(
+            160,
+            1200,
+            int(defaults.get("default_graph_height_px", 400) or 400),
+            step=20,
+            suffix=" px",
+        )
+        self._graph_height_tooltip = (
+            "Hauteur fixe de chaque graphique (aperçu, analyse, onglets)."
+        )
+        self._graph_height.setToolTip(self._graph_height_tooltip)
+        self._show_scale_bars = QCheckBox("Échelle flottante (barres temps / amplitude)")
+        self._show_scale_bars.setChecked(False)
+        self._show_scale_bars.setToolTip(
+            "Masque les graduations numériques sur les bords et affiche une barre "
+            "d’échelle flottante (ex. 100 ms · 200 µV)."
+        )
+        self._scale_bar_amp_manual = QCheckBox("Manuel")
+        self._scale_bar_amp_manual.setChecked(False)
+        self._scale_bar_amp = _spin(
+            0.01, 1_000_000.0, 100.0, decimals=2, step=10.0, suffix=" µV"
+        )
+        self._scale_bar_amp.setToolTip(
+            "Amplitude représentée par le bâton vertical. La longueur pixel "
+            "s’adapte automatiquement au zoom / à l’échelle Y."
+        )
+        self._scale_bar_time_manual = QCheckBox("Manuel")
+        self._scale_bar_time_manual.setChecked(False)
+        self._scale_bar_time_ms = _spin(
+            0.01, 1_000_000.0, 100.0, decimals=2, step=10.0, suffix=" ms"
+        )
+        self._scale_bar_time_ms.setToolTip(
+            "Durée représentée par le bâton horizontal. La longueur pixel "
+            "s’adapte automatiquement au zoom / à l’échelle X."
+        )
+        amp_row = QWidget()
+        amp_lay = QHBoxLayout(amp_row)
+        amp_lay.setContentsMargins(0, 0, 0, 0)
+        amp_lay.setSpacing(6)
+        amp_lay.addWidget(self._scale_bar_amp_manual)
+        amp_lay.addWidget(self._scale_bar_amp, 1)
+        time_row = QWidget()
+        time_lay = QHBoxLayout(time_row)
+        time_lay.setContentsMargins(0, 0, 0, 0)
+        time_lay.setSpacing(6)
+        time_lay.addWidget(self._scale_bar_time_manual)
+        time_lay.addWidget(self._scale_bar_time_ms, 1)
+        self._scale_bar_amp_manual.toggled.connect(self._sync_scale_bar_inputs)
+        self._scale_bar_time_manual.toggled.connect(self._sync_scale_bar_inputs)
+        self._show_scale_bars.toggled.connect(self._sync_scale_bar_inputs)
+        self._sync_scale_bar_inputs()
+        self._max_points = _int_spin(500, 200000, 6000, step=500)
+        self._max_points.setToolTip(
+            "Points dessinés par courbe. Au-delà, une enveloppe min/max conserve "
+            "tous les pics tout en restant rapide."
+        )
+        self._layout_form.addRow("Hauteur des graphs :", self._graph_height)
+        self._layout_form.addRow(self._show_scale_bars)
+        self._layout_form.addRow("Amplitude barre :", amp_row)
+        self._layout_form.addRow("Temps barre :", time_row)
+        self._layout_form.addRow("Points max / courbe :", self._max_points)
 
         # Revue montage continue uniquement.
         self._montage_review_group = QGroupBox("Revue montage")
         review_form = configure_narrow_form(QFormLayout(self._montage_review_group))
+        self._montage_review_channels = _int_spin(1, 128, 10)
+        self._montage_review_channels_tooltip = (
+            "Nombre de canaux empilés par page dans la revue montage. "
+            "Utilisez les boutons Suivant / Précédent du bandeau pour changer de page."
+        )
+        self._montage_review_channels.setToolTip(self._montage_review_channels_tooltip)
+        review_form.addRow("Canaux visibles :", self._montage_review_channels)
+        self._montage_review_page = 0
         self._montage_row_height = _int_spin(
             36,
             200,
             int(defaults.get("default_montage_row_min_height_px", 52) or 52),
             suffix=" px",
         )
-        self._montage_row_height.setToolTip(
+        self._montage_row_tooltip = (
             "Hauteur minimale d’une ligne canal×flux dans la revue montage. "
             "Plus bas = ouverture plus rapide, moins de détail vertical."
         )
+        self._montage_row_height.setToolTip(self._montage_row_tooltip)
         review_form.addRow("Hauteur de ligne :", self._montage_row_height)
         review_hint = QLabel(
-            "Visibilité des canaux : Session → Channels (cases). "
-            "Retour aperçu : Ctrl+Shift+M."
+            "Les graphs Pipeline (WIDE/HIGH/LOW/RMS/Spikes) sont empilés "
+            "par canal, page par page. Mode = Canal. "
+            "Visibilité canaux : Session → Channels. Retour : Ctrl+Shift+M."
         )
         review_hint.setObjectName("hintLabel")
         review_hint.setWordWrap(True)
         review_form.addRow(review_hint)
+        self._montage_review_tooltip = (
+            "Réglages propres à la revue montage (Ctrl+M)."
+        )
+        self._montage_review_group.setToolTip(self._montage_review_tooltip)
 
-        # Montages PDF (moyenne / 2e stim) — hors revue continue.
         montage_group, montage_inner = _collapsible_group(
             "Montages PDF (moyenne / 2e stim)", expanded=False
         )
         self._montage_pdf_group = montage_group
+        self._montage_pdf_tooltip = (
+            "Pagination des montages PDF moyenne / 2e stim (export). "
+            "Sans effet sur la revue montage continue."
+        )
+        self._montage_pdf_group.setToolTip(self._montage_pdf_tooltip)
         montage_form = configure_narrow_form(QFormLayout(montage_inner))
         montage_form.setContentsMargins(0, 0, 0, 0)
         self._montage_channels = _int_spin(2, 1024, 12)
-        self._montage_channels.setToolTip(
+        self._montage_channels_tooltip = (
             "Canaux empilés par page pour les montages PDF moyenne / 2e stim. "
-            "La revue continue affiche toujours tous les canaux visibles."
+            "La revue continue utilise « Canaux visibles » ci-dessus."
         )
+        self._montage_channels.setToolTip(self._montage_channels_tooltip)
         self._montage_page = _int_spin(0, 64, 0)
-        self._montage_page.setToolTip(
+        self._montage_page_tooltip = (
             "Bloc de canaux pour les montages PDF (0 = première page). "
             "Sans effet sur la revue montage continue."
         )
+        self._montage_page.setToolTip(self._montage_page_tooltip)
         montage_form.addRow("Canaux par montage :", self._montage_channels)
         montage_form.addRow("Page de montage :", self._montage_page)
 
         for group in (
-            streams_group,
             sync_group,
             axis_group,
+            zoom_group,
+            layout_group,
             self._montage_review_group,
             montage_group,
         ):
             page_layout.addWidget(group)
-        page_layout.addStretch(1)
 
         for int_widget in (
             self._montage_channels,
             self._montage_page,
+            self._montage_review_channels,
             self._montage_row_height,
+            self._graph_height,
+            self._max_points,
         ):
             int_widget.valueChanged.connect(lambda _v: self._emit_view())
-        for row in (self._x_limits, self._stim_hp_ylim, self._trace_ylim):
-            row.changed.connect(self._emit_view)
+        for zoom_spin in (
+            self._zoom_onset_t0,
+            self._zoom_onset_t1,
+            self._zoom_end_t0,
+            self._zoom_end_t1,
+        ):
+            zoom_spin.valueChanged.connect(lambda _v: self._emit_view())
+        self._x_limits.changed.connect(self._emit_view)
         self._time_sync.currentIndexChanged.connect(lambda _i: self._emit_view())
-        self._trigger_polarity.currentIndexChanged.connect(
-            lambda _i: self._on_display_trigger_changed()
-        )
-        self._display_trigger_threshold.valueChanged.connect(
-            lambda _v: self._on_display_trigger_changed()
-        )
+        self._show_scale_bars.toggled.connect(lambda _c: self._emit_view())
+        self._scale_bar_amp_manual.toggled.connect(lambda _c: self._emit_view())
+        self._scale_bar_time_manual.toggled.connect(lambda _c: self._emit_view())
+        self._scale_bar_amp.valueChanged.connect(lambda _v: self._emit_view())
+        self._scale_bar_time_ms.valueChanged.connect(lambda _v: self._emit_view())
+
+        self._add_style_groups(page_layout)
+        page_layout.addStretch(1)
         return page
 
-    # ------------------------------------------------------------ legend tab
+    def _sync_scale_bar_inputs(self, *_args: Any) -> None:
+        enabled = bool(self._show_scale_bars.isChecked())
+        self._scale_bar_amp_manual.setEnabled(enabled)
+        self._scale_bar_time_manual.setEnabled(enabled)
+        self._scale_bar_amp.setEnabled(
+            enabled and bool(self._scale_bar_amp_manual.isChecked())
+        )
+        self._scale_bar_time_ms.setEnabled(
+            enabled and bool(self._scale_bar_time_manual.isChecked())
+        )
 
-    def _build_legend_tab(self) -> QWidget:
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(8, 8, 8, 8)
-        page_layout.setSpacing(8)
+    # ---------------------------------------------------- style (dans Affichage)
 
+    def _add_style_groups(self, page_layout: QVBoxLayout) -> None:
+        """Légendes, textes et apparence — redessin immédiat (jamais F5)."""
         legend_group = QGroupBox("Légendes")
         legend_form = configure_narrow_form(QFormLayout(legend_group))
         self._legend_visible = QCheckBox("Afficher les légendes")
@@ -450,7 +574,7 @@ class ParamsPanel(QWidget):
             self._legend_location.addItem(
                 "Sous le panneau" if location == "below" else location.capitalize(), location
             )
-        self._legend_font = _spin(4.0, 24.0, 9.0, decimals=1, step=0.5, suffix=" pt")
+        self._legend_font = FontSizeFaceRow(4.0, 24.0, 9.0, decimals=1, step=0.5)
         self._legend_columns = _int_spin(1, 6, 1)
         self._legend_gap = _spin(0.0, 1.0, 0.22, decimals=2, step=0.02)
         self._legend_gap.setToolTip(
@@ -464,18 +588,42 @@ class ParamsPanel(QWidget):
         self._legend_counts.setChecked(True)
         legend_form.addRow(self._legend_visible)
         legend_form.addRow("Position :", self._legend_location)
-        legend_form.addRow("Taille de police :", self._legend_font)
+        legend_form.addRow("Police de la légende :", self._legend_font)
         legend_form.addRow("Colonnes :", self._legend_columns)
         legend_form.addRow("Distance au graphique :", self._legend_gap)
         legend_form.addRow(self._legend_frame)
         legend_form.addRow(self._legend_filters)
         legend_form.addRow(self._legend_counts)
 
-        style_group = QGroupBox("Style des panneaux")
+        style_group = QGroupBox("Textes et apparence")
         style_form = configure_narrow_form(QFormLayout(style_group))
-        self._title_font = _spin(5.0, 24.0, 10.0, decimals=1, step=0.5, suffix=" pt")
-        self._label_font = _spin(5.0, 24.0, 9.0, decimals=1, step=0.5, suffix=" pt")
-        self._tick_font = _spin(4.0, 20.0, 8.0, decimals=1, step=0.5, suffix=" pt")
+        self._text_title = QLineEdit()
+        self._text_title.setPlaceholderText("Automatique")
+        self._text_title.setToolTip("Laissez vide pour le titre généré automatiquement.")
+        self._text_xlabel = QLineEdit()
+        self._text_xlabel.setPlaceholderText("Automatique")
+        self._text_ylabel = QLineEdit()
+        self._text_ylabel.setPlaceholderText("Automatique")
+        self._text_series_suffix = QCheckBox(
+            "Suffixe de type de courbe (moyenne, RMS…)"
+        )
+        self._text_series_suffix.setChecked(True)
+        self._text_series_suffix.setToolTip(
+            "Décochez pour n’afficher que le nom d’enregistrement dans la légende."
+        )
+        self._text_legend_labels = QPlainTextEdit()
+        self._text_legend_labels.setPlaceholderText(
+            "Automatique — une entrée de légende par ligne,\n"
+            "dans l’ordre des courbes. Ligne vide = garder l’auto."
+        )
+        self._text_legend_labels.setMaximumHeight(90)
+        self._text_legend_labels.setToolTip(
+            "Remplace les libellés de légende. Les noms de base restent "
+            "aussi éditables dans le dock Enregistrements → Légende."
+        )
+        self._title_font = FontSizeFaceRow(5.0, 24.0, 10.0, decimals=1, step=0.5)
+        self._label_font = FontSizeFaceRow(5.0, 24.0, 9.0, decimals=1, step=0.5)
+        self._tick_font = FontSizeFaceRow(4.0, 20.0, 8.0, decimals=1, step=0.5)
         self._line_width = _spin(0.2, 5.0, 1.2, decimals=2, step=0.1)
         self._grid = QCheckBox("Afficher la grille")
         self._grid.setChecked(True)
@@ -485,16 +633,22 @@ class ParamsPanel(QWidget):
         self._show_borders.setToolTip(
             "Cadre avec graduations autour de la zone de tracé de chaque panneau."
         )
-        self._stim_markers = QCheckBox("Afficher les pointillés de stimulation")
+        self._ticks_inside = QCheckBox("Graduations vers l’intérieur")
+        self._ticks_inside.setChecked(False)
+        self._ticks_inside.setToolTip(
+            "Oriente les graduations (ticks) vers l’intérieur du cadre de tracé."
+        )
+        self._stim_markers = QCheckBox("Pointillés de début / fin de stimulation")
         self._stim_markers.setChecked(True)
         self._stim_markers.setToolTip(
-            "Lignes en pointillés au début (et à la fin) de stimulation sur les graphiques."
+            "Lignes en pointillés au début (et à la fin) de stimulation sur les graphiques. "
+            "Distinct des marqueurs sur les traces continues (Temps & marqueurs)."
         )
-        self._max_points = _int_spin(500, 200000, 6000, step=500)
-        self._max_points.setToolTip(
-            "Points dessinés par courbe. Au-delà, une enveloppe min/max conserve "
-            "tous les pics tout en restant rapide."
-        )
+        style_form.addRow("Titre :", self._text_title)
+        style_form.addRow("Axe X :", self._text_xlabel)
+        style_form.addRow("Axe Y :", self._text_ylabel)
+        style_form.addRow(self._text_series_suffix)
+        style_form.addRow("Légendes :", self._text_legend_labels)
         style_form.addRow("Police du titre :", self._title_font)
         style_form.addRow("Police des axes :", self._label_font)
         style_form.addRow("Police des ticks :", self._tick_font)
@@ -502,42 +656,47 @@ class ParamsPanel(QWidget):
         style_form.addRow(self._grid)
         style_form.addRow("Opacité de la grille :", self._grid_alpha)
         style_form.addRow(self._show_borders)
+        style_form.addRow(self._ticks_inside)
         style_form.addRow(self._stim_markers)
-        style_form.addRow("Points max / courbe :", self._max_points)
 
         page_layout.addWidget(legend_group)
         page_layout.addWidget(style_group)
-        page_layout.addStretch(1)
 
         for box in (
             self._legend_visible,
             self._legend_frame,
             self._legend_filters,
             self._legend_counts,
+            self._text_series_suffix,
             self._grid,
             self._show_borders,
+            self._ticks_inside,
             self._stim_markers,
         ):
             box.toggled.connect(lambda _c: self._emit_view())
         self._legend_location.currentIndexChanged.connect(lambda _i: self._emit_view())
         for spin in (
-            self._legend_font,
             self._legend_gap,
-            self._title_font,
-            self._label_font,
-            self._tick_font,
             self._line_width,
             self._grid_alpha,
         ):
             spin.valueChanged.connect(lambda _v: self._emit_view())
-        for int_spin in (self._legend_columns, self._max_points):
-            int_spin.valueChanged.connect(lambda _v: self._emit_view())
-        return page
+        for font_row in (
+            self._legend_font,
+            self._title_font,
+            self._label_font,
+            self._tick_font,
+        ):
+            font_row.changed.connect(self._emit_view)
+        self._legend_columns.valueChanged.connect(lambda _v: self._emit_view())
+        for line in (self._text_title, self._text_xlabel, self._text_ylabel):
+            line.textChanged.connect(lambda _t: self._emit_view())
+        self._text_legend_labels.textChanged.connect(self._emit_view)
 
     # -------------------------------------------------------- processing tab
 
     def _build_processing_tab(self) -> QWidget:
-        """Contenu Pipeline (embarqué sous l’onglet Canal)."""
+        """Traitement F5 (embarqué sous l’onglet Canal)."""
         defaults = self._defaults
         page = QWidget()
         page_layout = QVBoxLayout(page)
@@ -547,10 +706,17 @@ class ParamsPanel(QWidget):
         trigger_group = QGroupBox("Détection des stimulations")
         trigger_form = configure_narrow_form(QFormLayout(trigger_group))
         self._edge = _choice(_EDGE_CHOICES, str(defaults.get("default_edge", "falling")))
+        self._edge.setToolTip(
+            "Polarité TTL sur ANALOG-IN-0. Unique réglage de détection "
+            "(alimente aussi la sync « sur trigger » de l’onglet Affichage)."
+        )
         self._threshold = _spin(
             -100.0, 100.0, defaults.get("default_threshold", 1.0), decimals=3, suffix=" V"
         )
-        self._pre_s = _spin(0.0, 600.0, defaults.get("default_pre_s", 2.0), suffix=" s")
+        self._threshold.setToolTip(
+            "Seuil de détection du trigger sur ANALOG-IN-0 (V). Exige Traiter (F5)."
+        )
+        self._pre_s = _spin(0.0, 600.0, defaults.get("default_pre_s", 1.0), suffix=" s")
         self._post_s = _spin(0.001, 3600.0, defaults.get("default_post_s", 10.0), suffix=" s")
         self._section_spec = _choice(
             _SECTION_SPECS, str(defaults.get("default_section_spec", "count"))
@@ -587,8 +753,8 @@ class ParamsPanel(QWidget):
         sections_form.addRow("Fin virtuelle :", self._section_end)
 
         curves_hint = QLabel(
-            "Cochez une courbe pour afficher ses paramètres. "
-            "Les cases n’activent que le panneau (le pipeline F5 reste complet)."
+            "Cochez un groupe pour afficher ses courbes (tous modes) et régler "
+            "ses paramètres. Le traitement F5 reste complet même si une case est décochée."
         )
         curves_hint.setObjectName("hintLabel")
         curves_hint.setWordWrap(True)
@@ -596,6 +762,9 @@ class ParamsPanel(QWidget):
         # ---- WIDE : prétraitement wideband (notch / artefacts) ----
         self._curve_wide_box, wide_inner = _collapsible_group(
             "WIDE (brut)", expanded=True
+        )
+        self._curve_wide_box.setToolTip(
+            "Afficher WIDE (continuous / moyenne / stim) et ses paramètres (notch / artefacts)."
         )
         wide_form = configure_narrow_form(QFormLayout(wide_inner))
         wide_form.setContentsMargins(0, 0, 0, 0)
@@ -606,17 +775,33 @@ class ParamsPanel(QWidget):
             "Indépendant du notch éventuellement déjà enregistré dans le .rhs."
         )
         self._artifact_enabled = QCheckBox("Supprimer les artefacts de stimulation")
-        self._artifact_enabled.setChecked(True)
+        self._artifact_enabled.setChecked(
+            bool(defaults.get("default_intan_artifact_suppression_enabled", True))
+        )
         self._artifact_threshold = _spin(
-            1.0, 100000.0, 2500.0, decimals=1, step=50.0, suffix=" µV"
+            1.0,
+            100000.0,
+            float(defaults.get("default_intan_artifact_threshold_uv", 2500.0)),
+            decimals=1,
+            step=50.0,
+            suffix=" µV",
         )
         wide_form.addRow("Notch logiciel :", self._software_notch)
         wide_form.addRow(self._artifact_enabled)
         wide_form.addRow("Seuil d’artefact :", self._artifact_threshold)
+        self._raw_ylim = AxisLimitRow(AxisLimits(), unit=" µV")
+        self._raw_ylim.setToolTip(
+            "Échelle Y des panneaux WIDE (continuous, moyenne, stimulation, montage). "
+            "Redessin immédiat — pas de Traiter (F5)."
+        )
+        wide_form.addRow("Échelle Y :", self._raw_ylim)
 
         # ---- HIGH : filtre passe-haut (indépendant de LOW) ----
         self._curve_high_box, high_inner = _collapsible_group(
             "HIGH (passe-haut)", expanded=False
+        )
+        self._curve_high_box.setToolTip(
+            "Afficher HIGH (continuous / moyenne / stim) et ses paramètres de filtre."
         )
         high_form = configure_narrow_form(QFormLayout(high_inner))
         high_form.setContentsMargins(0, 0, 0, 0)
@@ -640,10 +825,26 @@ class ParamsPanel(QWidget):
         high_form.addRow("Type de filtre :", self._hp_filter_type)
         high_form.addRow("Ordre du filtre :", self._hp_filter_order)
         high_form.addRow("Coupure :", self._hp_filter_cutoff)
+        self._hp_ylim = AxisLimitRow(
+            AxisLimits(
+                enabled=bool(defaults.get("default_first_trigger_hp_ylim_enabled", False)),
+                minimum=float(defaults.get("default_first_trigger_hp_ylim_min_uv", -200.0)),
+                maximum=float(defaults.get("default_first_trigger_hp_ylim_max_uv", 200.0)),
+            ),
+            unit=" µV",
+        )
+        self._hp_ylim.setToolTip(
+            "Échelle Y des panneaux HIGH (continuous, moyenne, stimulation, montage). "
+            "Redessin immédiat — pas de Traiter (F5)."
+        )
+        high_form.addRow("Échelle Y :", self._hp_ylim)
 
         # ---- LOW : filtre passe-bas (indépendant de HIGH) ----
         self._curve_low_box, low_inner = _collapsible_group(
             "LOW (passe-bas)", expanded=False
+        )
+        self._curve_low_box.setToolTip(
+            "Afficher LOW (continuous / moyenne / stim) et ses paramètres de filtre."
         )
         low_form = configure_narrow_form(QFormLayout(low_inner))
         low_form.setContentsMargins(0, 0, 0, 0)
@@ -667,12 +868,26 @@ class ParamsPanel(QWidget):
         low_form.addRow("Type de filtre :", self._lp_filter_type)
         low_form.addRow("Ordre du filtre :", self._lp_filter_order)
         low_form.addRow("Coupure :", self._lp_filter_cutoff)
+        self._lp_ylim = AxisLimitRow(AxisLimits(), unit=" µV")
+        self._lp_ylim.setToolTip(
+            "Échelle Y des panneaux LOW (continuous, moyenne, stimulation, montage). "
+            "Redessin immédiat — pas de Traiter (F5)."
+        )
+        low_form.addRow("Échelle Y :", self._lp_ylim)
 
-        # ---- Spikes : détection sur le flux HIGH ----
+        # ---- Spikes : détection sur le flux HIGH + graphs analyse ----
         self._curve_spikes_box, spikes_inner = _collapsible_group(
             "Spikes", expanded=False
         )
-        spike_form = configure_narrow_form(QFormLayout(spikes_inner))
+        self._curve_spikes_box.setToolTip(
+            "Afficher les graphs spikes et les paramètres de détection "
+            "(même cases pour continuous / moyenne / stimulation)."
+        )
+        spikes_layout = QVBoxLayout(spikes_inner)
+        spikes_layout.setContentsMargins(0, 0, 0, 0)
+        spikes_layout.setSpacing(6)
+        spike_form_host = QWidget(spikes_inner)
+        spike_form = configure_narrow_form(QFormLayout(spike_form_host))
         spike_form.setContentsMargins(0, 0, 0, 0)
         self._threshold_mode = _choice(
             _THRESHOLD_MODES, str(defaults.get("default_spike_threshold_mode", "fixed"))
@@ -714,19 +929,73 @@ class ParamsPanel(QWidget):
         spike_form.addRow("Seuil fixe :", self._spike_threshold)
         spike_form.addRow("Polarité :", self._polarity)
         spike_form.addRow("Multiplicateur RMS :", self._rms_multiplier)
+        self._psth_bin = _spin(
+            0.001,
+            10.0,
+            float(defaults.get("default_psth_bin_window_s", DEFAULT_PSTH_BIN_S)),
+            decimals=3,
+            suffix=" s",
+        )
+        self._psth_bin.setToolTip(
+            "Largeur des bins du PSTH / firing rate. Modifier → Traiter (F5)."
+        )
+        self._sampling = _int_spin(
+            1, 100, int(defaults.get("default_sampling_percent", 100) or 100)
+        )
+        self._sampling.setToolTip(
+            "Pourcentage d’essais utilisés pour les graphs spikes (sous-échantillon)."
+        )
         spike_form.addRow("Avant le spike :", self._overlay_pre)
         spike_form.addRow("Après le spike :", self._overlay_post)
+        spike_form.addRow("Bin PSTH :", self._psth_bin)
+        spike_form.addRow("Échantillonnage :", self._sampling)
         self._threshold_mode.currentIndexChanged.connect(lambda _i: self._sync_threshold_rows())
+        spikes_layout.addWidget(spike_form_host)
+
+        spike_graphs_label = QLabel("Graphs (tous modes)")
+        spike_graphs_label.setObjectName("hintLabel")
+        spikes_layout.addWidget(spike_graphs_label)
+        self._cb_pipe_psth = QCheckBox("PSTH")
+        self._cb_pipe_trial_rate = QCheckBox("Firing rate / essai")
+        self._cb_pipe_raster = QCheckBox("Raster")
+        self._cb_pipe_raster.setToolTip(
+            "Aperçu canal : raster compact (comme en montage) + raster tous essais.\n"
+            "Revue montage : une ligne RST par canal."
+        )
+        self._cb_pipe_isi = QCheckBox("ISI")
+        self._cb_pipe_overlay = QCheckBox("Spike scope")
+        for box in (
+            self._cb_pipe_psth,
+            self._cb_pipe_trial_rate,
+            self._cb_pipe_raster,
+            self._cb_pipe_isi,
+            self._cb_pipe_overlay,
+        ):
+            spikes_layout.addWidget(box)
 
         # ---- RMS ----
         self._curve_rms_box, rms_inner = _collapsible_group("RMS", expanded=False)
+        self._curve_rms_box.setToolTip(
+            "Afficher le profil RMS et ses paramètres "
+            "(même case pour continuous / moyenne / stimulation)."
+        )
         rms_form = configure_narrow_form(QFormLayout(rms_inner))
         rms_form.setContentsMargins(0, 0, 0, 0)
         self._rms_window = _spin(
             0.001, 60.0, defaults.get("default_rms_window_s", 1.0), suffix=" s"
         )
         self._rms_window.setToolTip("Fenêtre glissante utilisée pour les profils RMS.")
+        self._rms_ylim_row = AxisLimitRow(
+            AxisLimits(enabled=True, minimum=0.0, maximum=20.0),
+            unit=" µV",
+            step=1.0,
+        )
+        self._rms_ylim_row.setToolTip(
+            "Échelle Y des panneaux et résumés RMS. "
+            "Redessin immédiat — pas de Traiter (F5)."
+        )
         rms_form.addRow("Fenêtre RMS :", self._rms_window)
+        rms_form.addRow("Échelle Y :", self._rms_ylim_row)
 
         # Mapping MEA : uniquement dans Session → Mapping (évite la double saisie).
         # Champ masqué pour sync API / build_config.
@@ -773,8 +1042,9 @@ class ParamsPanel(QWidget):
         ):
             page_layout.addWidget(group)
         hint = QLabel(
-            "Tout changement ici exige Traiter (F5). "
-            "Le cache ne recalcule que les étapes touchées."
+            "Filtres / spikes / fenêtre RMS → Traiter (F5). "
+            "Échelles Y dans chaque section → redessin immédiat. "
+            "Axe X / sync / apparence → Affichage."
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
@@ -795,6 +1065,7 @@ class ParamsPanel(QWidget):
             self._rms_multiplier,
             self._overlay_pre,
             self._overlay_post,
+            self._psth_bin,
         ):
             spin.valueChanged.connect(lambda _v: self._emit_config())
         self._threshold.valueChanged.connect(lambda _v: self._on_processing_threshold_changed())
@@ -803,6 +1074,7 @@ class ParamsPanel(QWidget):
             self._hp_filter_order,
             self._lp_filter_order,
             self._channel_workers,
+            self._sampling,
         ):
             int_spin.valueChanged.connect(lambda _v: self._emit_config())
         for box in (
@@ -818,15 +1090,44 @@ class ParamsPanel(QWidget):
         self._probe_edit.textChanged.connect(lambda _t: self._emit_config())
         self._work_edit.textChanged.connect(lambda _t: self._emit_config())
 
+        # Cases Pipeline → même handler pour continuous / moyenne / stimulation.
+        for box in (
+            self._curve_wide_box,
+            self._curve_high_box,
+            self._curve_low_box,
+            self._curve_rms_box,
+            self._curve_spikes_box,
+            self._cb_pipe_psth,
+            self._cb_pipe_trial_rate,
+            self._cb_pipe_raster,
+            self._cb_pipe_isi,
+            self._cb_pipe_overlay,
+        ):
+            box.toggled.connect(self._on_pipeline_visibility_toggled)
+        self._curve_spikes_box.toggled.connect(self._on_spikes_group_toggled)
+
+        for ylim_row in (
+            self._raw_ylim,
+            self._hp_ylim,
+            self._lp_ylim,
+            self._rms_ylim_row,
+        ):
+            ylim_row.changed.connect(self._emit_view)
+
         self._sync_section_rows()
         self._sync_threshold_rows()
         return page
 
-    def reveal_curve_params(self, *curves: str, focus_tab: bool = True) -> None:
-        """Déplie les panneaux de traitement associés aux courbes demandées.
+    def reveal_curve_params(
+        self,
+        *curves: str,
+        focus_tab: bool = True,
+        emit_streams: bool = True,
+    ) -> None:
+        """Coche / déplie les groupes Pipeline associés aux courbes demandées.
 
         ``curves`` accepte ``raw``/``wide``, ``hp``/``high``, ``lp``/``low``,
-        ``spikes``, ``rms``. Les cases ne pilotent que l’UI (pas le pipeline).
+        ``spikes``, ``rms``. WIDE/HIGH/LOW pilotent aussi l’affichage continuous.
         """
         mapping = {
             "raw": "_curve_wide_box",
@@ -838,19 +1139,29 @@ class ParamsPanel(QWidget):
             "spikes": "_curve_spikes_box",
             "rms": "_curve_rms_box",
         }
+        stream_attrs = {"_curve_wide_box", "_curve_high_box", "_curve_low_box"}
         opened = False
-        for key in curves:
-            attr = mapping.get(str(key).strip().lower())
-            if not attr:
-                continue
-            box = getattr(self, attr, None)
-            if box is None:
-                continue
-            if not box.isChecked():
-                box.setChecked(True)
-            opened = True
+        touched_streams = False
+        self._loading = True
+        try:
+            for key in curves:
+                attr = mapping.get(str(key).strip().lower())
+                if not attr:
+                    continue
+                box = getattr(self, attr, None)
+                if box is None:
+                    continue
+                if not box.isChecked():
+                    box.setChecked(True)
+                    if attr in stream_attrs:
+                        touched_streams = True
+                opened = True
+        finally:
+            self._loading = False
         if opened and focus_tab:
             self.focus_channel_tab()
+        if (touched_streams or opened) and emit_streams:
+            self.pipelineVisibilityChanged.emit()
 
     # -------------------------------------------------------------- behaviour
 
@@ -858,8 +1169,6 @@ class ParamsPanel(QWidget):
         no_trigger = str(self._edge.currentData()) == "none"
         by_count = str(self._section_spec.currentData()) == "count"
         self._threshold.setEnabled(not no_trigger)
-        self._display_trigger_threshold.setEnabled(not no_trigger)
-        self._trigger_polarity.setEnabled(not no_trigger)
         self._section_spec.setEnabled(no_trigger)
         self._section_count.setEnabled(no_trigger and by_count)
         self._section_duration.setEnabled(no_trigger and not by_count)
@@ -874,37 +1183,14 @@ class ParamsPanel(QWidget):
         self._spike_threshold.setEnabled(fixed)
         self._rms_multiplier.setEnabled(not fixed)
 
-    def _on_display_trigger_changed(self) -> None:
-        """Affichage → Pipeline : polarité / seuil, puis dirty + redessin."""
-        if self._loading:
-            return
-        polarity = str(self._trigger_polarity.currentData() or "low")
-        edge = TRIGGER_POLARITY_TO_EDGE.get(polarity, "falling")
-        if str(self._edge.currentData()) != "none":
-            idx = self._edge.findData(edge)
-            if idx >= 0 and self._edge.currentIndex() != idx:
-                self._edge.blockSignals(True)
-                self._edge.setCurrentIndex(idx)
-                self._edge.blockSignals(False)
-        thr = float(self._display_trigger_threshold.value())
-        if abs(float(self._threshold.value()) - thr) > 1e-12:
-            self._threshold.blockSignals(True)
-            self._threshold.setValue(thr)
-            self._threshold.blockSignals(False)
-        self._emit_config()
-        self._emit_view()
+    def _trigger_polarity_value(self) -> str:
+        """Polarité d’affichage dérivée du front de détection (Canal)."""
+        edge = str(self._edge.currentData() or "falling")
+        return EDGE_TO_TRIGGER_POLARITY.get(edge, "low")
 
     def _on_processing_edge_changed(self) -> None:
         if self._loading:
             return
-        edge = str(self._edge.currentData() or "falling")
-        polarity = EDGE_TO_TRIGGER_POLARITY.get(edge)
-        if polarity is not None:
-            idx = self._trigger_polarity.findData(polarity)
-            if idx >= 0 and self._trigger_polarity.currentIndex() != idx:
-                self._trigger_polarity.blockSignals(True)
-                self._trigger_polarity.setCurrentIndex(idx)
-                self._trigger_polarity.blockSignals(False)
         self._sync_section_rows()
         self._emit_config()
         self._emit_view()
@@ -912,11 +1198,6 @@ class ParamsPanel(QWidget):
     def _on_processing_threshold_changed(self) -> None:
         if self._loading:
             return
-        thr = float(self._threshold.value())
-        if abs(float(self._display_trigger_threshold.value()) - thr) > 1e-12:
-            self._display_trigger_threshold.blockSignals(True)
-            self._display_trigger_threshold.setValue(thr)
-            self._display_trigger_threshold.blockSignals(False)
         self._emit_config()
         self._emit_view()
 
@@ -931,33 +1212,149 @@ class ParamsPanel(QWidget):
             return
         self._view_debouncer.request()
 
+    def montage_review_channels(self) -> int:
+        """Canaux par page dans la revue montage."""
+        return max(1, int(self._montage_review_channels.value()))
+
+    def montage_review_page(self) -> int:
+        """Index de page courant (0-based) de la revue montage."""
+        return max(0, int(self._montage_review_page))
+
+    def set_montage_review_page(self, page: int, *, emit: bool = True) -> None:
+        """Fixer la page de revue montage (boutons Suivant / Précédent)."""
+        page = max(0, int(page))
+        if page == int(self._montage_review_page):
+            return
+        self._montage_review_page = page
+        if emit:
+            self._emit_view()
+
+    def clamp_montage_review_page(
+        self, *, n_visible: int | None = None, emit: bool = True
+    ) -> None:
+        """Ramener la page dans les bornes quand le nombre de canaux change."""
+        per_page = self.montage_review_channels()
+        if n_visible is None:
+            if self._montage_review_page < 0:
+                self._montage_review_page = 0
+                if emit:
+                    self._emit_view()
+            return
+        n_pages = max(1, (max(0, int(n_visible)) + per_page - 1) // per_page)
+        page = max(0, min(n_pages - 1, int(self._montage_review_page)))
+        if page != int(self._montage_review_page):
+            self._montage_review_page = page
+            if emit:
+                self._emit_view()
+
     def _emit_config(self) -> None:
         if self._loading:
             return
         self.configChanged.emit()
 
-    def _on_streams_toggled(self, *_args: Any) -> None:
+    def _on_pipeline_visibility_toggled(self, *_args: Any) -> None:
+        """Cases Pipeline → continuous / moyenne / stimulation (même chemin)."""
         if self._loading:
             return
         if not any(
             box.isChecked()
-            for box in (self._cb_stream_wide, self._cb_stream_high, self._cb_stream_low)
+            for box in (
+                self._curve_wide_box,
+                self._curve_high_box,
+                self._curve_low_box,
+                self._curve_rms_box,
+                self._curve_spikes_box,
+            )
         ):
             self._loading = True
-            self._cb_stream_wide.setChecked(True)
+            self._curve_wide_box.setChecked(True)
             self._loading = False
-        self.streamsChanged.emit(self.continuous_streams())
+        self.pipelineVisibilityChanged.emit()
+
+    def _on_spikes_group_toggled(self, checked: bool) -> None:
+        """À l’ouverture de Spikes : cocher PSTH si aucun graph n’est sélectionné."""
+        if self._loading or not checked:
+            return
+        if not any(
+            box.isChecked()
+            for box in (
+                self._cb_pipe_psth,
+                self._cb_pipe_trial_rate,
+                self._cb_pipe_raster,
+                self._cb_pipe_isi,
+                self._cb_pipe_overlay,
+            )
+        ):
+            self._loading = True
+            self._cb_pipe_psth.setChecked(True)
+            self._loading = False
+            # Réémettre : le toggle Spikes a déjà émis sans graph sélectionné.
+            self.pipelineVisibilityChanged.emit()
 
     def continuous_streams(self) -> tuple[AnalysisStream, ...]:
-        """Flux WIDE/HIGH/LOW cochés (aperçu continuous + montage)."""
+        """Flux WIDE/HIGH/LOW cochés — dérivés des mêmes cases que l’analyse."""
         streams: list[AnalysisStream] = []
-        if self._cb_stream_wide.isChecked():
+        if self._curve_wide_box.isChecked():
             streams.append("raw")
-        if self._cb_stream_high.isChecked():
+        if self._curve_high_box.isChecked():
             streams.append("hp")
-        if self._cb_stream_low.isChecked():
+        if self._curve_low_box.isChecked():
             streams.append("lp")
         return tuple(streams) or ("raw",)
+
+    def pipeline_visibility_flags(self) -> dict[str, bool]:
+        """Visibilité des courbes (tous modes) depuis les cases Pipeline."""
+        spikes_on = bool(self._curve_spikes_box.isChecked())
+        return {
+            "show_raw": bool(self._curve_wide_box.isChecked()),
+            "show_hp": bool(self._curve_high_box.isChecked()),
+            "show_lp": bool(self._curve_low_box.isChecked()),
+            "show_rms": bool(self._curve_rms_box.isChecked()),
+            "show_psth": spikes_on and bool(self._cb_pipe_psth.isChecked()),
+            "show_trial_rate": spikes_on and bool(self._cb_pipe_trial_rate.isChecked()),
+            "show_raster": spikes_on and bool(self._cb_pipe_raster.isChecked()),
+            "show_isi": spikes_on and bool(self._cb_pipe_isi.isChecked()),
+            "show_overlay": spikes_on and bool(self._cb_pipe_overlay.isChecked()),
+        }
+
+    # Alias historique.
+    def pipeline_analysis_flags(self) -> dict[str, bool]:
+        return self.pipeline_visibility_flags()
+
+    def sync_analysis_checks_from(self, analysis: AnalysisSettings | object) -> None:
+        """Aligne les cases Pipeline sur un ``AnalysisSettings`` (sans réémettre)."""
+        self._loading = True
+        try:
+            self._curve_wide_box.setChecked(bool(getattr(analysis, "show_raw", False)))
+            self._curve_high_box.setChecked(bool(getattr(analysis, "show_hp", False)))
+            self._curve_low_box.setChecked(bool(getattr(analysis, "show_lp", False)))
+            self._curve_rms_box.setChecked(bool(getattr(analysis, "show_rms", False)))
+            spike_flags = (
+                bool(getattr(analysis, "show_psth", False)),
+                bool(getattr(analysis, "show_trial_rate", False)),
+                bool(getattr(analysis, "show_raster", False)),
+                bool(getattr(analysis, "show_isi", False)),
+                bool(getattr(analysis, "show_overlay", False)),
+            )
+            any_spike = any(spike_flags)
+            self._curve_spikes_box.setChecked(any_spike)
+            self._cb_pipe_psth.setChecked(spike_flags[0])
+            self._cb_pipe_trial_rate.setChecked(spike_flags[1])
+            self._cb_pipe_raster.setChecked(spike_flags[2])
+            self._cb_pipe_isi.setChecked(spike_flags[3])
+            self._cb_pipe_overlay.setChecked(spike_flags[4])
+            if not any(
+                box.isChecked()
+                for box in (
+                    self._curve_wide_box,
+                    self._curve_high_box,
+                    self._curve_low_box,
+                    self._curve_rms_box,
+                )
+            ) and not any_spike:
+                self._curve_wide_box.setChecked(True)
+        finally:
+            self._loading = False
 
     def mark_stimulations(self) -> bool:
         return bool(self._cb_mark_stims.isChecked())
@@ -978,47 +1375,92 @@ class ParamsPanel(QWidget):
         return self._view_mode
 
     def _apply_view_mode_visibility(self) -> None:
-        """Masquer les contrôles qui n’agissent que sur l’autre vue."""
+        """Tous les paramètres restent visibles ; ceux de l’autre vue sont grisés."""
         montage = self._view_mode == "montage"
-        preview = not montage
+        preview_only_tip = "Sans effet en revue montage — basculez en aperçu (Ctrl+Shift+M)."
+        montage_only_tip = "Sans effet en aperçu canal — basculez en revue montage (Ctrl+M)."
 
-        # Canal reste visible (Pipeline F5) ; seule la zone aperçu est masquée en montage.
+        # Mode + Pipeline restent disponibles dans les deux vues (mêmes courbes).
         if hasattr(self, "_channel_host"):
-            self._channel_host.setVisible(preview)
+            self._channel_host.setVisible(True)
             if hasattr(self, "_pipeline_sep"):
-                self._pipeline_sep.setVisible(preview)
+                self._pipeline_sep.setVisible(True)
             if hasattr(self, "_pipeline_header"):
                 self._pipeline_header.setVisible(True)
 
         if self._channel_tab_index is not None:
             self.tabs.setTabVisible(self._channel_tab_index, True)
             tip = (
-                "Pipeline (filtres, spikes, RMS) → Traiter (F5)"
+                "Mode + Pipeline : mêmes courbes que l’aperçu pour la revue montage. "
+                "Traitement → Traiter (F5)"
                 if montage
-                else "Mode aperçu, courbes, plages — et Pipeline → Traiter (F5)"
+                else "Contenu du canal (mode, plages) et traitement → Traiter (F5)"
             )
             self.tabs.setTabToolTip(self._channel_tab_index, tip)
 
-        # Échelles : HP stim = aperçu (Analyse) ; pas le montage continu.
-        # RMS est réglé sous la case RMS (onglet Canal).
-        if hasattr(self, "_axis_form"):
-            _set_form_row_visible(self._axis_form, self._stim_hp_ylim, preview)
-
+        # Toujours visibles ; actifs seulement dans la vue concernée.
+        # Groupe revue (non repliable) : griser le bloc entier.
+        # Groupe PDF (repliable) : garder le titre cliquable, griser seulement les champs
+        # pour pouvoir l’ouvrir et voir les paramètres.
         if hasattr(self, "_montage_review_group"):
-            self._montage_review_group.setVisible(montage)
+            self._montage_review_group.setVisible(True)
+            self._montage_review_group.setEnabled(montage)
+            base = getattr(self, "_montage_review_tooltip", "")
+            self._montage_review_group.setToolTip(
+                base if montage else f"{base} {montage_only_tip}".strip()
+            )
         if hasattr(self, "_montage_pdf_group"):
-            # Pagination PDF utile surtout quand on travaille en multi-canaux.
-            self._montage_pdf_group.setVisible(montage)
+            self._montage_pdf_group.setVisible(True)
+            self._montage_pdf_group.setEnabled(True)
+            base = getattr(self, "_montage_pdf_tooltip", "")
+            self._montage_pdf_group.setToolTip(
+                base if montage else f"{base} {montage_only_tip}".strip()
+            )
+        if hasattr(self, "_montage_row_height"):
+            base = getattr(self, "_montage_row_tooltip", "")
+            self._montage_row_height.setToolTip(
+                base if montage else f"{base} {montage_only_tip}".strip()
+            )
+        if hasattr(self, "_montage_review_channels"):
+            base = getattr(self, "_montage_review_channels_tooltip", "")
+            self._montage_review_channels.setToolTip(
+                base if montage else f"{base} {montage_only_tip}".strip()
+            )
+        if hasattr(self, "_montage_channels"):
+            self._montage_channels.setEnabled(montage)
+            base = getattr(self, "_montage_channels_tooltip", "")
+            self._montage_channels.setToolTip(
+                base if montage else f"{base} {montage_only_tip}".strip()
+            )
+        if hasattr(self, "_montage_page"):
+            self._montage_page.setEnabled(montage)
+            base = getattr(self, "_montage_page_tooltip", "")
+            self._montage_page.setToolTip(
+                base if montage else f"{base} {montage_only_tip}".strip()
+            )
 
-        # Tooltips Affichage selon le mode.
+        # Hauteur des graphs : aperçu uniquement (le montage utilise la hauteur de ligne).
+        if hasattr(self, "_layout_form") and hasattr(self, "_graph_height"):
+            _set_form_row_visible(self._layout_form, self._graph_height, True)
+            _set_form_row_enabled(self._layout_form, self._graph_height, not montage)
+            base = getattr(self, "_graph_height_tooltip", "")
+            self._graph_height.setToolTip(
+                base if not montage else f"{base} {preview_only_tip}".strip()
+            )
+
         if montage:
             self.tabs.setTabToolTip(
                 1,
-                "Flux, sync, échelles traces, hauteur de ligne — redessin immédiat",
+                "Temps, axe X, hauteur de ligne, légendes et apparence — "
+                "redessin immédiat (échelles Y → Canal, par type de courbe). "
+                "Hauteur des graphs grisée : sans effet ici.",
             )
         else:
             self.tabs.setTabToolTip(
-                1, "Flux, échelles, sync — redessin immédiat (aperçu canal)"
+                1,
+                "Axe X, sync, disposition, légendes et apparence — "
+                "redessin immédiat (échelles Y → Canal, par type de courbe). "
+                "Revue montage / PDF grisés : sans effet en aperçu.",
             )
 
     def focus_processing_tab(self) -> None:
@@ -1093,7 +1535,8 @@ class ParamsPanel(QWidget):
         legend = LegendSettings(
             visible=self._legend_visible.isChecked(),
             location=str(self._legend_location.currentData()),  # type: ignore[arg-type]
-            font_size=float(self._legend_font.value()),
+            font_size=self._legend_font.size_value(),
+            face=self._legend_font.face_value(),
             columns=int(self._legend_columns.value()),
             gap=float(self._legend_gap.value()),
             frame=self._legend_frame.isChecked(),
@@ -1102,37 +1545,76 @@ class ParamsPanel(QWidget):
             show_reference_markers=self._stim_markers.isChecked(),
         )
         style = PanelStyle(
-            title_font_size=float(self._title_font.value()),
-            label_font_size=float(self._label_font.value()),
-            tick_font_size=float(self._tick_font.value()),
+            title_font_size=self._title_font.size_value(),
+            label_font_size=self._label_font.size_value(),
+            tick_font_size=self._tick_font.size_value(),
+            title_face=self._title_font.face_value(),
+            label_face=self._label_font.face_value(),
+            tick_face=self._tick_font.face_value(),
             line_width=float(self._line_width.value()),
             grid=self._grid.isChecked(),
             grid_alpha=float(self._grid_alpha.value()),
             show_borders=self._show_borders.isChecked(),
+            ticks_inside=self._ticks_inside.isChecked(),
+            show_scale_bars=self._show_scale_bars.isChecked(),
+            scale_bar_time_manual=bool(self._scale_bar_time_manual.isChecked()),
+            scale_bar_time_s=float(self._scale_bar_time_ms.value()) / 1000.0,
+            scale_bar_amplitude_manual=bool(self._scale_bar_amp_manual.isChecked()),
+            scale_bar_amplitude=float(self._scale_bar_amp.value()),
             max_points_per_curve=int(self._max_points.value()),
         )
-        d = self._defaults
+        legend_lines = tuple(
+            line.rstrip("\r")
+            for line in self._text_legend_labels.toPlainText().split("\n")
+        )
+        if legend_lines == ("",):
+            legend_lines = ()
+        texts = TextOverrides(
+            title=self._text_title.text().strip(),
+            xlabel=self._text_xlabel.text().strip(),
+            ylabel=self._text_ylabel.text().strip(),
+            legend_labels=legend_lines,
+            show_series_suffix=bool(self._text_series_suffix.isChecked()),
+        )
+        flags = self.pipeline_visibility_flags()
+        analysis = AnalysisSettings(
+            show_raw=bool(flags["show_raw"]),
+            show_hp=bool(flags["show_hp"]),
+            show_lp=bool(flags["show_lp"]),
+            show_rms=bool(flags["show_rms"]),
+            show_psth=bool(flags["show_psth"]),
+            show_trial_rate=bool(flags["show_trial_rate"]),
+            show_raster=bool(flags["show_raster"]),
+            show_isi=bool(flags["show_isi"]),
+            show_overlay=bool(flags["show_overlay"]),
+        )
         return ViewerSettings(
-            zoom_onset_t0_s=float(d.get("default_zoom_onset_t0_s", -0.1)),
-            zoom_onset_t1_s=float(d.get("default_zoom_onset_t1_s", 0.2)),
-            zoom_end_t0_s=float(d.get("default_zoom_end_t0_s", -0.1)),
-            zoom_end_t1_s=float(d.get("default_zoom_end_t1_s", 0.2)),
-            psth_bin_window_s=float(self._psth_bin_s),
-            sampling_percent=int(self._sampling_percent),
+            zoom_onset_t0_s=float(self._zoom_onset_t0.value()),
+            zoom_onset_t1_s=float(self._zoom_onset_t1.value()),
+            zoom_end_t0_s=float(self._zoom_end_t0.value()),
+            zoom_end_t1_s=float(self._zoom_end_t1.value()),
+            psth_bin_window_s=float(self._psth_bin.value()),
+            sampling_percent=int(self._sampling.value()),
             spike_overlay_pre_ms=float(self._overlay_pre.value()),
             spike_overlay_post_ms=float(self._overlay_post.value()),
             x_limits=self._x_limits.value(),
-            stim_hp_ylim=self._stim_hp_ylim.value(),
-            rms_ylim=self._rms_ylim,
-            trace_ylim=self._trace_ylim.value(),
+            raw_ylim=self._raw_ylim.value(),
+            hp_ylim=self._hp_ylim.value(),
+            lp_ylim=self._lp_ylim.value(),
+            rms_ylim=self._rms_ylim_row.value(),
             legend=legend,
             style=style,
+            texts=texts,
+            analysis=analysis,
             montage_channels=int(self._montage_channels.value()),
             montage_page=int(self._montage_page.value()),
+            montage_review_channels=int(self._montage_review_channels.value()),
+            montage_review_page=int(self._montage_review_page),
+            graph_height_px=int(self._graph_height.value()),
             montage_row_min_height_px=int(self._montage_row_height.value()),
             time_sync=str(self._time_sync.currentData() or "recording_start"),  # type: ignore[arg-type]
-            trigger_polarity=str(self._trigger_polarity.currentData() or "low"),  # type: ignore[arg-type]
-            trigger_threshold=float(self._display_trigger_threshold.value()),
+            trigger_polarity=self._trigger_polarity_value(),  # type: ignore[arg-type]
+            trigger_threshold=float(self._threshold.value()),
             continuous_stream=self.continuous_streams()[0],
             continuous_streams=self.continuous_streams(),
             continuous_mark_stims=self.mark_stimulations(),
@@ -1162,13 +1644,9 @@ class ParamsPanel(QWidget):
             if str(self._section_spec.currentData()) == "duration"
             else None
         )
-        # Polarité / seuil : Affichage prime si le mode n’est pas « sans déclencheur ».
+        # Front / seuil : source unique = Canal → Traitement.
         edge = str(self._edge.currentData())
         threshold = float(self._threshold.value())
-        if edge != "none":
-            polarity = str(self._trigger_polarity.currentData() or "low")
-            edge = TRIGGER_POLARITY_TO_EDGE.get(polarity, edge)
-            threshold = float(self._display_trigger_threshold.value())
         config = AnalysisConfig(
             rhs_file=Path(rhs_file),
             threshold=threshold,
@@ -1184,16 +1662,16 @@ class ParamsPanel(QWidget):
             spike_threshold_polarity=polarity,  # type: ignore[arg-type]
             spike_threshold_mode=str(self._threshold_mode.currentData()),  # type: ignore[arg-type]
             spike_threshold_rms_multiplier=float(self._rms_multiplier.value()),
-            psth_bin_window_s=float(self._psth_bin_s),
+            psth_bin_window_s=float(self._psth_bin.value()),
             spike_overlay_pre_ms=float(self._overlay_pre.value()),
             spike_overlay_post_ms=float(self._overlay_post.value()),
-            zoom_onset_t0_s=float(self._defaults.get("default_zoom_onset_t0_s", -0.1)),
-            zoom_onset_t1_s=float(self._defaults.get("default_zoom_onset_t1_s", 0.2)),
-            zoom_end_t0_s=float(self._defaults.get("default_zoom_end_t0_s", -0.1)),
-            zoom_end_t1_s=float(self._defaults.get("default_zoom_end_t1_s", 0.2)),
-            first_trigger_hp_ylim_enabled=self._stim_hp_ylim.value().enabled,
-            first_trigger_hp_ylim_min_uv=self._stim_hp_ylim.value().minimum,
-            first_trigger_hp_ylim_max_uv=self._stim_hp_ylim.value().maximum,
+            zoom_onset_t0_s=float(self._zoom_onset_t0.value()),
+            zoom_onset_t1_s=float(self._zoom_onset_t1.value()),
+            zoom_end_t0_s=float(self._zoom_end_t0.value()),
+            zoom_end_t1_s=float(self._zoom_end_t1.value()),
+            first_trigger_hp_ylim_enabled=self._hp_ylim.value().enabled,
+            first_trigger_hp_ylim_min_uv=self._hp_ylim.value().minimum,
+            first_trigger_hp_ylim_max_uv=self._hp_ylim.value().maximum,
             rms_window_s=float(self._rms_window.value()),
             intan_hp_filter_order=int(self._hp_filter_order.value()),
             intan_hp_filter_type=str(self._hp_filter_type.currentData()),  # type: ignore[arg-type]
@@ -1206,7 +1684,7 @@ class ParamsPanel(QWidget):
             intan_artifact_suppression_enabled=self._artifact_enabled.isChecked(),
             work_dir=Path(work_text) if work_text else None,
             channel_workers=int(self._channel_workers.value()) or None,
-            sampling_percent=int(self._sampling_percent),
+            sampling_percent=int(self._sampling.value()),
             probe_layout_json=self.probe_layout_path(),
         )
         if base is not None:

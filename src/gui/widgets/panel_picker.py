@@ -58,7 +58,7 @@ class PanelPickerDialog(QDialog):
         geometry = QFormLayout()
         geometry.addRow("Nom de la vue :", self._name_edit)
         geometry.addRow("Colonnes :", self._columns_spin)
-        geometry.addRow("Hauteur minimale des panneaux :", self._height_spin)
+        geometry.addRow("Hauteur des panneaux :", self._height_spin)
 
         self._section_boxes: dict[str, QCheckBox] = {}
         sections_row = QHBoxLayout()

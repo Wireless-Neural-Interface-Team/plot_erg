@@ -335,10 +335,12 @@ def _second_order_highpass(fc: float, q: float, fs: float) -> _BiquadCoeffs:
 
 
 def _second_order_notch(f_notch: float, bandwidth: float, fs: float) -> _BiquadCoeffs:
+    # Same IIR as intanutil.filter.notch_filter / Intan calculate_iir_parameters:
+    # a1 must be -b so that Direct Form I (y -= a1*y[n-1]) matches the reference.
     d = math.exp(-math.pi * bandwidth / fs)
     b = (1.0 + d * d) * math.cos(2.0 * math.pi * f_notch / fs)
     a = (1.0 + d * d) / 2.0
-    return _BiquadCoeffs(a, -b, a, b, d * d, False)
+    return _BiquadCoeffs(a, -b, a, -b, d * d, False)
 
 
 def _filter_biquad_chain(
@@ -597,10 +599,19 @@ def detect_spikes_intan(
     if search_end <= 0:
         return np.array([], dtype=np.int64)
     region = x[:search_end]
+    # Rising / falling edge through threshold (not every sample already beyond it).
     if thr >= 0:
-        candidates = np.flatnonzero(region > thr)
+        above = region > thr
+        prev = np.empty_like(above)
+        prev[0] = False
+        prev[1:] = above[:-1]
+        candidates = np.flatnonzero(above & ~prev)
     else:
-        candidates = np.flatnonzero(region < thr)
+        below = region < thr
+        prev = np.empty_like(below)
+        prev[0] = False
+        prev[1:] = below[:-1]
+        candidates = np.flatnonzero(below & ~prev)
     if candidates.size == 0:
         return np.array([], dtype=np.int64)
 

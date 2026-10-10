@@ -552,22 +552,59 @@ class ProcessedRecording:
             return int(sum(int(np.asarray(trial).size) for trial in data.spike_trains))
         return int(self.spikes.total_for_channel(ch))
 
+    def stream_ready(self, stream: str, ch: int) -> bool:
+        """True when the continuous stream row can be read without filtering."""
+        stream = str(stream)
+        ch = int(ch)
+        if stream == "raw":
+            source = self.source
+            amp = getattr(source, "amplifier", None) if source is not None else None
+            return amp is not None and 0 <= ch < int(getattr(amp, "shape", (0,))[0])
+        source = self.source
+        if source is None:
+            return False
+        bank = {
+            "hp": getattr(source, "highpass", None),
+            "lp": getattr(source, "lowpass", None),
+        }.get(stream)
+        if bank is None:
+            return False
+        is_ready = getattr(bank, "is_ready", None)
+        if callable(is_ready):
+            return bool(is_ready(ch))
+        # Non-lazy ndarray (e.g. precomputed stacks).
+        return 0 <= ch < int(getattr(bank, "shape", (0,))[0])
+
     def continuous_trace(
-        self, stream: str, ch: int, *, max_points: int | None = None
+        self,
+        stream: str,
+        ch: int,
+        *,
+        max_points: int | None = None,
+        require_ready: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Absolute-time continuous trace ``(t_s, values_uv)`` for one channel.
 
         When ``max_points`` is set and the row is denser, returns a min/max
         envelope so callers avoid building a full-rate time axis.
+
+        When ``require_ready`` is True and the HP/LP row is not cached yet,
+        returns empty arrays instead of running ``sosfilt`` (UI-safe).
         """
         empty = np.empty(0, dtype=np.float64)
         limit = int(max_points) if max_points is not None else 0
-        cache_key = (str(stream), int(ch), limit)
+        if limit <= 0 and max_points is None:
+            # Guardrail: never build a full-rate axis unless explicitly requested
+            # with max_points=0 from a worker / offline path.
+            limit = 0
+        cache_key = (str(stream), int(ch), limit, bool(require_ready))
         cached = self._continuous_cache.get(cache_key)
         if cached is not None:
             return cached
         source = self.source
         if source is None:
+            return empty, empty
+        if require_ready and str(stream) in {"hp", "lp"} and not self.stream_ready(stream, ch):
             return empty, empty
         array = {
             "raw": getattr(source, "amplifier", None),
@@ -872,6 +909,200 @@ def _deserialize_impedance(raw: Sequence[dict[str, Any]]) -> list[ImpedanceSessi
     return sorted(sessions, key=lambda s: s.when)
 
 
+def materialize_channel_cache(recording: ProcessedRecording) -> bool:
+    """Fold on-demand ``_channel_data`` into the arrays ``write_bundle`` persists.
+
+    The live GUI keeps trial averages / spikes / overlays only in RAM per channel.
+    Without this step, export would write an empty shell (``t_rel`` + triggers).
+    Returns True when at least one channel product was packed.
+    """
+    cache = getattr(recording, "_channel_data", None) or {}
+    if not cache:
+        return False
+
+    n_ch = int(recording.n_channels)
+    n_trials = int(recording.n_trials)
+    window = max(int(recording.meta.window_samples), 1)
+    derived = recording.derived
+    packed = False
+
+    for stream in STREAM_NAMES:
+        if not any(
+            stream in data.means and data.means.get(stream) is not None
+            for data in cache.values()
+        ):
+            continue
+        arr = np.full((n_ch, window), np.nan, dtype=np.float32)
+        for ch, data in cache.items():
+            curve = data.means.get(stream)
+            if curve is None:
+                continue
+            row = np.asarray(curve, dtype=np.float32).ravel()
+            n = min(window, int(row.size))
+            if n > 0:
+                arr[int(ch), :n] = row[:n]
+                packed = True
+        derived.means[stream] = arr
+
+    rms_time: np.ndarray | None = None
+    for data in cache.values():
+        if data.rms_time is not None and np.asarray(data.rms_time).size:
+            rms_time = np.asarray(data.rms_time, dtype=np.float64).ravel()
+            break
+    if rms_time is not None and rms_time.size:
+        derived.rms_time = rms_time
+        rms_width = int(rms_time.size)
+        for kind in RMS_KINDS:
+            if not any(kind in data.rms_profiles for data in cache.values()):
+                continue
+            arr = np.full((n_ch, rms_width), np.nan, dtype=np.float32)
+            for ch, data in cache.items():
+                values = data.rms_profiles.get(kind)
+                if values is None:
+                    continue
+                row = np.asarray(values, dtype=np.float32).ravel()
+                n = min(rms_width, int(row.size))
+                if n > 0:
+                    arr[int(ch), :n] = row[:n]
+                    packed = True
+            derived.rms_profiles[kind] = arr
+
+    channel_rms = (
+        np.asarray(derived.channel_rms_uv, dtype=np.float32).copy()
+        if derived.channel_rms_uv is not None and int(np.asarray(derived.channel_rms_uv).shape[0]) == n_ch
+        else np.full(n_ch, np.nan, dtype=np.float32)
+    )
+    thresholds = (
+        np.asarray(derived.thresholds_uv, dtype=np.float32).copy()
+        if derived.thresholds_uv is not None and int(np.asarray(derived.thresholds_uv).shape[0]) == n_ch
+        else np.full(n_ch, np.nan, dtype=np.float32)
+    )
+    captions = list(recording.threshold_captions)
+    while len(captions) < n_ch:
+        captions.append("")
+    for ch, data in cache.items():
+        idx = int(ch)
+        if 0 <= idx < n_ch:
+            channel_rms[idx] = float(data.channel_rms_uv)
+            thresholds[idx] = float(data.threshold_uv)
+            captions[idx] = str(data.threshold_caption or captions[idx])
+            packed = True
+    if np.any(np.isfinite(channel_rms)):
+        derived.channel_rms_uv = channel_rms
+    if np.any(np.isfinite(thresholds)):
+        derived.thresholds_uv = thresholds
+    recording.threshold_captions = captions
+
+    per_channel: list[list[np.ndarray]] = []
+    for ch in range(n_ch):
+        data = cache.get(ch)
+        if data is not None:
+            trains = [np.asarray(trial, dtype=np.float64) for trial in data.spike_trains]
+            while len(trains) < n_trials:
+                trains.append(np.empty(0, dtype=np.float64))
+            per_channel.append(trains[:n_trials])
+            packed = True
+        else:
+            per_channel.append(recording.spikes.per_trial(ch))
+    recording.spikes = SpikeTrains.from_lists(per_channel, n_trials)
+
+    t_ms: np.ndarray | None = None
+    for data in cache.values():
+        if data.overlay_t_ms is not None and np.asarray(data.overlay_t_ms).size:
+            t_ms = np.asarray(data.overlay_t_ms, dtype=np.float64).ravel()
+            break
+    if t_ms is None and recording.overlay.t_ms.size:
+        t_ms = np.asarray(recording.overlay.t_ms, dtype=np.float64).ravel()
+    if t_ms is not None:
+        ov_window = max(int(t_ms.size), 1)
+        counts = np.zeros(n_ch, dtype=np.int32)
+        totals = np.zeros(n_ch, dtype=np.int32)
+        means = np.zeros((n_ch, ov_window), dtype=np.float32)
+        wave_chunks: list[np.ndarray] = []
+        time_chunks: list[np.ndarray] = []
+        for ch in range(n_ch):
+            data = cache.get(ch)
+            if data is not None:
+                waves = np.asarray(data.overlay_waves, dtype=np.float32)
+                times = np.asarray(data.overlay_times, dtype=np.float32).ravel()
+                totals[ch] = int(data.overlay_total)
+                if data.overlay_mean is not None:
+                    mean = np.asarray(data.overlay_mean, dtype=np.float32).ravel()
+                    n = min(ov_window, int(mean.size))
+                    if n:
+                        means[ch, :n] = mean[:n]
+                packed = True
+            else:
+                _t, waves, times, total = recording.overlay.for_channel(ch)
+                waves = np.asarray(waves, dtype=np.float32)
+                times = np.asarray(times, dtype=np.float32).ravel()
+                totals[ch] = int(total)
+                mean = recording.overlay.mean_for_channel(ch)
+                if mean is not None:
+                    mean_arr = np.asarray(mean, dtype=np.float32).ravel()
+                    n = min(ov_window, int(mean_arr.size))
+                    if n:
+                        means[ch, :n] = mean_arr[:n]
+            if waves.ndim != 2 or waves.shape[0] == 0:
+                continue
+            if int(waves.shape[1]) != ov_window:
+                fixed = np.zeros((waves.shape[0], ov_window), dtype=np.float32)
+                n = min(ov_window, int(waves.shape[1]))
+                fixed[:, :n] = waves[:, :n]
+                waves = fixed
+            counts[ch] = int(waves.shape[0])
+            wave_chunks.append(waves)
+            time_chunks.append(times[: waves.shape[0]])
+        waves_all = (
+            np.concatenate(wave_chunks, axis=0)
+            if wave_chunks
+            else np.empty((0, ov_window), dtype=np.float32)
+        )
+        times_all = (
+            np.concatenate(time_chunks)
+            if time_chunks
+            else np.empty(0, dtype=np.float32)
+        )
+        recording.overlay = OverlaySnippets(
+            t_ms, counts, totals, waves_all, times_all, means
+        )
+
+    return packed
+
+
+def materialize_trigger_windows(recording: ProcessedRecording) -> int:
+    """Slice first/second stimulation windows from the live source into ``derived``.
+
+    Returns the number of ``(trigger, stream)`` arrays written.
+    """
+    if recording.source is None:
+        return 0
+    n_ch = int(recording.n_channels)
+    window = max(int(recording.meta.window_samples), 1)
+    written = 0
+    for trigger_index in (0, 1):
+        for stream in STREAM_NAMES:
+            key = (trigger_index, stream)
+            if key in recording.derived.trigger_windows:
+                continue
+            arr = np.full((n_ch, window), np.nan, dtype=np.float32)
+            any_ok = False
+            for ch in range(n_ch):
+                row = recording.trigger_window(trigger_index, stream, ch)
+                if row is None:
+                    continue
+                values = np.asarray(row, dtype=np.float32).ravel()
+                n = min(window, int(values.size))
+                if n <= 0:
+                    continue
+                arr[ch, :n] = values[:n]
+                any_ok = True
+            if any_ok:
+                recording.derived.trigger_windows[key] = arr
+                written += 1
+    return written
+
+
 def write_bundle(
     recording: ProcessedRecording,
     bundle: BundleLayout,
@@ -882,8 +1113,17 @@ def write_bundle(
     stream_paths: dict[str, Path] | None = None,
 ) -> Path:
     """Persist a recording as a reusable bundle directory. Returns its root."""
+    materialize_channel_cache(recording)
+    if include_trigger_windows:
+        materialize_trigger_windows(recording)
+
     bundle.ensure()
     derived = recording.derived
+    if not derived.means and not getattr(recording, "_channel_data", None):
+        raise ValueError(
+            "Nothing to export: no trial averages are available. "
+            "Compute channels (F6 / F7) before exporting a processed dataset."
+        )
     _save_array(bundle.derived_path("t_rel"), np.asarray(derived.t_rel, dtype=np.float64))
     _save_array(bundle.derived_path("triggers"), np.asarray(derived.triggers, dtype=np.int64))
     for stream, array in derived.means.items():

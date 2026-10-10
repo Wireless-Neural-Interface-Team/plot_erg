@@ -97,9 +97,9 @@ class RangeBarToolbar(QWidget):
         btn_process = _full_width_button("Appliquer les zooms", box)
         btn_process.setObjectName("primaryButton")
         btn_process.setToolTip(
-            "Créer un zoom continuous et les graphs d’analyse cochés "
-            "(moyenne / une stimulation) pour chaque plage — "
-            "ne relance pas le traitement F5"
+            "Ouvrir les zooms du canal dans une fenêtre dédiée "
+            "(continuous : tous flux / plages ; moyenne / stimulation : "
+            "graphs d’analyse cochés) — ne relance pas le traitement F5"
         )
         btn_process.clicked.connect(self.processRequested.emit)
 
@@ -398,3 +398,261 @@ class RangeBarController(QObject):
         self._redraw_artists()
         # Actualiser les fenêtres de zoom en direct (debouncé côté parent).
         self.barsChanged.emit(self.bars)
+
+
+class RangeBarControllerPg(QObject):
+    """Range bars on a :class:`~gui.widgets.plot_host.PlotHost` (pyqtgraph).
+
+    Uses ``LinearRegionItem`` / ``InfiniteLine``; left-drag moves edges.
+    Absolute / relative-stim modes are encoded in :class:`TimeRangeBar` and
+    interpreted by the parent window — this controller only edits ``t0``/``t1``.
+    """
+
+    barsChanged = Signal(object)  # tuple[TimeRangeBar, ...]
+
+    def __init__(self, parent: QObject | None = None) -> None:
+        super().__init__(parent)
+        self._bars: list[TimeRangeBar] = []
+        self._active_index = 0
+        self._host: Any | None = None
+        self._regions: list[Any] = []
+        self._lines: list[Any] = []
+        self._t_min = 0.0
+        self._t_max = 1.0
+        self._display_offset = 0.0
+        self._drag: tuple[int, str] | None = None
+        self._last_draw_s = 0.0
+        self._motion_dirty = False
+        self._updating = False
+        self._proxy_filters: list[Any] = []
+
+    @property
+    def bars(self) -> tuple[TimeRangeBar, ...]:
+        return tuple(self._bars)
+
+    @property
+    def active_index(self) -> int:
+        return self._active_index
+
+    @property
+    def is_dragging(self) -> bool:
+        return self._drag is not None
+
+    def set_active_index(self, index: int) -> None:
+        if not self._bars:
+            self._active_index = 0
+            return
+        self._active_index = max(0, min(len(self._bars) - 1, int(index)))
+        self._redraw_items()
+
+    def set_display_offset(self, offset_s: float) -> None:
+        new_offset = float(offset_s)
+        if abs(new_offset - self._display_offset) < 1e-15:
+            return
+        self._display_offset = new_offset
+        self._redraw_items()
+
+    def set_time_span(self, t_min: float, t_max: float) -> None:
+        self._t_min = float(t_min)
+        self._t_max = float(t_max)
+        if self._t_max <= self._t_min:
+            self._t_max = self._t_min + 1.0
+
+    def ensure_default_bar(self) -> None:
+        if self._bars:
+            return
+        self._bars = [
+            TimeRangeBar(
+                t0_s=self._t_min,
+                t1_s=self._t_max,
+                label="Plage 1",
+                bar_id=uuid.uuid4().hex[:8],
+            )
+        ]
+        self._active_index = 0
+        self.barsChanged.emit(self.bars)
+
+    def set_bars(self, bars: Sequence[TimeRangeBar], *, active_index: int = 0) -> None:
+        self._bars = [replace(b) for b in bars]
+        self._active_index = max(0, min(max(0, len(self._bars) - 1), int(active_index)))
+        self._redraw_items()
+
+    def add_bar(self, *, t0: float | None = None, t1: float | None = None) -> None:
+        a = self._t_min if t0 is None else float(t0)
+        b = self._t_max if t1 is None else float(t1)
+        if b <= a:
+            b = a + max(0.01, (self._t_max - self._t_min) * 0.1)
+        n = len(self._bars) + 1
+        self._bars.append(
+            TimeRangeBar(
+                t0_s=a,
+                t1_s=b,
+                label=f"Plage {n}",
+                bar_id=uuid.uuid4().hex[:8],
+            )
+        )
+        self._active_index = len(self._bars) - 1
+        self._redraw_items()
+        self.barsChanged.emit(self.bars)
+
+    def remove_active_bar(self) -> None:
+        if not self._bars:
+            return
+        self._bars.pop(self._active_index)
+        self._active_index = max(0, min(len(self._bars) - 1, self._active_index))
+        self._redraw_items()
+        self.barsChanged.emit(self.bars)
+
+    def attach(self, host: Any, axes: Sequence[Any] | Any | None = None) -> None:
+        """Attach to a PlotHost (``axes`` ignored — kept for API parity)."""
+        del axes
+        self.detach()
+        self._host = host
+        self._redraw_items()
+
+    def detach(self) -> None:
+        self._clear_items()
+        self._host = None
+        self._drag = None
+
+    def _plot_items(self) -> list[Any]:
+        host = self._host
+        if host is None:
+            return []
+        getter = getattr(host, "plot_items", None)
+        if callable(getter):
+            return list(getter() or [])
+        figure = getattr(host, "figure", None)
+        axes = list(getattr(figure, "axes", []) or []) if figure is not None else []
+        # AxisShim wraps PlotItem
+        out = []
+        for ax in axes:
+            plot = getattr(ax, "_plot", None)
+            if plot is not None:
+                out.append(plot)
+        return out
+
+    def _clear_items(self) -> None:
+        for item in self._regions + self._lines:
+            try:
+                parent = item.parentItem()
+                if parent is not None and hasattr(parent, "removeItem"):
+                    parent.removeItem(item)
+                else:
+                    for plot in self._plot_items():
+                        try:
+                            plot.removeItem(item)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        self._regions.clear()
+        self._lines.clear()
+
+    def _redraw_items(self) -> None:
+        self._clear_items()
+        plots = self._plot_items()
+        if not plots or not self._bars:
+            if self._host is not None:
+                try:
+                    self._host.draw_idle()
+                except Exception:
+                    pass
+            return
+        import pyqtgraph as pg
+        from PySide6.QtCore import Qt as _Qt
+
+        self._updating = True
+        try:
+            off = float(self._display_offset)
+            for index, bar in enumerate(self._bars):
+                t0, t1 = bar.ordered()
+                t0_d, t1_d = float(t0) - off, float(t1) - off
+                color = _BAR_COLORS[index % len(_BAR_COLORS)]
+                active = index == self._active_index
+                brush_color = pg.mkColor(color)
+                brush_color.setAlpha(60 if active else 30)
+                brush = pg.mkBrush(brush_color)
+                pen = pg.mkPen(color, width=1.6 if active else 1.0)
+                for plot in plots:
+                    region = pg.LinearRegionItem(
+                        values=(t0_d, t1_d),
+                        brush=brush,
+                        pen=pen,
+                        movable=True,
+                        swapMode="block",
+                    )
+                    region.setZValue(10)
+                    try:
+                        region.setAcceptedMouseButtons(_Qt.MouseButton.LeftButton)
+                    except Exception:
+                        pass
+                    plot.addItem(region)
+                    self._regions.append(region)
+                    region.sigRegionChanged.connect(
+                        lambda _r=region, i=index: self._on_region_changed(i, _r)
+                    )
+                    region.sigRegionChangeFinished.connect(
+                        lambda _r=region, i=index: self._on_region_finished(i, _r)
+                    )
+        finally:
+            self._updating = False
+        if self._host is not None:
+            try:
+                self._host.draw_idle()
+            except Exception:
+                pass
+
+    def _on_region_changed(self, index: int, region: Any) -> None:
+        if self._updating or not (0 <= index < len(self._bars)):
+            return
+        self._drag = (index, "region")
+        self._active_index = index
+        now = time.perf_counter()
+        if now - self._last_draw_s < 0.016:
+            self._motion_dirty = True
+            return
+        self._last_draw_s = now
+        self._motion_dirty = False
+        self._apply_region(index, region, emit=True)
+
+    def _on_region_finished(self, index: int, region: Any) -> None:
+        if not (0 <= index < len(self._bars)):
+            return
+        self._apply_region(index, region, emit=True)
+        self._drag = None
+        if self._motion_dirty:
+            self._motion_dirty = False
+            self._redraw_items()
+
+    def _apply_region(self, index: int, region: Any, *, emit: bool) -> None:
+        try:
+            a, b = region.getRegion()
+        except Exception:
+            return
+        off = float(self._display_offset)
+        t0 = max(self._t_min, min(self._t_max, float(a) + off))
+        t1 = max(self._t_min, min(self._t_max, float(b) + off))
+        if t1 < t0:
+            t0, t1 = t1, t0
+        eps = max(1e-4, (self._t_max - self._t_min) * 1e-4)
+        if t1 - t0 < eps:
+            t1 = t0 + eps
+        self._bars[index] = self._bars[index].with_bounds(t0, t1)
+        # Sync sibling regions (same bar on other rows) without feedback loops.
+        self._updating = True
+        try:
+            display = (float(t0) - off, float(t1) - off)
+            n_plots = max(1, len(self._plot_items()))
+            for reg_i, reg in enumerate(self._regions):
+                bar_i = reg_i // n_plots
+                if bar_i != index or reg is region:
+                    continue
+                try:
+                    reg.setRegion(display)
+                except Exception:
+                    pass
+        finally:
+            self._updating = False
+        if emit:
+            self.barsChanged.emit(self.bars)

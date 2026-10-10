@@ -65,6 +65,84 @@ def read_all_data_blocks(header, num_samples, num_blocks, fid):
     return data
 
 
+def read_all_data_blocks_to_memmap(
+    header,
+    num_samples,
+    num_blocks,
+    fid,
+    amplifier_memmap,
+    *,
+    progress_callback=None,
+):
+    """Stream amplifier samples into a float32 memmap; keep only ADC/timestamps in RAM.
+
+    Scales amplifier data to µV on the fly (same formula as ``scale_analog_data``)
+    so peak RAM stays O(block) for the amp path instead of 2× the full recording.
+    Returns a ``data`` dict with timestamps + board_adc (uint16) for later scaling;
+    ``amplifier_data`` is the memmap (already in µV float32).
+    """
+    print("Reading data from file (streaming to memmap)...")
+    n_amp = int(header['num_amplifier_channels'])
+    samples_per_block = int(header['num_samples_per_data_block'])
+    data = {
+        't': np.zeros(num_samples, dtype=np.int32),
+        'board_adc_data': np.zeros(
+            [header['num_board_adc_channels'], num_samples], dtype=np.uint16
+        ),
+        'amplifier_data': amplifier_memmap,
+    }
+    # Scratch uint16 for one block of amplifier samples.
+    block_u16 = np.empty((n_amp, samples_per_block), dtype=np.uint16)
+    index = 0
+    print_step = 10
+    percent_done = print_step
+    for i in range(num_blocks):
+        read_timestamps(fid, data, index, samples_per_block)
+        # Amplifier → scale → memmap (no full-file uint16 buffer).
+        if n_amp > 0:
+            tmp = np.fromfile(fid, dtype='uint16', count=samples_per_block * n_amp)
+            block_u16[:, :] = tmp.reshape(n_amp, samples_per_block)
+            end = index + samples_per_block
+            scaled = block_u16.astype(np.float32, copy=False)
+            scaled -= np.float32(32768.0)
+            scaled *= np.float32(0.195)
+            amplifier_memmap[:, index:end] = scaled
+        else:
+            end = index + samples_per_block
+
+        # Skip / read the rest of the block like read_analog_signals + digital.
+        if header['dc_amplifier_data_saved']:
+            fid.seek(2 * samples_per_block * n_amp, 1)
+        # Stim payload always skipped when LOAD_STIM_DATA is False.
+        fid.seek(2 * samples_per_block * n_amp, 1)
+        read_analog_signal_type(
+            fid,
+            data['board_adc_data'],
+            index,
+            samples_per_block,
+            header['num_board_adc_channels'],
+        )
+        n_dac = header['num_board_dac_channels']
+        if n_dac > 0:
+            fid.seek(2 * samples_per_block * n_dac, 1)
+        n_dig_in = header['num_board_dig_in_channels']
+        n_dig_out = header['num_board_dig_out_channels']
+        if n_dig_in > 0:
+            fid.seek(2 * samples_per_block, 1)
+        if n_dig_out > 0:
+            fid.seek(2 * samples_per_block, 1)
+
+        index = end
+        percent_done = print_progress(i, num_blocks, print_step, percent_done)
+        if progress_callback is not None and (i % max(1, num_blocks // 20) == 0 or i + 1 == num_blocks):
+            progress_callback((i + 1) / max(1, num_blocks))
+    try:
+        amplifier_memmap.flush()
+    except Exception:
+        pass
+    return data
+
+
 def check_end_of_file(filesize, fid):
     """Checks that the end of the file was reached at the expected position.
     If not, raise FileSizeError.

@@ -9,13 +9,17 @@ software).
 import sys
 import time
 
+import numpy as np
+
 from intanutil.header import (read_header,
                               header_to_result)
 from intanutil.data import (calculate_data_size,
                             read_all_data_blocks,
+                            read_all_data_blocks_to_memmap,
                             check_end_of_file,
                             parse_data,
-                            data_to_result)
+                            data_to_result,
+                            scale_timestamps)
 from intanutil.filter import apply_notch_filter
 
 
@@ -68,6 +72,56 @@ def read_data(filename):
     print('Done!  Elapsed time: {0:0.1f} seconds'.format(time.time() - tic))
 
     # Return 'result' dict.
+    return result
+
+
+def read_data_to_amplifier_memmap(filename, amplifier_memmap, *, progress_callback=None):
+    """Like ``read_data``, but streams amplifier samples into ``amplifier_memmap``.
+
+    ``amplifier_memmap`` must be writable float32 with shape
+    ``(n_amplifier_channels, n_samples)``. Peak RAM for the amplifier path is
+    one data block instead of a full-file uint16 + float32 copy.
+    """
+    tic = time.time()
+    with open(filename, 'rb') as fid:
+        header = read_header(fid)
+        data_present, filesize, num_blocks, num_samples = (
+            calculate_data_size(header, filename, fid))
+        print('FINISHED HEADER')
+        if not data_present:
+            result = {}
+            header_to_result(header, result)
+            print('Done!  Elapsed time: {0:0.1f} seconds'.format(time.time() - tic))
+            return result
+        n_amp = int(header['num_amplifier_channels'])
+        if tuple(amplifier_memmap.shape) != (n_amp, int(num_samples)):
+            raise ValueError(
+                f"amplifier_memmap shape {amplifier_memmap.shape} != "
+                f"({n_amp}, {num_samples})"
+            )
+        data = read_all_data_blocks_to_memmap(
+            header,
+            num_samples,
+            num_blocks,
+            fid,
+            amplifier_memmap,
+            progress_callback=progress_callback,
+        )
+        check_end_of_file(filesize, fid)
+
+    result = {}
+    header_to_result(header, result)
+    # Amplifier already scaled in the stream path; scale ADC + timestamps only.
+    scale_timestamps(header, data)
+    adc = data.get('board_adc_data')
+    if adc is not None and getattr(adc, 'size', 0):
+        scaled_adc = adc.astype(np.float32, copy=True)
+        scaled_adc -= np.float32(32768.0)
+        scaled_adc *= np.float32(312.5e-6)
+        data['board_adc_data'] = scaled_adc
+    apply_notch_filter(header, data)
+    data_to_result(header, data, result)
+    print('Done!  Elapsed time: {0:0.1f} seconds'.format(time.time() - tic))
     return result
 
 

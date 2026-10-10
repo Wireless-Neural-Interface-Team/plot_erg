@@ -572,13 +572,13 @@ def _draw_spike_panels_multi_channel(
             )
     if show_psth:
         if across_trials:
-            ax_fr.set_ylabel("Trial-averaged rate (Hz)")
+            ax_fr.set_ylabel("Rate (Hz)")
             ax_fr.set_title(
                 f"{sec}PSTH — trial-averaged firing rate "
                 f"(window = {bin_w:g} s) — {short}"
             )
         else:
-            ax_fr.set_ylabel("Firing rate (Hz)")
+            ax_fr.set_ylabel("Rate (Hz)")
             ax_fr.set_title(
                 f"{sec}PSTH — firing rate "
                 f"(window = {bin_w:g} s) — {short}"
@@ -586,6 +586,11 @@ def _draw_spike_panels_multi_channel(
         app.apply_grid(ax_fr)
         ax_fr.set_xlim(t_xlim_lo, t_xlim_hi)
         ax_fr.set_xlabel(TIME_REL_XLABEL)
+        try:
+            _y0, y1 = ax_fr.get_ylim()
+            ax_fr.set_ylim(0.0, max(float(y1), 1e-6))
+        except Exception:
+            pass
     max_trials = 0
     for rec_idx, st_per_trial in enumerate(spikes_per_recording):
         fr_trials = _trial_mean_firing_rate_hz(st_per_trial, (t_xlim_lo, t_xlim_hi))

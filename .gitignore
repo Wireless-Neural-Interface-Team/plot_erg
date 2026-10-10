@@ -6,3 +6,8 @@ dist/
 build/
 *.egg-info/
 plots/
+
+# Secrets / config NAS — garder seulement `.env.example` dans le dépôt
+.env
+.env.local
+.env.*.local

@@ -30,8 +30,10 @@ from panel_catalog import (
     is_global_panel,
     is_section_independent,
     is_section_panel,
+    merge_product_needs,
     panel_label,
     panel_needs_spikes,
+    panel_product_needs,
 )
 
 SectionKey = Literal["full", "zoom_onset", "zoom_trigger_end"]
@@ -148,22 +150,26 @@ class TimeRangeBar:
 
 @dataclass(frozen=True)
 class AnalysisSettings:
-    """Courbes / mode affichés en moyenne ou stimulation (pas en continuous)."""
+    """Courbes / mode d’aperçu — mêmes flags pour continuous, moyenne et stimulation.
+
+    ``show_raw`` / ``show_hp`` / ``show_lp`` pilotent aussi les flux continuous.
+    ``mode`` / ``stim_index`` ne changent que la source des traces (brut, mean, trial).
+    """
 
     mode: AnalysisMode = "average"
     stim_index: int = 0  # 0-based stimulation index when mode == stimulation
-    # Courbes : coches Paramètres → Canal (modes moyenne / stimulation).
+    # Courbes : coches Paramètres → Canal → Pipeline (tous modes).
     show_raw: bool = True
     show_hp: bool = False
     show_lp: bool = False
     show_rms: bool = False
     show_isi: bool = False
     show_overlay: bool = False  # spike scope
-    # Spikes : mêmes coches, visibles en mode moyenne / stimulation.
+    # Spikes : mêmes coches Pipeline.
     show_psth: bool = False
     show_trial_rate: bool = False
     show_raster: bool = False
-    # Résumés : aperçu canal (globale) uniquement.
+    # Résumés : aperçu canal (tous modes).
     show_summary_rms: bool = False  # mean RMS par enregistrement (profil)
     show_summary_rms_table: bool = False  # mean RMS par canal (table)
 
@@ -174,7 +180,7 @@ class AnalysisSettings:
         return None
 
     def selected_curve_panels(self) -> tuple[str, ...]:
-        """Traces / ISI / spike scope — aperçu (mode moyenne / stim)."""
+        """Traces / ISI / spike scope — tous modes d’aperçu."""
         panels: list[str] = []
         if self.show_raw:
             panels.append("analysis_raw")
@@ -199,13 +205,15 @@ class AnalysisSettings:
         )
 
     def selected_spike_panels(self) -> tuple[str, ...]:
-        """PSTH / FR par essai / raster — aperçu (mode moyenne / stim)."""
+        """PSTH / FR par essai / raster — tous modes d’aperçu."""
         panels: list[str] = []
         if self.show_psth:
             panels.append("analysis_psth")
         if self.show_trial_rate:
             panels.append("analysis_trial_rate")
         if self.show_raster:
+            # Compact style montage (eventplot) + raster tous essais.
+            panels.append("analysis_raster_channel")
             panels.append("analysis_raster")
         return tuple(panels)
 
@@ -222,8 +230,21 @@ class AnalysisSettings:
         """Courbes + spikes (sans résumés)."""
         return self.selected_curve_panels() + self.selected_spike_panels()
 
+    def selected_continuous_extra_panels(self) -> tuple[str, ...]:
+        """RMS / ISI / spike scope / spikes — sous les panneaux ``full_recording``.
+
+        WIDE/HIGH/LOW = un ``full_recording`` par flux (pas de doublon
+        ``analysis_raw`` / ``analysis_hp`` / ``analysis_lp``).
+        """
+        stream_panels = {"analysis_raw", "analysis_hp", "analysis_lp"}
+        return tuple(
+            key
+            for key in self.selected_analysis_panels()
+            if key not in stream_panels
+        )
+
     def selected_global_panels(self) -> tuple[str, ...]:
-        """Panneaux additionnels d’aperçu (hors continuous) : résumés seulement."""
+        """Panneaux additionnels d’aperçu : résumés seulement."""
         return self.selected_summary_panels()
 
     def describe(self) -> str:
@@ -233,12 +254,22 @@ class AnalysisSettings:
 
 
 @dataclass(frozen=True)
+class TextFace:
+    """Gras / italique / souligné pour un rôle typographique (titre, légende, …)."""
+
+    bold: bool = False
+    italic: bool = False
+    underline: bool = False
+
+
+@dataclass(frozen=True)
 class LegendSettings:
     """Legend appearance, applied to every panel at draw time."""
 
     visible: bool = True
     location: LegendLocation = "below"
     font_size: float = 9.0
+    face: TextFace = field(default_factory=TextFace)
     columns: int = 1
     # Distance légende ↔ graphique (fraction de la hauteur des axes si « below »,
     # sinon padding borderaxespad matplotlib).
@@ -260,6 +291,9 @@ class PanelStyle:
     title_font_size: float = 10.0
     label_font_size: float = 9.0
     tick_font_size: float = 8.0
+    title_face: TextFace = field(default_factory=TextFace)
+    label_face: TextFace = field(default_factory=TextFace)
+    tick_face: TextFace = field(default_factory=TextFace)
     line_width: float = 1.2
     grid: bool = True
     grid_alpha: float = 0.3
@@ -267,9 +301,34 @@ class PanelStyle:
     show_borders: bool = True
     # Graduations (ticks) orientées vers l’intérieur du cadre.
     ticks_inside: bool = False
+    # Barres d’échelle flottantes (temps / amplitude) à la place des graduations
+    # numériques sur les bords — style montage EEG / traces.
+    show_scale_bars: bool = False
+    # Longueurs manuelles (sinon auto ~18 % du span visible). La taille pixel
+    # des bâtons suit le zoom : valeur fixe en unités de données.
+    scale_bar_time_manual: bool = False
+    scale_bar_time_s: float = 0.1
+    scale_bar_amplitude_manual: bool = False
+    scale_bar_amplitude: float = 100.0
     # Max points drawn per curve (min/max envelope decimation above this).
     max_points_per_curve: int = 6000
     tight_layout: bool = True
+
+
+@dataclass(frozen=True)
+class TextOverrides:
+    """Remplacements manuels des textes de graphique (vide = automatique)."""
+
+    title: str = ""
+    xlabel: str = ""
+    ylabel: str = ""
+    # Une entrée par courbe, dans l’ordre de la légende. Entrée vide = garder l’auto.
+    legend_labels: tuple[str, ...] = ()
+    # Si False, masque les suffixes du type « — trial-averaged », « — RMS », …
+    show_series_suffix: bool = True
+
+    def resolved_legend_labels(self) -> tuple[str, ...]:
+        return tuple(str(label) for label in self.legend_labels)
 
 
 @dataclass(frozen=True)
@@ -304,17 +363,23 @@ class ViewerSettings:
     x_limits: AxisLimits = field(
         default_factory=lambda: AxisLimits(enabled=False, minimum=-0.1, maximum=0.4)
     )
-    stim_hp_ylim: AxisLimits = field(default_factory=AxisLimits)
+    # Échelles Y par type de courbe (réglables dans Canal → section cochée).
+    raw_ylim: AxisLimits = field(default_factory=AxisLimits)
+    hp_ylim: AxisLimits = field(default_factory=AxisLimits)
+    lp_ylim: AxisLimits = field(default_factory=AxisLimits)
     rms_ylim: AxisLimits = field(
         default_factory=lambda: AxisLimits(enabled=True, minimum=0.0, maximum=20.0)
     )
-    trace_ylim: AxisLimits = field(default_factory=AxisLimits)
     legend: LegendSettings = field(default_factory=LegendSettings)
     style: PanelStyle = field(default_factory=PanelStyle)
+    texts: TextOverrides = field(default_factory=TextOverrides)
     # Montage panels: how many channels to stack in one figure.
     # Kept modest — the default UX is channel-first, not a global montage.
     montage_channels: int = 12
     montage_page: int = 0
+    # Revue montage continue (GUI) : canaux par page + page courante.
+    montage_review_channels: int = 10
+    montage_review_page: int = 0
     # Noms de canaux exclus du montage (cases décochées dans Session → Channels).
     hidden_channels: tuple[str, ...] = ()
     analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
@@ -329,6 +394,9 @@ class ViewerSettings:
     # Polarité / seuil ANALOG-IN-0 (affichage + alimente le traitement F5).
     trigger_polarity: TriggerPolarity = "low"
     trigger_threshold: float = 1.0
+    # Hauteur fixe de chaque graphique (px) — aperçu, analyse, onglets.
+    # Pas d’ajustement automatique au viewport.
+    graph_height_px: int = 400
     # Hauteur minimale d’une ligne canal×flux dans le montage continu (px).
     # Plus bas = moins de pixels Agg (ouverture plus rapide).
     montage_row_min_height_px: int = 52
@@ -360,6 +428,15 @@ class ViewerSettings:
     def zoom_end_window(self) -> tuple[float, float]:
         return (float(self.zoom_end_t0_s), float(self.zoom_end_t1_s))
 
+    def ylim_for_stream(self, stream: str) -> AxisLimits:
+        """Échelle Y manuelle pour un flux WIDE / HIGH / LOW."""
+        key = str(stream).strip().lower()
+        if key in {"hp", "high"}:
+            return self.hp_ylim
+        if key in {"lp", "low"}:
+            return self.lp_ylim
+        return self.raw_ylim
+
     def validate(self) -> list[str]:
         """Liste de problèmes lisibles (vide si tout est valide)."""
         problems: list[str] = []
@@ -377,12 +454,14 @@ class ViewerSettings:
             problems.append("Superposition : le temps après détection doit être > 0 ms.")
         if self.x_limits.enabled and self.x_limits.as_tuple() is None:
             problems.append("Axe X : le maximum doit être > minimum.")
-        if self.stim_hp_ylim.enabled and self.stim_hp_ylim.as_tuple() is None:
-            problems.append("Axe Y passe-haut stim : le maximum doit être > minimum.")
-        if self.rms_ylim.enabled and self.rms_ylim.as_tuple() is None:
-            problems.append("Axe Y RMS : le maximum doit être > minimum.")
-        if self.trace_ylim.enabled and self.trace_ylim.as_tuple() is None:
-            problems.append("Axe Y traces : le maximum doit être > minimum.")
+        for label, limits in (
+            ("WIDE", self.raw_ylim),
+            ("HIGH", self.hp_ylim),
+            ("LOW", self.lp_ylim),
+            ("RMS", self.rms_ylim),
+        ):
+            if limits.enabled and limits.as_tuple() is None:
+                problems.append(f"Axe Y {label} : le maximum doit être > minimum.")
         if self.analysis.stim_index < 0:
             problems.append("L’indice de stimulation doit être ≥ 0.")
         return problems
@@ -394,24 +473,28 @@ def apply_local_display_settings(
     *,
     include_analysis: bool = False,
 ) -> ViewerSettings:
-    """Appliquer les réglages d’affichage d’*une* fenêtre sur une base partagée.
+    """Appliquer les réglages d’affichage d’*une* fenêtre (ou d’un panneau) sur une base.
 
-    Chaque fenêtre avec panneau local (détachée, Analyse, …) contrôle légende,
-    style, axes et sync pour *ses* graphs. Sans ceci, un redraw réinjecte les
-    axes / la sync de la fenêtre parente et ignore le panneau local.
+    Chaque fenêtre avec panneau local (détachée, Analyse, …) ou chaque graphique
+    avec overrides dédiés contrôle légende, style, axes et sync pour *ses*
+    graphs. Sans ceci, un redraw réinjecte les axes / la sync de la fenêtre
+    parente et ignore le panneau local.
     """
     kwargs: dict[str, object] = {
         "legend": local.legend,
         "style": local.style,
+        "texts": local.texts,
         "psth_bin_window_s": local.psth_bin_window_s,
         "sampling_percent": local.sampling_percent,
         "x_limits": local.x_limits,
-        "trace_ylim": local.trace_ylim,
+        "raw_ylim": local.raw_ylim,
+        "hp_ylim": local.hp_ylim,
+        "lp_ylim": local.lp_ylim,
         "rms_ylim": local.rms_ylim,
-        "stim_hp_ylim": local.stim_hp_ylim,
         "time_sync": local.time_sync,
         "trigger_polarity": local.trigger_polarity,
         "trigger_threshold": local.trigger_threshold,
+        "graph_height_px": int(local.graph_height_px),
     }
     if include_analysis:
         kwargs["analysis"] = local.analysis
@@ -433,6 +516,9 @@ class PanelPlacement:
     zoom_absolute: bool = False
     # Identifiant d’instance (ex. bar_id d’une plage) — clé stable, pas affiché.
     instance_id: str = ""
+    # Flux unique pour ``full_recording`` (raw / hp / lp) — un panneau par courbe,
+    # comme analysis_raw / analysis_hp / analysis_lp en moyenne / stimulation.
+    stream: str = ""
 
     @property
     def has_custom_zoom(self) -> bool:
@@ -440,16 +526,21 @@ class PanelPlacement:
 
     @property
     def key(self) -> str:
+        stream_part = f"/{self.stream}" if self.stream else ""
         suffix = f"#{self.instance_id}" if self.instance_id else ""
         if self.has_custom_zoom:
             label = self.zoom_label.strip() or f"{self.zoom_t0_s}:{self.zoom_t1_s}"
-            return f"{self.panel}@custom:{label}{suffix}"
+            return f"{self.panel}{stream_part}@custom:{label}{suffix}"
         if is_section_independent(self.panel):
-            return f"{self.panel}{suffix}" if suffix else self.panel
-        return f"{self.panel}@{self.section}{suffix}"
+            base = f"{self.panel}{stream_part}"
+            return f"{base}{suffix}" if suffix else base
+        return f"{self.panel}{stream_part}@{self.section}{suffix}"
 
     def title(self) -> str:
         label = panel_label(self.panel)
+        if self.stream:
+            short = STREAM_SHORT_LABELS.get(self.stream, self.stream.upper())
+            label = f"{label} — {short}"
         if self.has_custom_zoom:
             name = self.zoom_label.strip() or "zoom"
             unit = "s abs." if self.zoom_absolute else "s rel. stim"
@@ -485,7 +576,7 @@ class ViewTab:
     name: str
     panels: tuple[PanelPlacement, ...] = ()
     columns: int = 2
-    panel_height_px: int = 300
+    panel_height_px: int = 400
 
     def with_panels(self, panels: Sequence[PanelPlacement]) -> ViewTab:
         return replace(self, panels=tuple(panels))
@@ -531,8 +622,40 @@ class WorkspaceLayout:
             for placement in tab.panels
         )
 
+    def product_needs(self) -> tuple[bool, bool, bool, bool]:
+        """``(means, rms, spikes, overlay)`` required by any laid-out panel."""
+        needs = [
+            panel_product_needs(placement.panel)
+            for tab in self.tabs
+            for placement in tab.panels
+        ]
+        if not needs:
+            return False, False, False, False
+        return merge_product_needs(*needs)
+
+    def needs_all_channels(self) -> bool:
+        """True when at least one panel reads every channel (montage / résumé)."""
+        for tab in self.tabs:
+            for placement in tab.panels:
+                panel = str(placement.panel or "")
+                if panel.startswith("montage_") and panel != "montage_continuous_raw":
+                    return True
+                if panel in {"summary_rms", "summary_rms_table"}:
+                    return True
+                means, rms, spikes, overlay = panel_product_needs(panel)
+                if is_global_panel(panel) and (means or rms or spikes or overlay):
+                    return True
+        return False
+
     def to_plot_display(self, *, base: PlotDisplaySettings | None = None) -> PlotDisplaySettings:
-        """Derive classic PDF settings from the panels currently laid out."""
+        """Derive classic PDF settings from the panels currently laid out.
+
+        When the workspace has no panels (channel-preview-only GUI), fall back to
+        a full PDF layout so export is still useful.
+        """
+        has_any_panel = any(tab.panels for tab in self.tabs)
+        if not has_any_panel:
+            return base or PlotDisplaySettings.all_on()
         per_section: dict[str, set[str]] = {key: set() for key in SECTION_KEYS}
         globals_seen: set[str] = set()
         extras: set[str] = set()

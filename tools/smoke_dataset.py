@@ -21,7 +21,14 @@ from matplotlib.figure import Figure  # noqa: E402
 from dataset_builder import export_dataset, open_dataset  # noqa: E402
 from make_synthetic_dataset import build_synthetic  # noqa: E402
 from panel_registry import RenderRequest, render_panel  # noqa: E402
-from processed_dataset import archive_bundle, dataset_target_path  # noqa: E402
+from processed_dataset import (  # noqa: E402
+    ChannelData,
+    DerivedArrays,
+    OverlaySnippets,
+    SpikeTrains,
+    archive_bundle,
+    dataset_target_path,
+)
 from view_config import PanelPlacement, ViewerSettings  # noqa: E402
 
 
@@ -112,6 +119,59 @@ def main() -> int:
         print(f"  panels:  {statuses}")
         reopened.close()
         from_zip.close()
+
+        # GUI-like lazy state: products only in ``_channel_data``.
+        lazy = build_synthetic(label="lazy-export", seed=11, n_channels=4, n_trials=3)
+        for ch in range(lazy.n_channels):
+            means = {s: lazy.mean(s, ch) for s in ("raw", "hp", "lp")}
+            t_rms, v_mean = lazy.rms_profile("mean", ch)
+            _, v_first = lazy.rms_profile("first", ch)
+            _, v_second = lazy.rms_profile("second", ch)
+            t_ms, waves, times, total, mean_w = lazy.overlay_for_channel(ch)
+            lazy.store_channel(
+                ch,
+                ChannelData(
+                    means={k: np.asarray(v) for k, v in means.items() if v is not None},
+                    rms_time=np.asarray(t_rms),
+                    rms_profiles={
+                        "mean": np.asarray(v_mean),
+                        "first": np.asarray(v_first),
+                        "second": np.asarray(v_second),
+                    },
+                    channel_rms_uv=float(lazy.channel_rms_uv(ch)),
+                    threshold_uv=float(lazy.threshold_uv(ch)),
+                    threshold_caption=str(lazy.threshold_caption(ch)),
+                    spike_trains=list(lazy.spike_times(ch)),
+                    overlay_t_ms=np.asarray(t_ms),
+                    overlay_waves=np.asarray(waves),
+                    overlay_times=np.asarray(times),
+                    overlay_total=int(total),
+                    overlay_mean=None if mean_w is None else np.asarray(mean_w),
+                ),
+            )
+        lazy.derived = DerivedArrays(
+            t_rel=lazy.derived.t_rel,
+            triggers=lazy.derived.triggers,
+            means={},
+            trigger_windows={},
+            rms_time=None,
+            rms_profiles={},
+            channel_rms_uv=None,
+            thresholds_uv=None,
+        )
+        lazy.spikes = SpikeTrains.empty(lazy.n_channels, lazy.n_trials)
+        lazy.overlay = OverlaySnippets.empty(lazy.n_channels, 0)
+        expected_raw = np.asarray(lazy.mean("raw", 1), dtype=np.float64).copy()
+        assert expected_raw is not None and expected_raw.size
+        lazy_target = dataset_target_path(root, "lazy-export")
+        lazy_bundle = export_dataset(lazy, lazy_target)
+        lazy_reopened = open_dataset(lazy_bundle, label="lazy-reopened")
+        assert lazy_reopened.ready_channels == set(range(lazy.n_channels))
+        _assert_close("lazy mean[raw]", lazy_reopened.mean("raw", 1), expected_raw)
+        assert any(len(t) for t in lazy_reopened.spike_times(1))
+        lazy_reopened.close()
+        lazy.close()
+        print("lazy channel-cache export OK")
     return 0
 
 

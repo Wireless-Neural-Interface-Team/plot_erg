@@ -1445,6 +1445,124 @@ class _PlotRenderCache:
         self._channel_rms_uv: dict[tuple[int, int], float] = {}
         self._threshold: dict[tuple[int, int], tuple[float, str]] = {}
 
+    def seed_from_recordings(self, recordings: Sequence[Any]) -> int:
+        """Seed means from ProcessedRecording ChannelData when present.
+
+        Returns how many mean curves were imported. Missing products still fall
+        back to the historical AmplifierSpikeSource recompute path.
+        """
+        imported = 0
+        for src_idx, recording in enumerate(recordings):
+            channel_data = getattr(recording, "_channel_data", None)
+            if not isinstance(channel_data, dict) or not channel_data:
+                continue
+            for ch, data in channel_data.items():
+                ch_i = int(ch)
+                means = getattr(data, "means", None) or {}
+                for stream, store in (
+                    ("raw", self._mean_raw),
+                    ("hp", self._mean_hp),
+                    ("lp", self._mean_lp),
+                ):
+                    row = means.get(stream)
+                    if row is None:
+                        continue
+                    store[(src_idx, ch_i)] = self._normalize_mean_row(row, self.n_expected)
+                    imported += 1
+        return imported
+
+
+def plot_processed_recordings_pdf(
+    recordings: Sequence[Any],
+    configs: Sequence[Any],
+    *,
+    output_dir: Path | None = None,
+) -> Path:
+    """PDF export from ProcessedRecording objects (shared GUI/CLI data plane).
+
+    Ensures channel products, then delegates to ``plot_channel_multi_comparison``
+    using each recording's live ``AmplifierSpikeSource``.
+    """
+    from dataset_builder import ensure_channels
+
+    if not recordings:
+        raise ValueError("plot_processed_recordings_pdf requires at least one recording.")
+    if len(configs) != len(recordings):
+        raise ValueError("configs and recordings length mismatch.")
+
+    for recording, config in zip(recordings, configs):
+        channels = list(range(int(recording.n_channels)))
+        ensure_channels(
+            recording,
+            channels,
+            config,
+            need_means=True,
+            need_rms=True,
+            need_spikes=True,
+            need_overlay=True,
+        )
+        source = getattr(recording, "source", None)
+        if source is not None:
+            for bank_name in ("highpass", "lowpass"):
+                bank = getattr(source, bank_name, None)
+                prefetch = getattr(bank, "prefetch", None)
+                if callable(prefetch):
+                    prefetch(channels)
+
+    spike_sources = []
+    for recording in recordings:
+        source = getattr(recording, "source", None)
+        if source is None:
+            raise RuntimeError(f"Recording {recording.label!r} has no live streams.")
+        spike_sources.append(source)
+
+    cfg0 = configs[0]
+    out = Path(output_dir) if output_dir is not None else (
+        Path(cfg0.save_dir) if getattr(cfg0, "save_dir", None) else Path(cfg0.rhs_file).parent
+    )
+    fs_ref = float(recordings[0].meta.fs)
+    pre_n_common = min(int(r.meta.segmentation.pre_n) for r in recordings)
+    post_n_common = min(int(r.meta.segmentation.post_n) for r in recordings)
+    t_ref = np.arange(-pre_n_common, post_n_common, dtype=np.float64) / fs_ref
+    n_ch = min(int(r.n_channels) for r in recordings)
+    labels = [str(getattr(r, "label", "") or Path(c.rhs_file).stem) for r, c in zip(recordings, configs)]
+    styles = [getattr(r, "style", None) or getattr(c, "recording_style", None) for r, c in zip(recordings, configs)]
+    end_markers = [getattr(r.meta.segmentation, "end_rising_s", None) for r in recordings]
+
+    return plot_channel_multi_comparison(
+        t_rel=t_ref,
+        channel_names=list(recordings[0].channel_names)[:n_ch],
+        output_dir=out,
+        labels=labels,
+        spike_sources=spike_sources,
+        pre_n_common=pre_n_common,
+        post_n_common=post_n_common,
+        pdf_title=getattr(cfg0, "pdf_title", None),
+        trigger_end_rising_rel_s_list=end_markers,
+        fs=fs_ref,
+        spike_threshold_uv=float(cfg0.spike_threshold_uv),
+        spike_threshold_polarity=str(cfg0.spike_threshold_polarity),
+        spike_threshold_mode=str(cfg0.spike_threshold_mode),
+        spike_threshold_rms_multiplier=float(cfg0.spike_threshold_rms_multiplier),
+        spike_overlay_pre_ms=float(cfg0.spike_overlay_pre_ms),
+        spike_overlay_post_ms=float(cfg0.spike_overlay_post_ms),
+        psth_bin_window_s=float(cfg0.psth_bin_window_s),
+        rms_window_s=float(cfg0.rms_window_s),
+        zoom_mode=cfg0.zoom_mode,
+        zoom_onset_t0_s=float(cfg0.zoom_onset_t0_s),
+        zoom_onset_t1_s=float(cfg0.zoom_onset_t1_s),
+        zoom_end_t0_s=float(cfg0.zoom_end_t0_s),
+        zoom_end_t1_s=float(cfg0.zoom_end_t1_s),
+        sampling_percent=int(cfg0.sampling_percent),
+        probe_layout_json=getattr(cfg0, "probe_layout_json", None),
+        channel_workers=getattr(cfg0, "channel_workers", None),
+        first_trigger_hp_ylim_enabled=bool(cfg0.first_trigger_hp_ylim_enabled),
+        first_trigger_hp_ylim_min_uv=float(cfg0.first_trigger_hp_ylim_min_uv),
+        first_trigger_hp_ylim_max_uv=float(cfg0.first_trigger_hp_ylim_max_uv),
+        plot_display=getattr(cfg0, "plot_display", None),
+        recording_styles=styles,
+    )
+
     @staticmethod
     def _normalize_mean_row(row: np.ndarray, n_expected: int) -> np.ndarray:
         y = np.asarray(row, dtype=np.float64)

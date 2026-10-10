@@ -131,6 +131,8 @@ class ChannelEnsureRequest:
     need_rms: bool = True
     need_spikes: bool = True
     need_overlay: bool = True
+    # Warm HP/LP rows on the worker thread (never on the Qt UI thread).
+    need_filters: bool = True
 
 
 @dataclass
@@ -146,6 +148,7 @@ class _EnsureJob:
     need_rms: bool = True
     need_spikes: bool = True
     need_overlay: bool = True
+    need_filters: bool = True
 
     def key(self) -> tuple[int, int]:
         return (id(self.recording), int(self.channel))
@@ -161,7 +164,12 @@ class _EnsureJob:
             need_rms=self.need_rms or other.need_rms,
             need_spikes=self.need_spikes or other.need_spikes,
             need_overlay=self.need_overlay or other.need_overlay,
+            need_filters=self.need_filters or other.need_filters,
         )
+
+    @property
+    def products_requested(self) -> bool:
+        return bool(self.need_means or self.need_rms or self.need_spikes or self.need_overlay)
 
 
 def _jobs_from_requests(requests: Sequence[ChannelEnsureRequest]) -> list[_EnsureJob]:
@@ -179,9 +187,22 @@ def _jobs_from_requests(requests: Sequence[ChannelEnsureRequest]) -> list[_Ensur
                     need_rms=bool(request.need_rms),
                     need_spikes=bool(request.need_spikes),
                     need_overlay=bool(request.need_overlay),
+                    need_filters=bool(getattr(request, "need_filters", True)),
                 )
             )
     return jobs
+
+
+def _warm_filters(recording: Any, channel: int) -> None:
+    """Run LazyFilterBank.prefetch for one channel (worker thread only)."""
+    source = getattr(recording, "source", None)
+    if source is None:
+        return
+    for bank_name in ("highpass", "lowpass"):
+        bank = getattr(source, bank_name, None)
+        prefetch = getattr(bank, "prefetch", None)
+        if callable(prefetch):
+            prefetch([int(channel)])
 
 
 class ChannelEnsureWorker(QThread):
@@ -212,6 +233,8 @@ class ChannelEnsureWorker(QThread):
         self._low: list[_EnsureJob] = []
         self._cancel = threading.Event()
         self._wake = threading.Event()
+        # Once True, submit() refuses new work so the GUI can start a fresh worker.
+        self._shutting_down = False
         if requests:
             self.submit(requests, priority=priority)
 
@@ -228,12 +251,17 @@ class ChannelEnsureWorker(QThread):
         requests: Sequence[ChannelEnsureRequest],
         *,
         priority: bool = False,
-    ) -> None:
-        """Enqueue work; ``priority=True`` jumps ahead of background prefetch."""
+    ) -> bool:
+        """Enqueue work; ``priority=True`` jumps ahead of background prefetch.
+
+        Returns False when the worker is shutting down (caller must start a new one).
+        """
         jobs = _jobs_from_requests(requests)
         if not jobs:
-            return
+            return True
         with self._lock:
+            if self._shutting_down:
+                return False
             if priority:
                 prepared: list[_EnsureJob] = []
                 for job in jobs:
@@ -245,6 +273,7 @@ class ChannelEnsureWorker(QThread):
             high, low = len(self._high), len(self._low)
         self._wake.set()
         self.queue_changed.emit(high, low)
+        return True
 
     def _take_and_merge(self, job: _EnsureJob) -> _EnsureJob:
         key = job.key()
@@ -288,9 +317,12 @@ class ChannelEnsureWorker(QThread):
                         idle_rounds += 1
                         # Brief wait so a prioritize() right after the last job is seen.
                         if idle_rounds >= 4:
-                            if self._has_pending():
-                                idle_rounds = 0
-                                continue
+                            with self._lock:
+                                if self._high or self._low:
+                                    idle_rounds = 0
+                                    continue
+                                # Refuse further submit() before emitting finished_all.
+                                self._shutting_down = True
                             break
                         self._wake.wait(0.05)
                         self._wake.clear()
@@ -326,17 +358,23 @@ class ChannelEnsureWorker(QThread):
                         )
 
                     try:
-                        computed = ensure_channels(
-                            job.recording,
-                            [job.channel],
-                            job.config,
-                            progress=_progress,
-                            force=job.force,
-                            need_means=job.need_means,
-                            need_rms=job.need_rms,
-                            need_spikes=job.need_spikes,
-                            need_overlay=job.need_overlay,
-                        )
+                        if job.need_filters:
+                            _warm_filters(job.recording, job.channel)
+                        computed: list[int] = []
+                        if job.products_requested:
+                            computed = ensure_channels(
+                                job.recording,
+                                [job.channel],
+                                job.config,
+                                progress=_progress,
+                                force=job.force,
+                                need_means=job.need_means,
+                                need_rms=job.need_rms,
+                                need_spikes=job.need_spikes,
+                                need_overlay=job.need_overlay,
+                            )
+                        else:
+                            computed = [job.channel]
                     except InterruptedError:
                         ok = False
                         self.logged.emit("Channel computation interrupted.")
@@ -347,7 +385,7 @@ class ChannelEnsureWorker(QThread):
                         self.failed.emit(str(exc))
                     else:
                         done += 1
-                        if computed:
+                        if computed and job.products_requested:
                             name = (
                                 job.recording.channel_names[job.channel]
                                 if 0 <= job.channel < len(job.recording.channel_names)

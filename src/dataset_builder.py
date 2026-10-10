@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import gc
+import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -37,7 +38,6 @@ from core import (
     get_analog_in0_signal,
     get_channel_names,
     get_sampling_rate,
-    load_rhs_file,
     resolve_channel_workers,
     resolve_recording_windows,
     uses_analog_trigger,
@@ -230,27 +230,68 @@ def _ensure_raw_stream(
             if layout.analog_in0_path.exists()
             else np.empty(0, dtype=np.float64)
         )
-        progress.finish_stage(
-            cached=True,
-            message=f"Reusing cached wideband stream ({meta.get('n_channels', '?')} channels)",
-        )
-        return meta, amplifier, analog
+        # Legacy caches written with edge="none" may lack analog_in0 — fall through
+        # to a full RHS read when a trigger mode needs it.
+        if analog.size > 0 or not uses_analog_trigger(config):
+            progress.finish_stage(
+                cached=True,
+                message=f"Reusing cached wideband stream ({meta.get('n_channels', '?')} channels)",
+            )
+            return meta, amplifier, analog
+        del amplifier
+        progress.emit(0.02, "Cached wideband lacks ANALOG_IN 0 — re-reading RHS…")
 
     if not config.rhs_file.exists():
         raise FileNotFoundError(f"File not found: {config.rhs_file}")
-    progress.emit(0.05, f"Reading {config.rhs_file.name}...")
-    data = load_rhs_file(config.rhs_file)
+    progress.emit(0.05, f"Reading {config.rhs_file.name} (stream → memmap)...")
+    layout.ensure()
+
+    # Peek header for dimensions, then stream blocks straight into the cache file.
+    from intanutil.header import read_header
+    from intanutil.data import calculate_data_size
+    from load_intan_rhs_format import read_data_to_amplifier_memmap
+
+    with open(config.rhs_file, "rb") as fid:
+        header = read_header(fid)
+        data_present, _filesize, _num_blocks, num_samples = calculate_data_size(
+            header, str(config.rhs_file), fid
+        )
+    if not data_present:
+        raise RuntimeError(f"RHS file has no data blocks: {config.rhs_file}")
+    n_channels = int(header["num_amplifier_channels"])
+    n_samples = int(num_samples)
+    if n_channels <= 0 or n_samples <= 0:
+        raise RuntimeError("RHS file does not contain amplifier_data.")
+
+    amp_mm = open_writable_memmap(
+        layout.amplifier_path, (n_channels, n_samples), np.dtype(np.float32)
+    )
+    try:
+
+        def _on_read_progress(fraction: float) -> None:
+            check_analysis_cancelled()
+            progress.emit(
+                0.05 + 0.85 * float(fraction),
+                f"Streaming RHS → cache ({int(fraction * 100)}%)",
+            )
+
+        data = read_data_to_amplifier_memmap(
+            str(config.rhs_file),
+            amp_mm,
+            progress_callback=_on_read_progress,
+        )
+        amp_mm.flush()
+    finally:
+        del amp_mm
+
     check_analysis_cancelled()
     fs = get_sampling_rate(data)
-    amplifier_raw = np.asarray(data.get("amplifier_data"))
-    if amplifier_raw.size == 0:
-        raise RuntimeError("RHS file does not contain amplifier_data.")
-    n_channels, n_samples = int(amplifier_raw.shape[0]), int(amplifier_raw.shape[1])
-    analog = (
-        np.asarray(get_analog_in0_signal(data), dtype=np.float64)
-        if uses_analog_trigger(config)
-        else np.empty(0, dtype=np.float64)
-    )
+    try:
+        analog = np.asarray(get_analog_in0_signal(data), dtype=np.float64)
+    except RuntimeError:
+        analog = np.empty(0, dtype=np.float64)
+        if uses_analog_trigger(config):
+            raise
     version = data.get("version") or {}
     frequency = data.get("frequency_parameters") or {}
     meta = {
@@ -262,29 +303,10 @@ def _ensure_raw_stream(
         "rhs_version_major": int(version.get("major", 3)),
         "notch_filter_frequency_hz": float(frequency.get("notch_filter_frequency") or 0.0),
     }
-
-    progress.emit(0.6, f"Caching wideband stream ({n_channels} channels)...")
-    layout.ensure()
-    amp_mm = open_writable_memmap(
-        layout.amplifier_path, (n_channels, n_samples), np.dtype(np.float32)
-    )
-    try:
-        for index, (start, end) in enumerate(_chunked(n_channels, 10)):
-            check_analysis_cancelled()
-            amp_mm[start:end] = np.asarray(amplifier_raw[start:end], dtype=np.float32)
-            progress.emit(
-                0.6 + 0.35 * (end / max(1, n_channels)),
-                f"Caching wideband stream: channel {end}/{n_channels}",
-            )
-            del index
-        amp_mm.flush()
-    finally:
-        del amp_mm
     if analog.size:
         np.save(layout.analog_in0_path, np.asarray(analog, dtype=np.float32))
     layout.write_meta(meta)
 
-    del amplifier_raw
     if isinstance(data, dict):
         data.pop("amplifier_data", None)
         data.pop("board_adc_data", None)
@@ -361,44 +383,100 @@ class _FilteredDiskStore:
         else:
             self.notch = None
             self.ready_notch = None
+        # Protect concurrent channel fills from ensure_channels workers.
+        self._lock = threading.Lock()
+        self._closed = False
 
-    def read_ready(self, kind: str, ch: int) -> np.ndarray | None:
-        if kind == "hp":
-            if not bool(self.ready_hp[ch]):
-                return None
-            return np.asarray(self.hp[ch], dtype=np.float32)
-        if kind == "lp":
-            if not bool(self.ready_lp[ch]):
-                return None
-            return np.asarray(self.lp[ch], dtype=np.float32)
-        if kind == "notch":
-            if self.notch is None or self.ready_notch is None:
-                return None
-            if not bool(self.ready_notch[ch]):
-                return None
-            return np.asarray(self.notch[ch], dtype=np.float64)
-        raise ValueError(kind)
+    def close(self) -> None:
+        """Release memmap handles so the cache directory can be deleted on Windows."""
+        if self._closed:
+            return
+        self._closed = True
+        for attr in ("hp", "lp", "ready_hp", "ready_lp", "notch", "ready_notch"):
+            arr = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if arr is None:
+                continue
+            try:
+                mmap = getattr(arr, "_mmap", None)
+                if mmap is not None:
+                    mmap.close()
+            except Exception:
+                pass
 
-    def write(self, kind: str, ch: int, row: np.ndarray) -> None:
-        if kind == "hp":
-            self.hp[ch] = np.asarray(row, dtype=np.float32)
-            self.ready_hp[ch] = True
-            self.hp.flush()
-            self.ready_hp.flush()
-        elif kind == "lp":
-            self.lp[ch] = np.asarray(row, dtype=np.float32)
-            self.ready_lp[ch] = True
-            self.lp.flush()
-            self.ready_lp.flush()
-        elif kind == "notch":
-            if self.notch is None or self.ready_notch is None:
-                return
-            self.notch[ch] = np.asarray(row, dtype=np.float32)
-            self.ready_notch[ch] = True
-            self.notch.flush()
-            self.ready_notch.flush()
-        else:
+    def is_ready(self, kind: str, ch: int) -> bool:
+        with self._lock:
+            if kind == "hp":
+                return bool(self.ready_hp[ch])
+            if kind == "lp":
+                return bool(self.ready_lp[ch])
+            if kind == "notch":
+                if self.notch is None or self.ready_notch is None:
+                    return False
+                return bool(self.ready_notch[ch])
             raise ValueError(kind)
+
+    def read_ready(self, kind: str, ch: int, *, copy: bool = False) -> np.ndarray | None:
+        """Return a ready row, or None.
+
+        By default returns a memmap view (float32 for hp/lp). Pass ``copy=True``
+        when the caller will retain the array outside the store lock / LRU.
+        """
+        with self._lock:
+            if kind == "hp":
+                if not bool(self.ready_hp[ch]):
+                    return None
+                row = self.hp[ch]
+                return np.array(row, dtype=np.float32, copy=True) if copy else row
+            if kind == "lp":
+                if not bool(self.ready_lp[ch]):
+                    return None
+                row = self.lp[ch]
+                return np.array(row, dtype=np.float32, copy=True) if copy else row
+            if kind == "notch":
+                if self.notch is None or self.ready_notch is None:
+                    return None
+                if not bool(self.ready_notch[ch]):
+                    return None
+                row = self.notch[ch]
+                return np.asarray(row, dtype=np.float64) if copy else row
+            raise ValueError(kind)
+
+    def write(self, kind: str, ch: int, row: np.ndarray, *, flush: bool = False) -> None:
+        with self._lock:
+            if kind == "hp":
+                self.hp[ch] = np.asarray(row, dtype=np.float32)
+                self.ready_hp[ch] = True
+                if flush:
+                    self.hp.flush()
+                    self.ready_hp.flush()
+            elif kind == "lp":
+                self.lp[ch] = np.asarray(row, dtype=np.float32)
+                self.ready_lp[ch] = True
+                if flush:
+                    self.lp.flush()
+                    self.ready_lp.flush()
+            elif kind == "notch":
+                if self.notch is None or self.ready_notch is None:
+                    return
+                self.notch[ch] = np.asarray(row, dtype=np.float32)
+                self.ready_notch[ch] = True
+                if flush:
+                    self.notch.flush()
+                    self.ready_notch.flush()
+            else:
+                raise ValueError(kind)
+
+    def flush(self) -> None:
+        """Flush all memmaps (call after a batch of writes)."""
+        with self._lock:
+            for arr in (self.hp, self.lp, self.ready_hp, self.ready_lp, self.notch, self.ready_notch):
+                if arr is None:
+                    continue
+                try:
+                    arr.flush()
+                except Exception:
+                    pass
 
 
 class LazyFilterBank:
@@ -420,6 +498,7 @@ class LazyFilterBank:
         filter_sos: np.ndarray | None = None,
         notch_sos: np.ndarray | None = None,
         disk_store: _FilteredDiskStore | None = None,
+        shared_lock: threading.Lock | None = None,
     ) -> None:
         if kind not in ("hp", "lp"):
             raise ValueError(f"Unsupported filter bank kind: {kind}")
@@ -437,26 +516,43 @@ class LazyFilterBank:
             filter_sos = (hp_sos if kind == "hp" else lp_sos) if filter_sos is None else filter_sos
         self._notch_sos = notch_sos
         self._sos = filter_sos
+        # Shared with the sibling HP/LP bank when they share ``notch_cache``.
+        self._lock = shared_lock if shared_lock is not None else threading.Lock()
+
+    def close(self) -> None:
+        """Drop RAM rows and release the shared disk store (idempotent)."""
+        self._cache.clear()
+        if self._notch_cache is not None:
+            self._notch_cache.clear()
+        store = self._disk
+        self._disk = None
+        if store is not None:
+            store.close()
 
     def __getitem__(self, index: int | tuple[Any, ...]) -> np.ndarray:
         # Support ``bank[ch, start:end]`` like a 2D ndarray (filters the row, then slices).
         if isinstance(index, tuple):
             if not index:
                 raise IndexError("Empty index")
-            row = self[int(index[0])]
+            row = self._row(int(index[0]), flush_disk=True)
             return row[index[1:]] if len(index) > 1 else row
-        ch = int(index)
-        cached = self._cache.get(ch)
-        if cached is not None:
-            self._cache.move_to_end(ch)
-            return cached
+        return self._row(int(index), flush_disk=True)
+
+    def _row(self, ch: int, *, flush_disk: bool) -> np.ndarray:
+        with self._lock:
+            cached = self._cache.get(ch)
+            if cached is not None:
+                self._cache.move_to_end(ch)
+                return cached
 
         if self._disk is not None:
-            from_disk = self._disk.read_ready(self._kind, ch)
+            # Copy into LRU so callers keep a stable buffer after later writes.
+            from_disk = self._disk.read_ready(self._kind, ch, copy=True)
             if from_disk is not None:
-                self._cache[ch] = from_disk
-                while len(self._cache) > self._max_cached:
-                    self._cache.popitem(last=False)
+                with self._lock:
+                    self._cache[ch] = from_disk
+                    while len(self._cache) > self._max_cached:
+                        self._cache.popitem(last=False)
                 return from_disk
 
         from scipy.signal import sosfilt
@@ -465,10 +561,13 @@ class LazyFilterBank:
         signal = self._notched_signal(ch, sosfilt)
         filtered = np.asarray(sosfilt(self._sos, signal), dtype=np.float32)
         if self._disk is not None:
-            self._disk.write(self._kind, ch, filtered)
-        self._cache[ch] = filtered
-        while len(self._cache) > self._max_cached:
-            self._cache.popitem(last=False)
+            self._disk.write(self._kind, ch, filtered, flush=False)
+            if flush_disk:
+                self._disk.flush()
+        with self._lock:
+            self._cache[ch] = filtered
+            while len(self._cache) > self._max_cached:
+                self._cache.popitem(last=False)
         return filtered
 
     def _notched_signal(self, ch: int, sosfilt: Any) -> np.ndarray:
@@ -476,37 +575,53 @@ class LazyFilterBank:
             return np.asarray(self._amplifier[ch], dtype=np.float64)
 
         if self._notch_cache is not None:
-            signal = self._notch_cache.get(ch)
-            if signal is not None:
-                self._notch_cache.move_to_end(ch)
-                return signal
+            with self._lock:
+                signal = self._notch_cache.get(ch)
+                if signal is not None:
+                    self._notch_cache.move_to_end(ch)
+                    return signal
 
         if self._disk is not None:
-            from_disk = self._disk.read_ready("notch", ch)
+            from_disk = self._disk.read_ready("notch", ch, copy=True)
             if from_disk is not None:
                 if self._notch_cache is not None:
-                    self._notch_cache[ch] = from_disk
-                    while len(self._notch_cache) > self._max_cached:
-                        self._notch_cache.popitem(last=False)
+                    with self._lock:
+                        self._notch_cache[ch] = from_disk
+                        while len(self._notch_cache) > self._max_cached:
+                            self._notch_cache.popitem(last=False)
                 return from_disk
 
         wide = np.asarray(self._amplifier[ch], dtype=np.float64)
         signal = sosfilt(self._notch_sos, wide)
         if self._disk is not None:
-            self._disk.write("notch", ch, signal)
+            self._disk.write("notch", ch, signal, flush=False)
         if self._notch_cache is not None:
-            self._notch_cache[ch] = signal
-            while len(self._notch_cache) > self._max_cached:
-                self._notch_cache.popitem(last=False)
+            with self._lock:
+                self._notch_cache[ch] = signal
+                while len(self._notch_cache) > self._max_cached:
+                    self._notch_cache.popitem(last=False)
         return signal
 
     def clear(self) -> None:
-        self._cache.clear()
+        with self._lock:
+            self._cache.clear()
 
-    def prefetch(self, channels: Sequence[int]) -> None:
+    def is_ready(self, ch: int) -> bool:
+        """True when the row is already in RAM or on disk (no sosfilt)."""
+        ch = int(ch)
+        with self._lock:
+            if ch in self._cache:
+                return True
+        if self._disk is not None:
+            return self._disk.is_ready(self._kind, ch)
+        return False
+
+    def prefetch(self, channels: Sequence[int], *, flush_batch: bool = True) -> None:
         """Warm RAM (and disk) cache for the given channel indices."""
         for ch in channels:
-            _ = self[int(ch)]
+            self._row(int(ch), flush_disk=False)
+        if flush_batch and self._disk is not None:
+            self._disk.flush()
 
 
 # ---------------------------------------------------------------- segmentation
@@ -610,6 +725,7 @@ def build_recording(
         int(raw_meta["n_samples"]),
         with_notch=notch_sos is not None,
     )
+    filter_lock = threading.Lock()
     high = LazyFilterBank(
         amplifier,
         dsp,
@@ -618,6 +734,7 @@ def build_recording(
         filter_sos=hp_sos,
         notch_sos=notch_sos,
         disk_store=disk_store,
+        shared_lock=filter_lock,
     )
     low = LazyFilterBank(
         amplifier,
@@ -627,6 +744,7 @@ def build_recording(
         filter_sos=lp_sos,
         notch_sos=notch_sos,
         disk_store=disk_store,
+        shared_lock=filter_lock,
     )
     source = AmplifierSpikeSource(
         amplifier=amplifier,
@@ -999,17 +1117,13 @@ def export_dataset(
     bundle = BundleLayout(root=Path(destination))
     if progress is not None:
         progress(f"Exporting processed dataset to {bundle.root}...")
-    trigger_windows = recording.derived.trigger_windows
-    if include_trigger_windows and not trigger_windows and recording.source is not None:
-        hp = getattr(recording.source, "highpass", None)
-        if isinstance(hp, LazyFilterBank):
-            if progress is not None:
-                progress(
-                    "Skipping stimulation-window export — channels are computed on demand."
-                )
-        else:
-            if progress is not None:
-                progress("Extracting first / second stimulation windows...")
+    if include_trigger_windows and not recording.derived.trigger_windows:
+        if progress is not None:
+            progress("Extracting first / second stimulation windows...")
+        # Prefer bulk extract when full stacks are available; otherwise
+        # ``write_bundle`` materializes per-channel slices from the live source.
+        hp = getattr(recording.source, "highpass", None) if recording.source else None
+        if recording.source is not None and not isinstance(hp, LazyFilterBank):
             recording.derived.trigger_windows = _trigger_windows(
                 {
                     "raw": recording.source.amplifier,

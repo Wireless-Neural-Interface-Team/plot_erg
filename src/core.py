@@ -227,8 +227,8 @@ def resolve_recording_windows(
         pre_s=config.pre_s,
         post_s=config.post_s,
     )
-    end_rising_rel_s = mean_time_to_next_rising_edge_s(
-        analog_in0, trigger_indices, config.threshold, fs
+    end_rising_rel_s = mean_time_to_pulse_end_s(
+        analog_in0, trigger_indices, config.threshold, fs, trigger_edge=config.edge
     )
     return (
         valid_triggers,
@@ -251,24 +251,42 @@ def detect_edges(signal: np.ndarray, threshold: float, edge: str) -> np.ndarray:
     raise ValueError("edge must be 'falling' or 'rising'.")
 
 
+def mean_time_to_pulse_end_s(
+    signal: np.ndarray,
+    trigger_indices: np.ndarray,
+    threshold: float,
+    fs: float,
+    *,
+    trigger_edge: str = "falling",
+) -> float | None:
+    """Mean time (s) from each trigger to the opposite edge (typical pulse end).
+
+    Falling trigger → next rising (active-high pulse end).
+    Rising trigger → next falling (active-low / rising-onset pulse end).
+    """
+    trigger_indices = np.asarray(trigger_indices, dtype=np.int64)
+    end_edge = "rising" if trigger_edge == "falling" else "falling"
+    end_idx = detect_edges(signal, threshold, end_edge)
+    if end_idx.size == 0 or trigger_indices.size == 0:
+        return None
+    positions = np.searchsorted(end_idx, trigger_indices + 1, side="left")
+    valid = positions < end_idx.size
+    if not np.any(valid):
+        return None
+    deltas = (end_idx[positions[valid]] - trigger_indices[valid]).astype(np.float64) / float(fs)
+    return float(np.mean(deltas))
+
+
 def mean_time_to_next_rising_edge_s(
     signal: np.ndarray,
     trigger_indices: np.ndarray,
     threshold: float,
     fs: float,
 ) -> float | None:
-    """Mean time (s) from each trigger to the next rising-edge crossing (typical pulse end)."""
-    trigger_indices = np.asarray(trigger_indices, dtype=np.int64)
-    rising_idx = detect_edges(signal, threshold, "rising")
-    if rising_idx.size == 0 or trigger_indices.size == 0:
-        return None
-    # First rising edge strictly after each trigger (O(T log R)).
-    positions = np.searchsorted(rising_idx, trigger_indices + 1, side="left")
-    valid = positions < rising_idx.size
-    if not np.any(valid):
-        return None
-    deltas = (rising_idx[positions[valid]] - trigger_indices[valid]).astype(np.float64) / float(fs)
-    return float(np.mean(deltas))
+    """Backward-compatible alias: pulse end after a falling-edge trigger."""
+    return mean_time_to_pulse_end_s(
+        signal, trigger_indices, threshold, fs, trigger_edge="falling"
+    )
 
 
 def detect_spikes_at_threshold(
@@ -457,18 +475,22 @@ class AmplifierSpikeSource:
         if self._closed:
             return
         self._closed = True
-        for arr in (self.amplifier, self.highpass, self.lowpass):
-            try:
-                if isinstance(arr, np.memmap):
+        for name in ("amplifier", "highpass", "lowpass"):
+            arr = getattr(self, name)
+            setattr(self, name, np.empty((0,)))
+            if isinstance(arr, np.memmap):
+                try:
                     arr._mmap.close()
-            except Exception:
-                pass
-        self.amplifier = np.empty((0,))
-        self.highpass = np.empty((0,))
-        self.lowpass = np.empty((0,))
-        if self.work_dir is not None and self.work_dir.exists():
-            shutil.rmtree(self.work_dir, ignore_errors=True)
-            cleanup_plot_erg_root_if_empty(self.work_dir)
+                except Exception:
+                    pass
+            elif hasattr(arr, "close"):
+                # LazyFilterBank (and similar) hold their own disk memmaps.
+                try:
+                    arr.close()
+                except Exception:
+                    pass
+        # Keep ``work_dir`` on disk so the next CLI run can reuse HP/LP memmaps.
+        # Callers that want a throwaway temp dir should delete it themselves.
 
 
 def valid_triggers_and_timebase(
@@ -561,7 +583,9 @@ def persist_amp_and_filtered_stacks(
         print("Reusing cached amplifier / filtered memmaps (.plot_erg).")
         return amp_path, high_path, low_path
 
-    intan_dsp.save_json(work_dir / "intan_dsp.json")
+    # Write JSON only after stacks succeed — otherwise a crash mid-filter would
+    # leave new settings + stale HP/LP and look "valid" on the next run.
+    json_path = work_dir / "intan_dsp.json"
 
     n_ch, n_samp = int(shape[0]), int(shape[1])
     workers = resolve_channel_workers(channel_workers, n_ch)
@@ -614,6 +638,7 @@ def persist_amp_and_filtered_stacks(
             low_mm.flush()
         finally:
             del amp_mm, high_mm, low_mm
+        intan_dsp.save_json(json_path)
         return amp_path, high_path, low_path
 
     if amplifier_memmap is not None:
@@ -627,6 +652,7 @@ def persist_amp_and_filtered_stacks(
             cancel_check=check_analysis_cancelled,
             progress_every=progress_every,
         )
+        intan_dsp.save_json(json_path)
         return amp_path, high_path, low_path
 
     raise ValueError("persist_amp_and_filtered_stacks requires amplifier_2d or amplifier_memmap.")

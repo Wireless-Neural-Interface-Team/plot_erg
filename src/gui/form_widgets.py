@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from view_config import AxisLimits
+from view_config import AxisLimits, TextFace
 
 
 def configure_narrow_form(form: QFormLayout) -> QFormLayout:
@@ -151,6 +151,100 @@ def make_axis_spin(
     if suffix:
         box.setSuffix(suffix)
     return box
+
+
+class FontFaceRow(QWidget):
+    """Cases Gras / Italique / Souligné pour un rôle typographique."""
+
+    changed = Signal()
+
+    def __init__(
+        self, face: TextFace | None = None, parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        face = face or TextFace()
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(0)
+        self._bold = QCheckBox("Gras")
+        self._italic = QCheckBox("Italique")
+        self._underline = QCheckBox("Souligné")
+        bold_font = self._bold.font()
+        bold_font.setBold(True)
+        self._bold.setFont(bold_font)
+        italic_font = self._italic.font()
+        italic_font.setItalic(True)
+        self._italic.setFont(italic_font)
+        underline_font = self._underline.font()
+        underline_font.setUnderline(True)
+        self._underline.setFont(underline_font)
+        self._bold.setChecked(bool(face.bold))
+        self._italic.setChecked(bool(face.italic))
+        self._underline.setChecked(bool(face.underline))
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(8)
+        root.addWidget(self._bold)
+        root.addWidget(self._italic)
+        root.addWidget(self._underline)
+        root.addStretch(1)
+        for box in (self._bold, self._italic, self._underline):
+            box.toggled.connect(lambda _c: self.changed.emit())
+
+    def value(self) -> TextFace:
+        return TextFace(
+            bold=self._bold.isChecked(),
+            italic=self._italic.isChecked(),
+            underline=self._underline.isChecked(),
+        )
+
+    def set_value(self, face: TextFace) -> None:
+        self._bold.setChecked(bool(face.bold))
+        self._italic.setChecked(bool(face.italic))
+        self._underline.setChecked(bool(face.underline))
+
+
+class FontSizeFaceRow(QWidget):
+    """Taille de police (pt) + Gras / Italique / Souligné."""
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        minimum: float,
+        maximum: float,
+        value: float,
+        face: TextFace | None = None,
+        *,
+        decimals: int = 1,
+        step: float = 0.5,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(0)
+        self._size = make_double_spin(
+            minimum, maximum, value, decimals=decimals, step=step, suffix=" pt"
+        )
+        self._face = FontFaceRow(face, self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(2)
+        root.addWidget(self._size)
+        root.addWidget(self._face)
+        self._size.valueChanged.connect(lambda _v: self.changed.emit())
+        self._face.changed.connect(self.changed.emit)
+
+    def size_value(self) -> float:
+        return float(self._size.value())
+
+    def face_value(self) -> TextFace:
+        return self._face.value()
+
+    def set_size(self, value: float) -> None:
+        self._size.setValue(float(value))
+
+    def set_face(self, face: TextFace) -> None:
+        self._face.set_value(face)
 
 
 class AxisLimitRow(QWidget):

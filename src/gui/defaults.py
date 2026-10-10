@@ -53,6 +53,10 @@ def app_defaults_from_config(cfg: AnalysisConfig | None = None) -> dict[str, Any
         "default_intan_lp_filter_type": cfg.intan_lp_filter_type,
         "default_intan_lp_filter_cutoff_hz": cfg.intan_lp_filter_cutoff_hz,
         "default_software_notch_hz": int(getattr(cfg, "software_notch_hz", 0) or 0),
+        "default_intan_artifact_suppression_enabled": bool(
+            cfg.intan_artifact_suppression_enabled
+        ),
+        "default_intan_artifact_threshold_uv": float(cfg.intan_artifact_threshold_uv),
         "default_channel_workers": cfg.channel_workers,
         "default_sampling_percent": cfg.sampling_percent,
         "default_probe_layout_json": cfg.probe_layout_json,
@@ -76,7 +80,7 @@ def viewer_settings_from_defaults(defaults: Mapping[str, Any] | None = None) -> 
         sampling_percent=int(d.get("default_sampling_percent", 100) or 100),
         spike_overlay_pre_ms=float(d.get("default_spike_overlay_pre_ms", 2.0)),
         spike_overlay_post_ms=float(d.get("default_spike_overlay_post_ms", 4.0)),
-        stim_hp_ylim=AxisLimits(
+        hp_ylim=AxisLimits(
             enabled=bool(d.get("default_first_trigger_hp_ylim_enabled", False)),
             minimum=float(d.get("default_first_trigger_hp_ylim_min_uv", -200.0)),
             maximum=float(d.get("default_first_trigger_hp_ylim_max_uv", 200.0)),
@@ -86,9 +90,12 @@ def viewer_settings_from_defaults(defaults: Mapping[str, Any] | None = None) -> 
         style=PanelStyle(),
         montage_channels=12,
         montage_page=0,
+        montage_review_channels=10,
+        montage_review_page=0,
         time_sync=str(d.get("default_time_sync", "recording_start")),  # type: ignore[arg-type]
         trigger_polarity=str(d.get("default_trigger_polarity", polarity)),  # type: ignore[arg-type]
         trigger_threshold=float(d.get("default_threshold", 1.0)),
+        graph_height_px=int(d.get("default_graph_height_px", 400) or 400),
     )
 
 
@@ -148,9 +155,9 @@ def build_config_from_defaults(
         zoom_onset_t1_s=float(display.zoom_onset_t1_s),
         zoom_end_t0_s=float(display.zoom_end_t0_s),
         zoom_end_t1_s=float(display.zoom_end_t1_s),
-        first_trigger_hp_ylim_enabled=display.stim_hp_ylim.enabled,
-        first_trigger_hp_ylim_min_uv=display.stim_hp_ylim.minimum,
-        first_trigger_hp_ylim_max_uv=display.stim_hp_ylim.maximum,
+        first_trigger_hp_ylim_enabled=display.hp_ylim.enabled,
+        first_trigger_hp_ylim_min_uv=display.hp_ylim.minimum,
+        first_trigger_hp_ylim_max_uv=display.hp_ylim.maximum,
         rms_window_s=float(d.get("default_rms_window_s", 1.0)),
         intan_hp_filter_order=int(d.get("default_intan_hp_filter_order", 2) or 2),
         intan_hp_filter_type=str(d.get("default_intan_hp_filter_type", "bessel")),  # type: ignore[arg-type]
@@ -159,6 +166,12 @@ def build_config_from_defaults(
         intan_lp_filter_type=str(d.get("default_intan_lp_filter_type", "bessel")),  # type: ignore[arg-type]
         intan_lp_filter_cutoff_hz=float(d.get("default_intan_lp_filter_cutoff_hz", 250.0)),
         software_notch_hz=int(d.get("default_software_notch_hz", 0) or 0),  # type: ignore[arg-type]
+        intan_artifact_threshold_uv=float(
+            d.get("default_intan_artifact_threshold_uv", 2500.0)
+        ),
+        intan_artifact_suppression_enabled=bool(
+            d.get("default_intan_artifact_suppression_enabled", True)
+        ),
         work_dir=None,
         channel_workers=int(workers) if workers else None,
         sampling_percent=int(display.sampling_percent),

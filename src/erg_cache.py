@@ -372,6 +372,16 @@ def iter_raw_layouts(cache_root: Path) -> Iterator[RawStreamLayout]:
             yield RawStreamLayout(root=child)
 
 
+def iter_filter_layouts(cache_root: Path) -> Iterator[FilteredStreamLayout]:
+    """Yield on-disk HP/LP filter caches (``_filter_<hash>/``)."""
+    root = Path(cache_root)
+    if not root.exists():
+        return
+    for child in sorted(root.iterdir()):
+        if child.is_dir() and child.name.startswith("_filter_"):
+            yield FilteredStreamLayout(root=child)
+
+
 def _tree_size(root: Path) -> int:
     total = 0
     for path in Path(root).rglob("*"):
@@ -384,9 +394,10 @@ def _tree_size(root: Path) -> int:
 
 
 def cache_size_bytes(cache_root: Path) -> int:
-    """Total cache footprint, including the shared raw-stream caches."""
+    """Total cache footprint, including raw and filter stream caches."""
     total = sum(bundle.size_bytes() for bundle in iter_bundles(cache_root))
     total += sum(_tree_size(layout.root) for layout in iter_raw_layouts(cache_root))
+    total += sum(_tree_size(layout.root) for layout in iter_filter_layouts(cache_root))
     return total
 
 
@@ -399,8 +410,9 @@ def clear_cache(
     *,
     keep: set[Path] | None = None,
     include_raw: bool = True,
+    include_filters: bool = True,
 ) -> int:
-    """Delete cached bundles (and raw-stream caches). Returns the count removed."""
+    """Delete cached bundles (and raw / filter stream caches). Returns count removed."""
     protected = {Path(p).resolve() for p in (keep or set())}
     removed = 0
     for bundle in list(iter_bundles(cache_root)):
@@ -410,6 +422,12 @@ def clear_cache(
         removed += 1
     if include_raw:
         for layout in list(iter_raw_layouts(cache_root)):
+            if layout.root.resolve() in protected:
+                continue
+            remove_bundle(layout.root)
+            removed += 1
+    if include_filters:
+        for layout in list(iter_filter_layouts(cache_root)):
             if layout.root.resolve() in protected:
                 continue
             remove_bundle(layout.root)
@@ -424,22 +442,32 @@ def clear_cache(
 
 
 def prune_cache(cache_root: Path, *, max_bytes: int, keep: set[Path] | None = None) -> int:
-    """Remove the oldest bundles until the cache fits in ``max_bytes``."""
+    """Remove oldest bundles / filter caches until the cache fits in ``max_bytes``."""
     if max_bytes <= 0:
         return 0
     protected = {Path(p).resolve() for p in (keep or set())}
-    bundles = [
-        (bundle, bundle.size_bytes(), _bundle_mtime(bundle))
-        for bundle in iter_bundles(cache_root)
-        if bundle.root.resolve() not in protected
-    ]
-    total = sum(size for _b, size, _m in bundles)
-    bundles.sort(key=lambda item: item[2])
+    candidates: list[tuple[Path, int, float]] = []
+    for bundle in iter_bundles(cache_root):
+        if bundle.root.resolve() in protected:
+            continue
+        candidates.append((bundle.root, bundle.size_bytes(), _bundle_mtime(bundle)))
+    for layout in iter_filter_layouts(cache_root):
+        if layout.root.resolve() in protected:
+            continue
+        try:
+            mtime = layout.root.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        candidates.append((layout.root, _tree_size(layout.root), mtime))
+    total = sum(size for _p, size, _m in candidates)
+    # Also count raw caches in the budget, but prune bundles/filters first.
+    total += sum(_tree_size(layout.root) for layout in iter_raw_layouts(cache_root))
+    candidates.sort(key=lambda item: item[2])
     removed = 0
-    for bundle, size, _mtime in bundles:
+    for path, size, _mtime in candidates:
         if total <= max_bytes:
             break
-        remove_bundle(bundle.root)
+        remove_bundle(path)
         total -= size
         removed += 1
     return removed
