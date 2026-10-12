@@ -111,10 +111,13 @@ def read_data_to_amplifier_memmap(filename, amplifier_memmap, *, progress_callba
 
     result = {}
     header_to_result(header, result)
-    # Amplifier already scaled in the stream path; scale ADC + timestamps only.
-    scale_timestamps(header, data)
+    # Amplifier and ADC are already scaled in the stream path. The full
+    # timestamp vector is omitted on that path (gap check already printed).
+    timestamps = data.get('t')
+    if timestamps is not None and getattr(timestamps, 'size', 0):
+        scale_timestamps(header, data)
     adc = data.get('board_adc_data')
-    if adc is not None and getattr(adc, 'size', 0):
+    if adc is not None and getattr(adc, 'size', 0) and getattr(adc, 'dtype', None) != np.float32:
         scaled_adc = adc.astype(np.float32, copy=True)
         scaled_adc -= np.float32(32768.0)
         scaled_adc *= np.float32(312.5e-6)

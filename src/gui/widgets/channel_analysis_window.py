@@ -218,10 +218,10 @@ class ChannelAnalysisWindow(QWidget):
         self._cb_summary_rms = QCheckBox("Mean RMS / enregistrement")
         self._cb_summary_rms_table = QCheckBox("Mean RMS / canal")
         self._cb_summary_rms.setToolTip(
-            "Profil RMS moyen sur tous les canaux — une courbe par enregistrement."
+            "Profil RMS moyen sur les canaux cochés — une courbe par enregistrement."
         )
         self._cb_summary_rms_table.setToolTip(
-            "Table du RMS moyen par canal (une colonne par enregistrement)."
+            "Table du RMS moyen des canaux cochés (une colonne par enregistrement)."
         )
         self._cb_summary_rms.setChecked(analysis.show_summary_rms)
         self._cb_summary_rms_table.setChecked(analysis.show_summary_rms_table)
@@ -660,8 +660,7 @@ class ChannelAnalysisWindow(QWidget):
         self._sync_params_base()
         self._rebuild_placements()
         self.refreshRequested.emit(self)
-        if not self._embedded:
-            self.analysisCurvesChanged.emit(analysis)
+        self.analysisCurvesChanged.emit(analysis)
 
     def _sync_stim_enabled(self) -> None:
         self._stim_spin.setEnabled(self._preview_mode == "stimulation")
@@ -798,16 +797,13 @@ class ChannelAnalysisWindow(QWidget):
         return ()
 
     def _stim_reference_s(self) -> float | None:
-        """Onset de référence pour convertir une plage relative → absolue."""
+        """Onset de la stimulation choisie (le spin, même hors mode stimulation)."""
         if not self._stim_times_s:
             return None
-        analysis = self._analysis_from_toggles()
-        index = analysis.trigger_index()
-        if index is None:
+        index = max(0, int(self._stim_spin.value()) - 1)
+        if index >= len(self._stim_times_s):
             index = 0
-        if 0 <= int(index) < len(self._stim_times_s):
-            return float(self._stim_times_s[int(index)])
-        return float(self._stim_times_s[0])
+        return float(self._stim_times_s[index])
 
     def _any_zooms_applied(self) -> bool:
         return bool(self._zooms_applied)
@@ -859,7 +855,9 @@ class ChannelAnalysisWindow(QWidget):
                     )
                 else:
                     stim_t = self._stim_reference_s()
-                    if stim_t is not None:
+                    if stim_t is None:
+                        self._relative_zoom_skipped = True
+                    else:
                         zoom_panels.append(
                             base.with_custom_zoom(
                                 stim_t + t0,
@@ -912,6 +910,7 @@ class ChannelAnalysisWindow(QWidget):
                 )
 
     def _rebuild_placements(self, *, reopen_zooms: bool = False) -> None:
+        self._relative_zoom_skipped = False
         analysis = self._analysis_from_toggles()
         analysis_panels: list[PanelPlacement] = []
         zoom_panels: list[PanelPlacement] = []
@@ -1163,7 +1162,10 @@ class ChannelAnalysisWindow(QWidget):
         self._rebuild_placements(reopen_zooms=True)
         n_zoom = len(self._zoom_placements)
         kind = "analyse" if self.is_analysis_view() else "continuous"
-        self._status.setText(f"{len(bars)} plage(s) — {n_zoom} zoom(s) {kind}.")
+        warn = ""
+        if getattr(self, "_relative_zoom_skipped", False):
+            warn = " Plage relative ignorée : aucun onset de stimulation."
+        self._status.setText(f"{len(bars)} plage(s) — {n_zoom} zoom(s) {kind}.{warn}")
         self.refreshRequested.emit(self)
 
     # -------------------------------------------------------------- bars UI
@@ -1239,6 +1241,8 @@ class ChannelAnalysisWindow(QWidget):
         span = self._visible_graph_time_span()
         if span is not None:
             self._range_ctrl.set_time_span(span[0], span[1])
+        # Ne pas redessiner sur un ViewBox déjà détruit par un rebuild de grille.
+        self._range_ctrl.detach()
         before = len(self._range_ctrl.bars or ())
         self._range_ctrl.add_bar()
         bars = self._range_ctrl.bars or ()
@@ -1288,6 +1292,8 @@ class ChannelAnalysisWindow(QWidget):
         self._sync_analysis_range_ctrl_from_list()
         if self.is_analysis_view():
             self._attach_range_bars_to_analysis()
+        else:
+            self._attach_relative_bars_to_continuous()
         if self._zooms_applied:
             self._rebuild_placements(reopen_zooms=True)
             self.refreshRequested.emit(self)
@@ -1313,6 +1319,7 @@ class ChannelAnalysisWindow(QWidget):
             abs_bars = list(self._range_ctrl.bars or ())
             if 0 <= abs_idx < len(abs_bars):
                 abs_bars.pop(abs_idx)
+                self._range_ctrl.detach()
                 self._range_ctrl.set_bars(abs_bars, active_index=max(0, abs_idx - 1))
         remaining = self._all_range_bars()
         self._active_range_index = max(0, min(len(remaining) - 1, idx))
@@ -1330,14 +1337,16 @@ class ChannelAnalysisWindow(QWidget):
             self._active_range_index = 0
             return
         self._active_range_index = max(0, min(len(bars) - 1, int(index)))
-        # Sync controllers for drag targets.
         n_abs = len(self._range_ctrl.bars or ())
-        if self._active_range_index < n_abs:
+        if self.is_analysis_view():
+            # Le contrôleur d’analyse porte absolues puis relatives, dans cet ordre.
+            self._analysis_range_ctrl.set_active_index(self._active_range_index)
+        elif self._active_range_index < n_abs:
             self._range_ctrl.set_active_index(self._active_range_index)
+            self._analysis_range_ctrl.set_active_index(-1)
         else:
-            self._analysis_range_ctrl.set_active_index(
-                self._active_range_index - n_abs
-            )
+            self._range_ctrl.set_active_index(-1)
+            self._analysis_range_ctrl.set_active_index(self._active_range_index - n_abs)
         self._sync_settings_from_bars()
         self._update_range_counts()
 
@@ -1349,6 +1358,20 @@ class ChannelAnalysisWindow(QWidget):
     def _on_analysis_bars_changed(self, bars: object) -> None:
         """Glisser une barre Analyse → resynchroniser la liste partagée."""
         shared = [replace(b) for b in bars]  # type: ignore[arg-type]
+        if not self.is_analysis_view():
+            stim = self._stim_reference_s()
+            if stim is None:
+                return
+            self._relative_ranges = [
+                replace(bar, t0_s=float(bar.t0_s) - float(stim), t1_s=float(bar.t1_s) - float(stim))
+                for bar in shared
+                if bar.relative_to_stim
+            ]
+            n_abs = len(self._range_ctrl.bars or ())
+            self._active_range_index = n_abs + int(self._analysis_range_ctrl.active_index)
+            self._update_range_counts()
+            self._analysis_bars_debouncer.request()
+            return
         abs_bars = [b for b in shared if not b.relative_to_stim]
         rel_bars = [b for b in shared if b.relative_to_stim]
         try:
@@ -1364,9 +1387,18 @@ class ChannelAnalysisWindow(QWidget):
         self._update_range_counts()
         self._analysis_bars_debouncer.request()
 
+    def _refresh_spike_scope_for_active_range(self) -> None:
+        """La plage active filtre le spike scope — redessiner sans bouger les traces."""
+        if not self._analysis_from_toggles().show_overlay:
+            return
+        self._preserve_view = True
+        self._sync_settings_from_bars()
+        self.refreshRequested.emit(self)
+
     def _after_bars_moved(self) -> None:
         """Déplacement des barres continuous → zooms (si appliqués)."""
         if not self._zooms_applied:
+            self._refresh_spike_scope_for_active_range()
             return
         if self.is_analysis_view():
             self._after_analysis_bars_moved()
@@ -1383,6 +1415,7 @@ class ChannelAnalysisWindow(QWidget):
         if self._zoom_window is not None:
             self._render_zoom_window(self._zoom_window)
         self._status.setText("Barres déplacées — zooms actualisés.")
+        self._refresh_spike_scope_for_active_range()
 
     def _continuous_zoom_panel_lists(
         self,
@@ -1463,6 +1496,7 @@ class ChannelAnalysisWindow(QWidget):
     def _after_analysis_bars_moved(self) -> None:
         """Déplacement des barres → zooms analyse (fenêtre détachée)."""
         if not self._zooms_applied:
+            self._refresh_spike_scope_for_active_range()
             return
         analysis = self._ensure_analysis_curves()
         analysis_panels: list[PanelPlacement] = []
@@ -1488,6 +1522,7 @@ class ChannelAnalysisWindow(QWidget):
         if self._zoom_window is not None:
             self._render_zoom_window(self._zoom_window)
         self._status.setText("Barres déplacées — zooms actualisés.")
+        self._refresh_spike_scope_for_active_range()
 
     def _sync_analysis_range_ctrl_from_list(self) -> None:
         """Pousser les plages partagées vers le controller analyse."""
@@ -1749,9 +1784,10 @@ class ChannelAnalysisWindow(QWidget):
             if not self._analysis_range_ctrl.is_dragging:
                 self._attach_range_bars_to_analysis()
         else:
-            self._analysis_range_ctrl.detach()
             if not self._range_ctrl.is_dragging:
                 self._attach_range_bars_to_full_recording()
+            if not self._analysis_range_ctrl.is_dragging:
+                self._attach_relative_bars_to_continuous()
 
     def _attach_range_bars_to_full_recording(self) -> None:
         """Réattacher les barres interactives sur le panneau brut (non zoomé)."""
@@ -1783,6 +1819,47 @@ class ChannelAnalysisWindow(QWidget):
                 pass
             self._range_ctrl.attach(host)
             break
+
+    def _attach_relative_bars_to_continuous(self) -> None:
+        """Dessiner les plages relatives sur l’axe continu (temps fichier)."""
+        if self.is_analysis_view():
+            return
+        host = None
+        offset = 0.0
+        for placement in self._placements:
+            if placement.panel != "full_recording" or placement.has_custom_zoom:
+                continue
+            widget = self.grid.panel_widget(placement)
+            if widget is None:
+                continue
+            candidate = getattr(widget, "plot_host", None) or getattr(widget, "_plot", None)
+            plots = list(getattr(candidate, "plot_items", lambda: [])() or [])
+            if candidate is None or not plots:
+                continue
+            host = candidate
+            offset = continuous_sync_offset_s(self._stim_times_s, self.settings.time_sync)
+            break
+        rel = list(self._relative_ranges)
+        stim = self._stim_reference_s()
+        if host is None or not rel or stim is None:
+            self._analysis_range_ctrl.detach()
+            return
+        shown = [
+            replace(bar, t0_s=float(stim) + float(bar.t0_s), t1_s=float(stim) + float(bar.t1_s))
+            for bar in rel
+        ]
+        n_abs = len(self._range_ctrl.bars or ())
+        active = self._active_range_index - n_abs
+        try:
+            self._analysis_range_ctrl.barsChanged.disconnect(self._on_analysis_bars_changed)
+        except (TypeError, RuntimeError):
+            pass
+        self._analysis_range_ctrl.set_display_offset(offset)
+        self._analysis_range_ctrl.set_bars(shown, active_index=max(0, active))
+        if active < 0:
+            self._analysis_range_ctrl.set_active_index(-1)
+        self._analysis_range_ctrl.barsChanged.connect(self._on_analysis_bars_changed)
+        self._analysis_range_ctrl.attach(host)
 
     def closeEvent(self, event: Any) -> None:  # noqa: D102
         self._range_ctrl.detach()

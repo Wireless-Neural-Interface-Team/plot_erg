@@ -246,6 +246,22 @@ class ChannelEnsureWorker(QThread):
         with self._lock:
             return len(self._high), len(self._low)
 
+    def retain_channel_names(self, allowed: Sequence[str]) -> None:
+        """Retirer de la file les canaux qui ne sont plus cochés."""
+        names = {str(name) for name in allowed}
+
+        def _keep(job: _EnsureJob) -> bool:
+            channel_names = getattr(job.recording, "channel_names", ())
+            if 0 <= job.channel < len(channel_names):
+                return str(channel_names[job.channel]) in names
+            return False
+
+        with self._lock:
+            self._high = [job for job in self._high if _keep(job)]
+            self._low = [job for job in self._low if _keep(job)]
+            high, low = len(self._high), len(self._low)
+        self.queue_changed.emit(high, low)
+
     def submit(
         self,
         requests: Sequence[ChannelEnsureRequest],

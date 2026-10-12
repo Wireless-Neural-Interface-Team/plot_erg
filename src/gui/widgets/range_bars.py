@@ -210,6 +210,10 @@ class RangeBarControllerPg(QObject):
         if not self._bars:
             self._active_index = 0
             return
+        if int(index) < 0:
+            self._active_index = -1
+            self._redraw_items()
+            return
         self._active_index = max(0, min(len(self._bars) - 1, int(index)))
         self._redraw_items()
 

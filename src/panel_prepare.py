@@ -15,7 +15,11 @@ import numpy as np
 
 from display_config import STREAM_PLOT_COLORS, recording_trace_color
 from panel_catalog import panel_label
-from view_config import STREAM_SHORT_LABELS, continuous_sync_offset_s
+from view_config import (
+    STREAM_SHORT_LABELS,
+    continuous_sync_offset_s,
+    included_channel_indices,
+)
 
 # ---------------------------------------------------------------------------
 # Spec dataclasses
@@ -32,6 +36,7 @@ class CurveSeries:
     label: str = ""
     linewidth: float = 1.0
     row: int = 0
+    alpha: float = 1.0
 
 
 @dataclass
@@ -69,6 +74,55 @@ class AnnotationSpec:
     text: str = ""
     color: str = "#dc2626"
     row: int = 0
+    linestyle: str = ":"
+    label: str = ""
+
+
+# Courbes en µV sur lesquelles le seuil de spike a un sens visuel.
+_VOLTAGE_TRACE_KINDS = frozenset({"raw", "hp", "lp"})
+_SPIKE_THRESHOLD_COLOR = "#6d28d9"
+
+
+def _show_spike_threshold_lines(request: Any) -> bool:
+    settings = getattr(request, "settings", None)
+    return bool(getattr(settings, "show_spike_threshold", False))
+
+
+def _threshold_line_annotations(
+    request: Any,
+    channel_index: int,
+    *,
+    row: int = 0,
+    with_legend: bool = True,
+) -> list[AnnotationSpec]:
+    """Lignes horizontales du seuil de détection, une par valeur distincte."""
+    if not _show_spike_threshold_lines(request):
+        return []
+    recordings = list(getattr(request, "recordings", []) or [])
+    seen: set[float] = set()
+    out: list[AnnotationSpec] = []
+    for recording in recordings:
+        try:
+            thr = float(recording.threshold_uv(int(channel_index)))
+        except Exception:
+            continue
+        if not np.isfinite(thr):
+            continue
+        key = round(thr, 3)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            AnnotationSpec(
+                kind="hline",
+                y=float(thr),
+                color=_SPIKE_THRESHOLD_COLOR,
+                row=int(row),
+                linestyle="--",
+                label=f"Seuil ({thr:g} µV)" if with_legend else "",
+            )
+        )
+    return out
 
 
 @dataclass
@@ -140,6 +194,11 @@ class PanelSpec:
     legend_bold: bool = False
     legend_italic: bool = False
     legend_underline: bool = False
+    y_log: bool = False
+    x_ticks: list[tuple[float, str]] = field(default_factory=list)
+    table_headers: list[str] = field(default_factory=list)
+    table_rows: list[list[str]] = field(default_factory=list)
+    table_highlight_row: int = -1
 
 
 # ---------------------------------------------------------------------------
@@ -174,18 +233,20 @@ def prepare_panel(request: Any) -> PanelSpec:
             spec = _prepare_spike_like(request)
         elif panel == "montage_continuous_raw":
             spec = _prepare_montage_continuous(request)
+        elif panel == "montage_second_to_third_lp":
+            spec = _prepare_montage_second_to_third(request)
         elif panel.startswith("montage_"):
             spec = _prepare_montage_triggered(request)
-        elif panel in {"mea_layout", "impedance"}:
-            spec = _prepare_placeholder(
-                request,
-                f"{panel_label(panel)}\n(aperçu texte — export PDF via matplotlib)",
-            )
-        elif panel.startswith("summary_"):
-            spec = _prepare_placeholder(
-                request,
-                f"{panel_label(panel)}\n(résumé — export PDF via matplotlib)",
-            )
+        elif panel == "mea_layout":
+            spec = _prepare_mea_layout(request)
+        elif panel == "impedance":
+            spec = _prepare_impedance(request)
+        elif panel == "summary_rms":
+            spec = _prepare_summary_rms(request)
+        elif panel == "summary_rms_table":
+            spec = _prepare_summary_rms_table(request)
+        elif panel == "summary_impedance":
+            spec = _prepare_summary_impedance(request)
         else:
             spec = _prepare_placeholder(
                 request,
@@ -270,8 +331,20 @@ def restyle_panel_spec(spec: PanelSpec, request: Any) -> PanelSpec:
                 colors, j, fallback=str(getattr(item, "color", default_color) or default_color)
             )
             if isinstance(item, CurveSeries):
+                new_lw = float(lw)
+                extra: dict[str, Any] = {}
+                if panel in {"analysis_overlay", "spike_overlay"}:
+                    is_mean = bool(str(getattr(item, "label", "") or "").strip())
+                    if is_mean:
+                        new_lw = max(2.4, float(lw) * 2.2)
+                        extra["alpha"] = 1.0
+                    else:
+                        new_lw = max(0.5, float(lw) * 0.7)
+                        extra["alpha"] = _spike_trace_alpha(
+                            getattr(request, "settings", None)
+                        )
                 new_series[series_index] = replace(
-                    item, color=color, linewidth=float(lw)
+                    item, color=color, linewidth=new_lw, **extra
                 )
             elif isinstance(item, ScatterSeries):
                 new_series[series_index] = replace(item, color=color)
@@ -535,7 +608,6 @@ _MONTAGE_TRIGGERED: dict[str, tuple[str, int | None]] = {
     "montage_second_raw": ("raw", 1),
     "montage_second_hp": ("hp", 1),
     "montage_second_lp": ("lp", 1),
-    "montage_second_to_third_lp": ("lp", 1),
 }
 
 
@@ -805,6 +877,15 @@ def _prepare_full_recording(request: Any) -> PanelSpec:
                             row=row,
                         )
                     )
+        if stream_drawn and str(stream) in _VOLTAGE_TRACE_KINDS:
+            annotations.extend(
+                _threshold_line_annotations(
+                    request,
+                    request.channel_index,
+                    row=row,
+                    with_legend=(row == 0),
+                )
+            )
         if stream_drawn == 0:
             msg = f"{short} — calcul…" if pending_any else f"{short} indisponible"
             annotations.append(
@@ -930,6 +1011,11 @@ def _prepare_triggered_trace(request: Any) -> PanelSpec:
     mode = ""
     if panel.startswith("analysis_"):
         mode = f" ({request.settings.analysis.describe()})"
+    annotations = _stim_markers_rel(request)
+    if str(stream) in _VOLTAGE_TRACE_KINDS:
+        annotations.extend(
+            _threshold_line_annotations(request, request.channel_index, row=0)
+        )
     return PanelSpec(
         title=f"{request.channel_name} — {panel_label(panel)}{mode}",
         xlabel="Temps relatif à la stimulation (s)",
@@ -937,7 +1023,7 @@ def _prepare_triggered_trace(request: Any) -> PanelSpec:
         series=series,
         xlim=(float(window[0]), float(window[1])),
         ylim=_ylim_tuple(request.settings, stream),
-        annotations=_stim_markers_rel(request),
+        annotations=annotations,
         status="ok",
         layout_kind="single",
         row_kinds=[stream],
@@ -973,15 +1059,14 @@ def _stim_markers_rel(
 
 
 def _prepare_rms(request: Any) -> PanelSpec:
+    from channel_metrics import recording_rms_window_s, rms_profile_for_trigger
+
     panel = str(request.panel)
     if panel == "analysis_rms":
         trigger_index = request.settings.analysis.trigger_index()
-        kind = "mean" if trigger_index is None else ("first" if trigger_index == 0 else "second")
-        if trigger_index is not None and trigger_index > 1:
-            kind = "mean"
         mode = f" ({request.settings.analysis.describe()})"
     else:
-        kind = {"rms": "mean", "first_rms": "first", "second_rms": "second"}[panel]
+        trigger_index = {"rms": None, "first_rms": 0, "second_rms": 1}[panel]
         mode = ""
     window = request.section_window()
     if window is None:
@@ -994,7 +1079,12 @@ def _prepare_rms(request: Any) -> PanelSpec:
     max_pts = _max_points(request)
     series: list[SeriesItem] = []
     for index, recording in enumerate(request.recordings):
-        t, values = recording.rms_profile(kind, request.channel_index)
+        t, values = rms_profile_for_trigger(
+            recording,
+            request.channel_index,
+            trigger_index,
+            recording_rms_window_s(recording),
+        )
         if values.size == 0:
             continue
         mask = _mask_window(t, window)
@@ -1315,30 +1405,70 @@ def _prepare_trial_rate(request: Any) -> PanelSpec:
     )
 
 
+def _spike_trace_alpha(settings: Any) -> float:
+    """Opacité des traces individuelles du spike scope (la moyenne reste à 1)."""
+    raw = getattr(settings, "spike_overlay_alpha", 0.4)
+    if raw is None:
+        raw = 0.4
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 0.4
+    if not np.isfinite(value):
+        value = 0.4
+    return max(0.0, min(1.0, value))
+
+
+def _spike_overlay_mean(
+    waves: np.ndarray, stored: np.ndarray | None
+) -> np.ndarray | None:
+    """Moyenne exacte stockée, sinon moyenne des snippets affichés."""
+    if stored is not None:
+        arr = np.asarray(stored, dtype=np.float64).ravel()
+        if arr.size and np.any(np.isfinite(arr)):
+            return arr
+    arr = np.asarray(waves, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] == 0:
+        return None
+    with np.errstate(all="ignore"):
+        mean = np.nanmean(arr, axis=0)
+    if mean.size == 0 or not np.any(np.isfinite(mean)):
+        return None
+    return np.asarray(mean, dtype=np.float64)
+
+
 def _prepare_spike_overlay(request: Any) -> PanelSpec:
-    window = request.section_window()
-    windows = request.per_recording_windows()
-    lw = max(0.5, _line_width(request) * 0.7)
-    series: list[SeriesItem] = []
-    sampling = max(1, int(getattr(request.settings, "sampling_percent", 100) or 100))
+    from panel_registry import spike_scope_time_range
+
+    base_lw = _line_width(request)
+    trace_lw = max(0.5, base_lw * 0.7)
+    mean_lw = max(2.4, base_lw * 2.2)
     settings = getattr(request, "settings", None)
+    trace_alpha = _spike_trace_alpha(settings)
+    series: list[SeriesItem] = []
+    means: list[CurveSeries] = []
+    sampling = max(1, int(getattr(request.settings, "sampling_percent", 100) or 100))
     pre_ms = float(getattr(settings, "spike_overlay_pre_ms", 2.0) or 2.0)
     post_ms = float(getattr(settings, "spike_overlay_post_ms", 4.0) or 4.0)
     t_min_ms = -max(0.0, pre_ms)
     t_max_ms = max(1e-6, post_ms)
     abs_peak = 0.0
     for index, recording in enumerate(request.recordings):
-        t_range = windows[index] if index < len(windows) else window
-        t_ms, waves, _times, _total, _mean = recording.overlay_for_channel(
-            request.channel_index, t_range_s=t_range
+        t_range = spike_scope_time_range(request, recording, index)
+        t_ms, waves, _times, _total, stored_mean = recording.overlay_for_channel(
+            request.channel_index,
+            t_range_s=t_range,
+            pre_ms=pre_ms,
+            post_ms=post_ms,
         )
         if waves is None or getattr(waves, "shape", (0,))[0] == 0:
+            continue
+        if np.asarray(t_ms).size == 0:
             continue
         n = int(waves.shape[0])
         step = max(1, int(np.ceil(100.0 / sampling))) if sampling < 100 else 1
         color = str(request.colors[index % len(request.colors)])
         label = _series_label(request, index)
-        labeled = False
         t_arr = np.asarray(t_ms, dtype=np.float64)
         for i in range(0, n, step):
             y_arr = np.asarray(waves[i], dtype=np.float64)
@@ -1351,17 +1481,36 @@ def _prepare_spike_overlay(request: Any) -> PanelSpec:
                     x=t_arr,
                     y=y_arr,
                     color=color,
-                    label=label if not labeled else "",
-                    linewidth=lw,
+                    label="",
+                    linewidth=trace_lw,
+                    alpha=trace_alpha,
                 )
             )
-            labeled = True
-        try:
-            thr = float(recording.threshold_uv(request.channel_index))
-            if np.isfinite(thr):
-                abs_peak = max(abs_peak, abs(thr))
-        except Exception:
-            pass
+        mean_w = _spike_overlay_mean(waves, stored_mean)
+        if mean_w is not None and mean_w.size != t_arr.size:
+            mean_w = _spike_overlay_mean(waves, None)
+        if mean_w is not None and t_arr.size and mean_w.size == t_arr.size:
+            peak = float(np.nanmax(np.abs(mean_w)))
+            if np.isfinite(peak):
+                abs_peak = max(abs_peak, peak)
+            means.append(
+                CurveSeries(
+                    x=t_arr,
+                    y=mean_w,
+                    color=color,
+                    label=label,
+                    linewidth=mean_lw,
+                    alpha=1.0,
+                )
+            )
+        if _show_spike_threshold_lines(request):
+            try:
+                thr = float(recording.threshold_uv(request.channel_index))
+                if np.isfinite(thr):
+                    abs_peak = max(abs_peak, abs(thr))
+            except Exception:
+                pass
+    series.extend(means)
     if not series:
         return _placeholder(
             title=f"{request.channel_name} — Spike overlay",
@@ -1378,6 +1527,7 @@ def _prepare_spike_overlay(request: Any) -> PanelSpec:
         series=series,
         xlim=(t_min_ms, t_max_ms),
         ylim=(-y_half, y_half),
+        annotations=_threshold_line_annotations(request, request.channel_index, row=0),
         status="ok",
         row_kinds=["overlay"],
         show_legend=True,
@@ -1582,6 +1732,12 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                     )
                     row_drawn += 1
                     drawn += 1
+                if kind in _VOLTAGE_TRACE_KINDS and row_drawn:
+                    annotations.extend(
+                        _threshold_line_annotations(
+                            request, int(ch), row=row, with_legend=False
+                        )
+                    )
                 if stream_x is not None:
                     row_xlim = (float(stream_x[0]), float(stream_x[1]))
             elif kind == "rms":
@@ -1618,12 +1774,24 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                 if extra_section_x is not None:
                     row_xlim = (float(extra_section_x[0]), float(extra_section_x[1]))
             elif kind == "overlay":
+                from panel_registry import spike_scope_time_range
+
                 color_default = _MONTAGE_EXTRA_COLORS["overlay"]
+                pre_ms = float(
+                    getattr(request.settings, "spike_overlay_pre_ms", 2.0) or 2.0
+                )
+                post_ms = float(
+                    getattr(request.settings, "spike_overlay_post_ms", 4.0) or 4.0
+                )
+                row_xlim = (-max(0.0, pre_ms), max(1e-6, post_ms))
                 for index, recording in enumerate(recordings):
                     if ch >= int(recording.n_channels):
                         continue
                     t_ms, waves, _times, _total, mean = recording.overlay_for_channel(
-                        ch, t_range_s=extra_section_x
+                        ch,
+                        t_range_s=spike_scope_time_range(request, recording, index),
+                        pre_ms=pre_ms,
+                        post_ms=post_ms,
                     )
                     color = recording_trace_color(
                         request.colors, index, fallback=color_default
@@ -1645,6 +1813,7 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                         arr = np.asarray(waves, dtype=np.float64)
                         t_arr = np.asarray(t_ms, dtype=np.float64)
                         n_show = min(12, int(arr.shape[0]))
+                        wave_alpha = _spike_trace_alpha(request.settings)
                         for wave in arr[:n_show]:
                             series.append(
                                 CurveSeries(
@@ -1653,11 +1822,18 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                                     color=str(color),
                                     label="",
                                     linewidth=max(0.4, lw * 0.55),
+                                    alpha=wave_alpha,
                                     row=row,
                                 )
                             )
                         row_drawn += 1
                         drawn += 1
+                if row_drawn:
+                    annotations.extend(
+                        _threshold_line_annotations(
+                            request, int(ch), row=row, with_legend=False
+                        )
+                    )
             elif kind in {"raster", "psth", "trial_rate", "isi"}:
                 from draw_primitives import (
                     _isi_time_and_values_s,
@@ -1925,6 +2101,7 @@ def _prepare_montage_triggered(request: Any) -> PanelSpec:
     default_color = STREAM_PLOT_COLORS.get(stream, "#334155")
 
     series: list[SeriesItem] = []
+    annotations: list[AnnotationSpec] = []
     row_labels: list[str] = []
     row_ylims: list[tuple[float, float] | None] = []
     row_kinds: list[str] = []
@@ -1945,6 +2122,7 @@ def _prepare_montage_triggered(request: Any) -> PanelSpec:
         row_channels.append(int(ch))
         row_keys.append((int(ch), stream))
         row_highlight.append(int(ch) == int(request.channel_index))
+        row_drawn = 0
         for index, recording in enumerate(recordings):
             if ch >= int(recording.n_channels):
                 continue
@@ -1978,18 +2156,26 @@ def _prepare_montage_triggered(request: Any) -> PanelSpec:
                     row=row,
                 )
             )
+            row_drawn += 1
             drawn += 1
+        if str(stream) in _VOLTAGE_TRACE_KINDS and row_drawn:
+            annotations.extend(
+                _threshold_line_annotations(
+                    request, int(ch), row=row, with_legend=False
+                )
+            )
 
     if drawn == 0:
         return _prepare_placeholder(request, "Montage vide.", status="empty")
 
     n_rows = max(1, len(channel_indices))
+    annotations.extend(_stim_markers_rel(request, rows=range(n_rows)))
     return PanelSpec(
         title=panel_label(panel),
         xlabel="Temps relatif à la stimulation (s)",
         series=series,
         xlim=(float(window[0]), float(window[1])),
-        annotations=_stim_markers_rel(request, rows=range(n_rows)),
+        annotations=annotations,
         status="ok",
         layout_kind="montage",
         n_rows=n_rows,
@@ -1999,4 +2185,379 @@ def _prepare_montage_triggered(request: Any) -> PanelSpec:
         row_channels=row_channels,
         row_keys=row_keys,
         row_highlight=row_highlight,
+    )
+
+
+def _prepare_montage_second_to_third(request: Any) -> PanelSpec:
+    """Passe-bas continu du début de la fenêtre 2e stim à la fin de la 3e."""
+    try:
+        from panel_registry import _montage_channel_slice
+    except Exception:
+        return _prepare_placeholder(request, "Helpers montage indisponibles.", status="unavailable")
+
+    recordings = list(request.recordings)
+    reference = recordings[0]
+    n_channels = min(int(rec.n_channels) for rec in recordings)
+    channel_indices, _n_pages = _montage_channel_slice(request, n_channels)
+    max_pts = _max_points(request)
+    lw = max(0.6, _line_width(request) * 0.85)
+    color = STREAM_PLOT_COLORS.get("lp", "#1e40af")
+    series: list[SeriesItem] = []
+    row_labels: list[str] = []
+    row_ylims: list[tuple[float, float] | None] = []
+    row_kinds: list[str] = []
+    row_channels: list[int] = []
+    row_keys: list[tuple[int, str]] = []
+    row_highlight: list[bool] = []
+    annotations: list[AnnotationSpec] = []
+    drawn = 0
+    pending = 0
+    missing_span = 0
+    x_min: float | None = None
+    x_max: float | None = None
+
+    for row, ch in enumerate(channel_indices):
+        name = (
+            reference.channel_names[ch]
+            if ch < len(reference.channel_names)
+            else f"CH{ch}"
+        )
+        row_labels.append(name)
+        row_ylims.append(_ylim_tuple(request.settings, "lp"))
+        row_kinds.append("lp")
+        row_channels.append(int(ch))
+        row_keys.append((int(ch), "lp-span"))
+        row_highlight.append(int(ch) == int(request.channel_index))
+        row_drawn = 0
+        for index, recording in enumerate(recordings):
+            if ch >= int(recording.n_channels):
+                continue
+            outcome, payload = _second_to_third_lp_span(recording, int(ch))
+            if outcome == "pending":
+                pending += 1
+                continue
+            if outcome != "ok" or payload is None:
+                missing_span += 1
+                continue
+            t, y, third_s = payload
+            t, y = _decimate(t, y, max_pts)
+            series.append(
+                CurveSeries(
+                    x=t,
+                    y=y,
+                    color=recording_trace_color(request.colors, index, fallback=color),
+                    label=_series_label(request, index, "2e→3e", stream="lp"),
+                    linewidth=lw,
+                    row=row,
+                )
+            )
+            row_drawn += 1
+            drawn += 1
+            lo, hi = float(np.min(t)), float(np.max(t))
+            x_min = lo if x_min is None else min(x_min, lo)
+            x_max = hi if x_max is None else max(x_max, hi)
+            if index == 0:
+                annotations.append(AnnotationSpec(kind="vline", x=0.0, color="#dc2626", row=row))
+                annotations.append(
+                    AnnotationSpec(kind="vline", x=float(third_s), color="#c2410c", row=row)
+                )
+        if row_drawn:
+            annotations.extend(
+                _threshold_line_annotations(
+                    request, int(ch), row=row, with_legend=False
+                )
+            )
+
+    if drawn == 0:
+        if pending and missing_span == 0:
+            return _prepare_placeholder(
+                request,
+                "Passe-bas pas encore calculé pour cet intervalle.\nCalculer les canaux (F6).",
+                status="pending",
+            )
+        return _prepare_placeholder(
+            request,
+            "Intervalle 2e→3e indisponible.\nIl faut au moins 3 stimulations valides et le flux passe-bas.",
+            status="unavailable",
+        )
+
+    n_rows = max(1, len(channel_indices))
+    xlim = (x_min, x_max) if x_min is not None and x_max is not None and x_max > x_min else None
+    return PanelSpec(
+        title=panel_label("montage_second_to_third_lp"),
+        xlabel="Temps relatif à la 2e stimulation (s)",
+        series=series,
+        xlim=xlim,
+        annotations=annotations,
+        status="ok",
+        layout_kind="montage",
+        n_rows=n_rows,
+        row_labels=row_labels,
+        row_ylims=row_ylims,
+        row_kinds=row_kinds,
+        row_channels=row_channels,
+        row_keys=row_keys,
+        row_highlight=row_highlight,
+    )
+
+
+def _second_to_third_lp_span(
+    recording: Any, ch: int
+) -> tuple[str, tuple[np.ndarray, np.ndarray, float] | None]:
+    """``(status, (t_s, y_uv, t_3rd_s))`` — t=0 à l’onset de la 2e stimulation."""
+    source = getattr(recording, "source", None)
+    if source is None:
+        return "missing", None
+    triggers = np.asarray(getattr(source, "valid_triggers", []), dtype=np.int64)
+    if triggers.size < 3:
+        return "short", None
+    if not bool(recording.stream_ready("lp", int(ch))):
+        return "pending", None
+    seg = recording.meta.segmentation
+    start = int(triggers[1]) - int(seg.pre_n)
+    end = int(triggers[2]) + int(seg.post_n)
+    lp = getattr(source, "lowpass", None)
+    try:
+        n_samples = int(lp.shape[1])
+        y = np.asarray(lp[int(ch)][start:end], dtype=np.float64)
+    except Exception:
+        return "missing", None
+    fs = float(recording.meta.fs)
+    if start < 0 or end > n_samples or end <= start or fs <= 0 or y.size == 0:
+        return "bounds", None
+    trig2 = int(triggers[1])
+    t = (np.arange(y.size, dtype=np.float64) + float(start - trig2)) / fs
+    third_s = float(int(triggers[2]) - trig2) / fs
+    return "ok", (t, y, third_s)
+
+
+def _prepare_mea_layout(request: Any) -> PanelSpec:
+    from probe_layout import match_contact_index
+
+    layout = getattr(request, "probe_layout", None)
+    if layout is None:
+        return _prepare_placeholder(
+            request,
+            "Aucune carte MEA chargée.\nChoisir un JSON de sonde dans les paramètres.",
+            status="unavailable",
+        )
+    positions = np.asarray(layout.positions_um, dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[0] == 0:
+        return _prepare_placeholder(request, "Carte MEA vide.", status="unavailable")
+    active = match_contact_index(layout, str(request.channel_name))
+    if active is None:
+        return _prepare_placeholder(
+            request,
+            f"Le canal {request.channel_name} n’est pas sur cette carte MEA.",
+            status="unavailable",
+        )
+    series: list[SeriesItem] = [
+        ScatterSeries(
+            x=positions[:, 0],
+            y=positions[:, 1],
+            color="#94a3b8",
+            label="Contacts",
+            size=8.0,
+        ),
+        ScatterSeries(
+            x=np.asarray([positions[int(active), 0]], dtype=np.float64),
+            y=np.asarray([positions[int(active), 1]], dtype=np.float64),
+            color="#ea580c",
+            label=str(request.channel_name),
+            size=14.0,
+        ),
+    ]
+    pad = 0.08 * max(float(np.ptp(positions[:, 0])), float(np.ptp(positions[:, 1])), 1.0)
+    return PanelSpec(
+        title=f"Carte MEA — {request.channel_name}",
+        xlabel="x (µm)",
+        ylabel="y (µm)",
+        series=series,
+        xlim=(float(np.min(positions[:, 0]) - pad), float(np.max(positions[:, 0]) + pad)),
+        ylim=(float(np.min(positions[:, 1]) - pad), float(np.max(positions[:, 1]) + pad)),
+        annotations=[
+            AnnotationSpec(
+                kind="text",
+                x=float(positions[int(active), 0]),
+                y=float(positions[int(active), 1]),
+                text=str(request.channel_name),
+                color="#9a3412",
+            )
+        ],
+        status="ok",
+    )
+
+
+def _session_tick(when: Any, index: int) -> str:
+    if hasattr(when, "strftime"):
+        try:
+            return when.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+    text = str(when or "").strip()
+    return text or f"Session {index + 1}"
+
+
+def _prepare_impedance(request: Any) -> PanelSpec:
+    sessions = list(getattr(request, "impedance_sessions", []) or [])
+    if not sessions:
+        return _prepare_placeholder(
+            request,
+            "Pas de données d’impédance.\nDéposer le CSV compagnon à côté de l’enregistrement.",
+            status="unavailable",
+        )
+    channel = str(request.channel_name)
+    xs: list[float] = []
+    ys: list[float] = []
+    ticks: list[tuple[float, str]] = []
+    for index, session in enumerate(sessions):
+        magnitudes = getattr(session, "magnitudes_ohm", {}) or {}
+        value = float(magnitudes.get(channel, float("nan")))
+        if not np.isfinite(value) or value <= 0:
+            continue
+        x = float(len(xs))
+        xs.append(x)
+        ys.append(value)
+        ticks.append((x, _session_tick(getattr(session, "when", None), index)))
+    if not xs:
+        return _prepare_placeholder(request, f"Pas d’impédance pour {channel}.", status="empty")
+    x_arr = np.asarray(xs, dtype=np.float64)
+    y_arr = np.asarray(ys, dtype=np.float64)
+    return PanelSpec(
+        title=f"Impédance |Z| @ 1 kHz — {channel}",
+        xlabel="Session",
+        ylabel="|Z| @ 1 kHz (Ω)",
+        series=[
+            CurveSeries(x=x_arr, y=y_arr, color="#2563eb", label=channel, linewidth=1.2),
+            ScatterSeries(x=x_arr, y=y_arr, color="#2563eb", label="", size=8.0),
+        ],
+        x_ticks=ticks,
+        y_log=True,
+        status="ok",
+    )
+
+
+def _included_channels(request: Any, recording: Any) -> list[int]:
+    hidden = tuple(getattr(getattr(request, "settings", None), "hidden_channels", ()) or ())
+    names = list(getattr(recording, "channel_names", ()) or ())
+    n_channels = int(getattr(recording, "n_channels", 0) or 0)
+    return included_channel_indices(n_channels, names, hidden)
+
+
+def _prepare_summary_rms(request: Any) -> PanelSpec:
+    lw = _line_width(request)
+    max_pts = _max_points(request)
+    series: list[SeriesItem] = []
+    for index, recording in enumerate(request.recordings):
+        t, values = recording.mean_rms_across_channels(
+            "mean", channels=_included_channels(request, recording)
+        )
+        if values.size == 0:
+            continue
+        x, y = _decimate(
+            np.asarray(t, dtype=np.float64),
+            np.asarray(values, dtype=np.float64),
+            max_pts,
+        )
+        series.append(
+            CurveSeries(
+                x=x,
+                y=y,
+                color=str(request.colors[index % len(request.colors)]),
+                label=_series_label(request, index, "RMS moyen"),
+                linewidth=lw,
+            )
+        )
+    if not series:
+        return _prepare_placeholder(request, "Résumé RMS indisponible.", status="unavailable")
+    return PanelSpec(
+        title=panel_label("summary_rms"),
+        xlabel="Temps relatif à la stimulation (s)",
+        ylabel="RMS moyen (µV)",
+        series=series,
+        ylim=_ylim_tuple(request.settings, "rms"),
+        status="ok",
+        row_kinds=["rms"],
+    )
+
+
+def _prepare_summary_rms_table(request: Any) -> PanelSpec:
+    recordings = list(request.recordings)
+    reference = recordings[0]
+    indices = _included_channels(request, reference)
+    if not indices:
+        return _prepare_placeholder(request, "Aucun canal sélectionné.", status="unavailable")
+    headers = ["Canal"] + [
+        str(request.labels[i] if i < len(request.labels) else f"Enreg. {i + 1}")
+        for i in range(len(recordings))
+    ]
+    rows: list[list[str]] = []
+    any_value = False
+    highlight_row = -1
+    highlight = int(getattr(request, "channel_index", -1) or -1)
+    for row_index, ch in enumerate(indices):
+        if ch == highlight:
+            highlight_row = row_index
+        name = (
+            reference.channel_names[ch]
+            if ch < len(reference.channel_names)
+            else f"CH{ch}"
+        )
+        cells = [str(name)]
+        for recording in recordings:
+            _t, profile = recording.rms_profile("mean", ch)
+            if profile.size and np.any(np.isfinite(profile)):
+                cells.append(f"{float(np.nanmean(profile)):.2f}")
+                any_value = True
+            else:
+                cells.append("—")
+        rows.append(cells)
+    if not any_value:
+        return _prepare_placeholder(
+            request, "Table RMS indisponible (canaux non calculés).", status="unavailable"
+        )
+    if not 0 <= highlight_row < len(rows):
+        highlight_row = -1
+    return PanelSpec(
+        title=panel_label("summary_rms_table"),
+        status="ok",
+        layout_kind="table",
+        table_headers=headers,
+        table_rows=rows,
+        table_highlight_row=highlight_row,
+    )
+
+
+def _prepare_summary_impedance(request: Any) -> PanelSpec:
+    sessions = list(getattr(request, "impedance_sessions", []) or [])
+    if not sessions:
+        return _prepare_placeholder(request, "Aucune session d’impédance.", status="unavailable")
+    xs: list[float] = []
+    ys: list[float] = []
+    ticks: list[tuple[float, str]] = []
+    for index, session in enumerate(sessions):
+        magnitudes = getattr(session, "magnitudes_ohm", {}) or {}
+        values = np.asarray(list(magnitudes.values()), dtype=np.float64)
+        values = values[np.isfinite(values) & (values > 0)]
+        if values.size == 0:
+            continue
+        x = float(len(xs))
+        xs.append(x)
+        ys.append(float(np.mean(values)))
+        ticks.append((x, _session_tick(getattr(session, "when", None), index)))
+    if not xs:
+        return _prepare_placeholder(request, "Aucune impédance moyenne valide.", status="unavailable")
+    x_arr = np.asarray(xs, dtype=np.float64)
+    y_arr = np.asarray(ys, dtype=np.float64)
+    return PanelSpec(
+        title=panel_label("summary_impedance"),
+        xlabel="Session",
+        ylabel="|Z| moyen @ 1 kHz (Ω)",
+        series=[
+            CurveSeries(x=x_arr, y=y_arr, color="#0f766e", label="|Z| moyen", linewidth=1.2),
+            ScatterSeries(x=x_arr, y=y_arr, color="#0f766e", size=8.0),
+        ],
+        x_ticks=ticks,
+        y_log=True,
+        status="ok",
     )

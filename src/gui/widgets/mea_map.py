@@ -592,7 +592,7 @@ class MeaMapWidget(QWidget):
                 if metric is not None and self._metric_label
                 else ""
             )
-            hidden = "\n(masqué dans le montage)" if contact.channel_name in self._hidden else ""
+            hidden = "\n(exclu du traitement)" if contact.channel_name in self._hidden else ""
             self.setToolTip(f"{contact.contact_id} → {contact.channel_name}{detail}{hidden}")
         else:
             self.setToolTip(f"{contact.contact_id} (non enregistré)")

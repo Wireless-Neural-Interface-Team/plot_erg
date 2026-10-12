@@ -50,10 +50,10 @@ class ChannelPanel(QWidget):
         self.list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.setToolTip(
-            "Coche : visible dans la revue montage (Ctrl+M).\n"
+            "Coche : canal inclus dans le traitement et la revue montage.\n"
             "Clic : sélectionner (aperçu central).\n"
             "Double-clic : inspecter (barres de plage + graphs).\n"
-            "Clic droit : masquer / afficher."
+            "Clic droit : exclure / réinclure."
         )
         self.list.currentItemChanged.connect(self._on_list_changed)
         self.list.itemDoubleClicked.connect(self._on_list_double_clicked)
@@ -97,17 +97,17 @@ class ChannelPanel(QWidget):
 
         self._btn_show_all = QPushButton("Tout", self)
         self._btn_show_all.setToolTip(
-            "Afficher tous les canaux dans la revue montage (Ctrl+M)"
+            "Inclure tous les canaux dans le traitement et la revue montage"
         )
         self._btn_show_all.clicked.connect(self.show_all)
         self._btn_hide_selected = QPushButton("Masquer", self)
         self._btn_hide_selected.setToolTip(
-            "Masquer les canaux sélectionnés dans la revue montage"
+            "Exclure les canaux surlignés du traitement et du montage"
         )
         self._btn_hide_selected.clicked.connect(self.hide_selected)
         self._btn_solo = QPushButton("Seul", self)
         self._btn_solo.setToolTip(
-            "N’afficher que les canaux sélectionnés dans la revue montage"
+            "Ne traiter et n’afficher que les canaux surlignés"
         )
         self._btn_solo.clicked.connect(self.solo_selected)
 
@@ -223,7 +223,7 @@ class ChannelPanel(QWidget):
             item.setText(f"{mark}{name}")
             tip = "Canal calculé" if ready else "Canal non calculé (F6 / Analyse)"
             if name in self._hidden:
-                tip += " — masqué dans le montage"
+                tip += " — exclu du traitement"
             item.setToolTip(tip)
             item.setData(Qt.ItemDataRole.UserRole, name)
             item.setForeground(QBrush(_HIDDEN_FG) if name in self._hidden else QBrush())
@@ -363,11 +363,11 @@ class ChannelPanel(QWidget):
                 Qt.CheckState.Unchecked if name in self._hidden else Qt.CheckState.Checked
             )
             item.setForeground(QBrush(_HIDDEN_FG) if name in self._hidden else QBrush())
-            tip = item.toolTip().split(" — masqué")[0]
-            if name in self._hidden and "masqué" not in tip:
-                item.setToolTip(f"{tip} — masqué dans le montage")
+            tip = item.toolTip().split(" — exclu")[0]
+            if name in self._hidden and "exclu" not in tip:
+                item.setToolTip(f"{tip} — exclu du traitement")
             elif name not in self._hidden:
-                item.setToolTip(tip.replace(" — masqué dans le montage", ""))
+                item.setToolTip(tip.replace(" — exclu du traitement", ""))
         self._updating = False
         self._sync_map_hidden()
         self._update_visibility_label()
@@ -382,9 +382,9 @@ class ChannelPanel(QWidget):
         if total <= 0:
             self._visibility_label.setText("")
         elif hidden <= 0:
-            self._visibility_label.setText(f"{total} visibles (montage)")
+            self._visibility_label.setText(f"{total} sélectionnés")
         else:
-            self._visibility_label.setText(f"{total - hidden}/{total} au montage")
+            self._visibility_label.setText(f"{total - hidden}/{total} sélectionnés")
 
     def _emit_visibility(self) -> None:
         self.visibilityChanged.emit()
@@ -424,9 +424,9 @@ class ChannelPanel(QWidget):
             self._hidden.discard(name)
         # Mise à jour locale légère uniquement — le montage est redessiné via debounce.
         item.setForeground(QBrush(_HIDDEN_FG) if name in self._hidden else QBrush())
-        tip = item.toolTip().split(" — masqué")[0]
+        tip = item.toolTip().split(" — exclu")[0]
         if name in self._hidden:
-            item.setToolTip(f"{tip} — masqué dans le montage")
+            item.setToolTip(f"{tip} — exclu du traitement")
         else:
             item.setToolTip(tip)
         self._sync_map_hidden()

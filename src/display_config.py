@@ -60,7 +60,21 @@ class PlotDisplaySettings:
 
     @classmethod
     def all_on(cls) -> PlotDisplaySettings:
-        return cls()
+        """Toutes les pages, y compris 2e stimulation et montage 2e→3e."""
+        panels = SectionPanels(
+            second_trigger_raw=True,
+            second_trigger_hp=True,
+            second_trigger_lp=True,
+            second_rms=True,
+            second_psth=True,
+            second_isi=True,
+        )
+        return cls(
+            summary_second_stim_montage_page=True,
+            full_view=panels,
+            zoom_onset=panels,
+            zoom_trigger_end=panels,
+        )
 
     def section_panels(self, section: str) -> SectionPanels:
         if section == "full":

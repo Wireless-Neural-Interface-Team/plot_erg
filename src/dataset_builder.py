@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import datetime as _dt
 import gc
+import io
 import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
@@ -54,7 +56,7 @@ from erg_cache import (
 )
 from impedance_tracking import collect_impedance_sessions
 from intan_rhx_dsp import IntanDspSettings, build_intan_filter_sos
-from memmap_io import load_readonly_memmap, open_writable_memmap
+from memmap_io import close_memmap, load_readonly_memmap, open_writable_memmap
 from processed_dataset import (
     MAX_OVERLAY_SNIPPETS_PER_CHANNEL,
     ChannelData,
@@ -225,11 +227,15 @@ def _ensure_raw_stream(
     if layout.is_complete():
         meta = layout.read_meta()
         amplifier = load_readonly_memmap(layout.amplifier_path)
-        analog = (
-            np.asarray(load_readonly_memmap(layout.analog_in0_path), dtype=np.float64)
-            if layout.analog_in0_path.exists()
-            else np.empty(0, dtype=np.float64)
-        )
+        if layout.analog_in0_path.exists():
+            analog_mm = load_readonly_memmap(layout.analog_in0_path)
+            try:
+                analog = np.array(analog_mm, dtype=np.float32, copy=True)
+            finally:
+                close_memmap(analog_mm)
+                del analog_mm
+        else:
+            analog = np.empty(0, dtype=np.float32)
         # Legacy caches written with edge="none" may lack analog_in0 — fall through
         # to a full RHS read when a trigger mode needs it.
         if analog.size > 0 or not uses_analog_trigger(config):
@@ -251,7 +257,8 @@ def _ensure_raw_stream(
     from intanutil.data import calculate_data_size
     from load_intan_rhs_format import read_data_to_amplifier_memmap
 
-    with open(config.rhs_file, "rb") as fid:
+    with open(config.rhs_file, "rb") as fid, redirect_stdout(io.StringIO()):
+        # The streaming read prints the same header summary just after this peek.
         header = read_header(fid)
         data_present, _filesize, _num_blocks, num_samples = calculate_data_size(
             header, str(config.rhs_file), fid
@@ -287,7 +294,7 @@ def _ensure_raw_stream(
     check_analysis_cancelled()
     fs = get_sampling_rate(data)
     try:
-        analog = np.asarray(get_analog_in0_signal(data), dtype=np.float64)
+        analog = np.asarray(get_analog_in0_signal(data), dtype=np.float32)
     except RuntimeError:
         analog = np.empty(0, dtype=np.float64)
         if uses_analog_trigger(config):
@@ -439,7 +446,7 @@ class _FilteredDiskStore:
                 if not bool(self.ready_notch[ch]):
                     return None
                 row = self.notch[ch]
-                return np.asarray(row, dtype=np.float64) if copy else row
+                return np.array(row, dtype=np.float32, copy=True) if copy else row
             raise ValueError(kind)
 
     def write(self, kind: str, ch: int, row: np.ndarray, *, flush: bool = False) -> None:
@@ -469,6 +476,8 @@ class _FilteredDiskStore:
 
     def flush(self) -> None:
         """Flush all memmaps (call after a batch of writes)."""
+        if self._closed:
+            return
         with self._lock:
             for arr in (self.hp, self.lp, self.ready_hp, self.ready_lp, self.notch, self.ready_notch):
                 if arr is None:
@@ -499,6 +508,7 @@ class LazyFilterBank:
         notch_sos: np.ndarray | None = None,
         disk_store: _FilteredDiskStore | None = None,
         shared_lock: threading.Lock | None = None,
+        wide_cache: OrderedDict[int, np.ndarray] | None = None,
     ) -> None:
         if kind not in ("hp", "lp"):
             raise ValueError(f"Unsupported filter bank kind: {kind}")
@@ -508,22 +518,35 @@ class LazyFilterBank:
         self._max_cached = max(1, int(max_cached_channels))
         self._cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self._notch_cache = notch_cache
+        self._wide_cache = wide_cache
         self._disk = disk_store
         self.shape = (int(amplifier.shape[0]), int(amplifier.shape[1]))
         if notch_sos is None or filter_sos is None:
             built_notch, hp_sos, lp_sos = build_intan_filter_sos(dsp)
             notch_sos = built_notch if notch_sos is None else notch_sos
             filter_sos = (hp_sos if kind == "hp" else lp_sos) if filter_sos is None else filter_sos
-        self._notch_sos = notch_sos
-        self._sos = filter_sos
+        # float32 SOS keeps sosfilt from promoting a multi-million-sample row
+        # to float64. The coefficient error is far below 0.01 µV for these filters.
+        self._notch_sos = (
+            None if notch_sos is None else np.ascontiguousarray(notch_sos, dtype=np.float32)
+        )
+        self._sos = np.ascontiguousarray(filter_sos, dtype=np.float32)
         # Shared with the sibling HP/LP bank when they share ``notch_cache``.
         self._lock = shared_lock if shared_lock is not None else threading.Lock()
 
+    def flush(self) -> None:
+        """Push dirty filter rows to disk once (not once per channel)."""
+        if self._disk is not None:
+            self._disk.flush()
+
     def close(self) -> None:
         """Drop RAM rows and release the shared disk store (idempotent)."""
+        self.flush()
         self._cache.clear()
         if self._notch_cache is not None:
             self._notch_cache.clear()
+        if self._wide_cache is not None:
+            self._wide_cache.clear()
         store = self._disk
         self._disk = None
         if store is not None:
@@ -534,9 +557,9 @@ class LazyFilterBank:
         if isinstance(index, tuple):
             if not index:
                 raise IndexError("Empty index")
-            row = self._row(int(index[0]), flush_disk=True)
+            row = self._row(int(index[0]), flush_disk=False)
             return row[index[1:]] if len(index) > 1 else row
-        return self._row(int(index), flush_disk=True)
+        return self._row(int(index), flush_disk=False)
 
     def _row(self, ch: int, *, flush_disk: bool) -> np.ndarray:
         with self._lock:
@@ -570,9 +593,26 @@ class LazyFilterBank:
                 self._cache.popitem(last=False)
         return filtered
 
+    def _wide_row(self, ch: int) -> np.ndarray:
+        """Contiguous float32 copy of one amplifier channel, shared by HP and LP."""
+        cache = self._wide_cache
+        if cache is not None:
+            with self._lock:
+                cached = cache.get(ch)
+                if cached is not None:
+                    cache.move_to_end(ch)
+                    return cached
+        row = np.array(self._amplifier[ch], dtype=np.float32, copy=True)
+        if cache is not None:
+            with self._lock:
+                cache[ch] = row
+                while len(cache) > self._max_cached:
+                    cache.popitem(last=False)
+        return row
+
     def _notched_signal(self, ch: int, sosfilt: Any) -> np.ndarray:
         if self._notch_sos is None:
-            return np.asarray(self._amplifier[ch], dtype=np.float64)
+            return self._wide_row(ch)
 
         if self._notch_cache is not None:
             with self._lock:
@@ -591,8 +631,8 @@ class LazyFilterBank:
                             self._notch_cache.popitem(last=False)
                 return from_disk
 
-        wide = np.asarray(self._amplifier[ch], dtype=np.float64)
-        signal = sosfilt(self._notch_sos, wide)
+        wide = self._wide_row(ch)
+        signal = np.asarray(sosfilt(self._notch_sos, wide), dtype=np.float32)
         if self._disk is not None:
             self._disk.write("notch", ch, signal, flush=False)
         if self._notch_cache is not None:
@@ -718,6 +758,7 @@ def build_recording(
     notch_cache: OrderedDict[int, np.ndarray] | None = (
         OrderedDict() if notch_sos is not None else None
     )
+    wide_cache: OrderedDict[int, np.ndarray] = OrderedDict()
     filter_layout = filtered_layout_for(root, keys)
     disk_store = _FilteredDiskStore(
         filter_layout,
@@ -735,6 +776,7 @@ def build_recording(
         notch_sos=notch_sos,
         disk_store=disk_store,
         shared_lock=filter_lock,
+        wide_cache=wide_cache,
     )
     low = LazyFilterBank(
         amplifier,
@@ -745,6 +787,7 @@ def build_recording(
         notch_sos=notch_sos,
         disk_store=disk_store,
         shared_lock=filter_lock,
+        wide_cache=wide_cache,
     )
     source = AmplifierSpikeSource(
         amplifier=amplifier,
@@ -919,6 +962,13 @@ def ensure_channels(
                 computed.append(index)
                 done += 1
                 _emit(done / total, f"Channel {done}/{total}: {recording.channel_names[index]}")
+
+    for bank_name in ("highpass", "lowpass"):
+        bank = getattr(source, bank_name, None)
+        flush = getattr(bank, "flush", None)
+        if callable(flush):
+            flush()
+            break
 
     _emit(1.0, f"Computed {len(computed)} channel(s)")
     return computed

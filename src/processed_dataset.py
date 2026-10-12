@@ -442,6 +442,48 @@ class ChannelData:
     means_ready: bool = True
 
 
+def _overlay_span_covers(t_ms: np.ndarray, pre_ms: float, post_ms: float) -> bool:
+    """True si ``t_ms`` couvre déjà ``[-pre_ms, +post_ms]`` (à un échantillon près)."""
+    t = np.asarray(t_ms, dtype=np.float64).ravel()
+    finite = t[np.isfinite(t)]
+    if finite.size < 2:
+        return False
+    pre = max(0.0, float(pre_ms))
+    post = max(1e-6, float(post_ms))
+    step = float(np.nanmedian(np.abs(np.diff(finite))))
+    tol = max(1e-6, 0.51 * step) if np.isfinite(step) else 1e-3
+    return float(np.nanmin(finite)) <= -pre + tol and float(np.nanmax(finite)) >= post - tol
+
+
+def _crop_overlay_time(
+    t_ms: np.ndarray,
+    waves: np.ndarray,
+    mean: np.ndarray | None,
+    pre_ms: float,
+    post_ms: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Garde les échantillons dans ``[-pre_ms, +post_ms]``."""
+    t = np.asarray(t_ms, dtype=np.float64).ravel()
+    pre = max(0.0, float(pre_ms))
+    post = max(1e-6, float(post_ms))
+    if t.size == 0:
+        return t, waves, mean
+    mask = (t >= -pre - 1e-9) & (t <= post + 1e-9)
+    if not np.any(mask):
+        w = np.asarray(waves)
+        empty = w[:, :0] if w.ndim == 2 else w[:0]
+        return t[:0], empty, None
+    t_c = t[mask]
+    w = np.asarray(waves)
+    w_c = w[:, mask] if w.ndim == 2 else w
+    m_c = None
+    if mean is not None:
+        m = np.asarray(mean, dtype=np.float64).ravel()
+        if m.size == t.size:
+            m_c = m[mask]
+    return t_c, w_c, m_c
+
+
 class ProcessedRecording:
     """One recording prepared for viewing; channels are filled on demand."""
 
@@ -473,6 +515,11 @@ class ProcessedRecording:
         self.build_timings = list(build_timings)
         self._channel_data: dict[int, ChannelData] = {}
         self._data_generation = 0
+        # Snippets ré-extraits pour une fenêtre plus large que le cache (par canal).
+        self._overlay_override: dict[int, tuple[Any, ...]] = {}
+        # Dernière fenêtre (pre_ms, post_ms) déjà tentée — évite une boucle si la
+        # trace ne couvre pas toute la demande.
+        self._overlay_request: dict[int, tuple[float, float]] = {}
         # Cache des enveloppes continues (stream, ch, max_points) → (t, y).
         self._continuous_cache: dict[tuple[str, int, int], tuple[np.ndarray, np.ndarray]] = {}
 
@@ -531,7 +578,10 @@ class ProcessedRecording:
         return False
 
     def store_channel(self, ch: int, data: ChannelData) -> None:
-        self._channel_data[int(ch)] = data
+        index = int(ch)
+        self._channel_data[index] = data
+        self._overlay_override.pop(index, None)
+        self._overlay_request.pop(index, None)
         self._data_generation = int(getattr(self, "_data_generation", 0)) + 1
         while len(self.threshold_captions) <= int(ch):
             self.threshold_captions.append("")
@@ -544,6 +594,8 @@ class ProcessedRecording:
 
     def clear_channel_cache(self) -> None:
         self._channel_data.clear()
+        self._overlay_override.clear()
+        self._overlay_request.clear()
         self._data_generation = int(getattr(self, "_data_generation", 0)) + 1
 
     def spike_count(self, ch: int) -> int:
@@ -642,18 +694,24 @@ class ProcessedRecording:
         n_samples = int(i1 - i0)
         t_origin = float(i0) / fs
         if limit > 16 and n_samples > limit:
-            # Enveloppe min/max vectorisée (pas de boucle Python par bin).
+            # Enveloppe min/max sur tout l’intervalle. Un pas ``n // n_bins``
+            # laissait jusqu’à ``n_bins - 1`` échantillons hors du tracé
+            # (souvent plus d’une seconde en fin de fenêtre).
             n_bins = max(1, limit // 2)
-            bin_size = max(1, n_samples // n_bins)
-            usable = bin_size * n_bins
-            reshaped = np.asarray(row[:usable], dtype=np.float32).reshape(n_bins, bin_size)
-            lows = reshaped.min(axis=1)
-            highs = reshaped.max(axis=1)
-            mids = t_origin + (np.arange(n_bins, dtype=np.float64) + 0.5) * (
-                bin_size / fs
-            )
+            edges = np.linspace(0, n_samples, n_bins + 1)
+            edges = np.rint(edges).astype(np.int64)
+            edges[0] = 0
+            edges[-1] = n_samples
+            edges = np.unique(edges)
+            starts = edges[:-1]
+            widths = np.diff(edges)
+            values = np.asarray(row, dtype=np.float32)
+            lows = np.minimum.reduceat(values, starts)
+            highs = np.maximum.reduceat(values, starts)
+            centers = starts.astype(np.float64) + (widths.astype(np.float64) - 1.0) / 2.0
+            mids = t_origin + centers / fs
             out_t = np.repeat(mids, 2)
-            out_y = np.empty(n_bins * 2, dtype=np.float64)
+            out_y = np.empty(mids.size * 2, dtype=np.float64)
             out_y[0::2] = lows
             out_y[1::2] = highs
             result = (out_t, out_y)
@@ -747,13 +805,26 @@ class ProcessedRecording:
             return empty, empty
         return time_axis[:n], values[:n]
 
-    def mean_rms_across_channels(self, kind: str = "mean") -> tuple[np.ndarray, np.ndarray]:
-        """RMS profile averaged over ready channels (summary panel)."""
+    def mean_rms_across_channels(
+        self,
+        kind: str = "mean",
+        channels: Sequence[int] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """RMS profile averaged over ready channels (summary panel).
+
+        ``channels`` limits the mean to those indices. ``None`` uses every
+        ready channel.
+        """
+        allowed = None if channels is None else {int(ch) for ch in channels}
         empty = np.empty(0, dtype=np.float64)
+        if allowed is not None and not allowed:
+            return empty, empty
         if self._channel_data:
             rows: list[np.ndarray] = []
             time_axis: np.ndarray | None = None
-            for data in self._channel_data.values():
+            for ch, data in self._channel_data.items():
+                if allowed is not None and int(ch) not in allowed:
+                    continue
                 values = data.rms_profiles.get(kind)
                 if values is None or values.size == 0:
                     continue
@@ -773,6 +844,11 @@ class ProcessedRecording:
         values = np.asarray(array, dtype=np.float64)
         if values.size == 0:
             return empty, empty
+        if allowed is not None and values.ndim >= 2:
+            idx = [ch for ch in sorted(allowed) if 0 <= ch < int(values.shape[0])]
+            if not idx:
+                return empty, empty
+            values = values[idx]
         with np.errstate(invalid="ignore"):
             profile = np.nanmean(values, axis=0)
         time_axis = np.asarray(self.derived.rms_time, dtype=np.float64)
@@ -839,25 +915,107 @@ class ProcessedRecording:
         lo, hi = float(t_range_s[0]), float(t_range_s[1])
         return [arr[(arr >= lo) & (arr <= hi)] for arr in trains]
 
-    def overlay_for_channel(
-        self, ch: int, *, t_range_s: tuple[float, float] | None = None
+    def _read_overlay_channel(
+        self, ch: int
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray | None]:
-        """``(t_ms, waveforms, spike_times, total, exact_mean_or_None)``."""
+        """Snippets stockés (override live, sinon canal, sinon bundle)."""
+        override = self._overlay_override.get(int(ch))
+        if override is not None:
+            return override  # type: ignore[return-value]
         data = self._channel_data.get(int(ch))
         if data is not None:
             t_ms = np.asarray(data.overlay_t_ms, dtype=np.float64)
             waves = np.asarray(data.overlay_waves)
             times = np.asarray(data.overlay_times, dtype=np.float64)
             total = int(data.overlay_total)
-            mean = None if data.overlay_mean is None else np.asarray(data.overlay_mean, dtype=np.float64)
-        else:
-            t_ms, waves, times, total = self.overlay.for_channel(ch)
-            mean = self.overlay.mean_for_channel(ch)
-        if t_range_s is None:
+            mean = (
+                None
+                if data.overlay_mean is None
+                else np.asarray(data.overlay_mean, dtype=np.float64)
+            )
             return t_ms, waves, times, total, mean
-        lo, hi = float(t_range_s[0]), float(t_range_s[1])
-        keep = (times >= lo) & (times <= hi)
-        return t_ms, np.asarray(waves)[keep], times[keep], int(np.count_nonzero(keep)), None
+        t_ms, waves, times, total = self.overlay.for_channel(ch)
+        mean = self.overlay.mean_for_channel(ch)
+        return t_ms, waves, times, total, mean
+
+    def _ensure_overlay_coverage(self, ch: int, pre_ms: float, post_ms: float) -> None:
+        """Ré-extrait les snippets si la fenêtre demandée dépasse le cache."""
+        pre = max(0.0, float(pre_ms))
+        post = max(1e-6, float(post_ms))
+        asked = (round(pre, 4), round(post, 4))
+        if self._overlay_request.get(int(ch)) == asked:
+            return
+        t_ms, _waves, _times, _total, _mean = self._read_overlay_channel(ch)
+        if _overlay_span_covers(t_ms, pre, post):
+            self._overlay_request[int(ch)] = asked
+            return
+        source = self.source
+        if source is None or not hasattr(source, "high_trace_for_channel"):
+            self._overlay_request[int(ch)] = asked
+            return
+        if not hasattr(source, "valid_triggers"):
+            self._overlay_request[int(ch)] = asked
+            return
+        from draw_primitives import _extract_spike_waveforms
+
+        trains = self.spike_times(int(ch))
+        new_t, new_w, new_times = _extract_spike_waveforms(
+            source, int(ch), trains, pre_ms=pre, post_ms=post
+        )
+        new_w = np.asarray(new_w, dtype=np.float32)
+        total = int(new_w.shape[0]) if new_w.ndim == 2 else 0
+        mean = (
+            np.mean(np.asarray(new_w, dtype=np.float64), axis=0)
+            if total
+            else None
+        )
+        times = np.asarray(new_times, dtype=np.float64)
+        if total > MAX_OVERLAY_SNIPPETS_PER_CHANNEL:
+            picks = np.linspace(
+                0, total - 1, MAX_OVERLAY_SNIPPETS_PER_CHANNEL
+            ).astype(np.int64)
+            new_w = new_w[picks]
+            times = times[picks]
+        self._overlay_override[int(ch)] = (
+            np.asarray(new_t, dtype=np.float64),
+            new_w,
+            times,
+            total,
+            None if mean is None else np.asarray(mean, dtype=np.float64),
+        )
+        self._overlay_request[int(ch)] = asked
+        self._data_generation = int(self._data_generation) + 1
+
+    def overlay_for_channel(
+        self,
+        ch: int,
+        *,
+        t_range_s: tuple[float, float] | None = None,
+        pre_ms: float | None = None,
+        post_ms: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray | None]:
+        """``(t_ms, waveforms, spike_times, total, exact_mean_or_None)``.
+
+        ``t_range_s`` ne garde que les spikes dont le temps (s, relatif à la
+        stimulation) tombe dans la fenêtre. ``pre_ms`` / ``post_ms`` recadrent
+        chaque forme d’onde sur la fenêtre sélectionnée autour de la détection,
+        et ré-extraient la trace si le cache est plus court.
+        """
+        if pre_ms is not None and post_ms is not None:
+            self._ensure_overlay_coverage(int(ch), float(pre_ms), float(post_ms))
+        t_ms, waves, times, total, mean = self._read_overlay_channel(ch)
+        if t_range_s is not None:
+            lo, hi = float(t_range_s[0]), float(t_range_s[1])
+            keep = (times >= lo) & (times <= hi)
+            waves = np.asarray(waves)[keep]
+            times = times[keep]
+            total = int(np.count_nonzero(keep))
+            mean = None
+        if pre_ms is not None and post_ms is not None:
+            t_ms, waves, mean = _crop_overlay_time(
+                t_ms, waves, mean, float(pre_ms), float(post_ms)
+            )
+        return t_ms, waves, times, total, mean
 
     # ---------------------------------------------------------------- lifetime
 
@@ -868,6 +1026,8 @@ class ProcessedRecording:
         handle on the bundle and prevents it from being deleted or overwritten.
         """
         self._channel_data.clear()
+        self._overlay_override.clear()
+        self._overlay_request.clear()
         source = self.source
         self.source = None
         if source is not None and hasattr(source, "close"):

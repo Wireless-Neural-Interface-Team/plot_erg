@@ -1477,6 +1477,7 @@ def plot_processed_recordings_pdf(
     configs: Sequence[Any],
     *,
     output_dir: Path | None = None,
+    channels: Sequence[int] | None = None,
 ) -> Path:
     """PDF export from ProcessedRecording objects (shared GUI/CLI data plane).
 
@@ -1491,10 +1492,11 @@ def plot_processed_recordings_pdf(
         raise ValueError("configs and recordings length mismatch.")
 
     for recording, config in zip(recordings, configs):
-        channels = list(range(int(recording.n_channels)))
+        n_rec = int(recording.n_channels)
+        wanted = _resolve_plot_channels(n_rec, channels)
         ensure_channels(
             recording,
-            channels,
+            wanted,
             config,
             need_means=True,
             need_rms=True,
@@ -1507,7 +1509,7 @@ def plot_processed_recordings_pdf(
                 bank = getattr(source, bank_name, None)
                 prefetch = getattr(bank, "prefetch", None)
                 if callable(prefetch):
-                    prefetch(channels)
+                    prefetch(wanted)
 
     spike_sources = []
     for recording in recordings:
@@ -1561,6 +1563,7 @@ def plot_processed_recordings_pdf(
         first_trigger_hp_ylim_max_uv=float(cfg0.first_trigger_hp_ylim_max_uv),
         plot_display=getattr(cfg0, "plot_display", None),
         recording_styles=styles,
+        channel_indices=channels,
     )
 
     @staticmethod
@@ -1579,6 +1582,7 @@ def plot_processed_recordings_pdf(
         need_raw: bool = True,
         need_hp: bool = True,
         need_lp: bool = True,
+        channels: Sequence[int] | None = None,
     ) -> None:
         """Pre-compute channel means in parallel for the streams that are displayed."""
         if not (need_raw or need_hp or need_lp):
@@ -1587,7 +1591,10 @@ def plot_processed_recordings_pdf(
             n_ch = min(int(n_channels), int(src.amplifier.shape[0]))
             if n_ch <= 0:
                 continue
-            workers = resolve_channel_workers(channel_workers, n_ch)
+            wanted = _resolve_plot_channels(n_ch, channels)
+            if not wanted:
+                continue
+            workers = resolve_channel_workers(channel_workers, len(wanted))
             raw_all = hp_all = lp_all = None
             if need_raw:
                 check_analysis_cancelled()
@@ -1597,6 +1604,7 @@ def plot_processed_recordings_pdf(
                     self.pre_n,
                     self.post_n,
                     channel_workers=workers,
+                    channels=wanted,
                 )
             if need_hp:
                 check_analysis_cancelled()
@@ -1606,6 +1614,7 @@ def plot_processed_recordings_pdf(
                     self.pre_n,
                     self.post_n,
                     channel_workers=workers,
+                    channels=wanted,
                 )
             if need_lp:
                 check_analysis_cancelled()
@@ -1615,8 +1624,9 @@ def plot_processed_recordings_pdf(
                     self.pre_n,
                     self.post_n,
                     channel_workers=workers,
+                    channels=wanted,
                 )
-            for ch in range(n_ch):
+            for ch in wanted:
                 if raw_all is not None:
                     self._mean_raw[(src_idx, ch)] = self._normalize_mean_row(
                         raw_all[ch], self.n_expected
@@ -1711,16 +1721,24 @@ def plot_processed_recordings_pdf(
         n_channels: int,
         *,
         trigger_index: int | None = None,
+        channels: Sequence[int] | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Mean RMS across channels from already-cached per-channel profiles."""
-        key = (src_idx, None, trigger_index)
+        if channels is None:
+            indices = list(range(int(n_channels)))
+            key: tuple[Any, ...] = (src_idx, None, trigger_index)
+        else:
+            indices = [
+                int(ch) for ch in channels if 0 <= int(ch) < int(n_channels)
+            ]
+            key = (src_idx, None, trigger_index, tuple(indices))
         cached = self._rms.get(key)
         if cached is not None:
             return cached
         tx_ref: np.ndarray | None = None
         acc: np.ndarray | None = None
         n_ok = 0
-        for ch in range(int(n_channels)):
+        for ch in indices:
             per_ch = self._rms.get((src_idx, ch, trigger_index))
             if per_ch is None:
                 continue
@@ -1752,11 +1770,13 @@ def plot_processed_recordings_pdf(
         spike_threshold_uv: float,
         spike_threshold_polarity: str,
         spike_threshold_rms_multiplier: float,
+        channels: Sequence[int] | None = None,
     ) -> None:
         """Pre-compute per-channel RMS and spike times in parallel before PDF pages."""
         n_src = len(spike_sources)
         n_ch = int(n_channels)
-        jobs = [(si, ch) for si in range(n_src) for ch in range(n_ch)]
+        wanted = _resolve_plot_channels(n_ch, channels)
+        jobs = [(si, ch) for si in range(n_src) for ch in wanted]
 
         def _one(job: tuple[int, int]) -> None:
             si, ch = job
@@ -2335,6 +2355,32 @@ def _append_single_curve_stream_montage_pages(
         )
 
 
+def _resolve_plot_channels(
+    n_channels: int, channel_indices: Sequence[int] | None
+) -> list[int]:
+    """Indices à traiter. ``None`` = tous les canaux."""
+    limit = max(0, int(n_channels))
+    if channel_indices is None:
+        return list(range(limit))
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw in channel_indices:
+        ch = int(raw)
+        if 0 <= ch < limit and ch not in seen:
+            seen.add(ch)
+            out.append(ch)
+    return out
+
+
+def _selected_channel_names(
+    channel_names: Sequence[str], indices: Sequence[int]
+) -> list[str]:
+    return [
+        str(channel_names[ch]) if ch < len(channel_names) else f"CH{ch}"
+        for ch in indices
+    ]
+
+
 def _append_second_stim_stream_montage_pages(
     pdf: PdfPages,
     *,
@@ -2354,10 +2400,13 @@ def _append_second_stim_stream_montage_pages(
     zoom_onset_t0: float,
     zoom_onset_t1: float,
     show_zoom_span: bool,
+    channel_indices: Sequence[int] | None = None,
 ) -> None:
-    """One filter stream: all channels stacked for the second stimulation."""
+    """One filter stream: selected channels stacked for the second stimulation."""
+    indices = _resolve_plot_channels(n_channels, channel_indices)
+    names = _selected_channel_names(channel_names, indices)
     curves: list[Optional[np.ndarray]] = []
-    for ch in range(n_channels):
+    for ch in indices:
         check_analysis_cancelled()
         curves.append(
             _nth_trigger_window(
@@ -2372,7 +2421,7 @@ def _append_second_stim_stream_montage_pages(
     _append_single_curve_stream_montage_pages(
         pdf,
         curves=curves,
-        channel_names=channel_names,
+        channel_names=names,
         t_plot=t_plot,
         page_title=(
             f"All-channels montage — 2nd stimulation — {stream_title}"
@@ -2413,12 +2462,15 @@ def _append_mean_stim_stream_montage_pages(
     zoom_onset_t1: float,
     show_zoom_span: bool,
     render_cache: Optional[Any] = None,
+    channel_indices: Sequence[int] | None = None,
 ) -> None:
-    """One filter stream: all channels stacked for trial-averaged stimulations."""
+    """One filter stream: selected channels stacked for trial-averaged stimulations."""
+    indices = _resolve_plot_channels(n_channels, channel_indices)
+    names = _selected_channel_names(channel_names, indices)
     triggers = np.asarray(source.valid_triggers, dtype=np.int64)
     n_stim = int(triggers.size)
     curves: list[Optional[np.ndarray]] = []
-    for ch in range(n_channels):
+    for ch in indices:
         check_analysis_cancelled()
         if n_stim < 1:
             curves.append(None)
@@ -2451,7 +2503,7 @@ def _append_mean_stim_stream_montage_pages(
     _append_single_curve_stream_montage_pages(
         pdf,
         curves=curves,
-        channel_names=channel_names,
+        channel_names=names,
         t_plot=t_plot,
         page_title=(
             f"All-channels montage — trial-averaged — {stream_title}"
@@ -2482,8 +2534,14 @@ def _append_second_to_third_stim_span_lp_montage_pages(
     show_rec_in_title: bool,
     sampling_percent: int,
     end_marker: float | None,
+    channel_indices: Sequence[int] | None = None,
 ) -> None:
     """Continuous low-pass montage from 2nd stim window start through 3rd stim window end."""
+    indices = _resolve_plot_channels(n_channels, channel_indices)
+    channel_names = _selected_channel_names(channel_names, indices)
+    n_channels = len(indices)
+    if n_channels < 1:
+        return
     triggers = np.asarray(source.valid_triggers, dtype=np.int64)
     if triggers.size <= _THIRD_STIM_TRIGGER_INDEX:
         curves: list[Optional[np.ndarray]] = [None] * n_channels
@@ -2507,7 +2565,7 @@ def _append_second_to_third_stim_span_lp_montage_pages(
             t_plot = (np.arange(start, end, dtype=np.float64) - float(trig2)) / fs
             third_onset_s = float(trig3 - trig2) / fs
             curves = []
-            for ch in range(n_channels):
+            for ch in indices:
                 check_analysis_cancelled()
                 curves.append(
                     np.asarray(source.lowpass[ch, start:end], dtype=np.float64)
@@ -2692,6 +2750,7 @@ def _append_second_stim_channel_montage_pages(
     filter_short_lp: str | None = None,
     filter_short_hp: str | None = None,
     render_cache: Optional[Any] = None,
+    channel_indices: Sequence[int] | None = None,
 ) -> None:
     """Summary: trial-averaged LP/HP, 2nd stim LP/HP, then continuous 2nd→3rd LP span."""
     n_expected = int(t_rel.shape[0])
@@ -2734,6 +2793,7 @@ def _append_second_stim_channel_montage_pages(
             zoom_onset_t0=zoom_onset_t0,
             zoom_onset_t1=zoom_onset_t1,
             show_zoom_span=show_zoom_span,
+            channel_indices=channel_indices,
         )
         _append_mean_stim_stream_montage_pages(
             pdf,
@@ -2781,6 +2841,7 @@ def _append_second_stim_channel_montage_pages(
             show_rec_in_title=show_rec,
             sampling_percent=sampling_percent,
             end_marker=end_marker,
+            channel_indices=channel_indices,
         )
 
 
@@ -2910,6 +2971,7 @@ def plot_channel_multi_comparison(
     first_trigger_hp_ylim_max_uv: float = 200.0,
     plot_display: PlotDisplaySettings | None = None,
     recording_styles: Sequence[RecordingStyle] | None = None,
+    channel_indices: Sequence[int] | None = None,
 ) -> Path:
     """Multi-page PDF: overlay of N recordings (same aligned channels)."""
     _profile_before = _profile_snapshot()
@@ -2994,6 +3056,9 @@ def plot_channel_multi_comparison(
     filter_short = filter_short_hp
     rms_note = f"window {rms_window_s:g} s"
     n_channels = min(src.amplifier.shape[0] for src in spike_sources)
+    plot_channels = _resolve_plot_channels(
+        min(n_channels, len(channel_names)), channel_indices
+    )
     end_markers = [v for v in (trigger_end_rising_rel_s_list or []) if v is not None]
     _has_spike_cmp = (
         fs is not None
@@ -3029,10 +3094,11 @@ def plot_channel_multi_comparison(
         need_raw=need_raw,
         need_hp=need_hp,
         need_lp=need_lp,
+        channels=plot_channels,
     )
-    if need_rms or need_spikes:
+    if (need_rms or need_spikes) and plot_channels:
         print(
-            f"Pre-computing RMS and spikes for {n_channels} channel(s) × {n_records} recording(s)..."
+            f"Pre-computing RMS and spikes for {len(plot_channels)} channel(s) × {n_records} recording(s)..."
         )
         render_cache.prefill_channel_metrics(
             spike_sources,
@@ -3042,9 +3108,10 @@ def plot_channel_multi_comparison(
             spike_threshold_uv=spike_threshold_uv,
             spike_threshold_polarity=spike_threshold_polarity,
             spike_threshold_rms_multiplier=spike_threshold_rms_multiplier,
+            channels=plot_channels,
         )
     with PdfPages(pdf_path) as pdf:
-        for ch in range(n_channels):
+        for ch in plot_channels:
             check_analysis_cancelled()
             channel_name = str(channel_names[ch])
             means_ch_hp: list[np.ndarray] = []
@@ -3877,7 +3944,9 @@ def plot_channel_multi_comparison(
 
         rms_series: list[tuple[str, np.ndarray, np.ndarray]] = []
         for i in plot_indices:
-            tx_rms, rms_vals = render_cache.rms_profile_recording_mean(i, n_channels)
+            tx_rms, rms_vals = render_cache.rms_profile_recording_mean(
+                i, n_channels, channels=plot_channels
+            )
             label = labels[i] if i < len(labels) else f"Recording {i + 1}"
             rms_series.append((label, tx_rms, rms_vals))
         if rms_series and display.summary_rms_page:
@@ -3900,12 +3969,12 @@ def plot_channel_multi_comparison(
                 src = spike_sources[i]
                 label = labels[i] if i < len(labels) else f"Recording {i + 1}"
                 values = [
-                    render_cache.channel_rms_uv(i, src, ch) for ch in range(n_channels)
+                    render_cache.channel_rms_uv(i, src, ch) for ch in plot_channels
                 ]
                 rms_by_recording.append((label, values))
             _append_mean_rms_per_channel_table_page(
                 pdf,
-                channel_names[:n_channels],
+                _selected_channel_names(channel_names, plot_channels),
                 rms_by_recording,
                 filter_title=filter_title,
                 rms_window_s=rms_table_window_s,
@@ -3930,6 +3999,7 @@ def plot_channel_multi_comparison(
                 filter_short_lp=filter_short_lp,
                 filter_short_hp=filter_short_hp,
                 render_cache=render_cache,
+                channel_indices=plot_channels,
             )
 
     _profile_print_delta(

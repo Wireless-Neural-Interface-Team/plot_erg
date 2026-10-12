@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QSizePolicy,
+    QTableWidget,
+    QTableWidgetItem,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -85,6 +87,9 @@ class _EditableText:
 
     def get_text(self) -> str:
         item = self.item
+        axis = _axis_owning_label(item)
+        if axis is not None:
+            return str(getattr(axis, "labelText", "") or "")
         if isinstance(item, pg.LabelItem):
             return str(item.text or "")
         to_plain = getattr(item, "toPlainText", None)
@@ -93,9 +98,18 @@ class _EditableText:
         return str(getattr(item, "text", "") or "")
 
     def set_text(self, text: str) -> None:
+        """Remplacer uniquement la chaîne, en gardant police et style."""
         item = self.item
         if isinstance(item, pg.LabelItem):
-            item.setText(str(text))
+            _render_label_item(item, str(text))
+            return
+        axis = _axis_owning_label(item)
+        if axis is not None:
+            axis.labelText = str(text)
+            try:
+                axis._updateLabel()
+            except Exception:
+                pass
             return
         set_plain = getattr(item, "setPlainText", None)
         if callable(set_plain):
@@ -142,6 +156,155 @@ class _MontageRowLabel(pg.LabelItem):
         self.updateMin()
 
 
+def _html_text(text: str) -> str:
+    return (
+        str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+
+
+def _axis_owning_label(item: Any) -> Any | None:
+    """AxisItem dont ``label`` est ce QGraphicsTextItem, sinon None."""
+    parent_fn = getattr(item, "parentItem", None)
+    parent = parent_fn() if callable(parent_fn) else None
+    if parent is None:
+        return None
+    if getattr(parent, "label", None) is item and hasattr(parent, "labelStyle"):
+        return parent
+    return None
+
+
+def _css_pt(size: str) -> float | None:
+    raw = str(size or "").strip().lower().replace(" ", "")
+    if raw.endswith("pt"):
+        raw = raw[:-2]
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
+def _render_label_item(item: pg.LabelItem, text: str) -> None:
+    """Réécrire le HTML du LabelItem sans toucher taille, police ni style.
+
+    ``LabelItem.setText`` ignore le souligné : on le remet dans le span.
+    """
+    raw = str(text)
+    shown = raw if raw != "" else " "
+    opts = item.opts
+    item.text = raw
+    parts: list[str] = []
+    color = opts.get("color")
+    if color is None:
+        try:
+            color = pg.getConfigOption("foreground")
+        except Exception:
+            color = "#000000"
+    try:
+        qcolor = pg.mkColor(color)
+        parts.append("color: " + qcolor.name(QColor.NameFormat.HexArgb))
+    except Exception:
+        pass
+    family = opts.get("family")
+    if family:
+        parts.append("font-family: " + str(family))
+    size = opts.get("size")
+    if size:
+        parts.append("font-size: " + str(size))
+    if opts.get("bold") in (True, False):
+        parts.append("font-weight: " + ("bold" if opts["bold"] else "normal"))
+    if opts.get("italic") in (True, False):
+        parts.append("font-style: " + ("italic" if opts["italic"] else "normal"))
+    if opts.get("underline"):
+        parts.append("text-decoration: underline")
+    try:
+        item.item.setHtml(
+            "<span style='%s'>%s</span>" % ("; ".join(parts), _html_text(shown))
+        )
+        item.updateMin()
+        item.resizeEvent(None)
+        item.updateGeometry()
+    except Exception:
+        pass
+
+
+def _apply_axis_label_style(
+    axis: Any,
+    *,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+) -> None:
+    """Mettre le style dans ``labelStyle`` pour que ``_updateLabel`` le garde."""
+    style = dict(getattr(axis, "labelStyle", {}) or {})
+    if "size" in style and "font-size" not in style:
+        style["font-size"] = style.pop("size")
+    style["font-weight"] = "bold" if bold else "normal"
+    style["font-style"] = "italic" if italic else "normal"
+    if underline:
+        style["text-decoration"] = "underline"
+    else:
+        style.pop("text-decoration", None)
+    axis.labelStyle = style
+    try:
+        axis._updateLabel()
+    except Exception:
+        pass
+
+
+def _editor_font(item: Any) -> QFont:
+    """Police affichée pendant l’édition : celle du libellé, pas celle du formulaire."""
+    font = QFont()
+    bold = italic = underline = False
+    size = ""
+    family = ""
+    if isinstance(item, pg.LabelItem):
+        opts = getattr(item, "opts", {}) or {}
+        bold = bool(opts.get("bold"))
+        italic = bool(opts.get("italic"))
+        underline = bool(opts.get("underline"))
+        size = str(opts.get("size") or "")
+        family = str(opts.get("family") or "")
+    else:
+        axis = _axis_owning_label(item)
+        if axis is None:
+            current = item.font() if callable(getattr(item, "font", None)) else None
+            return current if isinstance(current, QFont) else font
+        style = dict(getattr(axis, "labelStyle", {}) or {})
+        bold = str(style.get("font-weight", "")).strip().lower() == "bold"
+        italic = str(style.get("font-style", "")).strip().lower() == "italic"
+        underline = "underline" in str(style.get("text-decoration", "")).lower()
+        size = str(style.get("font-size") or style.get("size") or "")
+        family = str(style.get("font-family") or "")
+    if family:
+        font.setFamily(family)
+    pt = _css_pt(size)
+    if pt is not None:
+        font.setPointSizeF(pt)
+    font.setBold(bold)
+    font.setItalic(italic)
+    font.setUnderline(underline)
+    return font
+
+
+def _editor_stylesheet(font: QFont) -> str:
+    weight = "700" if font.bold() else "400"
+    slant = "italic" if font.italic() else "normal"
+    deco = "underline" if font.underline() else "none"
+    family = font.family() or "Segoe UI"
+    pt = float(font.pointSizeF())
+    size = f"{pt:g}pt" if pt > 0 else "9pt"
+    return (
+        "QLineEdit { background: #fffbeb; border: 1px solid #d97706; "
+        "padding: 1px 4px; "
+        f"font-family: \"{family}\"; font-size: {size}; "
+        f"font-weight: {weight}; font-style: {slant}; "
+        f"text-decoration: {deco}; }}"
+    )
+
+
 def _apply_label_face(
     item: Any,
     *,
@@ -149,8 +312,21 @@ def _apply_label_face(
     italic: bool = False,
     underline: bool = False,
 ) -> None:
-    """Gras / italique / souligné sur LabelItem ou TextItem pyqtgraph."""
+    """Gras / italique / souligné, sans changer la taille ni la famille déjà posées."""
     if item is None:
+        return
+    axis = _axis_owning_label(item)
+    if axis is not None:
+        _apply_axis_label_style(
+            axis, bold=bool(bold), italic=bool(italic), underline=bool(underline)
+        )
+        return
+    if isinstance(item, pg.LabelItem):
+        opts = item.opts
+        opts["bold"] = bool(bold)
+        opts["italic"] = bool(italic)
+        opts["underline"] = bool(underline)
+        _render_label_item(item, str(getattr(item, "text", "") or ""))
         return
     for method, value in (
         ("setBold", bold),
@@ -163,15 +339,6 @@ def _apply_label_face(
                 fn(bool(value))
             except Exception:
                 pass
-    try:
-        opt = getattr(item, "opts", None)
-        if isinstance(opt, dict):
-            opt["bold"] = bool(bold)
-            opt["italic"] = bool(italic)
-            opt["underline"] = bool(underline)
-    except Exception:
-        pass
-    # TextItem / axes : souligné via QFont si exposé.
     try:
         font = item.font() if callable(getattr(item, "font", None)) else None
         if font is not None:
@@ -303,6 +470,7 @@ class PlotHost(QWidget):
         self._legend_item: Any | None = None
         self._cached_spec: PanelSpec | None = None
         self._structure_key: tuple[Any, ...] | None = None
+        self._table: QTableWidget | None = None
 
         # AA global = très coûteux au scroll / pan ; activé au cas par cas sur les courbes.
         pg.setConfigOptions(antialias=False, foreground=self._colors["fg"])
@@ -402,6 +570,52 @@ class PlotHost(QWidget):
             gen = self._autoscale_gen
             QTimer.singleShot(0, lambda g=gen: self._apply_limits_after_paint(g))
 
+    def _hide_table(self) -> None:
+        if self._table is not None:
+            self._table.hide()
+        self._glw.show()
+
+    def _show_table(self, spec: PanelSpec) -> None:
+        self._glw.hide()
+        if self._table is None:
+            self._table = QTableWidget(self)
+            self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            self._table.setAlternatingRowColors(True)
+            layout = self.layout()
+            if layout is not None:
+                layout.insertWidget(1, self._table, 1)
+        headers = [str(h) for h in spec.table_headers]
+        rows = [list(row) for row in spec.table_rows]
+        self._table.clear()
+        self._table.setColumnCount(len(headers))
+        self._table.setHorizontalHeaderLabels(headers)
+        self._table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, value in enumerate(row):
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self._table.setItem(r, c, item)
+        self._table.resizeColumnsToContents()
+        highlight = int(getattr(spec, "table_highlight_row", -1) or -1)
+        if 0 <= highlight < len(rows):
+            self._table.selectRow(highlight)
+            current = self._table.item(highlight, 0)
+            if current is not None:
+                self._table.scrollToItem(current)
+        title = str(spec.title or "").strip()
+        self._cursor_label.setText(title or "Table")
+        self._table.show()
+
+    def _apply_x_ticks(self, spec: PanelSpec | None) -> None:
+        ticks = list(getattr(spec, "x_ticks", ()) or []) if spec is not None else []
+        if not ticks or not self._plots:
+            return
+        try:
+            self._plots[0].getAxis("bottom").setTicks([ticks])
+        except Exception:
+            pass
+
     def render_request(self, request: Any) -> str:
         spec = prepare_panel(request)
         return self.render_spec(spec)
@@ -450,6 +664,13 @@ class PlotHost(QWidget):
         self._cancel_text_edit()
         self._spec = spec
         self._cached_spec = spec
+        if spec.layout_kind == "table" and spec.status == "ok":
+            self._clear_plots()
+            self._geometry_key = ("table", tuple(spec.table_headers), len(spec.table_rows))
+            self._show_table(spec)
+            self.figure._erg_status = spec.status
+            return spec.status
+        self._hide_table()
         placeholder = spec.layout_kind == "placeholder" or (
             spec.status in {"unavailable", "pending", "empty"} and not spec.series
         )
@@ -532,19 +753,17 @@ class PlotHost(QWidget):
         label_col = 0
         self._plot_col = plot_col
         self._data_row0 = 1
+        # La légende occupe la ligne juste sous les graphes. Sans ça, la
+        # première ligne ajoutée tombe sur une cellule prise : Qt refuse
+        # l’item, pyqtgraph le garde quand même, et le prochain clear() plante.
+        self._remove_legend()
         # Trim
         while len(self._plots) > n_rows:
             plot = self._plots.pop()
-            try:
-                self._glw.removeItem(plot)
-            except Exception:
-                pass
+            self._discard_layout_item(plot)
             if self._row_labels:
                 label = self._row_labels.pop()
-                try:
-                    self._glw.removeItem(label)
-                except Exception:
-                    pass
+                self._discard_layout_item(label)
             if self.figure.axes:
                 self.figure.axes.pop()
         # Extend
@@ -561,8 +780,10 @@ class PlotHost(QWidget):
                 color=self._colors["fg"],
                 size=f"{label_pt}pt",
             )
+            self._free_grid_cell(grid_row, label_col)
             self._glw.addItem(label, row=grid_row, col=label_col)
             self._row_labels.append(label)
+            self._free_grid_cell(grid_row, plot_col)
             plot = self._glw.addPlot(row=grid_row, col=plot_col)
             self._style_plot(plot, montage=True, spec=spec)
             self._configure_mouse(plot)
@@ -637,6 +858,12 @@ class PlotHost(QWidget):
     ) -> str:
         legend_entries = self._draw_series(spec)
         self._draw_annotations(spec)
+        seen_labels = {label for label, _color in legend_entries}
+        for ann in spec.annotations:
+            ann_label = str(getattr(ann, "label", "") or "").strip()
+            if ann.kind == "hline" and ann_label and ann_label not in seen_labels:
+                seen_labels.add(ann_label)
+                legend_entries.append((ann_label, str(ann.color)))
         # Autoscale / limites après affichage des courbes (pas pendant le build).
         self._queue_limits_after_paint(spec)
         self._apply_labels(spec, is_montage=is_montage)
@@ -711,13 +938,7 @@ class PlotHost(QWidget):
         self._legend_item = None
         if legend is None:
             return
-        try:
-            self._glw.removeItem(legend)
-        except Exception:
-            try:
-                legend.scene().removeItem(legend)
-            except Exception:
-                pass
+        self._discard_layout_item(legend)
         try:
             legend.close()
         except Exception:
@@ -894,7 +1115,10 @@ class PlotHost(QWidget):
                 continue
             xlim, ylim = saved
             try:
-                if restore_x:
+                # Overlay : temps en ms autour du spike — ne pas réappliquer
+                # l’échelle d’une autre famille (secondes) ni l’ancienne fenêtre.
+                kind = str(key[1])
+                if restore_x and kind != "overlay":
                     plot.setXRange(xlim[0], xlim[1], padding=0)
                     restored_any_x = True
                 do_y = (
@@ -997,6 +1221,193 @@ class PlotHost(QWidget):
 
     # ---------------------------------------------------------------- draw
 
+    def _qt_graphics_at(self, row: int, col: int) -> Any | None:
+        """Item Qt réellement posé en (row, col), même si le suivi pyqtgraph diverge."""
+        layout = self._glw.ci.layout
+        try:
+            row_count = int(layout.rowCount())
+            col_count = int(layout.columnCount())
+        except Exception:
+            return None
+        # Hors grille, itemAt() logue « invalid row, column » et renvoie null.
+        if row < 0 or col < 0 or row >= row_count or col >= col_count:
+            return None
+        try:
+            layout_item = layout.itemAt(int(row), int(col))
+        except TypeError:
+            return None
+        except Exception:
+            return None
+        if layout_item is None:
+            return None
+        try:
+            return layout_item.graphicsItem()
+        except Exception:
+            return layout_item
+
+    def _free_grid_cell(self, row: int, col: int) -> None:
+        """Libérer une cellule avant d’y poser un nouvel item."""
+        occupants: list[Any] = []
+        graphic = self._qt_graphics_at(row, col)
+        if graphic is not None:
+            occupants.append(graphic)
+        try:
+            tracked = self._glw.getItem(int(row), int(col))
+        except Exception:
+            tracked = None
+        if tracked is not None and all(tracked is not item for item in occupants):
+            occupants.append(tracked)
+        for item in occupants:
+            self._discard_layout_item(item)
+
+    def _discard_layout_item(self, item: Any) -> None:
+        """Retirer un item même quand ``GraphicsLayout.removeItem`` ne trouve plus son index."""
+        if item is None:
+            return
+        ci = self._glw.ci
+        try:
+            self._glw.removeItem(item)
+            return
+        except Exception:
+            pass
+        layout = ci.layout
+        if hasattr(layout, "count"):
+            try:
+                index = 0
+                while index < layout.count():
+                    layout_item = layout.itemAt(index)
+                    graphic = None
+                    try:
+                        graphic = (
+                            layout_item.graphicsItem()
+                            if layout_item is not None
+                            else None
+                        )
+                    except Exception:
+                        graphic = None
+                    if layout_item is item or graphic is item:
+                        layout.removeAt(index)
+                        continue
+                    index += 1
+            except Exception:
+                pass
+        try:
+            scene = item.scene()
+            if scene is not None:
+                scene.removeItem(item)
+        except Exception:
+            pass
+        for row, col in list(ci.items.get(item, ())):
+            row_map = ci.rows.get(row)
+            if row_map is not None and row_map.get(col) is item:
+                del row_map[col]
+        ci.items.pop(item, None)
+        try:
+            item.geometryChanged.disconnect(ci._updateItemBorder)
+        except Exception:
+            pass
+        border = ci.itemBorders.pop(item, None)
+        if border is not None:
+            try:
+                border_scene = border.scene()
+                if border_scene is not None:
+                    border_scene.removeItem(border)
+            except Exception:
+                pass
+
+    def _force_clear_layout(self) -> bool:
+        """Vider la grille après un ``clear()`` interrompu. False si Qt garde des cellules."""
+        ci = self._glw.ci
+        for item in list(ci.items.keys()):
+            self._discard_layout_item(item)
+        layout = ci.layout
+        if hasattr(layout, "count"):
+            try:
+                guard = int(layout.count()) + 1
+                while layout.count() and guard:
+                    guard -= 1
+                    before = int(layout.count())
+                    layout_item = layout.itemAt(0)
+                    graphic = None
+                    try:
+                        graphic = (
+                            layout_item.graphicsItem()
+                            if layout_item is not None
+                            else None
+                        )
+                    except Exception:
+                        graphic = None
+                    layout.removeAt(0)
+                    if graphic is not None:
+                        try:
+                            scene = graphic.scene()
+                            if scene is not None:
+                                scene.removeItem(graphic)
+                        except Exception:
+                            pass
+                    if int(layout.count()) >= before:
+                        break
+            except Exception:
+                pass
+        for border in list(ci.itemBorders.values()):
+            try:
+                scene = border.scene()
+                if scene is not None:
+                    scene.removeItem(border)
+            except Exception:
+                pass
+        ci.items.clear()
+        ci.rows.clear()
+        ci.itemBorders.clear()
+        ci.currentRow = 0
+        ci.currentCol = 0
+        remaining = 0
+        if hasattr(layout, "count"):
+            try:
+                remaining = int(layout.count())
+            except Exception:
+                remaining = 0
+        return remaining == 0 and not ci.items
+
+    def _replace_graphics_layout(self) -> None:
+        """Remplacer la grille quand QGraphicsGridLayout garde des cellules fantômes."""
+        glw = self._glw
+        new = pg.GraphicsLayout()
+        for name in (
+            "nextRow",
+            "nextCol",
+            "nextColumn",
+            "addPlot",
+            "addViewBox",
+            "addItem",
+            "getItem",
+            "addLayout",
+            "addLabel",
+            "removeItem",
+            "itemIndex",
+            "clear",
+        ):
+            setattr(glw, name, getattr(new, name))
+        glw.ci = new
+        glw.setCentralItem(new)
+
+    def _empty_graphics_layout(self) -> None:
+        try:
+            self._glw.clear()
+        except Exception:
+            if not self._force_clear_layout():
+                self._replace_graphics_layout()
+            return
+        ci = self._glw.ci
+        leftover = bool(ci.items)
+        if not leftover and hasattr(ci.layout, "count"):
+            try:
+                leftover = int(ci.layout.count()) > 0
+            except Exception:
+                leftover = False
+        if leftover and not self._force_clear_layout():
+            self._replace_graphics_layout()
+
     def _clear_plots(self) -> None:
         self._limits_after_paint = False
         self._autoscale_gen += 1
@@ -1004,7 +1415,7 @@ class PlotHost(QWidget):
         self._clear_scale_bar_items()
         self._scale_bar_lengths = []
         self._legend_item = None
-        self._glw.clear()
+        self._empty_graphics_layout()
         self._plots.clear()
         self._text_items.clear()
         self._row_labels.clear()
@@ -1032,6 +1443,11 @@ class PlotHost(QWidget):
             vb.setDefaultPadding(0.0)
         except Exception:
             pass
+        if spec is not None and bool(getattr(spec, "y_log", False)):
+            try:
+                plot.setLogMode(x=False, y=True)
+            except Exception:
+                pass
         show_borders = True if spec is None else bool(spec.show_borders)
         ticks_inside = False if spec is None else bool(spec.ticks_inside)
         tick_pt = 8 if montage else 9
@@ -1267,7 +1683,16 @@ class PlotHost(QWidget):
             if isinstance(item, CurveSeries):
                 if item.x.size == 0 or item.y.size == 0:
                     continue
-                pen = pg.mkPen(item.color, width=max(0.5, float(item.linewidth)))
+                width = max(0.5, float(item.linewidth))
+                raw_alpha = getattr(item, "alpha", 1.0)
+                alpha = 1.0 if raw_alpha is None else float(raw_alpha)
+                alpha = max(0.0, min(1.0, alpha))
+                if alpha < 0.999:
+                    qcolor = pg.mkColor(item.color)
+                    qcolor.setAlphaF(alpha)
+                    pen = pg.mkPen(qcolor, width=width)
+                else:
+                    pen = pg.mkPen(item.color, width=width)
                 # Pas de ``name`` : la légende est placée sous les graphs, pas dans le plot.
                 # float32 : moins de bande passante GPU/CPU au paint.
                 curve = plot.plot(
@@ -1277,6 +1702,10 @@ class PlotHost(QWidget):
                     connect="finite",
                     antialias=use_aa,
                 )
+                try:
+                    curve.setZValue(4 if alpha >= 0.999 else 1)
+                except Exception:
+                    pass
                 self._tune_plot_data_item(curve, dense=True)
             elif isinstance(item, ScatterSeries):
                 if item.x.size == 0:
@@ -1358,10 +1787,17 @@ class PlotHost(QWidget):
                 )
                 plot.addItem(line)
             elif ann.kind == "hline":
+                style_name = str(getattr(ann, "linestyle", ":") or ":")
+                if style_name in {"--", "dashed"}:
+                    pen_style = Qt.PenStyle.DashLine
+                elif style_name in {"-", "solid"}:
+                    pen_style = Qt.PenStyle.SolidLine
+                else:
+                    pen_style = Qt.PenStyle.DotLine
                 line = pg.InfiniteLine(
                     pos=float(ann.y),
                     angle=0,
-                    pen=pg.mkPen(ann.color, width=1.0, style=Qt.PenStyle.DotLine),
+                    pen=pg.mkPen(ann.color, width=1.2, style=pen_style),
                 )
                 plot.addItem(line)
             elif ann.kind == "span":
@@ -1509,6 +1945,7 @@ class PlotHost(QWidget):
             return
         self._limits_after_paint = False
         self._apply_pending_limits()
+        self._apply_x_ticks(self._spec)
         if self._spec.layout_kind == "montage":
             self._fit_montage_left_axis_widths(self._spec)
         # Longueurs auto basées sur le vrai viewRange (pas celui d’avant l’autoscale).
@@ -1643,7 +2080,12 @@ class PlotHost(QWidget):
                 elif row == 0:
                     ylabel = spec.ylabel or ""
                 if ylabel:
-                    plot.setLabel("left", ylabel, color=c["fg"], size=f"{label_pt}pt")
+                    plot.setLabel(
+                        "left",
+                        ylabel,
+                        color=c["fg"],
+                        **{"font-size": f"{label_pt}pt"},
+                    )
                     axis = plot.getAxis("left")
                     _apply_label_face(
                         getattr(axis, "label", None),
@@ -1662,7 +2104,10 @@ class PlotHost(QWidget):
                 plot.getAxis("bottom").setStyle(showValues=True)
                 if spec.xlabel:
                     plot.setLabel(
-                        "bottom", spec.xlabel, color=c["fg"], size=f"{label_pt}pt"
+                        "bottom",
+                        spec.xlabel,
+                        color=c["fg"],
+                        **{"font-size": f"{label_pt}pt"},
                     )
                     axis = plot.getAxis("bottom")
                     _apply_label_face(
@@ -1841,6 +2286,7 @@ class PlotHost(QWidget):
             legend.addItem(sample, name)
         if below or not self._plots:
             legend_row = int(n_rows) + int(self._data_row0)
+            self._free_grid_cell(legend_row, plot_col)
             self._glw.addItem(legend, row=legend_row, col=plot_col)
             try:
                 self._glw.ci.layout.setRowStretchFactor(legend_row, 0)
@@ -2337,10 +2783,9 @@ class PlotHost(QWidget):
         self._cancel_text_edit()
         edit = QLineEdit(self)
         edit.setText(hit.get_text())
-        edit.setStyleSheet(
-            "QLineEdit { background: #fffbeb; border: 1px solid #d97706; "
-            "padding: 1px 4px; font-size: 9pt; }"
-        )
+        editor_font = _editor_font(hit.item)
+        edit.setFont(editor_font)
+        edit.setStyleSheet(_editor_stylesheet(editor_font))
         try:
             rect = hit.item.sceneBoundingRect()
             top_left = self._glw.mapFromScene(rect.topLeft())

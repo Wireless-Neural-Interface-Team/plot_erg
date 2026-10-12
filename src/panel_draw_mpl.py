@@ -57,6 +57,7 @@ PREPARE_MPL_PANELS: frozenset[str] = frozenset(
         "analysis_overlay",
         "full_recording",
         "montage_continuous_raw",
+        "montage_second_to_third_lp",
         *(_MONTAGE_TRIGGERED.keys()),
     }
 )
@@ -174,11 +175,16 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
         if isinstance(item, CurveSeries):
             if item.x.size == 0 or item.y.size == 0:
                 continue
+            raw_alpha = getattr(item, "alpha", 1.0)
+            alpha = 1.0 if raw_alpha is None else float(raw_alpha)
+            alpha = max(0.0, min(1.0, alpha))
             (line,) = ax.plot(
                 np.asarray(item.x, dtype=np.float64),
                 np.asarray(item.y, dtype=np.float64),
                 color=item.color,
                 linewidth=max(0.5, float(item.linewidth)),
+                alpha=alpha,
+                zorder=3 if alpha >= 0.999 else 1,
                 label=label if show_label else None,
             )
             if show_label:
@@ -242,7 +248,11 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
         row = int(ann.row or 0)
         if row < 0 or row >= n_rows:
             row = 0
-        _draw_annotation(axes_flat[row], ann)
+        artist = _draw_annotation(axes_flat[row], ann)
+        ann_label = str(getattr(ann, "label", "") or "").strip()
+        if artist is not None and ann_label and ann_label not in seen:
+            seen.add(ann_label)
+            legend_labels.append((ann_label, artist))
 
     label_fs = float(spec.label_font_size)
     tick_fs = float(spec.tick_font_size)
@@ -384,11 +394,17 @@ def _disable_layout_engine(figure: Any) -> None:
             pass
 
 
-def _draw_annotation(ax: Any, ann: AnnotationSpec) -> None:
+def _draw_annotation(ax: Any, ann: AnnotationSpec) -> Any | None:
     if ann.kind == "vline":
         ax.axvline(float(ann.x), color=ann.color, linestyle="--", linewidth=1.0)
-    elif ann.kind == "hline":
-        ax.axhline(float(ann.y), color=ann.color, linestyle=":", linewidth=1.0)
+        return None
+    if ann.kind == "hline":
+        return ax.axhline(
+            float(ann.y),
+            color=ann.color,
+            linestyle=str(getattr(ann, "linestyle", ":") or ":"),
+            linewidth=1.0,
+        )
     elif ann.kind == "span":
         ax.axvspan(float(ann.x), float(ann.x2), color=ann.color, alpha=0.15)
     elif ann.kind == "text" and ann.text:

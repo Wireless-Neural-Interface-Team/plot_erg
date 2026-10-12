@@ -328,14 +328,13 @@ class ViewerWindow(QMainWindow):
         self._act_ensure_channel = QAction("Calculer le canal sélectionné", self)
         self._act_ensure_channel.setShortcut(QKeySequence("F6"))
         self._act_ensure_channel.setToolTip(
-            "Prioriser le canal affiché (le prefetch en arrière-plan continue ensuite)."
+            "Calculer le canal affiché s’il est coché."
         )
         self._act_ensure_channel.triggered.connect(self.ensure_selected_channels)
-        self._act_ensure_all = QAction("Calculer tous les canaux", self)
+        self._act_ensure_all = QAction("Calculer les canaux sélectionnés", self)
         self._act_ensure_all.setShortcut(QKeySequence("F7"))
         self._act_ensure_all.setToolTip(
-            "Lancer / relancer le calcul de tous les canaux en arrière-plan "
-            "(le canal affiché reste prioritaire)."
+            "Calculer les canaux cochés. Les canaux décochés sont ignorés."
         )
         self._act_ensure_all.triggered.connect(self.ensure_all_channels)
         act_cache = QAction("Gestionnaire de cache…", self)
@@ -757,7 +756,14 @@ class ViewerWindow(QMainWindow):
         resolved = recording.channel_index(channel)
         if resolved is None:
             return
-        neighbors = self._neighbor_channel_indices(int(resolved), n_channels)
+        allowed = set(self._processing_channel_indices(recording))
+        if int(resolved) not in allowed:
+            return
+        neighbors = [
+            ch
+            for ch in self._neighbor_channel_indices(int(resolved), n_channels)
+            if ch in allowed
+        ]
         if not neighbors:
             return
         need_means, need_rms, need_spikes, _need_overlay = self._view_product_needs()
@@ -774,16 +780,21 @@ class ViewerWindow(QMainWindow):
         )
 
     def _on_channel_visibility_changed(self) -> None:
-        """Masquer / afficher des canaux → rafraîchir seulement si un montage est affiché."""
+        """Cocher / décocher → ne plus calculer les canaux exclus."""
+        self._prune_unselected_ensure_jobs()
         tab = self._current_tab()
         if tab is None:
             return
-        if not any(
+        if any(
             p.panel == "montage_continuous_raw" or str(p.panel).startswith("montage_")
             for p in tab.panels
         ):
+            self._visibility_redraw_debouncer.request()
+            if self._in_montage:
+                self._ensure_montage_review_data()
             return
-        self._visibility_redraw_debouncer.request()
+        if self._view_needs_all_channels():
+            self._start_background_prefetch()
 
     @staticmethod
     def _is_montage_placement(placement: Any) -> bool:
@@ -1857,7 +1868,7 @@ class ViewerWindow(QMainWindow):
         if ok:
             self.status_panel.set_headline("Enregistrement prêt — calcul des canaux…")
             self._mark_display_loaded()
-            self._set_status("Prêt — le canal affiché est prioritaire ; le reste suit en arrière-plan.")
+            self._set_status("Prêt — calcul des canaux sélectionnés.")
         else:
             self.status_panel.set_headline("Traitement terminé avec des erreurs ou annulé.")
         self._refresh_channels()
@@ -1920,8 +1931,23 @@ class ViewerWindow(QMainWindow):
         if self._status_message.text() != text:
             self._status_message.setText(text)
 
+    def _processing_channel_indices(self, recording: Any) -> list[int]:
+        """Indices cochés : seuls ces canaux sont filtrés / moyennés / analysés."""
+        return self._montage_visible_indices(recording)
+
+    def _prune_unselected_ensure_jobs(self) -> None:
+        """Retirer de la file les canaux décochés."""
+        worker = self._ensure_worker
+        if worker is None or not self._ensure_accepting:
+            return
+        if not self.channel_panel.channels:
+            return
+        retain = getattr(worker, "retain_channel_names", None)
+        if callable(retain):
+            retain(self.channel_panel.visible_channels)
+
     def _channels_for_current_view(self, *, all_channels: bool = False) -> list[int]:
-        """Channel indices the GUI needs right now."""
+        """Channel indices the GUI needs right now (canaux cochés seulement)."""
         plotted = self._plotted()
         if not plotted:
             return []
@@ -1929,19 +1955,21 @@ class ViewerWindow(QMainWindow):
         n_channels = int(getattr(recording, "n_channels", 0))
         if n_channels <= 0:
             return []
+        allowed = self._processing_channel_indices(recording)
+        allowed_set = set(allowed)
         if all_channels or self._pending_ensure_all:
-            return list(range(n_channels))
+            return list(allowed)
 
-        # Revue montage : la page affichée (pas seulement le canal sélectionné).
+        # Revue montage : la page affichée (canaux cochés).
         if self._in_montage:
             page_indices, _page, _n_pages, _n_vis = self._montage_review_page_info(
                 recording
             )
-            if page_indices:
-                return list(page_indices)
-            visible = self._montage_visible_indices(recording)
-            if visible:
-                return list(visible)
+            page = [index for index in page_indices if index in allowed_set]
+            if page:
+                return page
+            if allowed:
+                return list(allowed)
 
         tab = self._current_tab()
         wants_global = False
@@ -1949,13 +1977,15 @@ class ViewerWindow(QMainWindow):
             wants_global = any(
                 placement.panel in GLOBAL_PANEL_FIELD_NAMES for placement in tab.panels
             )
-        if wants_global and recording.ready_channels and len(recording.ready_channels) >= n_channels:
-            return list(range(n_channels))
+        if wants_global:
+            ready = {int(ch) for ch in (getattr(recording, "ready_channels", ()) or ())}
+            if allowed and all(ch in ready for ch in allowed):
+                return list(allowed)
 
         channel = self.channel_panel.current_channel or ""
         resolved = recording.channel_index(channel)
-        if resolved is None:
-            return [0] if n_channels else []
+        if resolved is None or int(resolved) not in allowed_set:
+            return []
         return [int(resolved)]
 
     def ensure_selected_channels(self) -> None:
@@ -1964,8 +1994,12 @@ class ViewerWindow(QMainWindow):
         if not (need_means or need_rms or need_spikes or need_overlay):
             self._set_status("Rien à calculer pour la vue affichée (traces continues).")
             return
+        channels = self._channels_for_current_view(all_channels=False)
+        if not channels:
+            self._set_status("Le canal affiché n’est pas coché — cochez-le pour le calculer.")
+            return
         self._start_channel_ensure(
-            self._channels_for_current_view(all_channels=False),
+            channels,
             need_means=need_means,
             need_rms=need_rms,
             need_spikes=need_spikes,
@@ -2014,17 +2048,21 @@ class ViewerWindow(QMainWindow):
         )
 
     def _start_background_prefetch(self) -> None:
-        """Précalcul ciblé après le squelette : vue active, puis tous canaux si besoin."""
+        """Précalcul des canaux cochés : vue active, puis le reste de la sélection."""
         plotted_or_ready = self.recordings_panel.ready_entries()
         if not plotted_or_ready:
             return
         recording = plotted_or_ready[0].recording
-        n_channels = int(getattr(recording, "n_channels", 0) or 0)
-        if n_channels <= 0:
+        allowed = self._processing_channel_indices(recording)
+        if not allowed:
             return
         need_means, need_rms, need_spikes, need_overlay = self._view_product_needs()
-        # Vue active d’abord (filtres + produits), puis le reste si montage/résumés.
-        viewed = self._channels_for_current_view(all_channels=False)
+        # Vue active d’abord (filtres + produits), puis les autres canaux cochés.
+        viewed = [
+            ch
+            for ch in self._channels_for_current_view(all_channels=False)
+            if ch in set(allowed)
+        ]
         if viewed:
             self._start_channel_ensure(
                 viewed,
@@ -2039,7 +2077,7 @@ class ViewerWindow(QMainWindow):
             )
         if not self._view_needs_all_channels():
             return
-        remaining = [ch for ch in range(n_channels) if ch not in set(viewed)]
+        remaining = [ch for ch in allowed if ch not in set(viewed)]
         if remaining:
             self._start_channel_ensure(
                 remaining,
@@ -2097,10 +2135,11 @@ class ViewerWindow(QMainWindow):
             recording = entry.recording
             if recording is None or getattr(recording, "source", None) is None:
                 continue
+            allowed = set(self._processing_channel_indices(recording))
             missing = [
                 ch
                 for ch in channels
-                if 0 <= ch < recording.n_channels and _needs_work(recording, ch)
+                if ch in allowed and 0 <= ch < recording.n_channels and _needs_work(recording, ch)
             ]
             if not missing:
                 continue
@@ -2176,7 +2215,7 @@ class ViewerWindow(QMainWindow):
                         f"Priorité : calcul de {n} canal(aux) regardé(s)…"
                     )
                     self.status_panel.append_log(
-                        f"Canal(aux) prioritaire(s) : {len(channels)} — le prefetch continue ensuite."
+                        f"Canal(aux) prioritaire(s) : {len(channels)} — les autres canaux cochés suivent."
                     )
                 return
             # Worker is shutting down — start a fresh one after a short wait.
@@ -2269,7 +2308,7 @@ class ViewerWindow(QMainWindow):
         window_id = self._pending_window_id
         self._pending_window_id = None
         if ok:
-            self.status_panel.set_headline("Tous les canaux sont prêts.")
+            self.status_panel.set_headline("Canaux sélectionnés prêts.")
             self._set_status("Canaux prêts.")
             self._mark_display_loaded()
         else:
@@ -2432,13 +2471,19 @@ class ViewerWindow(QMainWindow):
             if entry.recording is not None and getattr(entry.recording, "source", None) is not None:
                 recordings.append(entry.recording)
         callback = self._pdf_callback
+        selected = (
+            self._processing_channel_indices(recordings[0]) if recordings else None
+        )
 
         def task() -> str:
             if recordings and len(recordings) == len(configs):
                 from plotting import plot_processed_recordings_pdf
 
                 plot_processed_recordings_pdf(
-                    recordings, configs, output_dir=target.parent
+                    recordings,
+                    configs,
+                    output_dir=target.parent,
+                    channels=selected,
                 )
             elif callback is not None:
                 callback(configs)

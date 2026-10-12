@@ -38,6 +38,22 @@ from panel_catalog import (
 
 SectionKey = Literal["full", "zoom_onset", "zoom_trigger_end"]
 
+
+def included_channel_indices(
+    n_channels: int,
+    names: Sequence[str],
+    hidden: Sequence[str] = (),
+) -> list[int]:
+    """Indices des canaux cochés (hors noms masqués)."""
+    hidden_set = {str(name) for name in hidden}
+    count = max(0, int(n_channels))
+    return [
+        index
+        for index in range(count)
+        if (names[index] if index < len(names) else f"CH{index}") not in hidden_set
+    ]
+
+
 SECTION_KEYS: tuple[SectionKey, ...] = ("full", "zoom_onset", "zoom_trigger_end")
 
 SECTION_LABELS: dict[str, str] = {
@@ -360,6 +376,10 @@ class ViewerSettings:
     sampling_percent: int = 100
     spike_overlay_pre_ms: float = 2.0
     spike_overlay_post_ms: float = 4.0
+    # Opacité des formes d’onde individuelles du spike scope (0–1). La moyenne reste opaque.
+    spike_overlay_alpha: float = 0.4
+    # Ligne horizontale du seuil de détection sur les courbes en µV et le spike scope.
+    show_spike_threshold: bool = False
     # Échelle X manuelle (temps, s) — prioritaire sur la section / le zoom placement.
     x_limits: AxisLimits = field(
         default_factory=lambda: AxisLimits(enabled=False, minimum=-0.1, maximum=0.4)
@@ -381,7 +401,7 @@ class ViewerSettings:
     # Revue montage continue (GUI) : canaux par page + page courante.
     montage_review_channels: int = 10
     montage_review_page: int = 0
-    # Noms de canaux exclus du montage (cases décochées dans Session → Channels).
+    # Noms de canaux exclus du traitement et du montage (cases décochées).
     hidden_channels: tuple[str, ...] = ()
     analysis: AnalysisSettings = field(default_factory=AnalysisSettings)
     # Contenu de l’aperçu canal : continuous | moyenne | une stimulation.
@@ -453,6 +473,8 @@ class ViewerSettings:
             problems.append("Superposition : le temps avant détection doit être ≥ 0 ms.")
         if self.spike_overlay_post_ms <= 0:
             problems.append("Superposition : le temps après détection doit être > 0 ms.")
+        if not (0.0 <= float(self.spike_overlay_alpha) <= 1.0):
+            problems.append("Spike scope : l’opacité des traces doit être entre 0 et 1.")
         if self.x_limits.enabled and self.x_limits.as_tuple() is None:
             problems.append("Axe X : le maximum doit être > minimum.")
         for label, limits in (
@@ -698,7 +720,18 @@ class WorkspaceLayout:
             )
             for key in SECTION_KEYS
         }
-        montage = any(name.startswith("montage_") for name in globals_seen)
+        # Le bundle PDF « 2e stim / 2e→3e » ne se déclenche pas pour la revue
+        # continue seule : elle n’a pas les mêmes pages.
+        stim_montages = {
+            "montage_mean_raw",
+            "montage_mean_hp",
+            "montage_mean_lp",
+            "montage_second_raw",
+            "montage_second_hp",
+            "montage_second_lp",
+            "montage_second_to_third_lp",
+        }
+        montage = bool(globals_seen & stim_montages)
         return PlotDisplaySettings(
             mea_layout="mea_layout" in extras or reference.mea_layout,
             impedance="impedance" in extras or reference.impedance,

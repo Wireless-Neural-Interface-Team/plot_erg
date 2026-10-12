@@ -45,6 +45,7 @@ from view_config import (
     TextFace,
     ViewerSettings,
     continuous_sync_offset_s,
+    included_channel_indices,
 )
 
 PanelScope = Literal["channel", "global"]
@@ -73,7 +74,6 @@ _MONTAGE_SPECS: dict[str, tuple[str, int | None, str]] = {
     "montage_second_raw": ("raw", 1, STREAM_PLOT_COLORS["raw"]),
     "montage_second_hp": ("hp", 1, STREAM_PLOT_COLORS["hp"]),
     "montage_second_lp": ("lp", 1, STREAM_PLOT_COLORS["lp"]),
-    "montage_second_to_third_lp": ("lp", 1, STREAM_PLOT_COLORS["lp"]),
 }
 
 _UNAVAILABLE_FONT = 9.0
@@ -547,6 +547,53 @@ def _absolute_range_to_relative(
             mid = 0.5 * (lo + hi)
             ref = float(stims[int(np.argmin(np.abs(stims - mid)))])
     return _clip_to_t_rel(recording, lo - ref, hi - ref)
+
+
+def spike_scope_time_range(
+    request: RenderRequest, recording: ProcessedRecording, index: int
+) -> tuple[float, float] | None:
+    """Fenêtre (s, relatif stim) dont le spike scope doit montrer les détections.
+
+    Zoom du panneau s’il existe, sinon la plage active, sinon la section.
+    """
+    if request.placement.has_custom_zoom:
+        t0 = float(request.placement.zoom_t0_s)
+        t1 = float(request.placement.zoom_t1_s)
+        if t1 < t0:
+            t0, t1 = t1, t0
+        if request.placement.zoom_absolute:
+            stim_index = request.settings.analysis.trigger_index()
+            converted = _absolute_range_to_relative(
+                recording, t0, t1, stim_index=stim_index
+            )
+            # Hors essai : aucune détection, pas le repli « essai entier ».
+            return converted if converted is not None else (1.0, 0.0)
+        clipped = _clip_to_t_rel(recording, t0, t1)
+        return clipped if clipped is not None else (1.0, 0.0)
+    windows = request.per_recording_windows()
+    bar = request.settings.active_range_bar()
+    if bar is not None:
+        t0, t1 = bar.ordered()
+        if bool(bar.relative_to_stim):
+            clipped = _clip_to_t_rel(recording, t0, t1)
+            return clipped if clipped is not None else (1.0, 0.0)
+        stim_index = request.settings.analysis.trigger_index()
+        converted = _absolute_range_to_relative(
+            recording, t0, t1, stim_index=stim_index
+        )
+        return converted if converted is not None else (1.0, 0.0)
+    if index < len(windows) and windows[index] is not None:
+        return windows[index]
+    return request.section_window()
+
+
+def _range_bar_fingerprint(request: RenderRequest) -> tuple[Any, ...]:
+    """Identité de la plage active — le spike scope doit se reconstruire avec elle."""
+    bar = request.settings.active_range_bar()
+    if bar is None:
+        return (None,)
+    t0, t1 = bar.ordered()
+    return (round(float(t0), 6), round(float(t1), 6), bool(bar.relative_to_stim))
 
 
 def _decimate(x: np.ndarray, y: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
@@ -1240,6 +1287,8 @@ def _stream_for_panel(panel: str) -> str | None:
     """Flux WIDE/HIGH/LOW associé à un panneau, ou ``None`` si non applicable."""
     if panel in _STREAM_FOR_PANEL:
         return _STREAM_FOR_PANEL[panel]
+    if panel == "montage_second_to_third_lp":
+        return "lp"
     if panel in _MONTAGE_SPECS:
         return _MONTAGE_SPECS[panel][0]
     key = str(panel)
@@ -1297,6 +1346,11 @@ def _relative_stim_window(request: RenderRequest) -> tuple[float, float] | None:
         clipped = _clip_to_t_rel(reference, lo, hi)
         if clipped is not None:
             return clipped
+    section = str(getattr(request, "section", "full") or "full")
+    if section != "full":
+        window = request.section_window()
+        if window is not None:
+            return window
     return rel0, rel1
 
 
@@ -1637,19 +1691,21 @@ def _render_analysis_trace(ax: Any, request: RenderRequest) -> str:
 
 
 def _render_analysis_rms(ax: Any, request: RenderRequest) -> str:
+    from channel_metrics import recording_rms_window_s, rms_profile_for_trigger
+
     trigger_index = _analysis_trigger_index(request)
-    kind = "mean" if trigger_index is None else ("first" if trigger_index == 0 else "second")
-    # For stim index > 1, fall back to computing from the single-stim RMS kind when possible;
-    # otherwise use "mean" profile clipped — prefer first/second for 0/1 and mean otherwise.
-    if trigger_index is not None and trigger_index > 1:
-        kind = "mean"
     window = request.section_window()
     if window is None:
         return _fail(ax, request, "Section unavailable (no stimulation-end marker).")
     mode_label = _analysis_mode_label(request)
     drawn = 0
     for index, recording in enumerate(request.recordings):
-        t, values = recording.rms_profile(kind, request.channel_index)
+        t, values = rms_profile_for_trigger(
+            recording,
+            request.channel_index,
+            trigger_index,
+            recording_rms_window_s(recording),
+        )
         if values.size == 0:
             continue
         mask = _mask_window(t, window)
@@ -1905,7 +1961,10 @@ def _render_spike_overlay(ax: Any, request: RenderRequest) -> str:
     thresholds: list[float] = []
     for index, recording in enumerate(request.recordings):
         t_ms, waves, times, _total, _mean = recording.overlay_for_channel(
-            request.channel_index, t_range_s=windows[index]
+            request.channel_index,
+            t_range_s=spike_scope_time_range(request, recording, index),
+            pre_ms=float(request.settings.spike_overlay_pre_ms),
+            post_ms=float(request.settings.spike_overlay_post_ms),
         )
         overlays.append((t_ms, waves, times))
         thresholds.append(recording.threshold_uv(request.channel_index))
@@ -1922,9 +1981,14 @@ def _render_spike_overlay(ax: Any, request: RenderRequest) -> str:
         intan_dsp=reference.meta.dsp if reference is not None else None,
         pre_ms=float(request.settings.spike_overlay_pre_ms),
         post_ms=float(request.settings.spike_overlay_post_ms),
-        thresholds_uv=thresholds,
+        thresholds_uv=(
+            thresholds
+            if bool(getattr(request.settings, "show_spike_threshold", False))
+            else None
+        ),
         colors=request.colors,
         appearance=_appearance(request),
+        trace_alpha=float(getattr(request.settings, "spike_overlay_alpha", 0.4)),
     )
     if not ax.axison:
         return "empty"
@@ -1984,10 +2048,19 @@ def _render_impedance(ax: Any, request: RenderRequest) -> str:
 # ----------------------------------------------------------- summary renderers
 
 
+def _included_channels(request: RenderRequest, recording: Any) -> list[int]:
+    hidden = tuple(getattr(request.settings, "hidden_channels", ()) or ())
+    names = list(getattr(recording, "channel_names", ()) or ())
+    n_channels = int(getattr(recording, "n_channels", 0) or 0)
+    return included_channel_indices(n_channels, names, hidden)
+
+
 def _render_summary_rms(ax: Any, request: RenderRequest) -> str:
     drawn = 0
     for index, recording in enumerate(request.recordings):
-        t, values = recording.mean_rms_across_channels("mean")
+        t, values = recording.mean_rms_across_channels(
+            "mean", channels=_included_channels(request, recording)
+        )
         if values.size == 0:
             continue
         _plot_curve(
@@ -2003,7 +2076,7 @@ def _render_summary_rms(ax: Any, request: RenderRequest) -> str:
         return _fail(ax, request, "RMS summary unavailable.")
     ax.set_xlabel("Time relative to stimulation (s)")
     ax.set_ylabel("Mean RMS across channels (µV)")
-    ax.set_title("Mean RMS profile across all channels")
+    ax.set_title("Mean RMS profile across selected channels")
     return "ok"
 
 
@@ -2018,9 +2091,9 @@ def _render_summary_rms_table(ax: Any, request: RenderRequest) -> str:
     if not recordings:
         return _fail(ax, request, "No recording selected.")
     reference = recordings[0]
-    n_channels = min(recording.n_channels for recording in recordings)
-    if n_channels == 0:
-        return _fail(ax, request, "No channel available.")
+    indices = _included_channels(request, reference)
+    if not indices:
+        return _fail(ax, request, "No channel selected.")
     ax.set_axis_off()
     # Libellés courts : les noms de fichiers complets se chevauchent sinon.
     n_cols = 1 + len(recordings)
@@ -2029,7 +2102,10 @@ def _render_summary_rms_table(ax: Any, request: RenderRequest) -> str:
         _short_table_label(request.labels[i], label_max) for i in range(len(recordings))
     ]
     rows: list[list[str]] = []
-    for ch in range(n_channels):
+    highlight_row = -1
+    for row_index, ch in enumerate(indices):
+        if int(ch) == int(request.channel_index):
+            highlight_row = row_index
         name = (
             reference.channel_names[ch]
             if ch < len(reference.channel_names)
@@ -2042,7 +2118,7 @@ def _render_summary_rms_table(ax: Any, request: RenderRequest) -> str:
                 f"{float(np.nanmean(profile)):.2f}" if profile.size else "—"
             )
         rows.append([name] + values)
-    highlight = request.channel_index
+    highlight = highlight_row
     # bbox : force le tableau dans l’axe (sinon les lignes débordent et sont coupées).
     table = ax.table(
         cellText=rows,
@@ -2063,7 +2139,7 @@ def _render_summary_rms_table(ax: Any, request: RenderRequest) -> str:
         if row == 0:
             cell.set_facecolor("#e2e8f0")
             props["weight"] = "bold"
-        elif row - 1 == highlight:
+        elif highlight >= 0 and row - 1 == highlight:
             cell.set_facecolor("#fde68a")
         elif row % 2 == 0:
             cell.set_facecolor("#f7f7f7")
@@ -2799,8 +2875,13 @@ def _montage_draw_extra_row(
             continue
 
         if kind == "overlay":
+            pre_ms = float(request.settings.spike_overlay_pre_ms)
+            post_ms = float(request.settings.spike_overlay_post_ms)
             t_ms, waves, _times, _total, mean = recording.overlay_for_channel(
-                ch, t_range_s=section_x
+                ch,
+                t_range_s=spike_scope_time_range(request, recording, index),
+                pre_ms=pre_ms,
+                post_ms=post_ms,
             )
             if mean is not None and np.asarray(mean).size and np.asarray(t_ms).size:
                 _plot_curve(
@@ -2817,8 +2898,18 @@ def _montage_draw_extra_row(
                 arr = np.asarray(waves, dtype=np.float64)
                 t_arr = np.asarray(t_ms, dtype=np.float64)
                 n_show = min(12, int(arr.shape[0]))
+                trace_alpha = max(
+                    0.0,
+                    min(1.0, float(getattr(request.settings, "spike_overlay_alpha", 0.4))),
+                )
                 for wave in arr[:n_show]:
-                    ax.plot(t_arr, wave, color=color, lw=max(0.4, line_w * 0.55), alpha=0.35)
+                    ax.plot(
+                        t_arr,
+                        wave,
+                        color=color,
+                        lw=max(0.4, line_w * 0.55),
+                        alpha=trace_alpha,
+                    )
                 drawn += 1
             continue
 
@@ -3119,6 +3210,9 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
             elif kind in {"psth", "raster"} and section_x is not None:
                 ax.set_xlim(section_x[0], section_x[1])
             elif kind == "overlay":
+                pre_ms = float(request.settings.spike_overlay_pre_ms)
+                post_ms = float(request.settings.spike_overlay_post_ms)
+                ax.set_xlim(-max(0.0, pre_ms), max(1e-6, post_ms))
                 ax.set_xlabel("")  # ms — label global en bas si dernière ligne
             if kind in {"rms", "psth", "raster"} and request.legend.show_reference_markers:
                 _draw_onset_offset_lines(
@@ -3299,14 +3393,18 @@ def _structure_fingerprint(request: RenderRequest) -> tuple[Any, ...]:
             str(request.settings.time_sync),
             bool(request.settings.continuous_mark_stims),
             bool(request.legend.show_reference_markers),
+            bool(getattr(request.settings, "show_spike_threshold", False)),
             bool(getattr(request.style, "show_scale_bars", False)),
             float(request.settings.psth_bin_window_s),
             int(request.settings.sampling_percent),
+            float(request.settings.spike_overlay_pre_ms),
+            float(request.settings.spike_overlay_post_ms),
             str(request.settings.texts.title or "").strip(),
             str(request.settings.texts.xlabel or "").strip(),
             str(request.settings.texts.ylabel or "").strip(),
             tuple(str(label) for label in request.settings.texts.legend_labels),
             bool(request.settings.texts.show_series_suffix),
+            _range_bar_fingerprint(request),
         )
 
     rec_fp = tuple(
@@ -3334,6 +3432,7 @@ def _structure_fingerprint(request: RenderRequest) -> tuple[Any, ...]:
         str(request.settings.analysis.mode),
         int(request.settings.analysis.trigger_index() or -1),
         bool(request.legend.show_reference_markers),
+        bool(getattr(request.settings, "show_spike_threshold", False)),
         bool(getattr(request.style, "show_scale_bars", False)),
         # Geometry that affects histograms / rasters / overlays / downsampling.
         float(request.settings.psth_bin_window_s),
@@ -3346,6 +3445,7 @@ def _structure_fingerprint(request: RenderRequest) -> tuple[Any, ...]:
         str(request.settings.texts.ylabel or "").strip(),
         tuple(str(label) for label in request.settings.texts.legend_labels),
         bool(request.settings.texts.show_series_suffix),
+        _range_bar_fingerprint(request),
     )
 
 

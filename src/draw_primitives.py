@@ -808,6 +808,7 @@ def _draw_spike_overlay_panel(
     thresholds_uv: Sequence[float] | None = None,
     colors: Sequence[Any] | None = None,
     appearance: DrawAppearance | None = None,
+    trace_alpha: float | None = None,
 ) -> None:
     """Overlay HIGH snippets aligned on threshold crossing."""
     if ax is None:
@@ -857,7 +858,10 @@ def _draw_spike_overlay_panel(
         if shown_f.size:
             abs_peak = max(abs_peak, float(np.nanmax(np.abs(shown_f))))
         abs_peak = max(abs_peak, float(np.nanmax(np.abs(mean_w))))
-        line_alpha = _spike_overlay_line_alpha(n_all)
+        if trace_alpha is None:
+            line_alpha = _spike_overlay_line_alpha(n_all)
+        else:
+            line_alpha = max(0.0, min(1.0, float(trace_alpha)))
         if n_shown > 0:
             segs = np.empty((n_shown, t_disp.size, 2), dtype=np.float64)
             segs[:, :, 0] = t_disp

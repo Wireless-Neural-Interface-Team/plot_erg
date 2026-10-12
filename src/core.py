@@ -12,7 +12,7 @@ from pathlib import Path
 import sys
 import threading
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -171,7 +171,9 @@ def no_trigger_sections_and_timebase(
         raise RuntimeError(
             f"Too many sections ({n_sections}) for recording length ({total_s:.3f} s)."
         )
-    n_sections = int(n_samples // section_len)
+    # Garder le nombre demandé. Le reste (n_samples % section_len) ne forme pas
+    # une section complète : le recalculer ici ajoutait une section en trop
+    # dès que n_samples // section_len > section_count.
     section_duration_resolved = section_len / float(fs)
     validate_section_trigger_window(
         section_duration_resolved,
@@ -228,7 +230,7 @@ def resolve_recording_windows(
         post_s=config.post_s,
     )
     end_rising_rel_s = mean_time_to_pulse_end_s(
-        analog_in0, trigger_indices, config.threshold, fs, trigger_edge=config.edge
+        analog_in0, valid_triggers, config.threshold, fs, trigger_edge=config.edge
     )
     return (
         valid_triggers,
@@ -734,8 +736,12 @@ def mean_triggered_windows_channelwise(
     pre_n: int,
     post_n: int,
     channel_workers: int | None = None,
+    channels: Sequence[int] | None = None,
 ) -> np.ndarray:
-    """Raw mean per channel (parallel, mmap-friendly row reads)."""
+    """Raw mean per channel (parallel, mmap-friendly row reads).
+
+    ``channels`` restricts the pass to those indices. Other rows stay zero.
+    """
     amplifier_data = np.asarray(amplifier_data)
     if amplifier_data.ndim != 2:
         raise RuntimeError("Unexpected amplifier_data shape (expected [n_channels, n_samples]).")
@@ -748,7 +754,20 @@ def mean_triggered_windows_channelwise(
     if valid_triggers.size == 0:
         raise RuntimeError("No valid window around stimulations.")
 
+    if channels is None:
+        wanted = list(range(n_ch))
+    else:
+        wanted = []
+        seen: set[int] = set()
+        for raw in channels:
+            ch = int(raw)
+            if 0 <= ch < n_ch and ch not in seen:
+                seen.add(ch)
+                wanted.append(ch)
+
     out = np.zeros((n_ch, win_len), dtype=np.float32)
+    if not wanted:
+        return out
     n_trig = float(valid_triggers.size)
 
     def _compute_one_channel(c: int) -> tuple[int, np.ndarray]:
@@ -761,9 +780,9 @@ def mean_triggered_windows_channelwise(
             acc += row[start:end]
         return c, acc / n_trig
 
-    worker_count = resolve_channel_workers(channel_workers, n_ch)
+    worker_count = resolve_channel_workers(channel_workers, len(wanted))
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        for c, mean_row in pool.map(_compute_one_channel, range(n_ch)):
+        for c, mean_row in pool.map(_compute_one_channel, wanted):
             out[c] = mean_row
     return out
 

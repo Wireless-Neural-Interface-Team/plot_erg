@@ -37,6 +37,8 @@ _EXPECTED_UNAVAILABLE = {
     "summary_impedance",
     "full_recording",
     "montage_continuous_raw",
+    # Le span 2e→3e exige le flux passe-bas continu, absent du dataset synthétique.
+    "montage_second_to_third_lp",
 }
 
 

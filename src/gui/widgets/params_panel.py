@@ -943,12 +943,25 @@ class ParamsPanel(QWidget):
         )
         for widget in (self._overlay_pre, self._overlay_post):
             widget.setToolTip(
-                "Fenêtre de forme d’onde autour de chaque détection. La modifier "
-                "ré-extrait les snippets (rapide : les flux filtrés restent en cache)."
+                "Fenêtre de forme d’onde autour de chaque détection. "
+                "Le spike scope s’y adapte tout de suite (les flux filtrés restent en cache)."
             )
+        self._overlay_alpha = _spin(0.0, 1.0, 0.4, decimals=2, step=0.05)
+        self._overlay_alpha.setToolTip(
+            "Opacité des formes d’onde individuelles dans le spike scope "
+            "(0 = invisible, 1 = opaque). La courbe moyenne reste opaque. "
+            "Redessin immédiat — pas de Traiter (F5)."
+        )
+        self._show_spike_threshold = QCheckBox("Afficher le seuil sur les courbes")
+        self._show_spike_threshold.setChecked(False)
+        self._show_spike_threshold.setToolTip(
+            "Ligne horizontale du seuil de détection (µV) sur les courbes WIDE, HIGH, "
+            "LOW et le spike scope. Redessin immédiat — pas de Traiter (F5)."
+        )
         spike_form.addRow("Mode de seuil :", self._threshold_mode)
         spike_form.addRow("Seuil fixe :", self._spike_threshold)
         spike_form.addRow("Polarité :", self._polarity)
+        spike_form.addRow(self._show_spike_threshold)
         spike_form.addRow("Multiplicateur RMS :", self._rms_multiplier)
         self._psth_bin = _spin(
             0.001,
@@ -970,6 +983,7 @@ class ParamsPanel(QWidget):
         )
         spike_form.addRow("Avant le spike :", self._overlay_pre)
         spike_form.addRow("Après le spike :", self._overlay_post)
+        spike_form.addRow("Opacité des traces :", self._overlay_alpha)
         spike_form.addRow("Bin PSTH :", self._psth_bin)
         spike_form.addRow("Échantillonnage :", self._sampling)
         self._threshold_mode.currentIndexChanged.connect(lambda _i: self._sync_threshold_rows())
@@ -1086,10 +1100,13 @@ class ParamsPanel(QWidget):
             self._rms_window,
             self._spike_threshold,
             self._rms_multiplier,
-            self._overlay_pre,
-            self._overlay_post,
         ):
             spin.valueChanged.connect(lambda _v: self._emit_config())
+        # Fenêtre du spike scope : redessin immédiat, sans invalider le cache filtres.
+        self._overlay_pre.valueChanged.connect(lambda _v: self._emit_view())
+        self._overlay_post.valueChanged.connect(lambda _v: self._emit_view())
+        self._overlay_alpha.valueChanged.connect(lambda _v: self._emit_view())
+        self._show_spike_threshold.toggled.connect(lambda _c: self._emit_view())
         # Bin PSTH / sampling : display (redraw) + config (PDF / F5).
         self._psth_bin.valueChanged.connect(lambda _v: self._emit_display_and_config())
         self._threshold.valueChanged.connect(lambda _v: self._on_processing_threshold_changed())
@@ -1628,6 +1645,8 @@ class ParamsPanel(QWidget):
             sampling_percent=int(self._sampling.value()),
             spike_overlay_pre_ms=float(self._overlay_pre.value()),
             spike_overlay_post_ms=float(self._overlay_post.value()),
+            spike_overlay_alpha=float(self._overlay_alpha.value()),
+            show_spike_threshold=bool(self._show_spike_threshold.isChecked()),
             x_limits=self._x_limits.value(),
             raw_ylim=self._raw_ylim.value(),
             hp_ylim=self._hp_ylim.value(),

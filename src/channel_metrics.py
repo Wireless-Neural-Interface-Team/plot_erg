@@ -5,6 +5,7 @@ Kept separate from ``plotting`` so GUI ``ensure_channels`` never imports Agg.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Sequence
 
 import numpy as np
@@ -67,10 +68,20 @@ def mean_trial_windows(
         return np.zeros(max(win, 0), dtype=np.float32)
     trigs = np.asarray(triggers, dtype=np.int64)
     starts = trigs - int(pre_n)
-    offsets = np.arange(win, dtype=np.int64)
-    index = starts[:, None] + offsets[None, :]
-    stacked = np.asarray(row, dtype=np.float64)[index]
-    return np.asarray(stacked.mean(axis=0), dtype=np.float32)
+    n_trials = int(starts.size)
+    # A full (n_trials, win) index is cheap for short windows and huge for a
+    # multi-second peri-stimulus window at 30 kHz. Accumulate in that case.
+    if n_trials * win <= 2_000_000:
+        offsets = np.arange(win, dtype=np.int64)
+        index = starts[:, None] + offsets[None, :]
+        stacked = np.asarray(row, dtype=np.float64)[index]
+        return np.asarray(stacked.mean(axis=0), dtype=np.float32)
+    acc = np.zeros(win, dtype=np.float64)
+    samples = np.asarray(row)
+    for start in starts.tolist():
+        acc += samples[int(start) : int(start) + win]
+    acc /= float(n_trials)
+    return acc.astype(np.float32, copy=False)
 
 
 def mean_rms_profile_from_row(
@@ -137,8 +148,10 @@ def mean_rms_profile_from_source_window(
     When ``trigger_index`` is set, only that stimulation is used (no averaging).
     When ``hp_row`` is provided with a single ``channel_index``, the row is used
     directly (avoids re-hitting LazyFilterBank).
+
+    ``rms_window_s`` overrides ``source.intan_dsp.rms_window_s`` for this call.
     """
-    del rms_window_s  # Intan uses source.intan_dsp.rms_window_s (1 s).
+    dsp = _dsp_with_rms_window(source.intan_dsp, rms_window_s)
     if source.valid_triggers.size == 0 or t1_s <= t0_s:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
 
@@ -149,7 +162,7 @@ def mean_rms_profile_from_source_window(
             valid_triggers=source.valid_triggers,
             t0_s=t0_s,
             t1_s=t1_s,
-            dsp=source.intan_dsp,
+            dsp=dsp,
             trigger_index=trigger_index,
         )
 
@@ -188,7 +201,7 @@ def mean_rms_profile_from_source_window(
     channel_indices: Sequence[int] = (
         [ch_idx] if ch_idx is not None else list(range(n_channels))
     )
-    pad = source.intan_dsp.rms_window_samples
+    pad = dsp.rms_window_samples
     acc = np.zeros(n_win, dtype=np.float64)
     n_ok = 0
     for trig in valid_trigs:
@@ -199,7 +212,7 @@ def mean_rms_profile_from_source_window(
             seg_end = int(trig + end_off)
             r0 = max(0, seg_start - pad)
             rms_seg = sliding_rms_intan_profile_range(
-                row, source.intan_dsp, r0, seg_end
+                row, dsp, r0, seg_end
             )
             seg_stack[i, :] = rms_seg[seg_start - r0 : seg_end - r0]
         acc += np.mean(seg_stack, axis=0)
@@ -207,3 +220,60 @@ def mean_rms_profile_from_source_window(
     if n_ok == 0:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     return t_axis, acc / float(n_ok)
+
+
+def _dsp_with_rms_window(dsp: Any, rms_window_s: float) -> Any:
+    """DSP dont la fenêtre RMS est celle demandée (sinon la valeur figée au build)."""
+    requested = float(rms_window_s)
+    current = float(getattr(dsp, "rms_window_s", requested) or requested)
+    if requested <= 0 or abs(current - requested) <= 1e-9:
+        return dsp
+    return replace(dsp, rms_window_s=requested)
+
+
+def recording_rms_window_s(recording: Any) -> float:
+    """Fenêtre RMS du DSP vivant, ou 1 s si l’enregistrement n’a pas de source."""
+    source = getattr(recording, "source", None)
+    dsp = getattr(source, "intan_dsp", None) if source is not None else None
+    if dsp is None:
+        return 1.0
+    return float(getattr(dsp, "rms_window_s", 1.0) or 1.0)
+
+
+def rms_profile_for_trigger(
+    recording: Any,
+    channel: int,
+    trigger_index: int | None,
+    rms_window_s: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Profil RMS ``mean`` / stim 1 / stim 2 en cache, sinon calcul de cet essai.
+
+    Les profils stockés ne couvrent que la moyenne, la 1re et la 2e stimulation.
+    À partir de la 3e, le profil est calculé sur le passe-haut déjà prêt — jamais
+    remplacé par la moyenne.
+    """
+    empty = np.empty(0, dtype=np.float64)
+    ch = int(channel)
+    if trigger_index is None:
+        return recording.rms_profile("mean", ch)
+    index = int(trigger_index)
+    if index == 0:
+        return recording.rms_profile("first", ch)
+    if index == 1:
+        return recording.rms_profile("second", ch)
+    source = getattr(recording, "source", None)
+    if source is None or not bool(recording.stream_ready("hp", ch)):
+        return empty, empty
+    t_rel = np.asarray(recording.t_rel, dtype=np.float64)
+    if t_rel.size < 2:
+        return empty, empty
+    hp = np.asarray(source.highpass[ch], dtype=np.float32)
+    return mean_rms_profile_from_source_window(
+        source,
+        float(t_rel[0]),
+        float(t_rel[-1]),
+        float(rms_window_s),
+        channel_index=ch,
+        trigger_index=index,
+        hp_row=hp,
+    )

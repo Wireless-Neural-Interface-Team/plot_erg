@@ -56,3 +56,6 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python tools/smoke_perf.py
+
+      - name: smoke_real_rhs (skipped without exemple.rhs)
+        run: python tools/smoke_real_rhs.py

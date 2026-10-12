@@ -220,6 +220,9 @@ def _keeps_rendered_xlim(
     previous: RenderRequest | None = None,
 ) -> bool:
     """True → garder le xlim du rendu (manuel, ou manuel→auto)."""
+    # Spike scope : l’abscisse est la fenêtre avant/après le spike, pas un zoom.
+    if str(request.panel) in {"analysis_overlay", "spike_overlay"}:
+        return True
     current = request.settings.x_limits.as_tuple()
     if current is not None:
         return True

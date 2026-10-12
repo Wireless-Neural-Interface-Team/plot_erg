@@ -11,3 +11,4 @@ plots/
 .env
 .env.local
 .env.*.local
+*.rhs

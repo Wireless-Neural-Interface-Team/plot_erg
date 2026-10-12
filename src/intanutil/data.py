@@ -65,6 +65,71 @@ def read_all_data_blocks(header, num_samples, num_blocks, fid):
     return data
 
 
+# One chunk is a few dozen megabytes: large enough for sequential channel
+# writes, small enough that peak RAM stays independent of recording length.
+_STREAM_BLOCKS_PER_CHUNK = 2048
+
+
+def _rhs_block_layout(header):
+    """Byte offsets of each field inside one RHS data block.
+
+    Must stay in lockstep with ``get_bytes_per_data_block``.
+    """
+    samples = int(header['num_samples_per_data_block'])
+    n_amp = int(header['num_amplifier_channels'])
+    n_adc = int(header['num_board_adc_channels'])
+    n_dac = int(header['num_board_dac_channels'])
+    cursor = 0
+    fields = {}
+
+    def _take(name, count, itemsize):
+        nonlocal cursor
+        fields[name] = (cursor, int(count), int(itemsize))
+        cursor += int(count) * int(itemsize)
+
+    _take('t', samples, 4)
+    _take('amp', samples * n_amp, 2)
+    if header['dc_amplifier_data_saved']:
+        _take('dc', samples * n_amp, 2)
+    _take('stim', samples * n_amp, 2)
+    _take('adc', samples * n_adc, 2)
+    _take('dac', samples * n_dac, 2)
+    if header['num_board_dig_in_channels'] > 0:
+        _take('dig_in', samples, 2)
+    if header['num_board_dig_out_channels'] > 0:
+        _take('dig_out', samples, 2)
+    return cursor, fields
+
+
+def _count_timestamp_gaps(timestamps, gaps, previous_last):
+    """Count missing steps of 1 inside a ``(n_blocks, samples_per_block)`` view."""
+    if timestamps.size == 0:
+        return gaps, previous_last
+    as_i64 = np.asarray(timestamps, dtype=np.int64)
+    gaps += int(np.count_nonzero(np.diff(as_i64, axis=1) != 1))
+    if as_i64.shape[0] > 1:
+        between = as_i64[1:, 0] - as_i64[:-1, -1]
+        gaps += int(np.count_nonzero(between != 1))
+    if previous_last is not None and int(as_i64[0, 0]) - int(previous_last) != 1:
+        gaps += 1
+    return gaps, int(as_i64[-1, -1])
+
+
+def _scale_strided_u16(values_u16, dest):
+    """Cast uint16 ``(n_blocks, n_channels, samples)`` into float32 ``dest``."""
+    n_blocks = int(values_u16.shape[0])
+    n_channels = int(dest.shape[0])
+    samples_per_block = int(values_u16.shape[2])
+    ordered = values_u16.transpose(1, 0, 2)
+    if dest.flags.c_contiguous and dest.size == n_channels * n_blocks * samples_per_block:
+        dest.reshape(n_channels, n_blocks, samples_per_block)[...] = ordered
+        return dest
+    tmp = np.empty((n_channels, n_blocks * samples_per_block), dtype=np.float32)
+    tmp.reshape(n_channels, n_blocks, samples_per_block)[...] = ordered
+    dest[...] = tmp
+    return dest
+
+
 def read_all_data_blocks_to_memmap(
     header,
     num_samples,
@@ -74,73 +139,103 @@ def read_all_data_blocks_to_memmap(
     *,
     progress_callback=None,
 ):
-    """Stream amplifier samples into a float32 memmap; keep only ADC/timestamps in RAM.
+    """Stream amplifier samples into a float32 memmap.
 
-    Scales amplifier data to µV on the fly (same formula as ``scale_analog_data``)
-    so peak RAM stays O(block) for the amp path instead of 2× the full recording.
-    Returns a ``data`` dict with timestamps + board_adc (uint16) for later scaling;
+    Blocks are read in large sequential chunks and each channel is written as
+    one contiguous slice. The previous per-block column write touched every
+    channel at a 128-sample stride and dominated runtime on multi-gigabyte
+    recordings.
+
+    Amplifier samples are scaled to µV on the fly (same formula as
+    ``scale_analog_data``). Board ADC is scaled to volts here as well.
+    The full timestamp vector is not retained: gaps are counted while
+    scanning, and time is ``sample_index / sample_rate`` when the count is 0.
     ``amplifier_data`` is the memmap (already in µV float32).
     """
     print("Reading data from file (streaming to memmap)...")
     n_amp = int(header['num_amplifier_channels'])
+    n_adc = int(header['num_board_adc_channels'])
     samples_per_block = int(header['num_samples_per_data_block'])
-    data = {
-        't': np.zeros(num_samples, dtype=np.int32),
-        'board_adc_data': np.zeros(
-            [header['num_board_adc_channels'], num_samples], dtype=np.uint16
-        ),
-        'amplifier_data': amplifier_memmap,
-    }
-    # Scratch uint16 for one block of amplifier samples.
-    block_u16 = np.empty((n_amp, samples_per_block), dtype=np.uint16)
+    bytes_per_block, fields = _rhs_block_layout(header)
+    expected = get_bytes_per_data_block(header)
+    if bytes_per_block != expected:
+        raise FileSizeError(
+            f"RHS block layout is {bytes_per_block} bytes, expected {expected}."
+        )
+
+    adc = (
+        np.empty((n_adc, int(num_samples)), dtype=np.float32)
+        if n_adc > 0
+        else np.empty((0, int(num_samples)), dtype=np.float32)
+    )
+    amp_shift = np.float32(32768.0)
+    amp_scale = np.float32(0.195)
+    adc_scale = np.float32(312.5e-6)
+
     index = 0
+    block_cursor = 0
+    n_gaps = 0
+    previous_last = None
     print_step = 10
     percent_done = print_step
-    for i in range(num_blocks):
-        read_timestamps(fid, data, index, samples_per_block)
-        # Amplifier → scale → memmap (no full-file uint16 buffer).
-        if n_amp > 0:
-            tmp = np.fromfile(fid, dtype='uint16', count=samples_per_block * n_amp)
-            block_u16[:, :] = tmp.reshape(n_amp, samples_per_block)
-            end = index + samples_per_block
-            scaled = block_u16.astype(np.float32, copy=False)
-            scaled -= np.float32(32768.0)
-            scaled *= np.float32(0.195)
-            amplifier_memmap[:, index:end] = scaled
-        else:
-            end = index + samples_per_block
+    num_blocks = int(num_blocks)
+    while block_cursor < num_blocks:
+        n_this = min(_STREAM_BLOCKS_PER_CHUNK, num_blocks - block_cursor)
+        raw = np.fromfile(fid, dtype=np.uint8, count=n_this * bytes_per_block)
+        if raw.size != n_this * bytes_per_block:
+            raise FileSizeError('Error: End of file reached early while reading data blocks.')
+        raw = raw.reshape(n_this, bytes_per_block)
+        n_chunk = n_this * samples_per_block
+        end = index + n_chunk
 
-        # Skip / read the rest of the block like read_analog_signals + digital.
-        if header['dc_amplifier_data_saved']:
-            fid.seek(2 * samples_per_block * n_amp, 1)
-        # Stim payload always skipped when LOAD_STIM_DATA is False.
-        fid.seek(2 * samples_per_block * n_amp, 1)
-        read_analog_signal_type(
-            fid,
-            data['board_adc_data'],
-            index,
-            samples_per_block,
-            header['num_board_adc_channels'],
-        )
-        n_dac = header['num_board_dac_channels']
-        if n_dac > 0:
-            fid.seek(2 * samples_per_block * n_dac, 1)
-        n_dig_in = header['num_board_dig_in_channels']
-        n_dig_out = header['num_board_dig_out_channels']
-        if n_dig_in > 0:
-            fid.seek(2 * samples_per_block, 1)
-        if n_dig_out > 0:
-            fid.seek(2 * samples_per_block, 1)
+        ts_off, ts_count, _ts_size = fields['t']
+        timestamps = np.ascontiguousarray(raw[:, ts_off:ts_off + ts_count * 4]).view('<i4')
+        timestamps = timestamps.reshape(n_this, samples_per_block)
+        n_gaps, previous_last = _count_timestamp_gaps(timestamps, n_gaps, previous_last)
+
+        if n_amp > 0:
+            amp_off, amp_count, _amp_size = fields['amp']
+            amp_u16 = np.ascontiguousarray(raw[:, amp_off:amp_off + amp_count * 2]).view('<u2')
+            amp_u16 = amp_u16.reshape(n_this, n_amp, samples_per_block)
+            scaled = np.empty((n_amp, n_chunk), dtype=np.float32)
+            _scale_strided_u16(amp_u16, scaled)
+            scaled -= amp_shift
+            scaled *= amp_scale
+            amplifier_memmap[:, index:end] = scaled
+
+        if n_adc > 0:
+            adc_off, adc_count, _adc_size = fields['adc']
+            adc_u16 = np.ascontiguousarray(raw[:, adc_off:adc_off + adc_count * 2]).view('<u2')
+            adc_u16 = adc_u16.reshape(n_this, n_adc, samples_per_block)
+            dest = adc[:, index:end]
+            _scale_strided_u16(adc_u16, dest)
+            dest -= amp_shift
+            dest *= adc_scale
 
         index = end
-        percent_done = print_progress(i, num_blocks, print_step, percent_done)
-        if progress_callback is not None and (i % max(1, num_blocks // 20) == 0 or i + 1 == num_blocks):
-            progress_callback((i + 1) / max(1, num_blocks))
+        block_cursor += n_this
+        percent_done = print_progress(
+            max(0, block_cursor - 1), num_blocks, print_step, percent_done
+        )
+        if progress_callback is not None:
+            progress_callback(block_cursor / max(1, num_blocks))
+
+    if n_gaps == 0:
+        print('No missing timestamps in data.')
+    else:
+        print('Warning: {0} gaps in timestamp data found.  '
+              'Time scale will not be uniform!'
+              .format(n_gaps))
     try:
         amplifier_memmap.flush()
     except Exception:
         pass
-    return data
+    return {
+        't': np.empty(0, dtype=np.float64),
+        'timestamp_gaps': int(n_gaps),
+        'board_adc_data': adc,
+        'amplifier_data': amplifier_memmap,
+    }
 
 
 def check_end_of_file(filesize, fid):
