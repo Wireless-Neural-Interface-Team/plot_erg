@@ -4,12 +4,9 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-import importlib.util
 import os
-import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import sys
 import threading
 from collections.abc import Iterator
 from typing import Any, Sequence
@@ -20,10 +17,8 @@ from config import AnalysisConfig, SectionSpecKind
 from intan_rhx_dsp import (
     effective_spike_threshold_uv,
     IntanDspSettings,
-    build_intan_filter_sos,
     detect_spikes_intan,
     mean_rms_intan_channel,
-    write_filtered_stack_channelwise,
 )
 _analysis_cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
     "analysis_cancel_event",
@@ -47,51 +42,6 @@ def check_analysis_cancelled() -> None:
     ev = _analysis_cancel_event.get()
     if ev is not None and ev.is_set():
         raise InterruptedError("Analysis interrupted.")
-
-
-def _import_intan_loader():
-    src_dir = Path(__file__).resolve().parent
-    loader_path = src_dir / "load_intan_rhs_format.py"
-    if not loader_path.exists():
-        raise RuntimeError(f"File not found: {loader_path}")
-
-    spec = importlib.util.spec_from_file_location("load_intan_rhs_format", loader_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Cannot build Python loader for load_intan_rhs_format.py.")
-
-    # Resolve reader internal imports (e.g. intanutil.*) from src/.
-    inserted_path = False
-    if str(src_dir) not in sys.path:
-        sys.path.insert(0, str(src_dir))
-        inserted_path = True
-
-    try:
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        read_data = getattr(module, "read_data", None)
-        if not callable(read_data):
-            raise RuntimeError("read_data is missing from load_intan_rhs_format.py.")
-        return read_data
-    except Exception as exc:
-        raise RuntimeError(
-            "Cannot import 'load_intan_rhs_format.py'. "
-            "Ensure the 'intanutil' package is present under src/ (full Intan zip). "
-            f"Detail: {exc}"
-        ) from exc
-    finally:
-        if inserted_path:
-            try:
-                sys.path.remove(str(src_dir))
-            except ValueError:
-                pass
-
-
-def load_rhs_file(rhs_path: Path) -> dict[str, Any]:
-    read_data = _import_intan_loader()
-    data = read_data(str(rhs_path))
-    if not isinstance(data, dict):
-        raise RuntimeError("Intan reader did not return a dictionary.")
-    return data
 
 
 def get_sampling_rate(data: dict[str, Any]) -> float:
@@ -279,18 +229,6 @@ def mean_time_to_pulse_end_s(
     return float(np.mean(deltas))
 
 
-def mean_time_to_next_rising_edge_s(
-    signal: np.ndarray,
-    trigger_indices: np.ndarray,
-    threshold: float,
-    fs: float,
-) -> float | None:
-    """Backward-compatible alias: pulse end after a falling-edge trigger."""
-    return mean_time_to_pulse_end_s(
-        signal, trigger_indices, threshold, fs, trigger_edge="falling"
-    )
-
-
 def detect_spikes_at_threshold(
     trace: np.ndarray,
     fs: float,
@@ -327,23 +265,6 @@ def resolve_work_dir(config: AnalysisConfig) -> Path:
         return config.work_dir
     root = config.save_dir if config.save_dir is not None else config.rhs_file.parent
     return root / ".plot_erg" / f"{config.rhs_file.stem}_work"
-
-
-def cleanup_plot_erg_root_if_empty(work_dir: Path | None) -> None:
-    """Remove the root .plot_erg folder only if empty."""
-    if work_dir is None:
-        return
-    root = work_dir.parent
-    if root.name != ".plot_erg":
-        return
-    if not root.exists():
-        return
-    try:
-        if not any(root.iterdir()):
-            root.rmdir()
-    except OSError:
-        # Non-empty, locked, or permission error: ignore.
-        pass
 
 
 class AmplifierSpikeSource:
@@ -387,23 +308,6 @@ class AmplifierSpikeSource:
     def high_trace_for_channel(self, ch: int) -> np.ndarray:
         return self._high_row(ch)
 
-    def windows_2d_for_channel(self, ch: int) -> np.ndarray:
-        row = self._high_row(ch)
-        trial_count = int(self.valid_triggers.size)
-        window_length = int(self._offsets.size)
-        if trial_count * window_length > 25_000_000:
-            raise RuntimeError(
-                "Spike window too large for 2D RAM extraction. "
-                "Reduce pre/post window or spike display sampling (%)."
-            )
-        trial_windows = np.empty((trial_count, window_length), dtype=np.float64)
-        for trial_index, trigger_index in enumerate(self.valid_triggers):
-            sample_start = int(trigger_index - self.pre_n)
-            sample_end = int(trigger_index + self.post_n)
-            trial_windows[trial_index] = np.asarray(
-                row[sample_start:sample_end], dtype=np.float64
-            )
-        return trial_windows
 
     def spike_times_per_trial_for_channel(
         self,
@@ -541,125 +445,6 @@ def gui_channel_workers(channel_workers: int | None, n_channels: int = MAX_PARAL
     return max(1, min(resolved, budget))
 
 
-def intan_memmap_cache_valid(
-    work_dir: Path,
-    intan_dsp: IntanDspSettings,
-    shape: tuple[int, int],
-) -> bool:
-    """True when on-disk amplifier + HP/LP filtered stacks match current DSP settings."""
-    amp_path = work_dir / "amplifier_raw.npy"
-    high_path = work_dir / "high_intan.npy"
-    low_path = work_dir / "low_intan.npy"
-    json_path = work_dir / "intan_dsp.json"
-    if not (amp_path.exists() and high_path.exists() and low_path.exists() and json_path.exists()):
-        return False
-    try:
-        if tuple(np.load(amp_path, mmap_mode="r").shape) != shape:
-            return False
-        if tuple(np.load(high_path, mmap_mode="r").shape) != shape:
-            return False
-        if tuple(np.load(low_path, mmap_mode="r").shape) != shape:
-            return False
-        return IntanDspSettings.load_json(json_path) == intan_dsp
-    except Exception:
-        return False
-
-
-def persist_amp_and_filtered_stacks(
-    work_dir: Path,
-    intan_dsp: IntanDspSettings,
-    shape: tuple[int, int],
-    *,
-    amplifier_2d: np.ndarray | None = None,
-    amplifier_memmap: np.memmap | None = None,
-    channel_workers: int | None = None,
-) -> tuple[Path, Path, Path]:
-    """One pass per channel: write amplifier_raw + high_intan + low_intan (separate SOS)."""
-    from memmap_io import open_writable_memmap
-
-    amp_path = work_dir / "amplifier_raw.npy"
-    high_path = work_dir / "high_intan.npy"
-    low_path = work_dir / "low_intan.npy"
-
-    if intan_memmap_cache_valid(work_dir, intan_dsp, shape):
-        print("Reusing cached amplifier / filtered memmaps (.plot_erg).")
-        return amp_path, high_path, low_path
-
-    # Write JSON only after stacks succeed — otherwise a crash mid-filter would
-    # leave new settings + stale HP/LP and look "valid" on the next run.
-    json_path = work_dir / "intan_dsp.json"
-
-    n_ch, n_samp = int(shape[0]), int(shape[1])
-    workers = resolve_channel_workers(channel_workers, n_ch)
-    notch_sos, hp_sos, lp_sos = build_intan_filter_sos(intan_dsp)
-    progress_every = max(1, n_ch // 10) if n_ch >= 20 else 0
-
-    if amplifier_2d is not None:
-        src = np.asarray(amplifier_2d)
-        amp_mm = open_writable_memmap(amp_path, (n_ch, n_samp), np.dtype(np.float32))
-        high_mm = open_writable_memmap(high_path, (n_ch, n_samp), np.dtype(np.float32))
-        low_mm = open_writable_memmap(low_path, (n_ch, n_samp), np.dtype(np.float32))
-        print(f"Writing amplifier + Intan HP/LP ({workers} worker(s), fused pass)...")
-
-        from scipy.signal import sosfilt
-
-        def _fused(ch: int) -> tuple[int, np.ndarray, np.ndarray, np.ndarray]:
-            check_analysis_cancelled()
-            row = np.asarray(src[ch], dtype=np.float32)
-            x = np.asarray(row, dtype=np.float64)
-            if notch_sos is not None:
-                x = sosfilt(notch_sos, x)
-            hi = sosfilt(hp_sos, x)
-            lo = sosfilt(lp_sos, x)
-            return (
-                ch,
-                row,
-                np.asarray(hi, dtype=np.float32),
-                np.asarray(lo, dtype=np.float32),
-            )
-
-        try:
-            if workers <= 1 or n_ch == 1:
-                for ch in range(n_ch):
-                    _, amp_row, hi_row, lo_row = _fused(ch)
-                    amp_mm[ch] = amp_row
-                    high_mm[ch] = hi_row
-                    low_mm[ch] = lo_row
-                    if progress_every > 0 and (ch + 1) % progress_every == 0:
-                        print(f"  fused pass: channel {ch + 1}/{n_ch}")
-            else:
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    for ch, amp_row, hi_row, lo_row in pool.map(_fused, range(n_ch)):
-                        amp_mm[ch] = amp_row
-                        high_mm[ch] = hi_row
-                        low_mm[ch] = lo_row
-                if progress_every > 0:
-                    print(f"  fused pass: {n_ch} channels ({workers} workers)")
-            amp_mm.flush()
-            high_mm.flush()
-            low_mm.flush()
-        finally:
-            del amp_mm, high_mm, low_mm
-        intan_dsp.save_json(json_path)
-        return amp_path, high_path, low_path
-
-    if amplifier_memmap is not None:
-        print(f"Computing Intan HP+LP software filters ({workers} worker(s), channel batches)...")
-        write_filtered_stack_channelwise(
-            amplifier_memmap,
-            high_path,
-            low_path,
-            intan_dsp,
-            channel_workers=workers,
-            cancel_check=check_analysis_cancelled,
-            progress_every=progress_every,
-        )
-        intan_dsp.save_json(json_path)
-        return amp_path, high_path, low_path
-
-    raise ValueError("persist_amp_and_filtered_stacks requires amplifier_2d or amplifier_memmap.")
-
-
 def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> IntanDspSettings:
     """RHX-compatible DSP settings from RHS metadata + analysis config."""
     return IntanDspSettings.from_rhs_data(
@@ -679,55 +464,6 @@ def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> In
         rms_window_s=float(config.rms_window_s),
         software_notch_hz=float(getattr(config, "software_notch_hz", 0) or 0),
     )
-
-
-def extract_triggered_windows(
-    amplifier_data: np.ndarray,
-    trigger_indices: np.ndarray,
-    fs: float,
-    pre_s: float,
-    post_s: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Legacy 3D window extraction.
-
-    Implemented without a giant 2D sample index matrix to avoid huge int64 allocations.
-    """
-    amplifier_data = np.asarray(amplifier_data)
-    if amplifier_data.ndim != 2:
-        raise RuntimeError("Unexpected amplifier_data shape (expected [n_channels, n_samples]).")
-
-    _, n_samples = amplifier_data.shape
-    pre_n = int(round(pre_s * fs))
-    post_n = int(round(post_s * fs))
-    win_len = pre_n + post_n
-    if win_len <= 1:
-        raise RuntimeError("Invalid time window.")
-
-    trigger_indices = np.asarray(trigger_indices, dtype=np.int64)
-    start_idx = trigger_indices - pre_n
-    end_idx = trigger_indices + post_n
-    valid_mask = (start_idx >= 0) & (end_idx <= n_samples)
-    valid_triggers = trigger_indices[valid_mask]
-
-    if valid_triggers.size == 0:
-        raise RuntimeError("No valid window around stimulations.")
-
-    n_trials = int(valid_triggers.size)
-    n_channels = int(amplifier_data.shape[0])
-    # Memory guard for excessive 3D allocation.
-    est_values = n_trials * n_channels * win_len
-    if est_values > 200_000_000:
-        raise RuntimeError(
-            "3D windows too large for RAM extraction. Use the per-channel streaming pipeline."
-        )
-
-    windows = np.empty((n_trials, n_channels, win_len), dtype=np.asarray(amplifier_data).dtype)
-    for i, trig in enumerate(valid_triggers):
-        start = int(trig - pre_n)
-        end = int(trig + post_n)
-        windows[i] = amplifier_data[:, start:end]
-    t_rel = np.arange(-pre_n, post_n, dtype=np.float64) / fs
-    return windows, t_rel
 
 
 def mean_triggered_windows_channelwise(

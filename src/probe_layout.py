@@ -27,10 +27,6 @@ class ProbeLayout:
             raise ValueError("positions_um, contact_ids, and device_channel_indices must have the same length.")
 
 
-# Header band: [left, bottom, width, height] in parent transAxes (MEA inset; Part 1 title on the left).
-PROBE_INSET_HEADER_RECT: tuple[float, float, float, float] = (0.20, 0.00, 1, 1)
-
-
 def _as_int_or_none(v: Any) -> int | None:
     if v is None:
         return None
@@ -199,22 +195,6 @@ def neighboring_channel_indices(
     return out
 
 
-def draw_probe_inset_on_axes(
-    parent_ax: Any,  # matplotlib.axes.Axes
-    layout: ProbeLayout,
-    channel_name: str,
-    *,
-    inset_rect: tuple[float, float, float, float] = PROBE_INSET_HEADER_RECT,
-) -> None:
-    """Inset on the header: one marker per electrode, ``contact_id`` labels, highlight for the active channel."""
-    inset_left, inset_bottom, inset_width, inset_height = inset_rect
-    inset_axes = parent_ax.inset_axes(
-        [inset_left, inset_bottom, inset_width, inset_height],
-        transform=parent_ax.transAxes,
-    )
-    draw_probe_layout_on_axes(inset_axes, layout, channel_name)
-
-
 def _cluster_count(values: np.ndarray) -> tuple[int, float]:
     """Number of distinct columns/rows and typical pitch (same units as ``values``)."""
     vals = np.asarray(values, dtype=np.float64)
@@ -294,8 +274,6 @@ def draw_probe_layout_on_axes(
     contact_positions_um = layout.positions_um
     n_cols, pitch_x = _cluster_count(contact_positions_um[:, 0])
     n_rows, pitch_y = _cluster_count(contact_positions_um[:, 1])
-    span_x_um = max(float(np.ptp(contact_positions_um[:, 0])), pitch_x, 1e-6)
-    span_y_um = max(float(np.ptp(contact_positions_um[:, 1])), pitch_y, 1e-6)
     pad_um = 0.55 * max(pitch_x, pitch_y)
     x_min_um = float(np.min(contact_positions_um[:, 0]) - pad_um)
     x_max_um = float(np.max(contact_positions_um[:, 0]) + pad_um)

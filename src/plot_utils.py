@@ -13,6 +13,60 @@ import numpy as np
 _SCALE_BAR_ATTR = "_erg_scale_bar"
 
 
+def preview_title_row_layout(text_height_px: float, gap_px: int) -> tuple[int, int]:
+    """Hauteur de la ligne de titre et espace sous cette ligne (aperçu canal).
+
+    Pyqtgraph fige le titre dans une bande de 30 px, texte centré. ``gap_px``
+    vaut 0 pour garder cet écart. Une valeur positive ajoute des pixels sous
+    la bande. Une valeur négative réduit l’espace sous le texte, pixel pour
+    pixel (la bande rétrécit de deux pixels par unité, car le texte est centré).
+    """
+    delta = int(gap_px)
+    if delta >= 0:
+        return 30, delta
+    text_px = max(1, int(math.ceil(float(text_height_px))))
+    return max(text_px, 30 + 2 * delta), 0
+
+
+def place_montage_row_label(
+    ax: Any,
+    text: str,
+    *,
+    fontsize: float,
+    labelpad: float = 8.0,
+    dx_px: float = 0.0,
+    dy_px: float = 0.0,
+) -> None:
+    """Titre de ligne montage, à gauche de la courbe.
+
+    ``dx_px`` positif rapproche le titre de la courbe.
+    ``dy_px`` positif le déplace vers le haut.
+    """
+    ax.set_ylabel(
+        text,
+        rotation=0,
+        ha="right",
+        va="center",
+        fontsize=fontsize,
+        labelpad=labelpad,
+    )
+    ax.tick_params(axis="y", which="both", labelleft=False)
+    x, y = -0.012, 0.5
+    fig = getattr(ax, "figure", None)
+    if fig is not None and (dx_px or dy_px):
+        from matplotlib.transforms import ScaledTranslation
+
+        dpi = float(getattr(fig, "dpi", 100.0) or 100.0)
+        trans = ax.transAxes + ScaledTranslation(
+            float(dx_px) / dpi,
+            float(dy_px) / dpi,
+            fig.dpi_scale_trans,
+        )
+        ax.yaxis.set_label_coords(x, y, transform=trans)
+    else:
+        ax.yaxis.set_label_coords(x, y)
+
+
 def mark_unavailable_axis(ax: Any, message: str, *, fontsize: float = 9.0) -> None:
     """Remplace un axe par un message centré (données indisponibles)."""
     from display_config import MUTED_AXIS_TEXT
@@ -207,6 +261,22 @@ def _mark_scale_artist(artist: Any) -> Any:
     return artist
 
 
+def _apply_scale_label_face(text: Any, face: Any) -> None:
+    """Gras / italique / souligné des libellés d'échelle (même rôle que les ticks)."""
+    if text is None or face is None:
+        return
+    try:
+        from panel_registry import apply_text_face
+
+        apply_text_face(text, face)
+    except Exception:
+        try:
+            text.set_fontweight("bold" if getattr(face, "bold", False) else "normal")
+            text.set_fontstyle("italic" if getattr(face, "italic", False) else "normal")
+        except Exception:
+            pass
+
+
 def draw_floating_scale_bars(
     ax: Any,
     *,
@@ -216,11 +286,12 @@ def draw_floating_scale_bars(
     y_size: float | None = None,
     fontsize: float = 8.0,
     color: str = "#111827",
-    linewidth: float = 1.8,
+    linewidth: float = 1.4,
     loc: str = "lower right",
     clear: bool = True,
     gutter: bool = False,
     below: bool = True,
+    face: Any = None,
 ) -> None:
     """Barres d’échelle flottantes (temps + amplitude).
 
@@ -298,6 +369,7 @@ def draw_floating_scale_bars(
             zorder=20,
         )
         _mark_scale_artist(text)
+        _apply_scale_label_face(text, face)
 
     if show_x:
         # X en données · Y = bord bas des axes + décalage fixe (points).
@@ -340,6 +412,7 @@ def draw_floating_scale_bars(
             zorder=20,
         )
         _mark_scale_artist(text)
+        _apply_scale_label_face(text, face)
 
     # ``loc`` conservé pour compatibilité d’appel ; placement géré ci-dessus.
     _ = loc

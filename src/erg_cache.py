@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -489,18 +488,3 @@ def human_bytes(n_bytes: float) -> str:
     return f"{value:.1f} TB"
 
 
-def available_disk_bytes(path: Path) -> int:
-    try:
-        target = path
-        while not target.exists() and target.parent != target:
-            target = target.parent
-        return int(shutil.disk_usage(target).free)
-    except OSError:
-        return 0
-
-
-def env_flag(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}

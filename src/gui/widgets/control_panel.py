@@ -234,9 +234,6 @@ class ControlPanel(QFrame):
 
 
 
-    def view_mode(self) -> ViewMode:
-
-        return self._view_mode
 
 
 

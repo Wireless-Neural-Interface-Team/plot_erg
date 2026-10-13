@@ -17,19 +17,19 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Literal, Sequence
 
-from display_config import PlotDisplaySettings, SectionPanels, ZoomMode
+from display_config import (
+    STIM_OFFSET_COLOR,
+    STIM_ONSET_COLOR,
+    PlotDisplaySettings,
+    SectionPanels,
+    ZoomMode,
+)
 from panel_catalog import (
-    ANALYSIS_PANEL_FIELD_NAMES,
-    ANALYSIS_PANEL_LABELS,
     EXTRA_CHANNEL_PANEL_FIELD_NAMES,
-    EXTRA_CHANNEL_PANEL_LABELS,
     GLOBAL_PANEL_FIELD_NAMES,
-    GLOBAL_PANEL_LABELS,
     SECTION_PANEL_FIELD_NAMES as PANEL_FIELD_NAMES,
-    SECTION_PANEL_LABELS as PANEL_LABELS,
     is_global_panel,
     is_section_independent,
-    is_section_panel,
     merge_product_needs,
     panel_label,
     panel_needs_spikes,
@@ -62,12 +62,6 @@ SECTION_LABELS: dict[str, str] = {
     "zoom_trigger_end": "Zoom fin",
 }
 
-SECTION_SHORT_LABELS: dict[str, str] = {
-    "full": "complet",
-    "zoom_onset": "début",
-    "zoom_trigger_end": "fin",
-}
-
 LegendLocation = Literal[
     "below",
     "best",
@@ -97,16 +91,22 @@ AnalysisStream = Literal["raw", "hp", "lp"]
 TimeSyncMode = Literal["recording_start", "trigger"]
 TriggerPolarity = Literal["low", "high"]  # low = falling, high = rising
 
-PREVIEW_CONTENT_LABELS: dict[PreviewContentMode, str] = {
-    "continuous": "Continuous (traces)",
-    "average": "Moyenne d’essais",
-    "stimulation": "Une stimulation",
-}
-
 STREAM_SHORT_LABELS: dict[str, str] = {
     "raw": "WIDE",
     "hp": "HIGH",
     "lp": "LOW",
+}
+
+# Suffixes des lignes montage (flux + graphs Pipeline). Les noms affichés
+# restent ceux-ci ; seule leur présence à côté du canal est optionnelle.
+MONTAGE_KIND_SHORT_LABELS: dict[str, str] = {
+    **STREAM_SHORT_LABELS,
+    "rms": "RMS",
+    "psth": "PSTH",
+    "trial_rate": "FR",
+    "raster": "RST",
+    "isi": "ISI",
+    "overlay": "WV",
 }
 
 TIME_SYNC_LABELS: dict[TimeSyncMode, str] = {
@@ -123,6 +123,23 @@ EDGE_TO_TRIGGER_POLARITY: dict[str, TriggerPolarity] = {
     "falling": "low",
     "rising": "high",
 }
+
+
+def montage_kind_short(kind: str) -> str:
+    """Libellé court d’un flux ou graph de montage (WIDE, LOW, RMS, …)."""
+    key = str(kind or "").strip().lower()
+    if key in MONTAGE_KIND_SHORT_LABELS:
+        return MONTAGE_KIND_SHORT_LABELS[key]
+    return key.upper()
+
+
+def montage_row_axis_label(channel_name: str, kind: str, *, show_kind: bool) -> str:
+    """Nom de canal, avec ou sans le type (WIDE, LOW, HIGH, RMS, …)."""
+    name = str(channel_name or "").strip()
+    if not show_kind:
+        return name
+    short = montage_kind_short(kind)
+    return f"{name} {short}".strip() if short else name
 
 
 def continuous_sync_offset_s(
@@ -212,13 +229,6 @@ class AnalysisSettings:
             panels.append("analysis_overlay")
         return tuple(panels)
 
-    def selected_trace_panels(self) -> tuple[str, ...]:
-        """Compat : traces tension + RMS uniquement."""
-        return tuple(
-            key
-            for key in self.selected_curve_panels()
-            if key in {"analysis_raw", "analysis_hp", "analysis_lp", "analysis_rms"}
-        )
 
     def selected_spike_panels(self) -> tuple[str, ...]:
         """PSTH / FR par essai / raster — tous modes d’aperçu."""
@@ -295,10 +305,6 @@ class LegendSettings:
     show_sample_counts: bool = True
     show_reference_markers: bool = True
 
-    def with_location(self, location: str) -> LegendSettings:
-        loc = location if location in LEGEND_LOCATIONS else "below"
-        return replace(self, location=loc)  # type: ignore[arg-type]
-
 
 @dataclass(frozen=True)
 class PanelStyle:
@@ -311,6 +317,11 @@ class PanelStyle:
     label_face: TextFace = field(default_factory=TextFace)
     tick_face: TextFace = field(default_factory=TextFace)
     line_width: float = 1.2
+    # Épaisseur (points) des pointillés de début / fin de stimulation.
+    stim_linewidth: float = 1.0
+    # Couleur des pointillés de début (onset) et de fin (offset) de stimulation.
+    stim_onset_color: str = STIM_ONSET_COLOR
+    stim_offset_color: str = STIM_OFFSET_COLOR
     grid: bool = True
     grid_alpha: float = 0.3
     # Cadre (spines) autour de la zone de tracé.
@@ -326,6 +337,8 @@ class PanelStyle:
     scale_bar_time_s: float = 0.1
     scale_bar_amplitude_manual: bool = False
     scale_bar_amplitude: float = 100.0
+    # Épaisseur (points) du trait noir des barres d’échelle flottantes.
+    scale_bar_linewidth: float = 1.4
     # Max points drawn per curve (min/max envelope decimation above this).
     # UI range is 500…200000 ; défaut = milieu de la plage.
     max_points_per_curve: int = 100_250
@@ -418,9 +431,19 @@ class ViewerSettings:
     # Hauteur fixe de chaque graphique (px) — aperçu, analyse, onglets.
     # Pas d’ajustement automatique au viewport.
     graph_height_px: int = 400
+    # Écart vertical titre ↔ courbe en aperçu canal (px).
+    # 0 = bandeau pyqtgraph (30 px, texte centré). Positif agrandit l’espace
+    # sous le titre, négatif le réduit.
+    preview_title_gap_px: int = 0
     # Hauteur minimale d’une ligne canal×flux dans le montage continu (px).
     # Plus bas = moins de pixels Agg (ouverture plus rapide).
     montage_row_min_height_px: int = 52
+    # Titres d’axes du montage : « A-002 LOW » si True, « A-002 » si False.
+    montage_show_kind_label: bool = True
+    # Décalage des titres de canal à côté des courbes (px).
+    # +x rapproche le titre de la courbe, +y le monte.
+    montage_label_dx_px: float = 0.0
+    montage_label_dy_px: float = 0.0
     # Barres de plage (zoom / traitement). Vide = aucune plage (défaut).
     range_bars: tuple[TimeRangeBar, ...] = ()
     active_range_index: int = 0
@@ -499,6 +522,64 @@ def copy_scale_bar_style(target: PanelStyle, source: PanelStyle) -> PanelStyle:
         scale_bar_time_s=float(source.scale_bar_time_s),
         scale_bar_amplitude_manual=bool(source.scale_bar_amplitude_manual),
         scale_bar_amplitude=float(source.scale_bar_amplitude),
+        scale_bar_linewidth=resolved_scale_bar_linewidth(source),
+    )
+
+
+def resolved_scale_bar_linewidth(style: object) -> float:
+    """Épaisseur (points) du trait noir des barres d’échelle flottantes."""
+    raw = getattr(style, "scale_bar_linewidth", 1.4)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 1.4
+    if value != value or value <= 0.0:
+        return 1.4
+    return value
+
+
+def resolved_stim_linewidth(style: object) -> float:
+    """Épaisseur (points) des pointillés de début / fin de stimulation."""
+    raw = getattr(style, "stim_linewidth", 1.0)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return 1.0
+    if value != value or value <= 0.0:
+        return 1.0
+    return value
+
+
+def _resolved_hex_color(raw: object, fallback: str) -> str:
+    """``#rgb`` / ``#rrggbb`` valide, sinon la couleur par défaut."""
+    text = str(raw or "").strip()
+    if len(text) == 4 and text.startswith("#"):
+        try:
+            int(text[1:], 16)
+        except ValueError:
+            return fallback
+        red, green, blue = text[1], text[2], text[3]
+        return f"#{red}{red}{green}{green}{blue}{blue}".lower()
+    if len(text) == 7 and text.startswith("#"):
+        try:
+            int(text[1:], 16)
+        except ValueError:
+            return fallback
+        return text.lower()
+    return fallback
+
+
+def resolved_stim_onset_color(style: object) -> str:
+    """Couleur des pointillés de début de stimulation."""
+    return _resolved_hex_color(
+        getattr(style, "stim_onset_color", None), STIM_ONSET_COLOR
+    )
+
+
+def resolved_stim_offset_color(style: object) -> str:
+    """Couleur des pointillés de fin de stimulation."""
+    return _resolved_hex_color(
+        getattr(style, "stim_offset_color", None), STIM_OFFSET_COLOR
     )
 
 

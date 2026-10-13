@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
@@ -165,8 +165,6 @@ class StatusPanel(QWidget):
             int(max(0.0, min(1.0, float(event.stage_fraction))) * 1000),
         )
 
-    def progress_fractions(self) -> tuple[float, float]:
-        return self._overall.value() / 1000.0, self._stage.value() / 1000.0
 
     def headline_text(self) -> str:
         return self._headline.text()
@@ -219,6 +217,3 @@ class StatusPanel(QWidget):
             f"{panels} panneau(x){where} · {seconds * 1000:.0f} ms",
         )
 
-    def set_cache_summary(self, lines: Sequence[str]) -> None:
-        if lines:
-            self.append_log("\n".join(lines))

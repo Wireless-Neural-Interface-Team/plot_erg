@@ -432,42 +432,6 @@ def run(config: AnalysisConfig) -> None:
     print(f"Total time (analysis + PDF): {stats['t_total_s']:.2f} s")
 
 
-def run_comparison(config_a: AnalysisConfig, config_b: AnalysisConfig) -> Path:
-    """Two recordings via the unified streaming engine."""
-    pdf_path, stats = _run_streaming_comparison([config_a, config_b], "A/B comparison")
-    print(f"Sample rate A: {stats['fs_values'][0]:.2f} Hz | B: {stats['fs_values'][1]:.2f} Hz")
-    if config_a.edge == "none":
-        print("--- Sections per recording (no ANALOG_IN stimulation) ---")
-        for i, cfg in enumerate((config_a, config_b)):
-            label = "A" if i == 0 else "B"
-            print(f"  Recording {label}: sections used={stats['n_valids'][i]}")
-    else:
-        print("--- Recording A ---")
-        print(f"  Stimulations detected: {stats['n_totals'][0]} | used: {stats['n_valids'][0]}")
-        print("--- Recording B ---")
-        print(f"  Stimulations detected: {stats['n_totals'][1]} | used: {stats['n_valids'][1]}")
-        print(f"Time window: [-{config_a.pre_s:.3f}s, +{config_a.post_s:.3f}s]")
-        print(f"ANALOG_IN 0 edge: {config_a.edge}")
-        if stats["end_markers"][0] is not None:
-            print(f"Mean delay to stimulation end (rising) — A: {stats['end_markers'][0]*1e3:.3f} ms")
-        if stats["end_markers"][1] is not None:
-            print(f"Mean delay to stimulation end (rising) — B: {stats['end_markers'][1]*1e3:.3f} ms")
-    print(f"Channels compared (overlay): {stats['n_ch']}")
-    print(f"Multiprocessing workers (A/B comparison): {stats['workers']}")
-    print(f"A/B compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
-    print(f"A/B PDF render time: {stats['t_render_s']:.2f} s")
-    print(
-        "Mean traces in PDF: raw + separate Intan HP and LP "
-        f"(HP {config_a.intan_hp_filter_type} @ {config_a.intan_hp_filter_cutoff_hz:g} Hz "
-        f"order {config_a.intan_hp_filter_order}; "
-        f"LP {config_a.intan_lp_filter_type} @ {config_a.intan_lp_filter_cutoff_hz:g} Hz "
-        f"order {config_a.intan_lp_filter_order})"
-    )
-    print(f"Comparison PDF written: {pdf_path}")
-    print(f"Total time (comparison + PDF): {stats['t_total_s']:.2f} s")
-    return pdf_path
-
-
 def run_multi_comparison(configs: list[AnalysisConfig]) -> None:
     """Process N recordings on a unified multi-trace plotting pipeline."""
     pdf_path, stats = _run_streaming_comparison(configs, "multi comparison")

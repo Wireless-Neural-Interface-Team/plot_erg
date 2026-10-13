@@ -14,18 +14,11 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-from scipy.signal import sosfilt
 
 # systemstate.h / spikeplot.cpp
 INTAN_SNIPPET_SIZE = 50
-INTAN_FRAMES_PER_BLOCK = 128
 INTAN_NOTCH_BANDWIDTH_HZ = 10.0
 INTAN_RMS_WINDOW_S = 1.0
-# Spike Scope waveform buffer around the detection sample (spikeplot.cpp).
-INTAN_SPIKE_PRE_DETECT_SAMPLES = 300
-INTAN_SPIKE_POST_DETECT_SAMPLES = 600
-INTAN_SPIKE_SCOPE_TSCALES_MS: tuple[float, ...] = (2.0, 4.0, 6.0, 10.0, 16.0, 20.0)
-INTAN_SPIKE_SCOPE_YSCALES_UV: tuple[float, ...] = (50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0)
 
 FilterType = Literal["bessel", "butterworth"]
 SpikeFilterKind = Literal["highpass", "lowpass"]
@@ -114,10 +107,6 @@ class IntanDspSettings:
         """
         soft = float(self.software_notch_hz or 0.0)
         return soft if soft > 0 else 0.0
-
-    def apply_notch_to_wideband(self) -> bool:
-        """True when wideband must be notch-filtered before HP/LP."""
-        return self.effective_notch_hz() > 0
 
     def filter_params(self, kind: SpikeFilterKind) -> tuple[int, FilterType, float]:
         """Return (order, type, cutoff_hz) for HIGH or LOW."""
@@ -264,50 +253,6 @@ class _BiquadCoeffs:
     is_dc_gain_zero: bool = False
 
 
-class _BiquadStream:
-    """Direct Form I biquad (filter.cpp / BiquadFilter::filterOne)."""
-
-    def __init__(self, coeffs: _BiquadCoeffs) -> None:
-        self.c = coeffs
-        self.first = True
-        self.prev_in = 0.0
-        self.prev_prev_in = 0.0
-        self.prev_out = 0.0
-        self.prev_prev_out = 0.0
-
-    def filter_one(self, x: float) -> float:
-        c = self.c
-        if self.first:
-            self.prev_in = x
-            self.prev_prev_in = x
-            if c.is_dc_gain_zero:
-                self.prev_out = 0.0
-                self.prev_prev_out = 0.0
-            else:
-                self.prev_out = x
-                self.prev_prev_out = x
-            self.first = False
-        out = (
-            c.b0 * x
-            + c.b1 * self.prev_in
-            + c.b2 * self.prev_prev_in
-            - c.a1 * self.prev_out
-            - c.a2 * self.prev_prev_out
-        )
-        self.prev_prev_in = self.prev_in
-        self.prev_in = x
-        self.prev_prev_out = self.prev_out
-        self.prev_out = out
-        return out
-
-    def process(self, signal: np.ndarray) -> np.ndarray:
-        x = np.asarray(signal, dtype=np.float64).ravel()
-        y = np.empty(x.size, dtype=np.float64)
-        for i in range(x.size):
-            y[i] = self.filter_one(float(x[i]))
-        return y
-
-
 def _first_order_lowpass(fc: float, fs: float) -> _BiquadCoeffs:
     k = math.exp(-2.0 * math.pi * fc / fs)
     return _BiquadCoeffs(1.0 - k, 0.0, 0.0, -k, 0.0, False)
@@ -335,7 +280,7 @@ def _second_order_highpass(fc: float, q: float, fs: float) -> _BiquadCoeffs:
 
 
 def _second_order_notch(f_notch: float, bandwidth: float, fs: float) -> _BiquadCoeffs:
-    # Same IIR as intanutil.filter.notch_filter / Intan calculate_iir_parameters:
+    # Same IIR as intanutil.filter.notch_filter:
     # a1 must be -b so that Direct Form I (y -= a1*y[n-1]) matches the reference.
     d = math.exp(-math.pi * bandwidth / fs)
     b = (1.0 + d * d) * math.cos(2.0 * math.pi * f_notch / fs)
@@ -370,23 +315,11 @@ def _filter_biquad_chain(
     return chain
 
 
-def _highpass_biquad_chain(order: int, fc: float, fs: float, ftype: FilterType) -> list[_BiquadCoeffs]:
-    return _filter_biquad_chain("highpass", order, fc, fs, ftype)
-
-
 def _coeffs_to_sos(coeffs: list[_BiquadCoeffs]) -> np.ndarray:
     sos = np.empty((len(coeffs), 6), dtype=np.float64)
     for i, c in enumerate(coeffs):
         sos[i] = (c.b0, c.b1, c.b2, 1.0, c.a1, c.a2)
     return sos
-
-
-def _cascade(signal: np.ndarray, coeffs: list[_BiquadCoeffs]) -> np.ndarray:
-    """Vectorized IIR cascade (scipy SOS, ~100× faster than sample-wise Python)."""
-    if not coeffs:
-        return np.asarray(signal, dtype=np.float64).ravel()
-    x = np.asarray(signal, dtype=np.float64).ravel()
-    return sosfilt(_coeffs_to_sos(coeffs), x)
 
 
 def build_intan_filter_sos(
@@ -416,93 +349,6 @@ def build_intan_filter_sos(
     return notch_sos, hp_sos, lp_sos
 
 
-def filter_wideband_with_sos(
-    wideband_uv: np.ndarray,
-    notch_sos: np.ndarray | None,
-    filter_sos: np.ndarray,
-) -> np.ndarray:
-    x = np.asarray(wideband_uv, dtype=np.float64).ravel()
-    if notch_sos is not None:
-        x = sosfilt(notch_sos, x)
-    return sosfilt(filter_sos, x)
-
-
-def wideband_to_filtered(
-    wideband_uv: np.ndarray,
-    settings: IntanDspSettings,
-    *,
-    kind: SpikeFilterKind = "highpass",
-) -> np.ndarray:
-    """Convert wideband amplifier (µV) to one Intan software-filtered waveform (HP or LP)."""
-    notch_sos, hp_sos, lp_sos = build_intan_filter_sos(settings)
-    sos = hp_sos if kind == "highpass" else lp_sos
-    return filter_wideband_with_sos(wideband_uv, notch_sos, sos)
-
-
-def wideband_to_high(
-    wideband_uv: np.ndarray,
-    settings: IntanDspSettings,
-) -> np.ndarray:
-    """HIGH (high-pass) path used for spike detection / RMS."""
-    return wideband_to_filtered(wideband_uv, settings, kind="highpass")
-
-
-def write_filtered_stack_channelwise(
-    amplifier: np.ndarray,
-    high_path: Path,
-    low_path: Path,
-    settings: IntanDspSettings,
-    *,
-    channel_workers: int = 1,
-    cancel_check: Any | None = None,
-    progress_every: int = 0,
-) -> tuple[Path, Path]:
-    """Filter wideband to HP + LP memmaps per channel (independent cascades)."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    from memmap_io import open_writable_memmap
-
-    arr = np.asarray(amplifier)
-    if arr.ndim != 2:
-        raise ValueError("write_filtered_stack_channelwise expects [n_channels, n_samples].")
-    n_ch, n_samp = int(arr.shape[0]), int(arr.shape[1])
-    workers = max(1, min(int(channel_workers), 16, n_ch))
-    high_out = open_writable_memmap(high_path, (n_ch, n_samp), np.dtype(np.float32))
-    low_out = open_writable_memmap(low_path, (n_ch, n_samp), np.dtype(np.float32))
-    notch_sos, hp_sos, lp_sos = build_intan_filter_sos(settings)
-
-    def _one(ch: int) -> tuple[int, np.ndarray, np.ndarray]:
-        if cancel_check is not None:
-            cancel_check()
-        row = np.asarray(arr[ch], dtype=np.float64)
-        if notch_sos is not None:
-            row = sosfilt(notch_sos, row)
-        hi = sosfilt(hp_sos, row)
-        lo = sosfilt(lp_sos, row)
-        return ch, np.asarray(hi, dtype=np.float32), np.asarray(lo, dtype=np.float32)
-
-    try:
-        if workers <= 1 or n_ch == 1:
-            for ch in range(n_ch):
-                _, hi_row, lo_row = _one(ch)
-                high_out[ch] = hi_row
-                low_out[ch] = lo_row
-                if progress_every > 0 and (ch + 1) % progress_every == 0:
-                    print(f"  filter → HP+LP: channel {ch + 1}/{n_ch}")
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                for ch, hi_row, lo_row in pool.map(_one, range(n_ch)):
-                    high_out[ch] = hi_row
-                    low_out[ch] = lo_row
-            if progress_every > 0:
-                print(f"  filter → HP+LP: {n_ch} channels ({workers} workers)")
-        high_out.flush()
-        low_out.flush()
-    finally:
-        del high_out, low_out
-    return high_path, low_path
-
-
 def rms_intan_at_index(high: np.ndarray, end_index: int, settings: IntanDspSettings) -> float:
     """RMS over the last `rms_window_s` ending at end_index (spikeplot.cpp)."""
     n = int(np.asarray(high).shape[-1]) if np.ndim(high) >= 1 else int(np.asarray(high).size)
@@ -524,11 +370,6 @@ def mean_rms_intan_channel(high: np.ndarray, settings: IntanDspSettings) -> floa
     if n == 0:
         return 0.0
     return rms_intan_at_index(high, n - 1, settings)
-
-
-def sliding_rms_intan_profile(high: np.ndarray, settings: IntanDspSettings) -> np.ndarray:
-    """RMS (µV) at each sample: sqrt(mean(x²)) over the preceding rms_window."""
-    return sliding_rms_intan_profile_range(high, settings, 0, None)
 
 
 def sliding_rms_intan_profile_range(

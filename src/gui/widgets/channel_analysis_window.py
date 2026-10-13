@@ -77,6 +77,9 @@ class ChannelAnalysisWindow(QWidget):
     closed = Signal(str)
     refreshRequested = Signal(object)
     previewModeChanged = Signal(str)
+    # Mode édité depuis le dock alors que la revue montage est affichée
+    # (n’altère pas le mode réel de l’aperçu).
+    externalContentEdited = Signal(str, int)
     # Coches d’analyse modifiées localement (ex. fermeture d’un panneau) → sync Pipeline.
     analysisCurvesChanged = Signal(object)
 
@@ -110,6 +113,9 @@ class ChannelAnalysisWindow(QWidget):
         self._user_closed_zoom_window = False
         self._placements: tuple[PanelPlacement, ...] = ()
         self._preview_mode: PreviewDisplayMode = "continuous"
+        # « preview » : le combo édite cette fenêtre. « montage » : il édite
+        # seulement le mode affiché dans le dock (profil montage).
+        self._mode_editor = "preview"
         if self._embedded:
             self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         else:
@@ -334,6 +340,42 @@ class ChannelAnalysisWindow(QWidget):
 
     def preview_mode(self) -> PreviewDisplayMode:
         return self._preview_mode
+
+    def stim_index(self) -> int:
+        """Indice 0-based de la stimulation de *cette* vue aperçu."""
+        if self._mode_editor == "montage":
+            return max(0, int(self.settings.analysis.stim_index))
+        return max(0, int(self._stim_spin.value()) - 1)
+
+    def set_dock_view(self, mode: str) -> None:
+        """Montrer les contrôles de l’aperçu, ou seulement le mode en revue montage."""
+        preview = str(mode) != "montage"
+        self._mode_editor = "preview" if preview else "montage"
+        for widget in (
+            self._range_toolbar,
+            self._relative_label,
+            self._context_box,
+            self._summary_box,
+            self._btn_redraw,
+        ):
+            widget.setVisible(preview)
+
+    def display_content_mode(self, mode: str, stim_index: int) -> None:
+        """Afficher un mode dans le combo sans changer le mode réel de l’aperçu."""
+        raw = str(mode or "continuous")
+        if raw not in ("continuous", "average", "stimulation"):
+            raw = "continuous"
+        self._mode_updating = True
+        self._mode_combo.blockSignals(True)
+        self._stim_spin.blockSignals(True)
+        index = self._mode_combo.findData(raw)
+        if index >= 0:
+            self._mode_combo.setCurrentIndex(index)
+        self._stim_spin.setValue(max(1, int(stim_index) + 1))
+        self._stim_spin.setEnabled(raw == "stimulation")
+        self._mode_combo.blockSignals(False)
+        self._stim_spin.blockSignals(False)
+        self._mode_updating = False
 
     def is_analysis_view(self) -> bool:
         return self._preview_mode in ("average", "stimulation")
@@ -623,10 +665,24 @@ class ChannelAnalysisWindow(QWidget):
         if self._mode_updating:
             return
         data = str(self._mode_combo.currentData() or "continuous")
+        if self._mode_editor == "montage":
+            self._stim_spin.setEnabled(data == "stimulation")
+            self.externalContentEdited.emit(
+                data, max(0, int(self._stim_spin.value()) - 1)
+            )
+            return
         self.set_preview_mode(data, redraw=True)
 
     def _on_stim_index_changed(self, *_args: Any) -> None:
-        if self._mode_updating or self._preview_mode != "stimulation":
+        if self._mode_updating:
+            return
+        if self._mode_editor == "montage":
+            data = str(self._mode_combo.currentData() or "continuous")
+            self.externalContentEdited.emit(
+                data, max(0, int(self._stim_spin.value()) - 1)
+            )
+            return
+        if self._preview_mode != "stimulation":
             return
         self.settings = self.local_settings()
         self._sync_params_base()
@@ -769,13 +825,6 @@ class ChannelAnalysisWindow(QWidget):
             self._pipeline_applying = False
 
     # Alias historique.
-    def apply_pipeline_analysis_curves(
-        self,
-        flags: Mapping[str, bool] | AnalysisSettings,
-        *,
-        redraw: bool = True,
-    ) -> None:
-        self.apply_pipeline_visibility(flags, redraw=redraw)
 
     def _wire_range_toolbar_once(self) -> None:
         """Une seule toolbar plages pour continuous / moyenne / stimulation."""
@@ -787,9 +836,6 @@ class ChannelAnalysisWindow(QWidget):
         toolbar.processRequested.connect(self._apply_zooms)
         self._update_range_counts()
 
-    def open_analysis_window(self) -> None:
-        """Compat : basculer vers le mode moyenne (plus de fenêtre séparée)."""
-        self.set_preview_mode("average", redraw=True)
 
     def _context_panels(self) -> tuple[str, ...]:
         if self._cb_impedance.isChecked():
@@ -1123,11 +1169,6 @@ class ChannelAnalysisWindow(QWidget):
         self._zoom_placements = ()
         self._user_closed_zoom_window = False
 
-    def _sync_analysis_window(self, *, force_open: bool = False) -> None:
-        """Compat : plus de fenêtre séparée — graphs déjà dans la grille."""
-        del force_open
-        self._update_range_counts()
-        self._sync_analysis_range_ctrl_from_list()
 
     def _close_analysis_window(self) -> None:
         """Compat : rien à fermer (graphs fusionnés dans l'aperçu)."""
@@ -1462,36 +1503,6 @@ class ChannelAnalysisWindow(QWidget):
             )
         return analysis_panels, zoom_panels
 
-    def _live_update_analysis_zoom_panels(
-        self, analysis_panels: list[PanelPlacement]
-    ) -> None:
-        """Mettre à jour les graphs analyse dans la grille sans ``configure``."""
-        if self._request_factory is None or not analysis_panels:
-            self._analysis_placements = tuple(analysis_panels)
-            return
-        for placement in analysis_panels:
-            widget = self.grid.panel_widget(placement)
-            if widget is None:
-                # Clé absente (1ʳᵉ applique ou courbe ajoutée) → rebuild complet.
-                self._rebuild_placements(reopen_zooms=False)
-                self.refreshRequested.emit(self)
-                return
-            updater = getattr(widget, "update_placement", None)
-            if callable(updater):
-                updater(placement)
-            else:
-                widget.placement = placement
-            request = self._request_factory(self, placement)
-            if request is None:
-                continue
-            # Bornes = plage courante ; conserver le paramétrage d’analyse.
-            settings = apply_local_display_settings(
-                request.settings,
-                self.local_settings(),
-                include_analysis=True,
-            )
-            widget.render(replace(request, settings=settings, preserve_view=False))
-        self._analysis_placements = tuple(analysis_panels)
 
     def _after_analysis_bars_moved(self) -> None:
         """Déplacement des barres → zooms analyse (fenêtre détachée)."""
@@ -1535,8 +1546,6 @@ class ChannelAnalysisWindow(QWidget):
         ctrl.set_bars(bars, active_index=self._active_range_index)
         ctrl.barsChanged.connect(self._on_analysis_bars_changed)
 
-    def _on_analysis_render_finished(self, _drawn: int = 0, _elapsed_s: float = 0.0) -> None:
-        self._attach_range_bars_to_analysis()
 
     def _attach_range_bars_to_analysis(self) -> None:
         """Réattacher les barres sur le premier graph temporel d'analyse (grille principale)."""

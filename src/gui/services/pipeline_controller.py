@@ -3,27 +3,7 @@
 from __future__ import annotations
 
 import contextlib
-from typing import Any, Protocol, runtime_checkable
-
-
-@runtime_checkable
-class PipelineHost(Protocol):
-    """Attributs / helpers attendus sur ViewerWindow (duck-typed)."""
-
-    _ensure_worker: Any
-    _ensure_accepting: bool
-    _build_worker: Any
-    _channel_compute_active: bool
-    _ensure_background: bool
-    _pending_window_id: str | None
-
-    def _set_channel_compute_active(
-        self, active: bool, *, background: bool = False
-    ) -> None: ...
-
-    def _set_busy(self, busy: bool) -> None: ...
-
-    def _start_channel_ensure(self, channels: list[int], **kwargs: Any) -> None: ...
+from typing import Any
 
 
 class PipelineController:
@@ -50,9 +30,6 @@ class PipelineController:
         host._ensure_worker = None
         host._set_channel_compute_active(False)
 
-    def start_channel_ensure(self, channels: list[int], **kwargs: Any) -> None:
-        """Façade vers ``host._start_channel_ensure``."""
-        self._host._start_channel_ensure(channels, **kwargs)
 
     def ensure_channels_for_indices(
         self,
@@ -73,10 +50,6 @@ class PipelineController:
     def set_busy(self, busy: bool) -> None:
         self._host._set_busy(busy)
 
-    def set_channel_compute_active(
-        self, active: bool, *, background: bool = False
-    ) -> None:
-        self._host._set_channel_compute_active(active, background=background)
 
     def pipeline_busy(self) -> bool:
         host = self._host

@@ -26,7 +26,6 @@ from display_config import RecordingStyle, resolve_display_label
 from erg_cache import (
     BundleLayout,
     CACHE_FORMAT_VERSION,
-    CacheKeys,
     DATASET_SUFFIX,
 )
 from impedance_tracking import ImpedanceSession
@@ -199,9 +198,6 @@ class RecordingMeta:
     def window_samples(self) -> int:
         return int(self.segmentation.pre_n + self.segmentation.post_n)
 
-    @property
-    def duration_s(self) -> float:
-        return float(self.n_samples) / float(self.fs) if self.fs > 0 else 0.0
 
     def filter_short_label(self, kind: str = "highpass") -> str:
         return self.dsp.filter_short_label(kind)  # type: ignore[arg-type]
@@ -592,11 +588,6 @@ class ProcessedRecording:
         """Monotonic counter bumped when channel products change (redraw fingerprint)."""
         return int(getattr(self, "_data_generation", 0))
 
-    def clear_channel_cache(self) -> None:
-        self._channel_data.clear()
-        self._overlay_override.clear()
-        self._overlay_request.clear()
-        self._data_generation = int(getattr(self, "_data_generation", 0)) + 1
 
     def spike_count(self, ch: int) -> int:
         data = self._channel_data.get(int(ch))
@@ -1496,7 +1487,3 @@ def recording_label_for(path: Path, custom: str | None) -> str:
     return resolve_display_label(Path(path).stem, custom)
 
 
-def keys_match(meta: RecordingMeta, keys: CacheKeys) -> bool:
-    """True when a loaded bundle was produced with the given cache keys."""
-    stored = dict(meta.cache_keys)
-    return all(stored.get(name) == value for name, value in keys.as_dict().items())

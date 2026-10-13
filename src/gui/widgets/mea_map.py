@@ -152,6 +152,7 @@ class MeaMapWidget(QWidget):
     """Electrode map that emits the channel name of the contact being clicked."""
 
     channelSelected = Signal(str)
+    channelCleared = Signal()  # clic à côté d’un contact → plus de canal
     channelActivated = Signal(str)  # double-clic → Analyse le canal
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -567,6 +568,13 @@ class MeaMapWidget(QWidget):
         if contact is not None and contact.channel_name:
             self.set_selected_channel(contact.channel_name)
             self.channelSelected.emit(contact.channel_name)
+        elif (
+            event.button() == Qt.MouseButton.LeftButton
+            and self._selected is not None
+        ):
+            # Clic à côté des contacts : annuler la sélection.
+            self.set_selected_channel(None)
+            self.channelCleared.emit()
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: Any) -> None:  # noqa: D102

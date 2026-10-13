@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import os
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
@@ -49,6 +50,7 @@ from draw_primitives import (  # noqa: F401 — re-export for PDF + legacy calle
     SPIKE_OVERLAY_DEFAULT_POST_MS,
     SPIKE_OVERLAY_DEFAULT_PRE_MS,
     TIME_REL_XLABEL,
+    DrawAppearance,
     _draw_impedance_evolution_panel,
     _draw_onset_offset_lines,
     _draw_spike_overlay_panel,
@@ -66,6 +68,60 @@ from probe_layout import (
 # Zoom panel window (s), time relative to trigger (t=0)
 ZOOM_T0 = -0.1
 ZOOM_T1 = 0.4
+
+# Épaisseur et couleurs des pointillés de trigger pendant un export PDF
+# (None = défauts historiques).
+_pdf_stim_linewidth: ContextVar[float | None] = ContextVar(
+    "pdf_stim_linewidth", default=None
+)
+_pdf_stim_onset_color: ContextVar[str | None] = ContextVar(
+    "pdf_stim_onset_color", default=None
+)
+_pdf_stim_offset_color: ContextVar[str | None] = ContextVar(
+    "pdf_stim_offset_color", default=None
+)
+
+
+def _trigger_line_width(fallback: float) -> float:
+    """Épaisseur des pointillés de trigger : paramètre GUI si fourni, sinon le défaut PDF."""
+    raw = _pdf_stim_linewidth.get()
+    if raw is None:
+        return float(fallback)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(fallback)
+    if value != value or value <= 0.0:
+        return float(fallback)
+    return value
+
+
+def _pdf_onset_ink(fallback: str = "red") -> str:
+    """Couleur PDF du début de stimulation (réglage GUI, sinon le défaut historique)."""
+    raw = str(_pdf_stim_onset_color.get() or "").strip()
+    return raw or fallback
+
+
+def _pdf_offset_ink(fallback: str = "#1d4ed8") -> str:
+    """Couleur PDF de la fin de stimulation (réglage GUI, sinon le défaut historique)."""
+    raw = str(_pdf_stim_offset_color.get() or "").strip()
+    return raw or fallback
+
+
+def _pdf_stim_appearance() -> DrawAppearance | None:
+    linewidth = _pdf_stim_linewidth.get()
+    onset = _pdf_stim_onset_color.get()
+    offset = _pdf_stim_offset_color.get()
+    if linewidth is None and not onset and not offset:
+        return None
+    kwargs: dict[str, Any] = {}
+    if linewidth is not None:
+        kwargs["stim_linewidth"] = _trigger_line_width(1.15)
+    if onset:
+        kwargs["stim_onset_color"] = str(onset)
+    if offset:
+        kwargs["stim_offset_color"] = str(offset)
+    return DrawAppearance(**kwargs)
 
 LEGEND_FONT_SIZE = 15
 AXIS_TITLE_FONT_SIZE = 16
@@ -969,11 +1025,12 @@ def _add_trace_reference_overlays(
     end_zoom_t1: float | None = None,
     aux_legend_label: Optional[str] = None,
 ) -> None:
+    stim_lw = _trigger_line_width(1.15)
     ax.axvline(
         0.0,
         linestyle="--",
-        linewidth=1.15,
-        color="red",
+        linewidth=stim_lw,
+        color=_pdf_onset_ink(),
         label=onset_label if aux_legend_label is None else aux_legend_label,
     )
     if end_line_specs:
@@ -981,8 +1038,8 @@ def _add_trace_reference_overlays(
             ax.axvline(
                 value,
                 linestyle="-.",
-                linewidth=1.15,
-                color="#1d4ed8",
+                linewidth=stim_lw,
+                color=_pdf_offset_ink(),
                 label=(label if aux_legend_label is None else (aux_legend_label if idx == 0 else "_nolegend_")),
             )
     else:
@@ -995,8 +1052,8 @@ def _add_trace_reference_overlays(
             ax.axvline(
                 float(value),
                 linestyle="-.",
-                linewidth=1.15,
-                color="#1d4ed8",
+                linewidth=stim_lw,
+                color=_pdf_offset_ink(),
                 label=leg,
             )
             labeled = True
@@ -1092,6 +1149,7 @@ def _plot_stim_event_panel(
             ax,
             end_markers=end_markers,
             end_line_specs=end_line_specs,
+            appearance=_pdf_stim_appearance(),
         )
     ax.set_title(title)
     ax.set_ylabel("Potential (µV)")
@@ -1444,127 +1502,6 @@ class _PlotRenderCache:
         ] = {}
         self._channel_rms_uv: dict[tuple[int, int], float] = {}
         self._threshold: dict[tuple[int, int], tuple[float, str]] = {}
-
-    def seed_from_recordings(self, recordings: Sequence[Any]) -> int:
-        """Seed means from ProcessedRecording ChannelData when present.
-
-        Returns how many mean curves were imported. Missing products still fall
-        back to the historical AmplifierSpikeSource recompute path.
-        """
-        imported = 0
-        for src_idx, recording in enumerate(recordings):
-            channel_data = getattr(recording, "_channel_data", None)
-            if not isinstance(channel_data, dict) or not channel_data:
-                continue
-            for ch, data in channel_data.items():
-                ch_i = int(ch)
-                means = getattr(data, "means", None) or {}
-                for stream, store in (
-                    ("raw", self._mean_raw),
-                    ("hp", self._mean_hp),
-                    ("lp", self._mean_lp),
-                ):
-                    row = means.get(stream)
-                    if row is None:
-                        continue
-                    store[(src_idx, ch_i)] = self._normalize_mean_row(row, self.n_expected)
-                    imported += 1
-        return imported
-
-
-def plot_processed_recordings_pdf(
-    recordings: Sequence[Any],
-    configs: Sequence[Any],
-    *,
-    output_dir: Path | None = None,
-    channels: Sequence[int] | None = None,
-) -> Path:
-    """PDF export from ProcessedRecording objects (shared GUI/CLI data plane).
-
-    Ensures channel products, then delegates to ``plot_channel_multi_comparison``
-    using each recording's live ``AmplifierSpikeSource``.
-    """
-    from dataset_builder import ensure_channels
-
-    if not recordings:
-        raise ValueError("plot_processed_recordings_pdf requires at least one recording.")
-    if len(configs) != len(recordings):
-        raise ValueError("configs and recordings length mismatch.")
-
-    for recording, config in zip(recordings, configs):
-        n_rec = int(recording.n_channels)
-        wanted = _resolve_plot_channels(n_rec, channels)
-        ensure_channels(
-            recording,
-            wanted,
-            config,
-            need_means=True,
-            need_rms=True,
-            need_spikes=True,
-            need_overlay=True,
-        )
-        source = getattr(recording, "source", None)
-        if source is not None:
-            for bank_name in ("highpass", "lowpass"):
-                bank = getattr(source, bank_name, None)
-                prefetch = getattr(bank, "prefetch", None)
-                if callable(prefetch):
-                    prefetch(wanted)
-
-    spike_sources = []
-    for recording in recordings:
-        source = getattr(recording, "source", None)
-        if source is None:
-            raise RuntimeError(f"Recording {recording.label!r} has no live streams.")
-        spike_sources.append(source)
-
-    cfg0 = configs[0]
-    out = Path(output_dir) if output_dir is not None else (
-        Path(cfg0.save_dir) if getattr(cfg0, "save_dir", None) else Path(cfg0.rhs_file).parent
-    )
-    fs_ref = float(recordings[0].meta.fs)
-    pre_n_common = min(int(r.meta.segmentation.pre_n) for r in recordings)
-    post_n_common = min(int(r.meta.segmentation.post_n) for r in recordings)
-    t_ref = np.arange(-pre_n_common, post_n_common, dtype=np.float64) / fs_ref
-    n_ch = min(int(r.n_channels) for r in recordings)
-    labels = [str(getattr(r, "label", "") or Path(c.rhs_file).stem) for r, c in zip(recordings, configs)]
-    styles = [getattr(r, "style", None) or getattr(c, "recording_style", None) for r, c in zip(recordings, configs)]
-    end_markers = [getattr(r.meta.segmentation, "end_rising_s", None) for r in recordings]
-
-    return plot_channel_multi_comparison(
-        t_rel=t_ref,
-        channel_names=list(recordings[0].channel_names)[:n_ch],
-        output_dir=out,
-        labels=labels,
-        spike_sources=spike_sources,
-        pre_n_common=pre_n_common,
-        post_n_common=post_n_common,
-        pdf_title=getattr(cfg0, "pdf_title", None),
-        trigger_end_rising_rel_s_list=end_markers,
-        fs=fs_ref,
-        spike_threshold_uv=float(cfg0.spike_threshold_uv),
-        spike_threshold_polarity=str(cfg0.spike_threshold_polarity),
-        spike_threshold_mode=str(cfg0.spike_threshold_mode),
-        spike_threshold_rms_multiplier=float(cfg0.spike_threshold_rms_multiplier),
-        spike_overlay_pre_ms=float(cfg0.spike_overlay_pre_ms),
-        spike_overlay_post_ms=float(cfg0.spike_overlay_post_ms),
-        psth_bin_window_s=float(cfg0.psth_bin_window_s),
-        rms_window_s=float(cfg0.rms_window_s),
-        zoom_mode=cfg0.zoom_mode,
-        zoom_onset_t0_s=float(cfg0.zoom_onset_t0_s),
-        zoom_onset_t1_s=float(cfg0.zoom_onset_t1_s),
-        zoom_end_t0_s=float(cfg0.zoom_end_t0_s),
-        zoom_end_t1_s=float(cfg0.zoom_end_t1_s),
-        sampling_percent=int(cfg0.sampling_percent),
-        probe_layout_json=getattr(cfg0, "probe_layout_json", None),
-        channel_workers=getattr(cfg0, "channel_workers", None),
-        first_trigger_hp_ylim_enabled=bool(cfg0.first_trigger_hp_ylim_enabled),
-        first_trigger_hp_ylim_min_uv=float(cfg0.first_trigger_hp_ylim_min_uv),
-        first_trigger_hp_ylim_max_uv=float(cfg0.first_trigger_hp_ylim_max_uv),
-        plot_display=getattr(cfg0, "plot_display", None),
-        recording_styles=styles,
-        channel_indices=channels,
-    )
 
     @staticmethod
     def _normalize_mean_row(row: np.ndarray, n_expected: int) -> np.ndarray:
@@ -1923,6 +1860,108 @@ def plot_processed_recordings_pdf(
         self._waveforms[key] = extracted
         return extracted
 
+
+def plot_processed_recordings_pdf(
+    recordings: Sequence[Any],
+    configs: Sequence[Any],
+    *,
+    output_dir: Path | None = None,
+    channels: Sequence[int] | None = None,
+    stim_linewidth: float | None = None,
+    stim_onset_color: str | None = None,
+    stim_offset_color: str | None = None,
+) -> Path:
+    """PDF export from ProcessedRecording objects (shared GUI/CLI data plane).
+
+    Ensures channel products, then delegates to ``plot_channel_multi_comparison``
+    using each recording's live ``AmplifierSpikeSource``.
+    """
+    from dataset_builder import ensure_channels
+
+    if not recordings:
+        raise ValueError("plot_processed_recordings_pdf requires at least one recording.")
+    if len(configs) != len(recordings):
+        raise ValueError("configs and recordings length mismatch.")
+
+    for recording, config in zip(recordings, configs):
+        n_rec = int(recording.n_channels)
+        wanted = _resolve_plot_channels(n_rec, channels)
+        ensure_channels(
+            recording,
+            wanted,
+            config,
+            need_means=True,
+            need_rms=True,
+            need_spikes=True,
+            need_overlay=True,
+        )
+        source = getattr(recording, "source", None)
+        if source is not None:
+            for bank_name in ("highpass", "lowpass"):
+                bank = getattr(source, bank_name, None)
+                prefetch = getattr(bank, "prefetch", None)
+                if callable(prefetch):
+                    prefetch(wanted)
+
+    spike_sources = []
+    for recording in recordings:
+        source = getattr(recording, "source", None)
+        if source is None:
+            raise RuntimeError(f"Recording {recording.label!r} has no live streams.")
+        spike_sources.append(source)
+
+    cfg0 = configs[0]
+    out = Path(output_dir) if output_dir is not None else (
+        Path(cfg0.save_dir) if getattr(cfg0, "save_dir", None) else Path(cfg0.rhs_file).parent
+    )
+    fs_ref = float(recordings[0].meta.fs)
+    pre_n_common = min(int(r.meta.segmentation.pre_n) for r in recordings)
+    post_n_common = min(int(r.meta.segmentation.post_n) for r in recordings)
+    t_ref = np.arange(-pre_n_common, post_n_common, dtype=np.float64) / fs_ref
+    n_ch = min(int(r.n_channels) for r in recordings)
+    labels = [str(getattr(r, "label", "") or Path(c.rhs_file).stem) for r, c in zip(recordings, configs)]
+    styles = [getattr(r, "style", None) or getattr(c, "recording_style", None) for r, c in zip(recordings, configs)]
+    end_markers = [getattr(r.meta.segmentation, "end_rising_s", None) for r in recordings]
+
+    return plot_channel_multi_comparison(
+        t_rel=t_ref,
+        channel_names=list(recordings[0].channel_names)[:n_ch],
+        output_dir=out,
+        labels=labels,
+        spike_sources=spike_sources,
+        pre_n_common=pre_n_common,
+        post_n_common=post_n_common,
+        pdf_title=getattr(cfg0, "pdf_title", None),
+        trigger_end_rising_rel_s_list=end_markers,
+        fs=fs_ref,
+        spike_threshold_uv=float(cfg0.spike_threshold_uv),
+        spike_threshold_polarity=str(cfg0.spike_threshold_polarity),
+        spike_threshold_mode=str(cfg0.spike_threshold_mode),
+        spike_threshold_rms_multiplier=float(cfg0.spike_threshold_rms_multiplier),
+        spike_overlay_pre_ms=float(cfg0.spike_overlay_pre_ms),
+        spike_overlay_post_ms=float(cfg0.spike_overlay_post_ms),
+        psth_bin_window_s=float(cfg0.psth_bin_window_s),
+        rms_window_s=float(cfg0.rms_window_s),
+        zoom_mode=cfg0.zoom_mode,
+        zoom_onset_t0_s=float(cfg0.zoom_onset_t0_s),
+        zoom_onset_t1_s=float(cfg0.zoom_onset_t1_s),
+        zoom_end_t0_s=float(cfg0.zoom_end_t0_s),
+        zoom_end_t1_s=float(cfg0.zoom_end_t1_s),
+        sampling_percent=int(cfg0.sampling_percent),
+        probe_layout_json=getattr(cfg0, "probe_layout_json", None),
+        channel_workers=getattr(cfg0, "channel_workers", None),
+        first_trigger_hp_ylim_enabled=bool(cfg0.first_trigger_hp_ylim_enabled),
+        first_trigger_hp_ylim_min_uv=float(cfg0.first_trigger_hp_ylim_min_uv),
+        first_trigger_hp_ylim_max_uv=float(cfg0.first_trigger_hp_ylim_max_uv),
+        plot_display=getattr(cfg0, "plot_display", None),
+        recording_styles=styles,
+        channel_indices=channels,
+        stim_linewidth=stim_linewidth,
+        stim_onset_color=stim_onset_color,
+        stim_offset_color=stim_offset_color,
+    )
+
+
 def _append_mean_impedance_summary_page(
     pdf: PdfPages,
     sessions: Sequence[ImpedanceSession],
@@ -2185,13 +2224,14 @@ def _montage_draw_reference_lines(
     zoom_onset_t1: float,
     show_zoom_span: bool,
 ) -> None:
-    ax.axvline(0.0, linestyle="--", linewidth=0.9, color="red", zorder=1)
+    stim_lw = _trigger_line_width(0.9)
+    ax.axvline(0.0, linestyle="--", linewidth=stim_lw, color=_pdf_onset_ink(), zorder=1)
     if end_marker is not None:
         ax.axvline(
             end_marker,
             linestyle="-.",
-            linewidth=0.9,
-            color="#1d4ed8",
+            linewidth=stim_lw,
+            color=_pdf_offset_ink(),
             zorder=1,
         )
     if show_zoom_span:
@@ -2644,11 +2684,12 @@ def _append_second_to_third_stim_span_lp_montage_pages(
                     ax.set_ylim(y0, y1)
 
             # t=0 = 2nd stim onset; mark 3rd stim onset on the continuous axis.
+            stim_lw = _trigger_line_width(0.9)
             ax.axvline(
                 0.0,
                 linestyle="--",
-                linewidth=0.9,
-                color="red",
+                linewidth=stim_lw,
+                color=_pdf_onset_ink(),
                 zorder=1,
                 label="2nd stim." if row_i == 0 else "_nolegend_",
             )
@@ -2656,7 +2697,7 @@ def _append_second_to_third_stim_span_lp_montage_pages(
                 ax.axvline(
                     third_onset_s,
                     linestyle="--",
-                    linewidth=0.9,
+                    linewidth=stim_lw,
                     color=_MONTAGE_STIM3_MARKER_COLOR,
                     zorder=1,
                     label="3rd stim." if row_i == 0 else "_nolegend_",
@@ -2665,16 +2706,16 @@ def _append_second_to_third_stim_span_lp_montage_pages(
                 ax.axvline(
                     float(end_marker),
                     linestyle="-.",
-                    linewidth=0.9,
-                    color="#1d4ed8",
+                    linewidth=stim_lw,
+                    color=_pdf_offset_ink(),
                     zorder=1,
                 )
                 if third_onset_s is not None:
                     ax.axvline(
                         float(third_onset_s) + float(end_marker),
                         linestyle="-.",
-                        linewidth=0.9,
-                        color="#1d4ed8",
+                        linewidth=stim_lw,
+                        color=_pdf_offset_ink(),
                         zorder=1,
                     )
 
@@ -2939,6 +2980,25 @@ def _append_mean_rms_per_channel_table_page(
 
 
 def plot_channel_multi_comparison(
+    *args: Any,
+    stim_linewidth: float | None = None,
+    stim_onset_color: str | None = None,
+    stim_offset_color: str | None = None,
+    **kwargs: Any,
+) -> Path:
+    """Point d’entrée PDF. Épaisseur et couleurs des pointillés de trigger."""
+    token_lw = _pdf_stim_linewidth.set(stim_linewidth)
+    token_on = _pdf_stim_onset_color.set(stim_onset_color)
+    token_off = _pdf_stim_offset_color.set(stim_offset_color)
+    try:
+        return _plot_channel_multi_comparison_impl(*args, **kwargs)
+    finally:
+        _pdf_stim_linewidth.reset(token_lw)
+        _pdf_stim_onset_color.reset(token_on)
+        _pdf_stim_offset_color.reset(token_off)
+
+
+def _plot_channel_multi_comparison_impl(
     t_rel: np.ndarray,
     channel_names: Sequence[str],
     output_dir: Path,
@@ -3598,12 +3658,6 @@ def plot_channel_multi_comparison(
                         channel_index=ch,
                     )
                     for src_idx in plot_indices
-                ]
-                st_list = [
-                    render_cache.spike_times_per_trial(
-                        src_idx, spike_sources[src_idx], ch, thr_uv
-                    )
-                    for src_idx, (thr_uv, _caption) in zip(plot_indices, thresholds_and_captions)
                 ]
                 if str(spike_threshold_mode).strip().lower() == "rms_multiple":
                     threshold_labels = [

@@ -58,7 +58,8 @@ class SessionPanel(QWidget):
         self.map_box.setObjectName("meaMapBox")
         self.map_box.setMinimumHeight(280)
         self.map_box.setToolTip(
-            "Carte des électrodes : clic = aperçu, double-clic = moyenne."
+            "Carte des électrodes : clic = aperçu, clic à côté = annuler, "
+            "double-clic = moyenne."
         )
 
         self._help = QLabel(

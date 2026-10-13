@@ -2,16 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Sequence
 
 from view_config import PanelPlacement
-
-
-@runtime_checkable
-class MontageHost(Protocol):
-    """Callbacks UI attendus quand le mode montage change."""
-
-    def sync_montage_ui(self, *, montage: bool) -> None: ...
 
 
 class MontageController:

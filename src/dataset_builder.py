@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -199,17 +199,6 @@ class _Progress:
     def finish(self) -> BuildReport:
         self.report.total_s = self.elapsed_s
         return self.report
-
-
-def _chunked(total: int, parts: int) -> Iterator[tuple[int, int]]:
-    if total <= 0:
-        return
-    step = max(1, total // max(1, parts))
-    start = 0
-    while start < total:
-        end = min(total, start + step)
-        yield start, end
-        start = end
 
 
 # ------------------------------------------------------------------ raw stream
@@ -513,7 +502,6 @@ class LazyFilterBank:
         if kind not in ("hp", "lp"):
             raise ValueError(f"Unsupported filter bank kind: {kind}")
         self._amplifier = amplifier
-        self._dsp = dsp
         self._kind = kind
         self._max_cached = max(1, int(max_cached_channels))
         self._cache: OrderedDict[int, np.ndarray] = OrderedDict()

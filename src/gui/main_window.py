@@ -78,6 +78,18 @@ _ORG = "plot_erg"
 _APP = "viewer"
 
 
+def _widget_alive(obj: Any) -> bool:
+    """True si le wrapper Python pointe encore vers un objet Qt C++."""
+    if obj is None:
+        return False
+    try:
+        from shiboken6 import isValid
+
+        return bool(isValid(obj))
+    except Exception:
+        return False
+
+
 class ViewerWindow(QMainWindow):
     """Fenêtre principale style RHX : session, scope, control panel."""
 
@@ -542,6 +554,9 @@ class ViewerWindow(QMainWindow):
 
     def _on_panel_detached(self, placement: PanelPlacement) -> None:
         existing = self._detached.get(placement.key)
+        if existing is not None and not _widget_alive(existing):
+            self._detached.pop(placement.key, None)
+            existing = None
         if existing is not None:
             existing.raise_()
             existing.activateWindow()
@@ -549,11 +564,19 @@ class ViewerWindow(QMainWindow):
         window = DetachedPanelWindow(
             placement, self._default_viewer_settings(), self
         )
-        window.closed.connect(lambda key=placement.key: self._detached.pop(key, None))
+        window.closed.connect(self._on_detached_closed)
         window.refreshRequested.connect(self._on_detached_refresh)
         self._detached[placement.key] = window
         window.show()
         self._render_detached(window)
+
+    def _on_detached_closed(self, placement: PanelPlacement) -> None:
+        self._detached.pop(placement.key, None)
+
+    def _forget_detached(self, window: DetachedPanelWindow) -> None:
+        key = getattr(getattr(window, "placement", None), "key", None)
+        if key is not None and self._detached.get(key) is window:
+            self._detached.pop(key, None)
 
     def _on_detached_refresh(self, window: DetachedPanelWindow) -> None:
         self._render_detached(window)
@@ -561,13 +584,19 @@ class ViewerWindow(QMainWindow):
     def _render_detached(self, window: DetachedPanelWindow) -> None:
         from dataclasses import replace as dc_replace
 
+        if not _widget_alive(window):
+            self._forget_detached(window)
+            return
         request = self._make_request(window.placement)
         if request is None:
             return
         # Affichage = panneau de *cette* fenêtre ; données / flux = vue centrale.
-        settings = apply_local_display_settings(
-            request.settings, window.local_settings()
-        )
+        try:
+            local = window.local_settings()
+        except RuntimeError:
+            self._forget_detached(window)
+            return
+        settings = apply_local_display_settings(request.settings, local)
         window.render(dc_replace(request, settings=settings))
 
     # --------------------------------------------------------------- rendering
@@ -663,25 +692,20 @@ class ViewerWindow(QMainWindow):
         self._preserve_view = False
 
     def _on_params_view_changed(self) -> None:
-        # Toujours passer par le merge complet (mode, flux, canaux masqués…).
+        # Profil de la vue affichée seulement (l’autre garde ses propres valeurs).
         self._settings = self._default_viewer_settings()
-        # Montage : hauteur = lignes × hauteur de ligne (jamais graph_height_px).
         if self._in_montage:
             self._clamp_montage_review_page()
             self._settings = self._default_viewer_settings()
             self._adapt_montage_height()
             self._sync_montage_page_controls()
-        else:
-            self._apply_graph_height_to_tabs()
-        if self._channel_inspect is not None and self._showing_channel_preview():
+            self._schedule_redraw(force=True, preserve_view=True)
+            return
+        self._apply_graph_height_to_tabs()
+        if self._channel_inspect is not None:
             self._channel_inspect.apply_viewer_settings(self._settings)
-            # Affichage (échelles, sync, hauteur…) : garder zoom/pan.
             self._channel_inspect.redraw(preserve_view=True)
             self._redraw_detached_windows()
-            return
-        # Revue montage / onglets : même règle — ne pas reset zoom/pan
-        # (ex. changement d’« Origine du temps » = sync seule).
-        self._schedule_redraw(force=True, preserve_view=True)
 
     def _apply_graph_height_to_tabs(self) -> None:
         """Propager la hauteur fixe Affichage aux onglets (hors revue montage)."""
@@ -983,11 +1007,13 @@ class ViewerWindow(QMainWindow):
             graph_setter(graph_h)
 
     def _default_viewer_settings(self) -> ViewerSettings:
-        """Réglages d’affichage de la vue centrale (ParamsPanel)."""
+        """Réglages d’affichage de la vue affichée (profil aperçu ou montage)."""
+        # L’inspecteur canal ne porte que l’aperçu (mode, résumés, plages).
+        inspect = None if self._in_montage else self._channel_inspect
         return merge_central_viewer_settings(
             self.params_panel.viewer_settings(),
             hidden_channels=self.channel_panel.hidden_channels,
-            channel_inspect=self._channel_inspect,
+            channel_inspect=inspect,
         )
 
     def _seed_settings_for_window(self) -> ViewerSettings:
@@ -1035,19 +1061,18 @@ class ViewerWindow(QMainWindow):
         self._preserve_view = False
         self._block_preserve_view = True
         window = self._channel_inspect
-        if window is not None:
+        if window is not None and not self._in_montage:
             self._syncing_pipeline_visibility = True
             try:
                 window.apply_pipeline_visibility(
                     self.params_panel.pipeline_visibility_flags(),
                     mark_stims=self.params_panel.mark_stimulations(),
-                    redraw=self._showing_channel_preview(),
+                    redraw=True,
                 )
             finally:
                 self._syncing_pipeline_visibility = False
-            if self._showing_channel_preview():
-                self._block_preserve_view = False
-                return
+            self._block_preserve_view = False
+            return
         if self._in_montage:
             self._settings = self._default_viewer_settings()
             self._sync_montage_review_panels()
@@ -1060,20 +1085,12 @@ class ViewerWindow(QMainWindow):
                 self._start_background_prefetch()
         self._schedule_redraw(force=True, reset_view=True)
 
-    @staticmethod
-    def _split_key(key: str) -> tuple[str, str]:
-        if "@" in key:
-            panel, section = key.split("@", 1)
-            return panel, section
-        return key, "full"
 
     def _on_tab_changed(self, index: int) -> None:
         self._workspace = replace(self._workspace, active_index=max(0, index))
         self._prioritize_viewed_channels()
         self._schedule_redraw()
 
-    def _pipeline_busy(self) -> bool:
-        return self._pipeline.pipeline_busy()
 
     def _pipeline_ui_locked(self) -> bool:
         """True tant qu’un build ou un calcul de canaux possède la barre de statut."""
@@ -1126,13 +1143,14 @@ class ViewerWindow(QMainWindow):
             )
         )
         if already:
-            self._settings = self._default_viewer_settings()
             self._set_view_mode(montage=True)
+            self._settings = self._default_viewer_settings()
             self._sync_montage_review_panels()
             self._schedule_redraw(force=True)
             self._set_status("Revue montage déjà affichée — graphs resynchronisés.")
             return
-        # Aligner sur ParamsPanel / aperçu (mode + flux + extras) avant le 1er redraw.
+        # Profil montage d’abord : hauteurs, flux et mode lui sont propres.
+        self._set_view_mode(montage=True)
         self._settings = self._default_viewer_settings()
         recording = plotted[0].recording
         n_channels = int(getattr(recording, "n_channels", 0) or 0)
@@ -1150,7 +1168,7 @@ class ViewerWindow(QMainWindow):
         )
         self._workspace = WorkspaceLayout(tabs=(montage_tab,), active_index=0)
         self._rebuild_tabs()
-        self._set_view_mode(montage=True)
+        self._update_view_stack()
         self.session_panel.show_channels()
         self._adapt_montage_height()
         self._sync_montage_page_controls()
@@ -1199,7 +1217,37 @@ class ViewerWindow(QMainWindow):
         """Callback MontageController : sync control panel / params / actions."""
         mode = "montage" if montage else "preview"
         self.control_panel.set_view_mode(mode)
-        self.params_panel.set_view_mode(mode)
+        window = self._channel_inspect
+        if window is not None and montage:
+            # Mémoriser le mode aperçu avant d’afficher le profil montage.
+            self.params_panel.set_content_mode(
+                window.preview_mode(), window.stim_index(), emit=False
+            )
+        self.params_panel.set_view_mode(mode, emit=False)
+        if window is not None:
+            if montage:
+                window.set_dock_view("montage")
+                active = self.params_panel.viewer_settings()
+                window.display_content_mode(
+                    active.preview_content, int(active.analysis.stim_index)
+                )
+            else:
+                # Lire le mode aperçu tant que l’éditeur pointe encore le montage
+                # (le spin affiche alors l’autre vue).
+                preview_mode = window.preview_mode()
+                preview_stim = window.stim_index()
+                window.set_dock_view("preview")
+                window.display_content_mode(preview_mode, preview_stim)
+                self._syncing_pipeline_visibility = True
+                try:
+                    window.apply_pipeline_visibility(
+                        self.params_panel.pipeline_visibility_flags(),
+                        mark_stims=self.params_panel.mark_stimulations(),
+                        redraw=False,
+                    )
+                finally:
+                    self._syncing_pipeline_visibility = False
+                window.apply_viewer_settings(self._default_viewer_settings())
         if hasattr(self, "_act_preview"):
             self._act_preview.setEnabled(bool(montage))
         if hasattr(self, "_act_montage"):
@@ -1398,6 +1446,7 @@ class ViewerWindow(QMainWindow):
             window.analysisCurvesChanged.connect(
                 self._on_preview_analysis_curves_changed
             )
+            window.externalContentEdited.connect(self._on_montage_content_edited)
             self._preview_layout.addWidget(window, 1)
             self._channel_inspect = window
             created = True
@@ -1419,9 +1468,15 @@ class ViewerWindow(QMainWindow):
         except Exception:
             window.set_stim_times([])
         try:
-            t, _ = recording.continuous_trace("raw", int(resolved))
-            if t.size:
-                window.set_time_span(float(t[0]), float(t[-1]))
+            # Bornes du fichier, sans charger les 9e6 échantillons juste pour t[0]/t[-1].
+            n_samples = int(getattr(recording.meta, "n_samples", 0) or 0)
+            fs = float(getattr(recording.meta, "fs", 0.0) or 0.0)
+            if n_samples > 1 and fs > 0:
+                window.set_time_span(0.0, (n_samples - 1) / fs)
+            else:
+                t, _ = recording.continuous_trace("raw", int(resolved), max_points=64)
+                if t.size:
+                    window.set_time_span(float(t[0]), float(t[-1]))
         except Exception:
             window.set_time_span(0.0, 1.0)
         window.apply_viewer_settings(self._default_viewer_settings())
@@ -1507,8 +1562,8 @@ class ViewerWindow(QMainWindow):
         )
 
     def _on_preview_analysis_curves_changed(self, analysis: object) -> None:
-        """Fermeture d’un panneau → réaligner les cases Pipeline."""
-        if self._syncing_pipeline_visibility:
+        """Fermeture d’un panneau aperçu → réaligner les cases Pipeline de l’aperçu."""
+        if self._syncing_pipeline_visibility or self._in_montage:
             return
         self._syncing_pipeline_visibility = True
         try:
@@ -1516,12 +1571,24 @@ class ViewerWindow(QMainWindow):
         finally:
             self._syncing_pipeline_visibility = False
 
-    def _on_preview_mode_changed(self, mode: object) -> None:
-        """Mode continuous / moyenne / stimulation → mêmes flags Pipeline + prefetch."""
-        window = self._channel_inspect
-        if window is None:
+    def _on_montage_content_edited(self, mode: object, stim_index: object) -> None:
+        """Mode du dock pendant la revue montage — n’écrit pas l’aperçu."""
+        if not self._in_montage:
             return
-        # Source de vérité unique = cases Pipeline (Canal).
+        self.params_panel.set_content_mode(str(mode), int(stim_index), emit=False)
+        self._settings = self._default_viewer_settings()
+        self._sync_montage_review_panels()
+        self._schedule_redraw(force=True, preserve_view=True)
+
+    def _on_preview_mode_changed(self, mode: object) -> None:
+        """Mode continuous / moyenne / stimulation de l’aperçu seul."""
+        del mode
+        window = self._channel_inspect
+        if window is None or self._in_montage:
+            return
+        self.params_panel.set_content_mode(
+            window.preview_mode(), window.stim_index(), emit=False
+        )
         self._syncing_pipeline_visibility = True
         try:
             window.apply_pipeline_visibility(
@@ -1531,22 +1598,14 @@ class ViewerWindow(QMainWindow):
             )
         finally:
             self._syncing_pipeline_visibility = False
-        if self._in_montage:
-            # Revue montage : même mode / graphs que l’aperçu.
-            self._settings = self._default_viewer_settings()
-            self._sync_montage_review_panels()
-            self._schedule_redraw(force=True)
-            return
-        # Même chemin pour continuous / moyenne / stimulation (RMS & spikes inclus).
         self._on_channel_window_refresh(window)
 
     def _on_channel_window_refresh(self, window: ChannelAnalysisWindow) -> None:
         if self._in_montage:
-            # Mode / stim / contexte / résumés → resync grille montage.
-            self._settings = self._default_viewer_settings()
-            self._sync_montage_review_panels()
-            self._schedule_redraw(force=True)
             return
+        self.params_panel.set_content_mode(
+            window.preview_mode(), window.stim_index(), emit=False
+        )
         need_means, need_rms, need_spikes, need_overlay = self._preview_product_needs(
             window
         )
@@ -1597,12 +1656,15 @@ class ViewerWindow(QMainWindow):
     def _make_request(self, placement: PanelPlacement) -> RenderRequest | None:
         entries = self._plotted()
         channel = self.channel_panel.current_channel or ""
-        channel_index = 0
-        if entries:
+        channel_index = -1
+        if entries and channel:
             recordings = [entry.recording for entry in entries]
             resolved = recordings[0].channel_index(channel)
-            channel_index = int(resolved) if resolved is not None else 0
-            self._check_channel_alignment(recordings, channel_index, channel)
+            if resolved is not None:
+                channel_index = int(resolved)
+                self._check_channel_alignment(recordings, channel_index, channel)
+            else:
+                channel_index = 0
         return self._build_render_request(
             placement,
             entries,
@@ -2479,11 +2541,15 @@ class ViewerWindow(QMainWindow):
             if recordings and len(recordings) == len(configs):
                 from plotting import plot_processed_recordings_pdf
 
+                style = self.params_panel.viewer_settings().style
                 plot_processed_recordings_pdf(
                     recordings,
                     configs,
                     output_dir=target.parent,
                     channels=selected,
+                    stim_linewidth=float(style.stim_linewidth),
+                    stim_onset_color=str(style.stim_onset_color),
+                    stim_offset_color=str(style.stim_offset_color),
                 )
             elif callback is not None:
                 callback(configs)

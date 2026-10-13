@@ -5,11 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Sequence
 
-from panel_catalog import SECTION_PANEL_FIELD_NAMES, SECTION_PANEL_LABELS
-
-# Compat : anciens noms importés par plotting / config.
-PANEL_FIELD_NAMES = SECTION_PANEL_FIELD_NAMES
-PANEL_LABELS = SECTION_PANEL_LABELS
+from panel_catalog import SECTION_PANEL_FIELD_NAMES
 
 ZoomMode = Literal["none", "onset", "trigger_end", "both"]
 
@@ -41,7 +37,7 @@ class SectionPanels:
     spike_overlay: bool = True
 
     def any_enabled(self) -> bool:
-        return any(getattr(self, name) for name in PANEL_FIELD_NAMES)
+        return any(getattr(self, name) for name in SECTION_PANEL_FIELD_NAMES)
 
 
 @dataclass(frozen=True)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QAction, QBrush, QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -52,6 +52,7 @@ class ChannelPanel(QWidget):
         self.list.setToolTip(
             "Coche : canal inclus dans le traitement et la revue montage.\n"
             "Clic : sélectionner (aperçu central).\n"
+            "Clic à côté de la liste : annuler la sélection.\n"
             "Double-clic : inspecter (barres de plage + graphs).\n"
             "Clic droit : exclure / réinclure."
         )
@@ -59,13 +60,16 @@ class ChannelPanel(QWidget):
         self.list.itemDoubleClicked.connect(self._on_list_double_clicked)
         self.list.itemChanged.connect(self._on_item_changed)
         self.list.customContextMenuRequested.connect(self._on_context_menu)
+        self.list.viewport().installEventFilter(self)
 
         self.map = MeaMapWidget(self)
         self.map.setToolTip(
             "Clic : sélectionner le canal.\n"
+            "Clic à côté d’un contact : annuler la sélection.\n"
             "Double-clic : inspecter (traces + barres de plage)."
         )
         self.map.channelSelected.connect(self._on_map_clicked)
+        self.map.channelCleared.connect(self.clear_selection)
         self.map.channelActivated.connect(self._on_map_activated)
 
         self._filter = QLineEdit(self)
@@ -162,6 +166,8 @@ class ChannelPanel(QWidget):
     # ------------------------------------------------------------------- inputs
 
     def set_channels(self, names: Sequence[str], *, keep_selection: bool = True) -> None:
+        old_names = list(self._channels)
+        cleared = keep_selection and self._current is None and bool(old_names)
         self._channels = [str(name) for name in names]
         previous = self._current if keep_selection else None
         # Conserver le masquage pour les canaux encore présents.
@@ -186,10 +192,15 @@ class ChannelPanel(QWidget):
         self._refresh_ready_badges()
         self._sync_map_hidden()
         self._update_visibility_label()
-        target = previous if previous in self._channels else (self._channels[0] if self._channels else None)
+        if previous in self._channels:
+            target = previous
+        elif cleared and self._channels == old_names:
+            target = None
+        else:
+            target = self._channels[0] if self._channels else None
         if target is None:
             self._current = None
-            self._title.setText("Aucun canal")
+            self._title.setText(self._empty_title())
             self.map.set_selected_channel(None)
         else:
             self.select(target, emit=target != previous)
@@ -238,14 +249,6 @@ class ChannelPanel(QWidget):
     def current_channel(self) -> str | None:
         return self._current
 
-    @property
-    def current_index(self) -> int:
-        if self._current is None:
-            return 0
-        try:
-            return self._channels.index(self._current)
-        except ValueError:
-            return 0
 
     @property
     def channels(self) -> list[str]:
@@ -258,6 +261,24 @@ class ChannelPanel(QWidget):
     @property
     def visible_channels(self) -> list[str]:
         return [name for name in self._channels if name not in self._hidden]
+
+    def clear_selection(self) -> None:
+        """Annuler le canal courant (liste, carte et surbrillance)."""
+        if self._current is None and not self.list.selectedItems():
+            return
+        self._updating = True
+        self._current = None
+        self.list.clearSelection()
+        self.list.setCurrentItem(None)
+        self._updating = False
+        self._title.setText(self._empty_title())
+        self.map.set_selected_channel(None)
+        self.channelChanged.emit("")
+
+    def _empty_title(self) -> str:
+        if self._channels:
+            return "Aucun canal sélectionné"
+        return "Aucun canal"
 
     def select(self, channel: str, *, emit: bool = True) -> None:
         channel = str(channel).lstrip("✓○ ").strip()
@@ -333,18 +354,6 @@ class ChannelPanel(QWidget):
         self._apply_hidden_to_items()
         self._emit_visibility()
 
-    def set_channel_hidden(self, channel: str, hidden: bool) -> None:
-        channel = str(channel).lstrip("✓○ ").strip()
-        if channel not in self._channels:
-            return
-        if hidden:
-            if len(self._hidden) + 1 >= len(self._channels):
-                return
-            self._hidden.add(channel)
-        else:
-            self._hidden.discard(channel)
-        self._apply_hidden_to_items()
-        self._emit_visibility()
 
     def _selected_names(self) -> list[str]:
         names: list[str] = []
@@ -390,6 +399,17 @@ class ChannelPanel(QWidget):
         self.visibilityChanged.emit()
 
     # ------------------------------------------------------------------- slots
+
+    def eventFilter(self, watched: Any, event: Any) -> bool:  # noqa: N802
+        if (
+            watched is self.list.viewport()
+            and event.type() == QEvent.Type.MouseButtonPress
+            and event.button() == Qt.MouseButton.LeftButton
+            and self.list.itemAt(event.position().toPoint()) is None
+        ):
+            self.clear_selection()
+            return True
+        return super().eventFilter(watched, event)
 
     def _on_list_changed(self, current: QListWidgetItem | None, _previous: Any) -> None:
         if self._updating or current is None:

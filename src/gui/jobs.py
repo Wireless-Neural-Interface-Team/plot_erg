@@ -76,9 +76,6 @@ class BuildWorker(QThread):
     def request_stop(self) -> None:
         self._cancel.set()
 
-    @property
-    def cancelled(self) -> bool:
-        return self._cancel.is_set()
 
     def run(self) -> None:  # noqa: D102 - QThread entry point
         import core
@@ -312,9 +309,6 @@ class ChannelEnsureWorker(QThread):
                 return self._low.pop(0)
             return None
 
-    def _has_pending(self) -> bool:
-        with self._lock:
-            return bool(self._high or self._low)
 
     def run(self) -> None:  # noqa: D102 - QThread entry point
         import core
@@ -466,8 +460,6 @@ class Debouncer(QObject):
         self._timer.setInterval(max(0, int(interval_ms)))
         self._timer.timeout.connect(self.triggered.emit)
 
-    def set_interval(self, interval_ms: int) -> None:
-        self._timer.setInterval(max(0, int(interval_ms)))
 
     def request(self) -> None:
         self._timer.start()

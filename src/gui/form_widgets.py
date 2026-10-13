@@ -2,16 +2,17 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
+    QColorDialog,
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -240,10 +241,10 @@ class FontSizeFaceRow(QWidget):
     def face_value(self) -> TextFace:
         return self._face.value()
 
-    def set_size(self, value: float) -> None:
-        self._size.setValue(float(value))
+    def set_size_value(self, size: float) -> None:
+        self._size.setValue(float(size))
 
-    def set_face(self, face: TextFace) -> None:
+    def set_face_value(self, face: TextFace) -> None:
         self._face.set_value(face)
 
 
@@ -308,3 +309,65 @@ class AxisLimitRow(QWidget):
         self._enabled.setChecked(bool(limits.enabled))
         self._min.setValue(float(limits.minimum))
         self._max.setValue(float(limits.maximum))
+
+
+def _swatch_ink(hex_color: str) -> str:
+    """Texte lisible sur le fond du nuancier."""
+    text = str(hex_color or "").strip().lstrip("#")
+    if len(text) != 6:
+        return "#111827"
+    try:
+        red = int(text[0:2], 16)
+        green = int(text[2:4], 16)
+        blue = int(text[4:6], 16)
+    except ValueError:
+        return "#111827"
+    luminance = (0.299 * red + 0.587 * green + 0.114 * blue) / 255.0
+    return "#111827" if luminance > 0.62 else "#f8fafc"
+
+
+class ColorSwatchButton(QPushButton):
+    """Bouton nuancier : clic → sélecteur de couleur, émet ``changed``."""
+
+    changed = Signal()
+
+    def __init__(
+        self,
+        color: str,
+        *,
+        dialog_title: str = "Choisir une couleur",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._dialog_title = dialog_title
+        self._color = str(color or "#000000")
+        self.setFixedHeight(26)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._apply()
+        self.clicked.connect(self._pick)
+
+    def color_value(self) -> str:
+        return self._color
+
+    def set_color(self, color: str) -> None:
+        self._color = str(color or self._color)
+        self._apply()
+
+    def _apply(self) -> None:
+        ink = _swatch_ink(self._color)
+        self.setText(self._color.upper())
+        self.setStyleSheet(
+            "QPushButton {"
+            f" background: {self._color}; color: {ink};"
+            " border: 1px solid #6b7280; border-radius: 4px; padding: 2px 8px;"
+            "}"
+            "QPushButton:hover { border: 1px solid #111827; }"
+        )
+
+    def _pick(self) -> None:
+        chosen = QColorDialog.getColor(QColor(self._color), self, self._dialog_title)
+        if not chosen.isValid():
+            return
+        self.set_color(chosen.name())
+        self.changed.emit()

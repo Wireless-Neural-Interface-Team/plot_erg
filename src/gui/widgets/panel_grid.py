@@ -511,12 +511,6 @@ class PanelGrid(QScrollArea):
         self._deferred.clear()
         return drawn
 
-    def cancel_render(self) -> None:
-        self._timer.stop()
-        self._scroll_timer.stop()
-        self._cull_timer.stop()
-        self._scroll_active = False
-        self._pending.clear()
 
     def _render_next(self) -> None:
         if self._scroll_active:

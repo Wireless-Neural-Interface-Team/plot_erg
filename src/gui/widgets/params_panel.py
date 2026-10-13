@@ -1,12 +1,13 @@
 """Paramètres d’affichage et de traitement, selon le coût d’un changement.
 
-Répartition des onglets (modèle mental) :
+L’aperçu canal et la revue montage ont chacun un profil d’affichage :
+mêmes noms de réglages, valeurs indépendantes. Le dock montre le profil
+de la vue active.
 
-- *Canal* — contenu du canal (mode, plages, contexte) + Pipeline de traitement
+- *Canal* — courbes et échelles Y du profil actif, plus le traitement commun
   (filtres, spikes, RMS, détection) → :attr:`configChanged` / Traiter (F5).
-- *Affichage* — axe X, sync, disposition, légendes, textes, apparence →
-  :attr:`viewChanged` (redessin immédiat, pas de recalcul).
-  Les échelles Y vivent dans Canal → section de chaque courbe cochée.
+- *Affichage* — axe X, sync, disposition, légendes, textes, apparence du
+  profil actif → :attr:`viewChanged` (redessin immédiat, pas de recalcul).
 """
 
 from __future__ import annotations
@@ -38,8 +39,10 @@ from PySide6.QtWidgets import (
 ViewMode = Literal["preview", "montage"]
 
 from config import AnalysisConfig
+from display_config import STIM_OFFSET_COLOR, STIM_ONSET_COLOR
 from gui.form_widgets import (
     AxisLimitRow,
+    ColorSwatchButton,
     FitWidthScrollArea,
     FontSizeFaceRow,
     configure_narrow_form,
@@ -152,6 +155,10 @@ class ParamsPanel(QWidget):
         self._defaults = dict(defaults or {})
         self._loading = True
         self._view_mode: ViewMode = "preview"
+        # Contenu (continuous / moyenne / stimulation) du profil affiché.
+        self._content_mode = "continuous"
+        self._content_stim = 0
+        self._profiles: dict[str, ViewerSettings] = {}
         # Ignored horizontal : le dock impose la largeur. Preferred/Expanding
         # faisait « aspirer » le layout vers sizeHint et écrasait le panneau au drag.
         self.setMinimumWidth(200)
@@ -247,6 +254,8 @@ class ParamsPanel(QWidget):
 
         self._view_debouncer = Debouncer(120, self)
         self._view_debouncer.triggered.connect(self.viewChanged.emit)
+        snap = self.viewer_settings()
+        self._profiles = {"preview": snap, "montage": snap}
         self._apply_view_mode_visibility()
         self._loading = False
 
@@ -392,6 +401,13 @@ class ParamsPanel(QWidget):
             "Hauteur fixe de chaque graphique (aperçu, analyse, onglets)."
         )
         self._graph_height.setToolTip(self._graph_height_tooltip)
+        self._preview_title_gap = _int_spin(-40, 240, 0, suffix=" px")
+        self._preview_title_gap_tooltip = (
+            "Espace vertical entre le titre du graphique et la courbe, "
+            "en aperçu canal. 0 = écart actuel. "
+            "Positif agrandit l’espace, négatif le réduit jusqu’à coller le titre à la courbe."
+        )
+        self._preview_title_gap.setToolTip(self._preview_title_gap_tooltip)
         self._show_scale_bars = QCheckBox("Échelle flottante (barres temps / amplitude)")
         self._show_scale_bars.setChecked(False)
         self._show_scale_bars.setToolTip(
@@ -428,6 +444,13 @@ class ParamsPanel(QWidget):
         time_lay.setSpacing(6)
         time_lay.addWidget(self._scale_bar_time_manual)
         time_lay.addWidget(self._scale_bar_time_ms, 1)
+        self._scale_bar_linewidth = _spin(
+            0.2, 20.0, 1.4, decimals=2, step=0.1, suffix=" pt"
+        )
+        self._scale_bar_linewidth.setToolTip(
+            "Épaisseur du trait noir des barres d’échelle flottantes "
+            "(temps et amplitude)."
+        )
         self._scale_bar_amp_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._scale_bar_time_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._show_scale_bars.toggled.connect(self._sync_scale_bar_inputs)
@@ -459,9 +482,11 @@ class ParamsPanel(QWidget):
         max_pts_lay.addWidget(max_pts_min_btn)
         max_pts_lay.addWidget(max_pts_max_btn)
         self._layout_form.addRow("Hauteur des graphs :", self._graph_height)
+        self._layout_form.addRow("Écart titre / courbe :", self._preview_title_gap)
         self._layout_form.addRow(self._show_scale_bars)
         self._layout_form.addRow("Amplitude barre :", amp_row)
         self._layout_form.addRow("Temps barre :", time_row)
+        self._layout_form.addRow("Épaisseur du trait :", self._scale_bar_linewidth)
         self._layout_form.addRow("Points max / courbe :", max_pts_row)
 
         # Revue montage continue uniquement.
@@ -487,6 +512,33 @@ class ParamsPanel(QWidget):
         )
         self._montage_row_height.setToolTip(self._montage_row_tooltip)
         review_form.addRow("Hauteur de ligne :", self._montage_row_height)
+        self._montage_show_kind_label = QCheckBox(
+            "Type à côté du canal (WIDE, LOW, HIGH…)"
+        )
+        self._montage_show_kind_label.setChecked(True)
+        self._montage_show_kind_tooltip = (
+            "Affiche ou masque le nom du flux à côté du canal "
+            "(WIDE, LOW, HIGH, RMS, PSTH…). "
+            "Décochez pour ne garder que le nom du canal. "
+            "Les libellés eux-mêmes ne changent pas."
+        )
+        self._montage_show_kind_label.setToolTip(self._montage_show_kind_tooltip)
+        review_form.addRow(self._montage_show_kind_label)
+        self._montage_label_dx = _int_spin(-300, 300, 0, suffix=" px")
+        self._montage_label_dx_tooltip = (
+            "Décalage horizontal des noms de canal, à côté des courbes. "
+            "0 = position par défaut. Positif rapproche le titre de la courbe, "
+            "négatif l’éloigne vers la gauche."
+        )
+        self._montage_label_dx.setToolTip(self._montage_label_dx_tooltip)
+        self._montage_label_dy = _int_spin(-120, 120, 0, suffix=" px")
+        self._montage_label_dy_tooltip = (
+            "Décalage vertical des noms de canal par rapport au centre de la ligne. "
+            "0 = centré sur la courbe. Positif monte le titre, négatif le descend."
+        )
+        self._montage_label_dy.setToolTip(self._montage_label_dy_tooltip)
+        review_form.addRow("Titres — horizontal :", self._montage_label_dx)
+        review_form.addRow("Titres — vertical :", self._montage_label_dy)
         review_hint = QLabel(
             "Les graphs Pipeline (WIDE/HIGH/LOW/RMS/Spikes) sont empilés "
             "par canal, page par page. Mode = Canal. "
@@ -541,7 +593,10 @@ class ParamsPanel(QWidget):
             self._montage_page,
             self._montage_review_channels,
             self._montage_row_height,
+            self._montage_label_dx,
+            self._montage_label_dy,
             self._graph_height,
+            self._preview_title_gap,
             self._max_points,
         ):
             int_widget.valueChanged.connect(lambda _v: self._emit_view())
@@ -555,10 +610,12 @@ class ParamsPanel(QWidget):
         self._x_limits.changed.connect(self._emit_view)
         self._time_sync.currentIndexChanged.connect(lambda _i: self._emit_view())
         self._show_scale_bars.toggled.connect(lambda _c: self._emit_view())
+        self._montage_show_kind_label.toggled.connect(lambda _c: self._emit_view())
         self._scale_bar_amp_manual.toggled.connect(lambda _c: self._emit_view())
         self._scale_bar_time_manual.toggled.connect(lambda _c: self._emit_view())
         self._scale_bar_amp.valueChanged.connect(lambda _v: self._emit_view())
         self._scale_bar_time_ms.valueChanged.connect(lambda _v: self._emit_view())
+        self._scale_bar_linewidth.valueChanged.connect(lambda _v: self._emit_view())
 
         self._add_style_groups(page_layout)
         page_layout.addStretch(1)
@@ -574,6 +631,7 @@ class ParamsPanel(QWidget):
         self._scale_bar_time_ms.setEnabled(
             enabled and bool(self._scale_bar_time_manual.isChecked())
         )
+        self._scale_bar_linewidth.setEnabled(enabled)
 
     # ---------------------------------------------------- style (dans Affichage)
 
@@ -595,7 +653,7 @@ class ParamsPanel(QWidget):
             self._legend_location.addItem(
                 "Sous le panneau" if location == "below" else location.capitalize(), location
             )
-        self._legend_font = FontSizeFaceRow(4.0, 24.0, 9.0, decimals=1, step=0.5)
+        self._legend_font = FontSizeFaceRow(4.0, 50.0, 9.0, decimals=1, step=0.5)
         self._legend_columns = _int_spin(1, 6, 1)
         self._legend_gap = _spin(0.0, 1.0, 0.22, decimals=2, step=0.02)
         self._legend_gap.setToolTip(
@@ -642,10 +700,26 @@ class ParamsPanel(QWidget):
             "Remplace les libellés de légende. Les noms de base restent "
             "aussi éditables dans le dock Enregistrements → Légende."
         )
-        self._title_font = FontSizeFaceRow(5.0, 24.0, 10.0, decimals=1, step=0.5)
-        self._label_font = FontSizeFaceRow(5.0, 24.0, 9.0, decimals=1, step=0.5)
-        self._tick_font = FontSizeFaceRow(4.0, 20.0, 8.0, decimals=1, step=0.5)
-        self._line_width = _spin(0.2, 5.0, 1.2, decimals=2, step=0.1)
+        self._title_font = FontSizeFaceRow(5.0, 50.0, 10.0, decimals=1, step=0.5)
+        self._label_font = FontSizeFaceRow(5.0, 50.0, 9.0, decimals=1, step=0.5)
+        self._tick_font = FontSizeFaceRow(4.0, 50.0, 8.0, decimals=1, step=0.5)
+        self._line_width = _spin(0.2, 20.0, 1.2, decimals=2, step=0.1)
+        self._stim_linewidth = _spin(0.2, 20.0, 1.0, decimals=2, step=0.1)
+        self._stim_linewidth.setToolTip(
+            "Épaisseur (points) des pointillés de début et de fin de stimulation."
+        )
+        self._stim_onset_color = ColorSwatchButton(
+            STIM_ONSET_COLOR, dialog_title="Couleur du début de stimulation"
+        )
+        self._stim_onset_color.setToolTip(
+            "Couleur des pointillés au début de chaque stimulation."
+        )
+        self._stim_offset_color = ColorSwatchButton(
+            STIM_OFFSET_COLOR, dialog_title="Couleur de la fin de stimulation"
+        )
+        self._stim_offset_color.setToolTip(
+            "Couleur des pointillés à la fin de chaque stimulation."
+        )
         self._grid = QCheckBox("Afficher la grille")
         self._grid.setChecked(True)
         self._grid_alpha = _spin(0.0, 1.0, 0.3, decimals=2, step=0.05)
@@ -662,8 +736,10 @@ class ParamsPanel(QWidget):
         self._stim_markers = QCheckBox("Pointillés de début / fin de stimulation")
         self._stim_markers.setChecked(True)
         self._stim_markers.setToolTip(
-            "Lignes en pointillés au début (et à la fin) de stimulation sur les graphiques. "
-            "Distinct des marqueurs sur les traces continues (Temps & marqueurs)."
+            "Lignes en pointillés au début et à la fin de stimulation "
+            "(aperçu, revue montage et graphiques d’analyse). "
+            "Sur les traces continues, décochez aussi "
+            "« Marqueurs de stimulation sur les traces » pour les masquer."
         )
         style_form.addRow("Titre :", self._text_title)
         style_form.addRow("Axe X :", self._text_xlabel)
@@ -679,6 +755,9 @@ class ParamsPanel(QWidget):
         style_form.addRow(self._show_borders)
         style_form.addRow(self._ticks_inside)
         style_form.addRow(self._stim_markers)
+        style_form.addRow("Épaisseur du trait de stimulation :", self._stim_linewidth)
+        style_form.addRow("Couleur début de stimulation :", self._stim_onset_color)
+        style_form.addRow("Couleur fin de stimulation :", self._stim_offset_color)
 
         page_layout.addWidget(legend_group)
         page_layout.addWidget(style_group)
@@ -699,9 +778,12 @@ class ParamsPanel(QWidget):
         for spin in (
             self._legend_gap,
             self._line_width,
+            self._stim_linewidth,
             self._grid_alpha,
         ):
             spin.valueChanged.connect(lambda _v: self._emit_view())
+        self._stim_onset_color.changed.connect(self._emit_view)
+        self._stim_offset_color.changed.connect(self._emit_view)
         for font_row in (
             self._legend_font,
             self._title_font,
@@ -774,8 +856,9 @@ class ParamsPanel(QWidget):
         sections_form.addRow("Fin virtuelle :", self._section_end)
 
         curves_hint = QLabel(
-            "Cochez un groupe pour afficher ses courbes (tous modes) et régler "
-            "ses paramètres. Le traitement F5 reste complet même si une case est décochée."
+            "Cochez un groupe pour afficher ses courbes dans la vue active "
+            "(aperçu ou montage) et régler ses paramètres. "
+            "Le traitement F5 reste commun, même si une case est décochée."
         )
         curves_hint.setObjectName("hintLabel")
         curves_hint.setWordWrap(True)
@@ -1159,50 +1242,6 @@ class ParamsPanel(QWidget):
         self._sync_threshold_rows()
         return page
 
-    def reveal_curve_params(
-        self,
-        *curves: str,
-        focus_tab: bool = True,
-        emit_streams: bool = True,
-    ) -> None:
-        """Coche / déplie les groupes Pipeline associés aux courbes demandées.
-
-        ``curves`` accepte ``raw``/``wide``, ``hp``/``high``, ``lp``/``low``,
-        ``spikes``, ``rms``. WIDE/HIGH/LOW pilotent aussi l’affichage continuous.
-        """
-        mapping = {
-            "raw": "_curve_wide_box",
-            "wide": "_curve_wide_box",
-            "hp": "_curve_high_box",
-            "high": "_curve_high_box",
-            "lp": "_curve_low_box",
-            "low": "_curve_low_box",
-            "spikes": "_curve_spikes_box",
-            "rms": "_curve_rms_box",
-        }
-        stream_attrs = {"_curve_wide_box", "_curve_high_box", "_curve_low_box"}
-        opened = False
-        touched_streams = False
-        self._loading = True
-        try:
-            for key in curves:
-                attr = mapping.get(str(key).strip().lower())
-                if not attr:
-                    continue
-                box = getattr(self, attr, None)
-                if box is None:
-                    continue
-                if not box.isChecked():
-                    box.setChecked(True)
-                    if attr in stream_attrs:
-                        touched_streams = True
-                opened = True
-        finally:
-            self._loading = False
-        if opened and focus_tab:
-            self.focus_channel_tab()
-        if (touched_streams or opened) and emit_streams:
-            self.pipelineVisibilityChanged.emit()
 
     # -------------------------------------------------------------- behaviour
 
@@ -1366,11 +1405,10 @@ class ParamsPanel(QWidget):
         }
 
     # Alias historique.
-    def pipeline_analysis_flags(self) -> dict[str, bool]:
-        return self.pipeline_visibility_flags()
 
     def sync_analysis_checks_from(self, analysis: AnalysisSettings | object) -> None:
         """Aligne les cases Pipeline sur un ``AnalysisSettings`` (sans réémettre)."""
+        previous = self._loading
         self._loading = True
         try:
             self._curve_wide_box.setChecked(bool(getattr(analysis, "show_raw", False)))
@@ -1402,7 +1440,7 @@ class ParamsPanel(QWidget):
             ) and not any_spike:
                 self._curve_wide_box.setChecked(True)
         finally:
-            self._loading = False
+            self._loading = previous
 
     def mark_stimulations(self) -> bool:
         return bool(self._cb_mark_stims.isChecked())
@@ -1411,24 +1449,133 @@ class ParamsPanel(QWidget):
         self._dirty_label.setText(message)
         self._dirty_row.setVisible(bool(message))
 
-    def set_view_mode(self, mode: ViewMode) -> None:
-        """Adapter Affichage / onglet Canal au mode aperçu ou revue montage."""
+    def set_content_mode(
+        self, mode: str, stim_index: int = 0, *, emit: bool = True
+    ) -> None:
+        """Mémoriser le mode d’affichage du profil en cours (aperçu ou montage)."""
+        raw = str(mode or "continuous")
+        if raw not in ("continuous", "average", "stimulation"):
+            raw = "continuous"
+        stim = max(0, int(stim_index))
+        if raw == self._content_mode and stim == self._content_stim:
+            return
+        self._content_mode = raw
+        self._content_stim = stim
+        if emit:
+            self._emit_view()
+
+    def settings_for(self, mode: ViewMode) -> ViewerSettings:
+        """Réglages d’une vue, y compris si elle n’est pas affichée."""
         resolved: ViewMode = mode if mode in ("preview", "montage") else "preview"
         if resolved == self._view_mode:
-            return
-        self._view_mode = resolved
-        self._apply_view_mode_visibility()
+            return self.viewer_settings()
+        stored = self._profiles.get(resolved)
+        return stored if stored is not None else self.viewer_settings()
 
-    def view_mode(self) -> ViewMode:
-        return self._view_mode
+    def set_view_mode(self, mode: ViewMode, *, emit: bool = True) -> None:
+        """Afficher le profil de l’aperçu ou celui de la revue montage."""
+        resolved: ViewMode = mode if mode in ("preview", "montage") else "preview"
+        if resolved != self._view_mode:
+            self._profiles[self._view_mode] = self.viewer_settings()
+            self._view_mode = resolved
+            stored = self._profiles.get(resolved)
+            if stored is not None:
+                self._load_profile(stored)
+        self._apply_view_mode_visibility()
+        if emit and not self._loading:
+            self.viewChanged.emit()
+
+    def _load_profile(self, settings: ViewerSettings) -> None:
+        """Recharger les widgets d’affichage depuis un profil (sans signal)."""
+        self._loading = True
+        try:
+            self._content_mode = str(getattr(settings, "preview_content", None) or "continuous")
+            if self._content_mode not in ("continuous", "average", "stimulation"):
+                self._content_mode = "continuous"
+            self._content_stim = max(0, int(settings.analysis.stim_index))
+            self._x_limits.set_value(settings.x_limits)
+            self._raw_ylim.set_value(settings.raw_ylim)
+            self._hp_ylim.set_value(settings.hp_ylim)
+            self._lp_ylim.set_value(settings.lp_ylim)
+            self._rms_ylim_row.set_value(settings.rms_ylim)
+            self._zoom_onset_t0.setValue(float(settings.zoom_onset_t0_s))
+            self._zoom_onset_t1.setValue(float(settings.zoom_onset_t1_s))
+            self._zoom_end_t0.setValue(float(settings.zoom_end_t0_s))
+            self._zoom_end_t1.setValue(float(settings.zoom_end_t1_s))
+            self._set_combo_data(self._time_sync, settings.time_sync)
+            self._cb_mark_stims.setChecked(bool(settings.continuous_mark_stims))
+            self._graph_height.setValue(int(settings.graph_height_px))
+            self._preview_title_gap.setValue(int(settings.preview_title_gap_px))
+            style = settings.style
+            self._show_scale_bars.setChecked(bool(style.show_scale_bars))
+            self._scale_bar_amp_manual.setChecked(bool(style.scale_bar_amplitude_manual))
+            self._scale_bar_amp.setValue(float(style.scale_bar_amplitude))
+            self._scale_bar_time_manual.setChecked(bool(style.scale_bar_time_manual))
+            self._scale_bar_time_ms.setValue(float(style.scale_bar_time_s) * 1000.0)
+            self._scale_bar_linewidth.setValue(float(style.scale_bar_linewidth))
+            self._sync_scale_bar_inputs()
+            self._max_points.setValue(int(style.max_points_per_curve))
+            self._montage_review_channels.setValue(int(settings.montage_review_channels))
+            self._montage_review_page = max(0, int(settings.montage_review_page))
+            self._montage_row_height.setValue(int(settings.montage_row_min_height_px))
+            self._montage_show_kind_label.setChecked(bool(settings.montage_show_kind_label))
+            self._montage_label_dx.setValue(int(round(float(settings.montage_label_dx_px))))
+            self._montage_label_dy.setValue(int(round(float(settings.montage_label_dy_px))))
+            self._montage_channels.setValue(int(settings.montage_channels))
+            self._montage_page.setValue(int(settings.montage_page))
+            legend = settings.legend
+            self._legend_visible.setChecked(bool(legend.visible))
+            self._set_combo_data(self._legend_location, legend.location)
+            self._legend_font.set_size_value(float(legend.font_size))
+            self._legend_font.set_face_value(legend.face)
+            self._legend_columns.setValue(int(legend.columns))
+            self._legend_gap.setValue(float(legend.gap))
+            self._legend_frame.setChecked(bool(legend.frame))
+            self._legend_filters.setChecked(bool(legend.show_filter_details))
+            self._legend_counts.setChecked(bool(legend.show_sample_counts))
+            texts = settings.texts
+            self._text_title.setText(str(texts.title or ""))
+            self._text_xlabel.setText(str(texts.xlabel or ""))
+            self._text_ylabel.setText(str(texts.ylabel or ""))
+            self._text_series_suffix.setChecked(bool(texts.show_series_suffix))
+            self._text_legend_labels.setPlainText(
+                "\n".join(texts.legend_labels) if texts.legend_labels else ""
+            )
+            self._title_font.set_size_value(float(style.title_font_size))
+            self._title_font.set_face_value(style.title_face)
+            self._label_font.set_size_value(float(style.label_font_size))
+            self._label_font.set_face_value(style.label_face)
+            self._tick_font.set_size_value(float(style.tick_font_size))
+            self._tick_font.set_face_value(style.tick_face)
+            self._line_width.setValue(float(style.line_width))
+            self._stim_linewidth.setValue(float(style.stim_linewidth))
+            self._stim_onset_color.set_color(str(style.stim_onset_color))
+            self._stim_offset_color.set_color(str(style.stim_offset_color))
+            self._grid.setChecked(bool(style.grid))
+            self._grid_alpha.setValue(float(style.grid_alpha))
+            self._show_borders.setChecked(bool(style.show_borders))
+            self._ticks_inside.setChecked(bool(style.ticks_inside))
+            self._stim_markers.setChecked(bool(legend.show_reference_markers))
+            self._overlay_pre.setValue(float(settings.spike_overlay_pre_ms))
+            self._overlay_post.setValue(float(settings.spike_overlay_post_ms))
+            self._overlay_alpha.setValue(float(settings.spike_overlay_alpha))
+            self._show_spike_threshold.setChecked(bool(settings.show_spike_threshold))
+            self._psth_bin.setValue(float(settings.psth_bin_window_s))
+            self._sampling.setValue(int(settings.sampling_percent))
+            self.sync_analysis_checks_from(settings.analysis)
+        finally:
+            self._loading = False
+
+    @staticmethod
+    def _set_combo_data(box: QComboBox, value: object) -> None:
+        index = box.findData(value)
+        box.setCurrentIndex(index if index >= 0 else 0)
 
     def _apply_view_mode_visibility(self) -> None:
-        """Tous les paramètres restent visibles ; ceux de l’autre vue sont grisés."""
+        """Montrer les paramètres de la vue active ; masquer ceux de l’autre."""
         montage = self._view_mode == "montage"
-        preview_only_tip = "Sans effet en revue montage — basculez en aperçu (Ctrl+Shift+M)."
-        montage_only_tip = "Sans effet en aperçu canal — basculez en revue montage (Ctrl+M)."
 
-        # Mode + Pipeline restent disponibles dans les deux vues (mêmes courbes).
+        # Courbes, échelles et apparence : mêmes noms, valeurs du profil actif.
         if hasattr(self, "_channel_host"):
             self._channel_host.setVisible(True)
             if hasattr(self, "_pipeline_sep"):
@@ -1436,84 +1583,34 @@ class ParamsPanel(QWidget):
             if hasattr(self, "_pipeline_header"):
                 self._pipeline_header.setVisible(True)
 
+        view_name = "revue montage" if montage else "aperçu canal"
         if self._channel_tab_index is not None:
             self.tabs.setTabVisible(self._channel_tab_index, True)
-            tip = (
-                "Mode + Pipeline : mêmes courbes que l’aperçu pour la revue montage. "
-                "Traitement → Traiter (F5)"
-                if montage
-                else "Contenu du canal (mode, plages) et traitement → Traiter (F5)"
+            self.tabs.setTabToolTip(
+                self._channel_tab_index,
+                f"Courbes et échelles Y de la {view_name}. "
+                "Le traitement (filtres, détection) reste commun → Traiter (F5).",
             )
-            self.tabs.setTabToolTip(self._channel_tab_index, tip)
 
-        # Toujours visibles ; actifs seulement dans la vue concernée.
-        # Groupe revue (non repliable) : griser le bloc entier.
-        # Groupe PDF (repliable) : garder le titre cliquable, griser seulement les champs
-        # pour pouvoir l’ouvrir et voir les paramètres.
         if hasattr(self, "_montage_review_group"):
-            self._montage_review_group.setVisible(True)
-            self._montage_review_group.setEnabled(montage)
-            base = getattr(self, "_montage_review_tooltip", "")
-            self._montage_review_group.setToolTip(
-                base if montage else f"{base} {montage_only_tip}".strip()
-            )
+            self._montage_review_group.setVisible(montage)
+            self._montage_review_group.setEnabled(True)
         if hasattr(self, "_montage_pdf_group"):
-            self._montage_pdf_group.setVisible(True)
+            self._montage_pdf_group.setVisible(montage)
             self._montage_pdf_group.setEnabled(True)
-            base = getattr(self, "_montage_pdf_tooltip", "")
-            # Pagination PDF (export) — sans effet sur la revue continue à l’écran.
-            self._montage_pdf_group.setToolTip(
-                f"{base} Sans effet sur la revue continue à l’écran."
-                if montage
-                else base
-            )
-        if hasattr(self, "_montage_row_height"):
-            base = getattr(self, "_montage_row_tooltip", "")
-            self._montage_row_height.setToolTip(
-                base if montage else f"{base} {montage_only_tip}".strip()
-            )
-        if hasattr(self, "_montage_review_channels"):
-            base = getattr(self, "_montage_review_channels_tooltip", "")
-            self._montage_review_channels.setToolTip(
-                base if montage else f"{base} {montage_only_tip}".strip()
-            )
-        if hasattr(self, "_montage_channels"):
-            # Toujours éditables : pagination des montages PDF (export), pas la revue.
-            self._montage_channels.setEnabled(True)
-            base = getattr(self, "_montage_channels_tooltip", "")
-            self._montage_channels.setToolTip(base)
-        if hasattr(self, "_montage_page"):
-            self._montage_page.setEnabled(True)
-            base = getattr(self, "_montage_page_tooltip", "")
-            self._montage_page.setToolTip(base)
-
-        # Hauteur des graphs : aperçu uniquement (le montage utilise la hauteur de ligne).
         if hasattr(self, "_layout_form") and hasattr(self, "_graph_height"):
-            _set_form_row_visible(self._layout_form, self._graph_height, True)
-            _set_form_row_enabled(self._layout_form, self._graph_height, not montage)
-            base = getattr(self, "_graph_height_tooltip", "")
-            self._graph_height.setToolTip(
-                base if not montage else f"{base} {preview_only_tip}".strip()
-            )
+            _set_form_row_visible(self._layout_form, self._graph_height, not montage)
+            _set_form_row_enabled(self._layout_form, self._graph_height, True)
+        if hasattr(self, "_layout_form") and hasattr(self, "_preview_title_gap"):
+            _set_form_row_visible(self._layout_form, self._preview_title_gap, not montage)
+            _set_form_row_enabled(self._layout_form, self._preview_title_gap, True)
 
-        if montage:
-            self.tabs.setTabToolTip(
-                1,
-                "Temps, axe X, hauteur de ligne, légendes et apparence — "
-                "redessin immédiat (échelles Y → Canal, par type de courbe). "
-                "Hauteur des graphs grisée : sans effet ici.",
-            )
-        else:
-            self.tabs.setTabToolTip(
-                1,
-                "Axe X, sync, disposition, légendes et apparence — "
-                "redessin immédiat (échelles Y → Canal, par type de courbe). "
-                "Revue montage / PDF grisés : sans effet en aperçu.",
-            )
+        self.tabs.setTabToolTip(
+            1,
+            f"Affichage de la {view_name} — indépendant de l’autre vue. "
+            "Redessin immédiat.",
+        )
 
-    def focus_processing_tab(self) -> None:
-        """Compat : le Pipeline vit dans l’onglet Canal."""
-        self.focus_channel_tab()
 
     def focus_channel_tab(self) -> None:
         if self._channel_tab_index is None:
@@ -1600,6 +1697,9 @@ class ParamsPanel(QWidget):
             label_face=self._label_font.face_value(),
             tick_face=self._tick_font.face_value(),
             line_width=float(self._line_width.value()),
+            stim_linewidth=float(self._stim_linewidth.value()),
+            stim_onset_color=self._stim_onset_color.color_value(),
+            stim_offset_color=self._stim_offset_color.color_value(),
             grid=self._grid.isChecked(),
             grid_alpha=float(self._grid_alpha.value()),
             show_borders=self._show_borders.isChecked(),
@@ -1609,6 +1709,7 @@ class ParamsPanel(QWidget):
             scale_bar_time_s=float(self._scale_bar_time_ms.value()) / 1000.0,
             scale_bar_amplitude_manual=bool(self._scale_bar_amp_manual.isChecked()),
             scale_bar_amplitude=float(self._scale_bar_amp.value()),
+            scale_bar_linewidth=float(self._scale_bar_linewidth.value()),
             max_points_per_curve=int(self._max_points.value()),
         )
         legend_lines = tuple(
@@ -1625,7 +1726,13 @@ class ParamsPanel(QWidget):
             show_series_suffix=bool(self._text_series_suffix.isChecked()),
         )
         flags = self.pipeline_visibility_flags()
+        content = str(self._content_mode or "continuous")
+        if content not in ("continuous", "average", "stimulation"):
+            content = "continuous"
+        analysis_mode = "stimulation" if content == "stimulation" else "average"
         analysis = AnalysisSettings(
+            mode=analysis_mode,  # type: ignore[arg-type]
+            stim_index=max(0, int(self._content_stim)),
             show_raw=bool(flags["show_raw"]),
             show_hp=bool(flags["show_hp"]),
             show_lp=bool(flags["show_lp"]),
@@ -1661,13 +1768,18 @@ class ParamsPanel(QWidget):
             montage_review_channels=int(self._montage_review_channels.value()),
             montage_review_page=int(self._montage_review_page),
             graph_height_px=int(self._graph_height.value()),
+            preview_title_gap_px=int(self._preview_title_gap.value()),
             montage_row_min_height_px=int(self._montage_row_height.value()),
+            montage_show_kind_label=bool(self._montage_show_kind_label.isChecked()),
+            montage_label_dx_px=float(self._montage_label_dx.value()),
+            montage_label_dy_px=float(self._montage_label_dy.value()),
             time_sync=str(self._time_sync.currentData() or "recording_start"),  # type: ignore[arg-type]
             trigger_polarity=self._trigger_polarity_value(),  # type: ignore[arg-type]
             trigger_threshold=float(self._threshold.value()),
             continuous_stream=self.continuous_streams()[0],
             continuous_streams=self.continuous_streams(),
             continuous_mark_stims=self.mark_stimulations(),
+            preview_content=content,  # type: ignore[arg-type]
         )
 
     def probe_layout_path(self) -> Path | None:

@@ -106,12 +106,3 @@ class RenderRequestFactory:
             return make(placement)
         return None
 
-    def make_request_or_blank(self, placement: PanelPlacement) -> RenderRequest:
-        """Façade : délègue à ``host._make_request_or_blank`` si présent."""
-        make = getattr(self._host, "_make_request_or_blank", None)
-        if callable(make):
-            return make(placement)
-        request = self.make_request(placement)
-        if request is not None:
-            return request
-        return self.blank(placement)

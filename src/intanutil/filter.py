@@ -59,7 +59,7 @@ def notch_filter(signal_in, f_sample, f_notch, bandwidth):
     if x.size < 3:
         return np.asarray(signal_in)
 
-    # Same coefficients as the historical sample-wise IIR (calculate_iir_parameters).
+    # Same coefficients as the historical sample-wise notch IIR.
     t_step = 1.0 / float(f_sample)
     f_c = float(f_notch) * t_step
     d = math.exp(-2.0 * math.pi * (float(bandwidth) / 2.0) * t_step)
@@ -77,43 +77,3 @@ def notch_filter(signal_in, f_sample, f_notch, bandwidth):
     return sosfilt(sos, x)
 
 
-def calculate_iir_parameters(bandwidth, t_step, f_c):
-    """Calculates parameters d, b, a0, a1, a2, a, b0, b1, and b2 used for
-    IIR filter and return them in a dict.
-    """
-    parameters = {}
-    d = math.exp(-2.0*math.pi*(bandwidth/2.0)*t_step)
-    b = (1.0 + d*d) * math.cos(2.0*math.pi*f_c)
-    a0 = 1.0
-    a1 = -b
-    a2 = d*d
-    a = (1.0 + d*d)/2.0
-    b0 = 1.0
-    b1 = -2.0 * math.cos(2.0*math.pi*f_c)
-    b2 = 1.0
-
-    parameters['d'] = d
-    parameters['b'] = b
-    parameters['a0'] = a0
-    parameters['a1'] = a1
-    parameters['a2'] = a2
-    parameters['a'] = a
-    parameters['b0'] = b0
-    parameters['b1'] = b1
-    parameters['b2'] = b2
-    return parameters
-
-
-def calculate_iir(i, signal_in, signal_out, iir_parameters):
-    """Calculates a single sample of IIR filter passing signal_in through
-    iir_parameters, resulting in signal_out.
-    """
-    sample = ((
-        iir_parameters['a'] * iir_parameters['b2'] * signal_in[i - 2]
-        + iir_parameters['a'] * iir_parameters['b1'] * signal_in[i - 1]
-        + iir_parameters['a'] * iir_parameters['b0'] * signal_in[i]
-        - iir_parameters['a2'] * signal_out[i - 2]
-        - iir_parameters['a1'] * signal_out[i - 1])
-        / iir_parameters['a0'])
-
-    return sample

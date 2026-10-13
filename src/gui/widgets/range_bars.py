@@ -192,7 +192,6 @@ class RangeBarControllerPg(QObject):
         self._last_draw_s = 0.0
         self._motion_dirty = False
         self._updating = False
-        self._proxy_filters: list[Any] = []
 
     @property
     def bars(self) -> tuple[TimeRangeBar, ...]:
@@ -230,9 +229,6 @@ class RangeBarControllerPg(QObject):
         if self._t_max <= self._t_min:
             self._t_max = self._t_min + 1.0
 
-    def ensure_default_bar(self) -> None:
-        """Compat : ne crée plus de plage — l’UI démarre vide."""
-        return
 
     def set_bars(self, bars: Sequence[TimeRangeBar], *, active_index: int = 0) -> None:
         self._bars = [replace(b) for b in bars]
@@ -268,13 +264,6 @@ class RangeBarControllerPg(QObject):
         self._redraw_items()
         self.barsChanged.emit(self.bars)
 
-    def remove_active_bar(self) -> None:
-        if not self._bars:
-            return
-        self._bars.pop(self._active_index)
-        self._active_index = max(0, min(len(self._bars) - 1, self._active_index))
-        self._redraw_items()
-        self.barsChanged.emit(self.bars)
 
     def attach(self, host: Any, axes: Sequence[Any] | Any | None = None) -> None:
         """Attach to a PlotHost (``axes`` ignored — kept for API parity)."""

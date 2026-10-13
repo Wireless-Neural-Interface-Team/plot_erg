@@ -67,7 +67,7 @@ class _ReorderTable(QTableWidget):
         self.setDragDropOverwriteMode(False)
         self._drag_rows: list[int] = []
 
-    def startDrag(self, supportedActions: Qt.DropAction) -> None:  # noqa: N802
+    def startDrag(self, _supportedActions: Qt.DropAction) -> None:  # noqa: N802
         rows = sorted({index.row() for index in self.selectionModel().selectedRows()})
         if not rows:
             return
@@ -674,14 +674,6 @@ class RecordingsPanel(QWidget):
         )
         self.styleChanged.emit()
 
-    def _on_legend_toggled(self, row_id: int, checked: bool) -> None:
-        if self._updating:
-            return
-        entry = self.entry(row_id)
-        if entry is None:
-            return
-        entry.style = replace(entry.style, legend_visible=bool(checked))
-        self.styleChanged.emit()
 
     # --------------------------------------------------------------- utilities
 

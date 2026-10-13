@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Sequence
-
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -225,6 +223,3 @@ def pick_panels(tab: ViewTab, parent: QWidget | None = None) -> ViewTab | None:
     return dialog.result_tab()
 
 
-def quick_add_entries() -> Sequence[tuple[str, str, str]]:
-    """``(group, key, label)`` triples for a compact “add panel” menu."""
-    return tuple((info.group, info.key, info.label) for info in PANEL_CATALOG)

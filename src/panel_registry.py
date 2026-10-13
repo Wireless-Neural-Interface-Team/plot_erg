@@ -43,9 +43,14 @@ from view_config import (
     PanelPlacement,
     PanelStyle,
     TextFace,
+    montage_row_axis_label,
     ViewerSettings,
     continuous_sync_offset_s,
     included_channel_indices,
+    resolved_scale_bar_linewidth,
+    resolved_stim_linewidth,
+    resolved_stim_offset_color,
+    resolved_stim_onset_color,
 )
 
 PanelScope = Literal["channel", "global"]
@@ -842,10 +847,19 @@ def _apply_scale_bars(
         x_size=x_size,
         y_size=y_size,
         fontsize=float(style.tick_font_size),
-        linewidth=max(1.4, float(style.line_width) * 1.15),
+        linewidth=resolved_scale_bar_linewidth(style),
         # Même gouttière que le montage : la marge droite _AXES_RIGHT_SCALEBARS
         # est réservée pour ça (sinon le libellé Y reste dans la zone de tracé).
         gutter=True,
+        face=style.tick_face,
+    )
+
+
+def _montage_label_shift_px(settings: Any) -> tuple[float, float]:
+    """Décalage (dx, dy) des titres de ligne, en pixels."""
+    return (
+        float(getattr(settings, "montage_label_dx_px", 0.0) or 0.0),
+        float(getattr(settings, "montage_label_dy_px", 0.0) or 0.0),
     )
 
 
@@ -855,23 +869,24 @@ def _set_montage_row_ylabel(
     *,
     fontsize: float,
     labelpad: float = 8.0,
+    settings: Any = None,
 ) -> None:
     """Titre de ligne montage (canal / flux), aligné verticalement et entre lignes.
 
     Les graduations Y numériques sont masquées : leur largeur dépend du ``ylim``
     et décale sinon les libellés ``rotation=0`` d’une ligne à l’autre.
     """
-    ax.set_ylabel(
+    from plot_utils import place_montage_row_label
+
+    dx_px, dy_px = _montage_label_shift_px(settings)
+    place_montage_row_label(
+        ax,
         text,
-        rotation=0,
-        ha="right",
-        va="center",
         fontsize=fontsize,
         labelpad=labelpad,
+        dx_px=dx_px,
+        dy_px=dy_px,
     )
-    ax.tick_params(axis="y", which="both", labelleft=False)
-    # Ancrage fixe (coords axes) : indépendant de la largeur des ticks.
-    ax.yaxis.set_label_coords(-0.012, 0.5)
 
 
 def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
@@ -907,7 +922,7 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
     row_kinds = list(getattr(figure, "_erg_montage_row_kinds", None) or [])
     last = len(axes) - 1
     fontsize = float(style.tick_font_size)
-    linewidth = max(1.4, float(style.line_width) * 1.15)
+    linewidth = resolved_scale_bar_linewidth(style)
 
     def _units_for_row(row: int) -> tuple[str | None, str | None]:
         if row < len(row_kinds):
@@ -946,6 +961,7 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
                 fontsize=fontsize,
                 linewidth=linewidth,
                 gutter=True,
+                face=style.tick_face,
             )
         else:
             clear_floating_scale_bars(ax)
@@ -961,6 +977,7 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
                 linewidth=linewidth,
                 clear=False,
                 below=True,
+                face=style.tick_face,
             )
 
 
@@ -1137,6 +1154,7 @@ def _apply_text_overrides(figure: Any, request: RenderRequest) -> None:
                         ax,
                         ylabel,
                         fontsize=float(ax.yaxis.label.get_fontsize() or 8.0),
+                        settings=request.settings,
                     )
                     apply_text_face(ax.yaxis.label, style.label_face)
         else:
@@ -1275,12 +1293,6 @@ def _apply_montage_row_ylim(ax: Any, kind: str, settings: Any) -> None:
         # Ces kinds n’ont pas de réglage Y manuel : toujours ré-autoscaler,
         # sinon un ylim figé (souvent 0–1) coupe WV / FR / ISI.
         _apply_ylim(ax, AxisLimits())
-
-
-def _apply_xlim(ax: Any, limits: Any) -> None:
-    bounds = limits.as_tuple() if limits is not None else None
-    if bounds is not None:
-        ax.set_xlim(bounds[0], bounds[1])
 
 
 def _stream_for_panel(panel: str) -> str | None:
@@ -2461,6 +2473,7 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
             ax,
             name,
             fontsize=max(5.0, request.style.tick_font_size - 1.0),
+            settings=request.settings,
         )
         ax.tick_params(
             axis="both",
@@ -2632,11 +2645,19 @@ def _montage_continuous_row_specs(
             else f"CH{ch}"
         )
         for kind in kinds:
-            if kind in _MONTAGE_STREAM_KINDS:
-                short = STREAM_SHORT_LABELS.get(kind, kind.upper())
-            else:
-                short = _MONTAGE_EXTRA_LABELS.get(kind, kind.upper())
-            row_specs.append((ch, kind, f"{name} {short}"))
+            row_specs.append(
+                (
+                    ch,
+                    kind,
+                    montage_row_axis_label(
+                        name,
+                        kind,
+                        show_kind=bool(
+                            getattr(request.settings, "montage_show_kind_label", True)
+                        ),
+                    ),
+                )
+            )
     max_pts = _montage_continuous_max_points(request)
     return row_specs, reference, mode, kinds, max_pts
 
@@ -2802,7 +2823,6 @@ def _try_shrink_continuous_montage(figure: Any, request: RenderRequest) -> str |
         kind if kind in _MONTAGE_STREAM_KINDS else "raw" for _ch, kind, _label in row_specs
     ]
     figure._erg_montage_row_kinds = [kind for _ch, kind, _label in row_specs]
-    figure._erg_montage_review_mode = mode
     curves = stored.get("curves") if isinstance(stored.get("curves"), dict) else {}
     figure._erg_montage_state = {
         "kind": "continuous_review",
@@ -2965,7 +2985,7 @@ def _montage_draw_extra_row(
             continue
 
         if kind == "isi":
-            t_isi, d_isi = _isi_time_and_values_s(trains, isi_window_s=section_x)
+            _, d_isi = _isi_time_and_values_s(trains, isi_window_s=section_x)
             if d_isi.size == 0:
                 continue
             # Histogramme compact (ms) pour rester lisible en ligne montage.
@@ -3011,12 +3031,11 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
     row_specs: list[tuple[int, str, str]] = []
     for ch in channel_indices:
         name = reference.channel_names[ch] if ch < len(reference.channel_names) else f"CH{ch}"
+        show_kind = bool(getattr(request.settings, "montage_show_kind_label", True))
         for kind in kinds:
-            if kind in _MONTAGE_STREAM_KINDS:
-                short = STREAM_SHORT_LABELS.get(kind, kind.upper())
-            else:
-                short = _MONTAGE_EXTRA_LABELS.get(kind, kind.upper())
-            row_specs.append((ch, kind, f"{name} {short}"))
+            row_specs.append(
+                (ch, kind, montage_row_axis_label(name, kind, show_kind=show_kind))
+            )
     if not row_specs:
         return _fail(
             figure.add_subplot(111),
@@ -3075,21 +3094,15 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
 
     draw_app = _appearance(request)
     stim_xs: list[float] = []
+    stim_end_xs: list[float] = []
     if mode == "continuous" and request.settings.continuous_mark_stims:
-        remaining = 60
-        for index, recording in enumerate(recordings):
-            if remaining <= 0:
-                break
-            stims = np.asarray(recording.stimulation_times_s(), dtype=np.float64)
-            offset = float(offsets[index]) if index < len(offsets) else 0.0
-            for stim_t in stims:
-                if remaining <= 0:
-                    break
-                stim_x = float(stim_t) - offset
-                if stream_x is not None and not (stream_x[0] <= stim_x <= stream_x[1]):
-                    continue
-                stim_xs.append(stim_x)
-                remaining -= 1
+        from panel_prepare import _continuous_stim_marks
+
+        for stim_x, role in _continuous_stim_marks(recordings, sync_mode, stream_x):
+            if role == "offset":
+                stim_end_xs.append(float(stim_x))
+            else:
+                stim_xs.append(float(stim_x))
 
     for row_i, (ch, kind, label) in enumerate(row_specs):
         ax = axes[row_i]
@@ -3172,9 +3185,15 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
                 )
                 channel_drawn += 1
                 drawn += 1
-            if mode == "continuous" and stim_xs:
+            if mode == "continuous" and (stim_xs or stim_end_xs):
+                mark_stim_times(ax, stim_xs, appearance=draw_app, alpha=0.40)
                 mark_stim_times(
-                    ax, stim_xs, appearance=draw_app, alpha=0.40, linewidth=0.55
+                    ax,
+                    stim_end_xs,
+                    appearance=draw_app,
+                    alpha=0.40,
+                    color=draw_app.stim_offset_color,
+                    linestyle="-.",
                 )
             elif mode != "continuous" and request.legend.show_reference_markers:
                 _draw_onset_offset_lines(
@@ -3234,7 +3253,9 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
                 color=MUTED_AXIS_TEXT,
             )
 
-        _set_montage_row_ylabel(ax, label, fontsize=label_fs)
+        _set_montage_row_ylabel(
+            ax, label, fontsize=label_fs, settings=request.settings
+        )
         ax.tick_params(
             axis="both",
             labelsize=tick_fs,
@@ -3283,7 +3304,6 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
         kind if kind in _MONTAGE_STREAM_KINDS else "raw" for _ch, kind, _label in row_specs
     ]
     figure._erg_montage_row_kinds = [kind for _ch, kind, _label in row_specs]
-    figure._erg_montage_review_mode = mode
     figure._erg_montage_state = {
         "kind": "continuous_review",
         "base_geom": _montage_continuous_base_geom(request),
@@ -3393,6 +3413,8 @@ def _structure_fingerprint(request: RenderRequest) -> tuple[Any, ...]:
             str(request.settings.time_sync),
             bool(request.settings.continuous_mark_stims),
             bool(request.legend.show_reference_markers),
+            bool(getattr(request.legend, "show_filter_details", True)),
+            bool(getattr(request.legend, "show_sample_counts", True)),
             bool(getattr(request.settings, "show_spike_threshold", False)),
             bool(getattr(request.style, "show_scale_bars", False)),
             float(request.settings.psth_bin_window_s),
@@ -3425,13 +3447,17 @@ def _structure_fingerprint(request: RenderRequest) -> tuple[Any, ...]:
         window,
         tuple(request.highlight_zooms),
         int(request.settings.montage_page),
+        int(getattr(request.settings, "montage_channels", 12) or 12),
         str(getattr(request.placement, "stream", "") or "")
         if request.panel == "full_recording"
         else "",
         str(request.settings.time_sync),
+        bool(getattr(request.settings, "continuous_mark_stims", True)),
         str(request.settings.analysis.mode),
         int(request.settings.analysis.trigger_index() or -1),
         bool(request.legend.show_reference_markers),
+        bool(getattr(request.legend, "show_filter_details", True)),
+        bool(getattr(request.legend, "show_sample_counts", True)),
         bool(getattr(request.settings, "show_spike_threshold", False)),
         bool(getattr(request.style, "show_scale_bars", False)),
         # Geometry that affects histograms / rasters / overlays / downsampling.
@@ -3449,12 +3475,78 @@ def _structure_fingerprint(request: RenderRequest) -> tuple[Any, ...]:
     )
 
 
+def _apply_stim_marker_linewidth(
+    axes: Sequence[Any],
+    linewidth: float,
+    *,
+    onset_color: str | None = None,
+    offset_color: str | None = None,
+    known_colors: set[str] | None = None,
+) -> None:
+    """Met à jour épaisseur et couleur des pointillés de stimulation déjà dessinés."""
+    from matplotlib.colors import to_hex
+
+    stim_colors = {"#dc2626", "#1d4ed8", "#c2410c", "#ff0000"}
+    if known_colors:
+        stim_colors.update(str(color).lower() for color in known_colors if color)
+    onset = str(onset_color or "").lower()
+    offset = str(offset_color or "").lower()
+    if onset:
+        stim_colors.add(onset)
+    if offset:
+        stim_colors.add(offset)
+    width = float(linewidth)
+
+    def _hex(color: Any) -> str:
+        try:
+            return to_hex(color).lower()
+        except Exception:
+            return str(color).lower()
+
+    def _is_stim(color: Any) -> bool:
+        return _hex(color) in stim_colors
+
+    for ax in axes:
+        for line in ax.get_lines():
+            if not _is_stim(line.get_color()):
+                continue
+            xs = line.get_xdata()
+            if len(xs) >= 2 and abs(float(xs[0]) - float(xs[-1])) > 1e-9:
+                continue
+            line.set_linewidth(width)
+            style_name = str(line.get_linestyle())
+            ink = _hex(line.get_color())
+            if offset and style_name in {"-.", "dashdot"} and ink != "#c2410c":
+                line.set_color(offset_color)
+            elif onset and style_name in {"--", "dashed"} and ink != "#c2410c":
+                line.set_color(onset_color)
+        for coll in getattr(ax, "collections", ()):
+            try:
+                colors = coll.get_edgecolors()
+            except Exception:
+                continue
+            if colors is None or len(colors) == 0 or not _is_stim(colors[0]):
+                continue
+            coll.set_linewidths(width)
+
+
 def _refresh_panel_style(figure: Any, request: RenderRequest) -> str:
     """Update colors / fonts / ylims / surbrillance on an existing figure (no rebuild)."""
     status = str(getattr(figure, "_erg_status", "ok") or "ok")
     colors = list(request.colors)
     lw = float(request.style.line_width)
     axes = list(getattr(figure, "axes", []) or [])
+    onset_color = resolved_stim_onset_color(request.style)
+    offset_color = resolved_stim_offset_color(request.style)
+    known = set(getattr(figure, "_erg_stim_colors", ()) or ())
+    _apply_stim_marker_linewidth(
+        axes,
+        resolved_stim_linewidth(request.style),
+        onset_color=onset_color,
+        offset_color=offset_color,
+        known_colors=known,
+    )
+    figure._erg_stim_colors = tuple(known | {onset_color, offset_color})
     row_channels = getattr(figure, "_erg_montage_row_channels", None)
     selected = int(request.channel_index)
     for row, ax in enumerate(axes):
@@ -3685,13 +3777,3 @@ def render_panel(figure: Any, request: RenderRequest) -> str:
     return status
 
 
-def panels_for_scope(scope: PanelScope) -> tuple[PanelInfo, ...]:
-    return tuple(info for info in PANEL_CATALOG if info.scope == scope)
-
-
-def all_panel_keys() -> tuple[str, ...]:
-    return tuple(info.key for info in PANEL_CATALOG)
-
-
-def is_known_panel(key: str) -> bool:
-    return key in PANEL_INFO_BY_KEY or key in EXTRA_CHANNEL_PANEL_FIELD_NAMES

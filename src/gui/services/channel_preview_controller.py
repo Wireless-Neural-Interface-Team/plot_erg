@@ -21,8 +21,3 @@ class ChannelPreviewController:
         if widget is not None:
             widget.hide()
 
-    def set_placeholder_visible(self, visible: bool) -> None:
-        if visible:
-            self.show_placeholder()
-        else:
-            self.hide_placeholder()

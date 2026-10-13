@@ -17,7 +17,10 @@ from panel_prepare import (
     PanelSpec,
     ScatterSeries,
     _MONTAGE_TRIGGERED,
+    montage_vline_span_keys,
+    montage_vline_spans,
 )
+from plot_utils import place_montage_row_label
 
 _CHANNEL_HIGHLIGHT = "#fff7ed"
 
@@ -244,11 +247,20 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
             if show_label:
                 legend_labels.append((label, artist))
 
+    stim_spans = montage_vline_spans(spec) if is_montage else []
+    stim_span_keys = montage_vline_span_keys(stim_spans)
+    stim_lw = max(0.2, float(getattr(spec, "stim_linewidth", 1.0) or 1.0))
     for ann in spec.annotations:
         row = int(ann.row or 0)
         if row < 0 or row >= n_rows:
             row = 0
-        artist = _draw_annotation(axes_flat[row], ann)
+        if ann.kind == "vline" and (
+            row,
+            round(float(ann.x), 6),
+            str(ann.color or ""),
+        ) in stim_span_keys:
+            continue
+        artist = _draw_annotation(axes_flat[row], ann, stim_linewidth=stim_lw)
         ann_label = str(getattr(ann, "label", "") or "").strip()
         if artist is not None and ann_label and ann_label not in seen:
             seen.add(ann_label)
@@ -298,10 +310,21 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
         elif not share_x:
             ax.relim()
             ax.autoscale_view(scalex=True, scaley=False)
+        label_text = ""
         if row < len(spec.row_labels) and spec.row_labels[row]:
-            ax.set_ylabel(str(spec.row_labels[row]), fontsize=label_fs)
+            label_text = str(spec.row_labels[row])
         elif row == 0 and spec.ylabel:
-            ax.set_ylabel(spec.ylabel, fontsize=label_fs)
+            label_text = str(spec.ylabel)
+        if is_montage and label_text:
+            place_montage_row_label(
+                ax,
+                label_text,
+                fontsize=label_fs,
+                dx_px=float(getattr(spec, "row_label_dx_px", 0.0) or 0.0),
+                dy_px=float(getattr(spec, "row_label_dy_px", 0.0) or 0.0),
+            )
+        elif label_text:
+            ax.set_ylabel(label_text, fontsize=label_fs)
         if row == n_rows - 1 and spec.xlabel:
             ax.set_xlabel(spec.xlabel, fontsize=label_fs)
         else:
@@ -324,7 +347,7 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
         for tick_label in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
             _apply_spec_text_face(tick_label, spec, role="tick")
 
-    if spec.title and not is_montage:
+    if spec.title:
         figure.suptitle(
             spec.title,
             fontsize=float(spec.title_font_size),
@@ -348,9 +371,56 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
             for text in leg.get_texts():
                 _apply_spec_text_face(text, spec, role="legend")
 
+    if stim_spans:
+        _draw_montage_stim_spans(figure, axes_flat, stim_spans, linewidth=stim_lw)
     _attach_montage_metadata(figure, spec)
     figure._erg_status = status
     return status
+
+
+def _draw_montage_stim_spans(
+    figure: Any,
+    axes: list[Any],
+    spans: list[tuple[float, str, tuple[int, ...]]],
+    *,
+    linewidth: float = 1.0,
+) -> None:
+    """Un seul pointillé par stimulation, du premier canal concerné au dernier."""
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Rectangle
+    from matplotlib.transforms import blended_transform_factory
+
+    for x, color, rows in spans:
+        if not rows or rows[0] >= len(axes) or rows[-1] >= len(axes):
+            continue
+        ax_top = axes[rows[0]]
+        ax_bot = axes[rows[-1]]
+        y_top = float(ax_top.get_position().y1)
+        y_bot = float(ax_bot.get_position().y0)
+        if y_top < y_bot:
+            y_top, y_bot = y_bot, y_top
+        box = ax_top.get_position()
+        clip = Rectangle(
+            (float(box.x0), y_bot),
+            float(box.width),
+            max(0.0, y_top - y_bot),
+            transform=figure.transFigure,
+            linewidth=0,
+            fill=False,
+        )
+        line = Line2D(
+            [float(x), float(x)],
+            [y_bot, y_top],
+            transform=blended_transform_factory(ax_top.transData, figure.transFigure),
+            color=color,
+            linestyle="--",
+            linewidth=float(linewidth),
+            clip_on=True,
+            zorder=4,
+            solid_capstyle="butt",
+        )
+        line.set_clip_path(clip)
+        figure.add_artist(line)
 
 
 def _attach_montage_metadata(figure: Any, spec: PanelSpec) -> None:
@@ -394,9 +464,16 @@ def _disable_layout_engine(figure: Any) -> None:
             pass
 
 
-def _draw_annotation(ax: Any, ann: AnnotationSpec) -> Any | None:
+def _draw_annotation(
+    ax: Any, ann: AnnotationSpec, *, stim_linewidth: float = 1.0
+) -> Any | None:
     if ann.kind == "vline":
-        ax.axvline(float(ann.x), color=ann.color, linestyle="--", linewidth=1.0)
+        ax.axvline(
+            float(ann.x),
+            color=ann.color,
+            linestyle="--",
+            linewidth=float(stim_linewidth),
+        )
         return None
     if ann.kind == "hline":
         return ax.axhline(

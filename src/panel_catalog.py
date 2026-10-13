@@ -262,12 +262,6 @@ def is_global_panel(field_name: str) -> bool:
     return field_name in GLOBAL_PANEL_FIELD_NAMES
 
 
-def is_section_panel(field_name: str) -> bool:
-    if field_name in SECTION_PANEL_FIELD_NAMES:
-        return True
-    return field_name in ANALYSIS_PANEL_FIELD_NAMES and field_name != "full_recording"
-
-
 def is_section_independent(field_name: str) -> bool:
     return (
         field_name in GLOBAL_PANEL_FIELD_NAMES

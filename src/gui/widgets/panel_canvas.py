@@ -495,9 +495,6 @@ class PanelCanvas(QFrame):
 
     # ----------------------------------------------------------------- style
 
-    @property
-    def has_style_overrides(self) -> bool:
-        return self._style_overrides is not None
 
     @property
     def style_height_px(self) -> int | None:

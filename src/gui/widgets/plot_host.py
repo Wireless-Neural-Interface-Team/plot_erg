@@ -11,9 +11,19 @@ from typing import Any, Literal
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QPoint, QPointF, Qt, QTimer, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPen
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QFontMetrics,
+    QPainterPath,
+    QPen,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
+    QGraphicsItem,
     QGraphicsLineItem,
     QGraphicsSimpleTextItem,
     QHBoxLayout,
@@ -28,14 +38,15 @@ from PySide6.QtWidgets import (
 )
 
 from panel_prepare import (
-    AnnotationSpec,
     CurveSeries,
     HistSeries,
     PanelSpec,
     ScaleBarSpec,
     ScatterSeries,
-    prepare_panel,
+    montage_vline_span_keys,
+    montage_vline_spans,
 )
+from plot_utils import preview_title_row_layout
 
 INTERACTION_HINT = (
     "Clic texte = éditer · Ctrl+molette = zoom · clic milieu/droit = pan · "
@@ -125,14 +136,46 @@ class _MontageRowLabel(pg.LabelItem):
 
     ``LabelItem(justify='right')`` de pyqtgraph aligne le texte en haut de la
     cellule — d’où le décalage croissant par rapport aux graphes (centrés).
+
+    ``_dx`` positif rapproche le titre de la courbe, ``_dy`` positif le monte.
     """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._anchor_plot: pg.PlotItem | None = None
+        self._dx = 0.0
+        self._dy = 0.0
         super().__init__(*args, **kwargs)
+        try:
+            self.setFlag(self.GraphicsItemFlag.ItemClipsChildrenToShape, False)
+        except Exception:
+            pass
+
+    def boundingRect(self) -> Any:  # noqa: N802
+        rect = super().boundingRect()
+        if self._dx == 0.0 and self._dy == 0.0:
+            return rect
+        pad_x = abs(self._dx) + 4.0
+        pad_y = abs(self._dy) + 4.0
+        return rect.adjusted(-pad_x, -pad_y, pad_x, pad_y)
 
     def set_anchor_plot(self, plot: pg.PlotItem | None) -> None:
         self._anchor_plot = plot
+        try:
+            self.resizeEvent(None)
+        except Exception:
+            pass
+
+    def set_pixel_offset(self, dx: float, dy: float) -> None:
+        try:
+            self.prepareGeometryChange()
+        except Exception:
+            pass
+        self._dx = float(dx)
+        self._dy = float(dy)
+        try:
+            self.setZValue(20)
+        except Exception:
+            pass
         try:
             self.resizeEvent(None)
         except Exception:
@@ -150,16 +193,131 @@ class _MontageRowLabel(pg.LabelItem):
                 cy = float(self.mapFromScene(vb_center).y())
             except Exception:
                 cy = rect.center().y()
-        bounds.moveCenter(QPointF(rect.center().x(), cy))
-        bounds.moveRight(rect.right())
+        bounds.moveCenter(QPointF(rect.center().x(), cy - self._dy))
+        bounds.moveRight(rect.right() + self._dx)
         self.item.setPos(bounds.topLeft() - self.itemRect().topLeft())
         self.updateMin()
+
+
+class _MontageStimSpanItem(QGraphicsItem):
+    """Pointillés de stimulation d’un seul tenant, d’un canal à l’autre.
+
+    Les ``InfiniteLine`` sont rognées par chaque ViewBox : le trait s’arrête
+    au bord du graphe. Cet item vit dans la scène et traverse aussi l’intervalle
+    entre les lignes.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._lines: list[tuple[float, float, float, QPen]] = []
+        self._bounds = QRectF()
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self.setZValue(1000)
+        # Forme vide : le trait ne doit pas intercepter le zoom / le pan.
+        try:
+            self.setCacheMode(QGraphicsItem.CacheMode.NoCache)
+        except Exception:
+            pass
+
+    def set_lines(self, lines: list[tuple[float, float, float, QPen]]) -> None:
+        self.prepareGeometryChange()
+        self._lines = lines
+        if not lines:
+            self._bounds = QRectF()
+            self.hide()
+            self.update()
+            return
+        xs = [item[0] for item in lines]
+        ys = [item[1] for item in lines] + [item[2] for item in lines]
+        pad = 3.0
+        self._bounds = QRectF(
+            min(xs) - pad,
+            min(ys) - pad,
+            max(xs) - min(xs) + 2.0 * pad,
+            max(ys) - min(ys) + 2.0 * pad,
+        )
+        self.show()
+        self.update()
+
+    def boundingRect(self) -> QRectF:  # noqa: N802
+        return self._bounds
+
+    def shape(self) -> QPainterPath:  # noqa: N802
+        return QPainterPath()
+
+    def paint(self, painter: Any, option: Any, widget: Any = None) -> None:  # noqa: N802
+        del option, widget
+        for x, y0, y1, pen in self._lines:
+            painter.setPen(pen)
+            painter.drawLine(QPointF(x, y0), QPointF(x, y1))
+
+
+def _montage_label_shift(spec: Any) -> tuple[float, float]:
+    return (
+        float(getattr(spec, "row_label_dx_px", 0.0) or 0.0),
+        float(getattr(spec, "row_label_dy_px", 0.0) or 0.0),
+    )
+
+
+def _montage_label_column_extra(spec: Any) -> int:
+    """Largeur supplémentaire à gauche si le titre est décalé vers la gauche."""
+    dx, _dy = _montage_label_shift(spec)
+    if dx >= 0:
+        return 0
+    return int(round(-dx))
+
+
+_LABEL_FAMILY = "Segoe UI"
 
 
 def _html_text(text: str) -> str:
     return (
         str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     )
+
+
+def _face_qfont(
+    size_pt: float, *, bold: bool = False, italic: bool = False, underline: bool = False
+) -> QFont:
+    """Police explicite : sans famille, Qt ignore gras et italique dans le HTML."""
+    font = QFont(_LABEL_FAMILY)
+    font.setPointSizeF(max(5.0, float(size_pt)))
+    font.setWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
+    font.setBold(bool(bold))
+    font.setItalic(bool(italic))
+    font.setUnderline(bool(underline))
+    return font
+
+
+def _stamp_text_face(text_item: Any, font: QFont, color: QColor | None = None) -> None:
+    """Appliquer gras / italique / souligné aux caractères déjà posés.
+
+    Un ``span`` CSS sans variante de police ne change pas les glyphes : seul
+    le soulignement (trait) apparaît. Le format de caractère force les trois.
+    """
+    document = getattr(text_item, "document", None)
+    if not callable(document):
+        return
+    doc = document()
+    if doc is None:
+        return
+    try:
+        doc.setDefaultFont(font)
+        text_item.setFont(font)
+    except Exception:
+        pass
+    cursor = QTextCursor(doc)
+    cursor.select(QTextCursor.SelectionType.Document)
+    fmt = QTextCharFormat()
+    fmt.setFontFamily(font.family() or _LABEL_FAMILY)
+    if font.pointSizeF() > 0:
+        fmt.setFontPointSize(float(font.pointSizeF()))
+    fmt.setFontWeight(QFont.Weight.Bold if font.bold() else QFont.Weight.Normal)
+    fmt.setFontItalic(bool(font.italic()))
+    fmt.setFontUnderline(bool(font.underline()))
+    if color is not None:
+        fmt.setForeground(QBrush(color))
+    cursor.setCharFormat(fmt)
 
 
 def _axis_owning_label(item: Any) -> Any | None:
@@ -202,32 +360,66 @@ def _render_label_item(item: pg.LabelItem, text: str) -> None:
             color = pg.getConfigOption("foreground")
         except Exception:
             color = "#000000"
+    qcolor: QColor | None = None
     try:
         qcolor = pg.mkColor(color)
         parts.append("color: " + qcolor.name(QColor.NameFormat.HexArgb))
     except Exception:
-        pass
-    family = opts.get("family")
-    if family:
-        parts.append("font-family: " + str(family))
+        qcolor = None
+    family = str(opts.get("family") or _LABEL_FAMILY)
+    parts.append('font-family: "%s"' % family)
     size = opts.get("size")
     if size:
         parts.append("font-size: " + str(size))
-    if opts.get("bold") in (True, False):
-        parts.append("font-weight: " + ("bold" if opts["bold"] else "normal"))
-    if opts.get("italic") in (True, False):
-        parts.append("font-style: " + ("italic" if opts["italic"] else "normal"))
-    if opts.get("underline"):
+    bold = bool(opts.get("bold"))
+    italic = bool(opts.get("italic"))
+    underline = bool(opts.get("underline"))
+    parts.append("font-weight: " + ("700" if bold else "400"))
+    parts.append("font-style: " + ("italic" if italic else "normal"))
+    if underline:
         parts.append("text-decoration: underline")
+    body = _html_text(shown)
+    if underline:
+        body = "<u>%s</u>" % body
+    if italic:
+        body = "<i>%s</i>" % body
+    if bold:
+        body = "<b>%s</b>" % body
     try:
-        item.item.setHtml(
-            "<span style='%s'>%s</span>" % ("; ".join(parts), _html_text(shown))
+        item.item.setHtml("<span style='%s'>%s</span>" % ("; ".join(parts), body))
+        pt = _css_pt(str(size or "")) or 9.0
+        _stamp_text_face(
+            item.item,
+            _face_qfont(pt, bold=bold, italic=italic, underline=underline),
+            qcolor if isinstance(qcolor, QColor) else None,
         )
         item.updateMin()
         item.resizeEvent(None)
         item.updateGeometry()
     except Exception:
         pass
+
+
+def _ensure_axis_label_stamper(axis: Any) -> None:
+    """Réappliquer le style après chaque ``_updateLabel`` (préfixe SI, resize)."""
+    if getattr(axis, "_erg_label_face", False):
+        return
+    original = axis._updateLabel
+
+    def _update() -> None:
+        original()
+        font = getattr(axis, "_erg_label_font", None)
+        label = getattr(axis, "label", None)
+        if font is None or label is None:
+            return
+        _stamp_text_face(label, font, getattr(axis, "_erg_label_color", None))
+        try:
+            axis._adjustSize()
+        except Exception:
+            pass
+
+    axis._updateLabel = _update
+    axis._erg_label_face = True
 
 
 def _apply_axis_label_style(
@@ -241,13 +433,24 @@ def _apply_axis_label_style(
     style = dict(getattr(axis, "labelStyle", {}) or {})
     if "size" in style and "font-size" not in style:
         style["font-size"] = style.pop("size")
-    style["font-weight"] = "bold" if bold else "normal"
+    style["font-family"] = '"%s"' % _LABEL_FAMILY
+    style["font-weight"] = "700" if bold else "400"
     style["font-style"] = "italic" if italic else "normal"
     if underline:
         style["text-decoration"] = "underline"
     else:
         style.pop("text-decoration", None)
     axis.labelStyle = style
+    pt = _css_pt(str(style.get("font-size") or style.get("size") or "")) or 9.0
+    axis._erg_label_font = _face_qfont(
+        pt, bold=bool(bold), italic=bool(italic), underline=bool(underline)
+    )
+    color = style.get("color")
+    try:
+        axis._erg_label_color = pg.mkColor(color) if color else None
+    except Exception:
+        axis._erg_label_color = None
+    _ensure_axis_label_stamper(axis)
     try:
         axis._updateLabel()
     except Exception:
@@ -273,7 +476,8 @@ def _editor_font(item: Any) -> QFont:
             current = item.font() if callable(getattr(item, "font", None)) else None
             return current if isinstance(current, QFont) else font
         style = dict(getattr(axis, "labelStyle", {}) or {})
-        bold = str(style.get("font-weight", "")).strip().lower() == "bold"
+        weight = str(style.get("font-weight", "")).strip().lower()
+        bold = weight in {"bold", "700", "600", "bolder"}
         italic = str(style.get("font-style", "")).strip().lower() == "italic"
         underline = "underline" in str(style.get("text-decoration", "")).lower()
         size = str(style.get("font-size") or style.get("size") or "")
@@ -348,6 +552,147 @@ def _apply_label_face(
             item.setFont(font)
     except Exception:
         pass
+
+
+def _tick_qfont(
+    size_pt: float, *, bold: bool = False, italic: bool = False, underline: bool = False
+) -> QFont:
+    """Police de ticks. Le QPicture de l'axe ne rejoue ni gras, ni italique, ni souligné."""
+    return _face_qfont(size_pt, bold=bold, italic=italic, underline=underline)
+
+
+def _scale_label_item(label: str, font: QFont, brush: QBrush) -> QGraphicsSimpleTextItem:
+    """Libellé d'échelle : même police que les ticks, souligné à part."""
+    text = QGraphicsSimpleTextItem(label)
+    text.setFont(font)
+    text.setBrush(brush)
+    if font.underline():
+        metrics = QFontMetrics(font)
+        advance = float(metrics.horizontalAdvance(label))
+        y = float(metrics.ascent()) + float(max(1, int(metrics.underlinePos())))
+        line = QGraphicsLineItem(0.0, y, advance, y, text)
+        pen = QPen(brush.color())
+        pen.setWidthF(max(1.0, float(metrics.lineWidth())))
+        pen.setCosmetic(True)
+        line.setPen(pen)
+    return text
+
+
+def _paint_tick_underlines(axis: Any, painter: Any, text_specs: Any) -> None:
+    """Souligner les valeurs de ticks : ``QPainter.drawText`` les coupe au cadre."""
+    style = getattr(axis, "style", None)
+    font = style.get("tickFont") if isinstance(style, dict) else None
+    if font is None or not font.underline() or not text_specs:
+        return
+    metrics = QFontMetrics(font)
+    try:
+        pen = QPen(axis.textPen())
+        pen.setWidthF(max(1.0, float(metrics.lineWidth())))
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+    except Exception:
+        return
+    try:
+        painter.setClipping(False)
+    except Exception:
+        pass
+    align_right = int(Qt.AlignmentFlag.AlignRight)
+    align_hcenter = int(Qt.AlignmentFlag.AlignHCenter)
+    align_vcenter = int(Qt.AlignmentFlag.AlignVCenter)
+    align_bottom = int(Qt.AlignmentFlag.AlignBottom)
+    descent = max(1, int(metrics.underlinePos()))
+    for rect, flags, text in text_specs:
+        shown = str(text or "")
+        if not shown:
+            continue
+        fl = int(flags)
+        advance = float(metrics.horizontalAdvance(shown))
+        height = float(metrics.height())
+        if fl & align_vcenter:
+            top = float(rect.center().y()) - height / 2.0
+        elif fl & align_bottom:
+            top = float(rect.bottom()) - height
+        else:
+            top = float(rect.top())
+        if fl & align_right:
+            left = float(rect.right()) - advance
+        elif fl & align_hcenter:
+            left = float(rect.center().x()) - advance / 2.0
+        else:
+            left = float(rect.left())
+        y = top + float(metrics.ascent()) + float(descent)
+        painter.drawLine(QPointF(left, y), QPointF(left + advance, y))
+
+
+def _paint_tick_labels(axis: Any, painter: Any, text_specs: Any) -> None:
+    """Dessiner les graduations sur le painter réel, pas dans le QPicture."""
+    if not text_specs:
+        return
+    style = getattr(axis, "style", None)
+    font = style.get("tickFont") if isinstance(style, dict) else None
+    if font is None:
+        return
+    painter.save()
+    try:
+        draw_font = QFont(font)
+        # Le trait est ajouté à part : ``drawText`` le coupe au cadre de l'axe.
+        draw_font.setUnderline(False)
+        painter.setFont(draw_font)
+        try:
+            painter.setPen(axis.textPen())
+        except Exception:
+            pass
+        try:
+            painter.setClipRect(axis.boundingRect())
+        except Exception:
+            pass
+        for rect, flags, text in text_specs:
+            shown = str(text or "")
+            if shown:
+                painter.drawText(rect, int(flags), shown)
+        if font.underline():
+            painter.setClipping(False)
+            _paint_tick_underlines(axis, painter, text_specs)
+    finally:
+        painter.restore()
+
+
+def _ensure_tick_underline_painter(axis: Any) -> None:
+    """Graduations hors QPicture : le cache perd gras, italique et souligné."""
+    if getattr(axis, "_erg_tick_underline", False):
+        return
+    original_draw = axis.drawPicture
+    original_paint = axis.paint
+
+    def draw_picture(painter: Any, axis_spec: Any, tick_specs: Any, text_specs: Any) -> None:
+        axis._erg_text_specs = text_specs
+        original_draw(painter, axis_spec, tick_specs, [])
+
+    def paint(painter: Any, opt: Any, widget: Any = None) -> None:
+        original_paint(painter, opt, widget)
+        _paint_tick_labels(axis, painter, getattr(axis, "_erg_text_specs", None))
+
+    axis.drawPicture = draw_picture
+    axis.paint = paint
+    axis._erg_tick_underline = True
+
+
+def _apply_plot_tick_font(
+    plot: pg.PlotItem, spec: PanelSpec | None, *, montage: bool = False
+) -> None:
+    """Gras / italique / souligné des graduations, y compris après un refresh."""
+    tick_pt = 8.0 if montage else 9.0
+    bold = italic = underline = False
+    if spec is not None:
+        tick_pt = float(getattr(spec, "tick_font_size", tick_pt) or tick_pt)
+        bold = bool(getattr(spec, "tick_bold", False))
+        italic = bool(getattr(spec, "tick_italic", False))
+        underline = bool(getattr(spec, "tick_underline", False))
+    font = _tick_qfont(tick_pt, bold=bold, italic=italic, underline=underline)
+    for name in ("left", "bottom", "top", "right"):
+        axis = plot.getAxis(name)
+        _ensure_tick_underline_painter(axis)
+        axis.setStyle(tickFont=font)
 
 
 def _scope_colors() -> dict[str, str]:
@@ -526,7 +871,6 @@ class PlotHost(QWidget):
         root.addWidget(self._glw, 1)
         root.addWidget(self._cursor_label)
 
-        self._draw_pending = False
         self._draw_timer = QTimer(self)
         self._draw_timer.setSingleShot(True)
         self._draw_timer.setInterval(_COALESCE_MS)
@@ -536,6 +880,15 @@ class PlotHost(QWidget):
         self._scale_bar_timer.setSingleShot(True)
         self._scale_bar_timer.setInterval(40)
         self._scale_bar_timer.timeout.connect(self._refresh_scale_bars)
+        # Traits de stim continus : recalcul après pan / zoom / redimensionnement.
+        self._stim_span_item: _MontageStimSpanItem | None = None
+        self._stim_span_specs: list[tuple[float, str, tuple[int, ...]]] = []
+        self._stim_span_width = 1.0
+        self._stim_span_connected: list[Any] = []
+        self._stim_span_timer = QTimer(self)
+        self._stim_span_timer.setSingleShot(True)
+        self._stim_span_timer.setInterval(16)
+        self._stim_span_timer.timeout.connect(self._update_stim_spans)
 
         # Limites appliquées après le premier paint (courbes déjà à l’écran).
         self._autoscale_gen = 0
@@ -555,12 +908,10 @@ class PlotHost(QWidget):
         self._text_pins.clear()
 
     def draw_idle(self) -> None:
-        self._draw_pending = True
         if not self._draw_timer.isActive():
             self._draw_timer.start()
 
     def _flush_draw(self) -> None:
-        self._draw_pending = False
         try:
             self._glw.update()
         except Exception:
@@ -616,9 +967,6 @@ class PlotHost(QWidget):
         except Exception:
             pass
 
-    def render_request(self, request: Any) -> str:
-        spec = prepare_panel(request)
-        return self.render_spec(spec)
 
     @staticmethod
     def _geometry_key_for(spec: PanelSpec) -> tuple[Any, ...]:
@@ -797,6 +1145,7 @@ class PlotHost(QWidget):
             except Exception:
                 pass
         self._bind_montage_row_label_anchors()
+        self._apply_montage_label_offsets(spec)
 
     def _refresh_spec(self, spec: PanelSpec) -> str:
         """Reuse existing PlotItems — clear data items only, then redraw."""
@@ -837,10 +1186,14 @@ class PlotHost(QWidget):
                 plot.getViewBox().setBackgroundColor(c["axes"])
             if not is_montage:
                 self._style_plot(plot, montage=False, spec=spec)
-            elif spec.grid:
-                plot.showGrid(x=True, y=True, alpha=float(spec.grid_alpha))
             else:
-                plot.showGrid(x=False, y=False)
+                # Pas de reconstruction d’axes, mais bordures, ticks et police
+                # doivent suivre les réglages d’affichage.
+                self._apply_axis_frame(plot, montage=True, spec=spec)
+                if spec.grid:
+                    plot.showGrid(x=True, y=True, alpha=float(spec.grid_alpha))
+                else:
+                    plot.showGrid(x=False, y=False)
         status = self._finish_draw(spec, is_montage=is_montage, n_rows=n_rows)
         # Zoom X partagé entre pages : seulement si les lignes partagent le même X.
         if (
@@ -913,10 +1266,18 @@ class PlotHost(QWidget):
         c = self._colors
         label_pt = max(5, int(round(float(spec.label_font_size or 8.0))))
         size = f"{label_pt}pt"
+        font = QFont("Segoe UI", label_pt)
+        font.setBold(bool(spec.label_bold))
+        font.setItalic(bool(spec.label_italic))
+        font.setUnderline(bool(getattr(spec, "label_underline", False)))
+        metrics = QFontMetrics(font)
+        extra = _montage_label_column_extra(spec)
+        max_w = 48 + extra
         for row, label in enumerate(self._row_labels):
             text = ""
             if row < len(spec.row_labels) and spec.row_labels[row]:
                 text = str(spec.row_labels[row])
+            max_w = max(max_w, int(metrics.horizontalAdvance(text)) + 10 + extra)
             try:
                 label.setText(text or " ")
                 label.setAttr("size", size)
@@ -932,6 +1293,17 @@ class PlotHost(QWidget):
                 )
             except Exception:
                 pass
+        try:
+            self._glw.ci.layout.setColumnFixedWidth(0, max_w)
+        except Exception:
+            pass
+        self._apply_montage_label_offsets(spec)
+
+    def _apply_montage_label_offsets(self, spec: PanelSpec) -> None:
+        dx, dy = _montage_label_shift(spec)
+        for label in self._row_labels:
+            if isinstance(label, _MontageRowLabel):
+                label.set_pixel_offset(dx, dy)
 
     def _remove_legend(self) -> None:
         legend = self._legend_item
@@ -985,17 +1357,6 @@ class PlotHost(QWidget):
             except Exception:
                 pass
 
-    def capture_view(self) -> list[tuple[tuple[float, float], tuple[float, float]]] | None:
-        return self.capture_view_limits()
-
-    def restore_view(
-        self,
-        limits: list[tuple[tuple[float, float], tuple[float, float]]] | None,
-        *,
-        restore_x: bool = True,
-        restore_y: bool | list[bool] | tuple[bool, ...] = True,
-    ) -> None:
-        self.restore_view_limits(limits, restore_x=restore_x, restore_y=restore_y)
 
     def capture_view_limits(
         self,
@@ -1408,10 +1769,16 @@ class PlotHost(QWidget):
         if leftover and not self._force_clear_layout():
             self._replace_graphics_layout()
 
+    def resizeEvent(self, event: Any) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if getattr(self, "_stim_span_specs", None):
+            self._schedule_stim_span_update()
+
     def _clear_plots(self) -> None:
         self._limits_after_paint = False
         self._autoscale_gen += 1
         self._disconnect_scale_bar_range()
+        self._clear_stim_spans()
         self._clear_scale_bar_items()
         self._scale_bar_lengths = []
         self._legend_item = None
@@ -1448,17 +1815,19 @@ class PlotHost(QWidget):
                 plot.setLogMode(x=False, y=True)
             except Exception:
                 pass
+        self._apply_axis_frame(plot, montage=montage, spec=spec)
+
+    def _apply_axis_frame(
+        self,
+        plot: pg.PlotItem,
+        *,
+        montage: bool,
+        spec: PanelSpec | None,
+    ) -> None:
+        """Bordures, sens des graduations et police des ticks."""
+        c = self._colors
         show_borders = True if spec is None else bool(spec.show_borders)
         ticks_inside = False if spec is None else bool(spec.ticks_inside)
-        tick_pt = 8 if montage else 9
-        tick_bold = False
-        tick_italic = False
-        tick_underline = False
-        if spec is not None:
-            tick_pt = max(5, int(round(float(spec.tick_font_size or tick_pt))))
-            tick_bold = bool(spec.tick_bold)
-            tick_italic = bool(spec.tick_italic)
-            tick_underline = bool(getattr(spec, "tick_underline", False))
         spine_pen = (
             pg.mkPen(c["spine"], width=0.8)
             if show_borders
@@ -1472,25 +1841,17 @@ class PlotHost(QWidget):
                 axis.setStyle(tickLength=(-6 if ticks_inside else 6))
             except Exception:
                 pass
-        font = QFont()
-        font.setPointSize(tick_pt)
-        font.setBold(tick_bold)
-        font.setItalic(tick_italic)
-        font.setUnderline(tick_underline)
-        plot.getAxis("left").setStyle(tickFont=font)
-        plot.getAxis("bottom").setStyle(tickFont=font)
-        # Masquer axes haut / droite sauf ticks_inside (repères intérieurs).
+        _apply_plot_tick_font(plot, spec, montage=montage)
         try:
             plot.showAxis("top", show=bool(ticks_inside and show_borders))
             plot.showAxis("right", show=bool(ticks_inside and show_borders))
             if ticks_inside and show_borders:
-                plot.getAxis("top").setStyle(showValues=False, tickFont=font)
-                plot.getAxis("right").setStyle(showValues=False, tickFont=font)
+                plot.getAxis("top").setStyle(showValues=False)
+                plot.getAxis("right").setStyle(showValues=False)
         except Exception:
             pass
         if montage:
             plot.getAxis("bottom").setStyle(showValues=False)
-            # Pas de ylabel vertical pyqtgraph — libellés horizontaux en colonne dédiée.
             plot.getAxis("left").setStyle(showValues=True)
             try:
                 plot.getAxis("left").showLabel(False)
@@ -1774,16 +2135,26 @@ class PlotHost(QWidget):
         return legend_entries
 
     def _draw_annotations(self, spec: PanelSpec) -> None:
+        spans = (
+            montage_vline_spans(spec) if spec.layout_kind == "montage" else []
+        )
+        covered = montage_vline_span_keys(spans)
+        self._stim_span_specs = spans
+        stim_width = max(0.2, float(getattr(spec, "stim_linewidth", 1.0) or 1.0))
+        self._stim_span_width = stim_width
         for ann in spec.annotations:
             row = int(ann.row or 0)
             if row < 0 or row >= len(self._plots):
                 row = 0
             plot = self._plots[row]
             if ann.kind == "vline":
+                x_key = round(float(ann.x), 6)
+                if (row, x_key, str(ann.color or "")) in covered:
+                    continue
                 line = pg.InfiniteLine(
                     pos=float(ann.x),
                     angle=90,
-                    pen=pg.mkPen(ann.color, width=1.0, style=Qt.PenStyle.DashLine),
+                    pen=pg.mkPen(ann.color, width=stim_width, style=Qt.PenStyle.DashLine),
                 )
                 plot.addItem(line)
             elif ann.kind == "hline":
@@ -1813,6 +2184,146 @@ class PlotHost(QWidget):
                 # Place in view center after limits applied — use viewbox center later.
                 text.setPos(0.0, 0.0)
                 self._text_items.append(text)
+        self._arm_stim_spans()
+
+    def _arm_stim_spans(self) -> None:
+        """Brancher le trait continu et le positionner dès que la géométrie existe."""
+        if not self._stim_span_specs:
+            self._clear_stim_spans()
+            return
+        self._ensure_stim_span_item()
+        self._connect_stim_spans()
+        self._schedule_stim_span_update()
+
+    def _ensure_stim_span_item(self) -> _MontageStimSpanItem:
+        item = self._stim_span_item
+        if item is None:
+            item = _MontageStimSpanItem()
+            self._glw.scene().addItem(item)
+            self._stim_span_item = item
+        elif item.scene() is None:
+            self._glw.scene().addItem(item)
+        return item
+
+    def _clear_stim_spans(self) -> None:
+        self._stim_span_timer.stop()
+        self._stim_span_specs = []
+        self._disconnect_stim_spans()
+        item = self._stim_span_item
+        if item is None:
+            return
+        try:
+            scene = item.scene()
+            if scene is not None:
+                scene.removeItem(item)
+        except Exception:
+            pass
+        self._stim_span_item = None
+
+    def _disconnect_stim_spans(self) -> None:
+        for vb in self._stim_span_connected:
+            try:
+                vb.sigRangeChanged.disconnect(self._schedule_stim_span_update)
+            except Exception:
+                pass
+            try:
+                vb.sigResized.disconnect(self._schedule_stim_span_update)
+            except Exception:
+                pass
+        self._stim_span_connected.clear()
+
+    def _connect_stim_spans(self) -> None:
+        self._disconnect_stim_spans()
+        seen: set[int] = set()
+        for _x, _color, rows in self._stim_span_specs:
+            for row in rows:
+                if row < 0 or row >= len(self._plots) or row in seen:
+                    continue
+                seen.add(row)
+                vb = self._plots[row].getViewBox()
+                try:
+                    vb.sigRangeChanged.connect(self._schedule_stim_span_update)
+                    self._stim_span_connected.append(vb)
+                except Exception:
+                    continue
+                try:
+                    vb.sigResized.connect(self._schedule_stim_span_update)
+                except Exception:
+                    pass
+
+    def _schedule_stim_span_update(self, *_args: Any) -> None:
+        if not self._stim_span_specs:
+            return
+        if not self._stim_span_timer.isActive():
+            self._stim_span_timer.start()
+
+    def _stim_span_scene_point(
+        self, plot: pg.PlotItem, x: float
+    ) -> tuple[float, float, float] | None:
+        """``(x scène, haut, bas)`` du ViewBox si ``x`` est visible."""
+        vb = plot.getViewBox()
+        try:
+            rect = vb.sceneBoundingRect()
+            (x0, x1), _y = vb.viewRange()
+        except Exception:
+            return None
+        x0, x1 = float(x0), float(x1)
+        if rect.width() < 2.0 or rect.height() < 2.0:
+            return None
+        if not np.isfinite([x0, x1, x]).all() or x0 == x1:
+            return None
+        lo, hi = (x0, x1) if x0 < x1 else (x1, x0)
+        if x < lo or x > hi:
+            return None
+        frac = (float(x) - x0) / (x1 - x0)
+        scene_x = float(rect.left()) + frac * float(rect.width())
+        return (scene_x, float(rect.top()), float(rect.bottom()))
+
+    def _update_stim_spans(self) -> None:
+        """Recaler les pointillés sur les ViewBox (y compris l’espace entre canaux)."""
+        self._stim_span_timer.stop()
+        specs = self._stim_span_specs
+        if not specs or not self._plots:
+            if self._stim_span_item is not None:
+                self._stim_span_item.set_lines([])
+            return
+        item = self._ensure_stim_span_item()
+        lines: list[tuple[float, float, float, QPen]] = []
+        align_px = 2.0
+        stim_width = max(0.2, float(getattr(self, "_stim_span_width", 1.0) or 1.0))
+        for x, color, rows in specs:
+            pen = QPen(QColor(color))
+            pen.setWidthF(stim_width)
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            pending: list[tuple[float, float, float]] = []
+
+            def flush() -> None:
+                if not pending:
+                    return
+                xs = [point[0] for point in pending]
+                if max(xs) - min(xs) <= align_px:
+                    scene_x = sum(xs) / len(xs)
+                    lines.append((scene_x, pending[0][1], pending[-1][2], pen))
+                else:
+                    for scene_x, top, bottom in pending:
+                        lines.append((scene_x, top, bottom, pen))
+                pending.clear()
+
+            for row in rows:
+                if row < 0 or row >= len(self._plots):
+                    flush()
+                    continue
+                mapped = self._stim_span_scene_point(self._plots[row], float(x))
+                if mapped is None:
+                    flush()
+                    continue
+                if pending and abs(mapped[0] - pending[-1][0]) > align_px:
+                    flush()
+                pending.append(mapped)
+            flush()
+        item.set_lines(lines)
 
     def _scale_bar_item_ids(self) -> set[int]:
         return {id(item) for _plot, item in self._scale_bar_items}
@@ -1948,6 +2459,8 @@ class PlotHost(QWidget):
         self._apply_x_ticks(self._spec)
         if self._spec.layout_kind == "montage":
             self._fit_montage_left_axis_widths(self._spec)
+            self._update_stim_spans()
+            self._schedule_stim_span_update()
         # Longueurs auto basées sur le vrai viewRange (pas celui d’avant l’autoscale).
         self._resync_scale_bar_lengths()
         self._refresh_scale_bars()
@@ -2016,17 +2529,6 @@ class PlotHost(QWidget):
                 )
                 self._autoscale_y_from_data(plot, non_negative=nonneg)
 
-    def _apply_limits(self, spec: PanelSpec) -> None:
-        """Application synchrone (reset vue / tests) — pas le chemin rendu usuel."""
-        self._clear_scale_bar_items()
-        self._queue_limits_after_paint(spec)
-        self._limits_after_paint = False
-        # Pending xlim du spec ; si auto, résoudre depuis les courbes maintenant.
-        if self._pending_auto_x:
-            self._pending_xlim = self._resolve_shared_xlim(spec)
-            self._pending_auto_x = False
-        self._apply_pending_limits()
-        self._resync_scale_bar_lengths()
 
     def _apply_labels(self, spec: PanelSpec, *, is_montage: bool = False) -> None:
         c = self._colors
@@ -2072,6 +2574,7 @@ class PlotHost(QWidget):
                 self._editable.append(
                     _EditableText(title_item, "title", axes_index=0, item_index=0)
                 )
+            self._apply_preview_title_gap(self._plots[0], spec)
         for row, plot in enumerate(self._plots):
             if not is_montage:
                 ylabel = ""
@@ -2100,31 +2603,38 @@ class PlotHost(QWidget):
                                 label_item, "ylabel", axes_index=row, item_index=0
                             )
                         )
-            if row == len(self._plots) - 1:
-                plot.getAxis("bottom").setStyle(showValues=True)
-                if spec.xlabel:
-                    plot.setLabel(
-                        "bottom",
-                        spec.xlabel,
-                        color=c["fg"],
-                        **{"font-size": f"{label_pt}pt"},
-                    )
-                    axis = plot.getAxis("bottom")
-                    _apply_label_face(
-                        getattr(axis, "label", None),
-                        bold=bool(spec.label_bold),
-                        italic=bool(spec.label_italic),
-                        underline=bool(getattr(spec, "label_underline", False)),
-                    )
-                    label_item = getattr(axis, "label", None)
-                    if label_item is not None:
-                        self._editable.append(
-                            _EditableText(
-                                label_item, "xlabel", axes_index=row, item_index=0
-                            )
+            is_last = row == len(self._plots) - 1
+            bottom = plot.getAxis("bottom")
+            if not is_last:
+                if is_montage:
+                    # Sinon une ligne qui a été la dernière garde « Temps ».
+                    self._clear_bottom_axis_label(bottom)
+                else:
+                    bottom.setStyle(showValues=False)
+                continue
+            bottom.setStyle(showValues=True)
+            if spec.xlabel:
+                plot.setLabel(
+                    "bottom",
+                    spec.xlabel,
+                    color=c["fg"],
+                    **{"font-size": f"{label_pt}pt"},
+                )
+                _apply_label_face(
+                    getattr(bottom, "label", None),
+                    bold=bool(spec.label_bold),
+                    italic=bool(spec.label_italic),
+                    underline=bool(getattr(spec, "label_underline", False)),
+                )
+                label_item = getattr(bottom, "label", None)
+                if label_item is not None:
+                    self._editable.append(
+                        _EditableText(
+                            label_item, "xlabel", axes_index=row, item_index=0
                         )
-            else:
-                plot.getAxis("bottom").setStyle(showValues=False)
+                    )
+            elif is_montage:
+                self._clear_bottom_axis_label(bottom, collapse=False)
 
         # Center placeholder-like text annotations that had pos 0,0
         for text in self._text_items:
@@ -2133,6 +2643,50 @@ class PlotHost(QWidget):
                 if parent is not None:
                     (x0, x1), (y0, y1) = parent.viewRange()
                     text.setPos(0.5 * (x0 + x1), 0.5 * (y0 + y1))
+            except Exception:
+                pass
+
+    def _apply_preview_title_gap(self, plot: pg.PlotItem, spec: PanelSpec) -> None:
+        """Écarter ou rapprocher le titre de la courbe (aperçu, hors montage)."""
+        title = getattr(plot, "titleLabel", None)
+        layout = getattr(plot, "layout", None)
+        if title is None or layout is None or not title.isVisible():
+            return
+        text_h = 14.0
+        try:
+            text_h = max(1.0, float(title.itemRect().height()))
+        except Exception:
+            text_h = 14.0
+        row_h, spacing = preview_title_row_layout(
+            text_h, int(getattr(spec, "title_gap_px", 0) or 0)
+        )
+        try:
+            title.setMaximumHeight(row_h)
+            layout.setRowFixedHeight(0, row_h)
+            layout.setRowSpacing(0, spacing)
+        except Exception:
+            pass
+
+    def _clear_bottom_axis_label(self, axis: Any, *, collapse: bool = True) -> None:
+        """Retirer le titre d’axe X. ``collapse`` enlève aussi la hauteur réservée."""
+        if collapse:
+            try:
+                axis.setStyle(showValues=False)
+            except Exception:
+                pass
+        try:
+            if str(getattr(axis, "labelText", "") or ""):
+                axis.setLabel("")
+            else:
+                axis.showLabel(False)
+        except Exception:
+            try:
+                axis.showLabel(False)
+            except Exception:
+                pass
+        if collapse:
+            try:
+                axis.setHeight(None)
             except Exception:
                 pass
 
@@ -2203,14 +2757,15 @@ class PlotHost(QWidget):
         font.setItalic(bool(spec.label_italic))
         font.setUnderline(bool(getattr(spec, "label_underline", False)))
         metrics = QFontMetrics(font)
-        max_w = 48
+        extra = _montage_label_column_extra(spec)
+        max_w = 48 + extra
         size = f"{label_pt}pt"
         row0 = int(self._data_row0)
         for row in range(n_rows):
             text = ""
             if row < len(spec.row_labels) and spec.row_labels[row]:
                 text = str(spec.row_labels[row])
-            max_w = max(max_w, int(metrics.horizontalAdvance(text)) + 10)
+            max_w = max(max_w, int(metrics.horizontalAdvance(text)) + 10 + extra)
             label = _MontageRowLabel(
                 text or " ",
                 justify="right",
@@ -2234,8 +2789,9 @@ class PlotHost(QWidget):
             self._glw.ci.layout.setColumnStretchFactor(label_col + 1, 1)
         except Exception:
             pass
+        self._apply_montage_label_offsets(spec)
 
-    def _legend_overlay_offset(self, location: str) -> tuple[int, int]:
+    def _legend_overlay_offset(self, location: str, *, extra_px: int = 0) -> tuple[int, int]:
         """Offset pyqtgraph (positif = haut/gauche, négatif = bas/droite)."""
         loc = (location or "below").strip().lower()
         mapping = {
@@ -2247,7 +2803,23 @@ class PlotHost(QWidget):
             "center left": (10, 0),
             "best": (-10, 10),
         }
-        return mapping.get(loc, (-10, 10))
+        dx, dy = mapping.get(loc, (-10, 10))
+        extra = max(0, int(extra_px))
+        if extra:
+            if dx < 0:
+                dx -= extra
+            elif dx > 0:
+                dx += extra
+            if dy > 0:
+                dy += extra
+            elif dy < 0:
+                dy -= extra
+        return dx, dy
+
+    @staticmethod
+    def _legend_gap_px(spec: PanelSpec) -> int:
+        """Écart légende ↔ graphique (fraction d’axes → pixels)."""
+        return max(0, int(round(float(getattr(spec, "legend_gap", 0.0) or 0.0) * 160.0)))
 
     def _place_legend(
         self,
@@ -2264,15 +2836,14 @@ class PlotHost(QWidget):
         font_pt = max(5, int(round(float(spec.legend_font_size or 9.0))))
         columns = max(1, int(spec.legend_columns or 1))
         frame = bool(spec.legend_frame)
-        # gap (fraction) → espacement vertical entre entrées (px approximatif).
-        ver_spacing = max(0, int(round(2.0 + 18.0 * float(spec.legend_gap or 0.0))))
+        gap_px = self._legend_gap_px(spec)
         location = str(spec.legend_location or "below")
         below = location.strip().lower() in {"below", ""}
         self._remove_legend()
         legend = pg.LegendItem(
-            offset=(0, 0) if below else self._legend_overlay_offset(location),
+            offset=(0, 0) if below else self._legend_overlay_offset(location, extra_px=gap_px),
             horSpacing=8,
-            verSpacing=ver_spacing,
+            verSpacing=4,
             labelTextSize=f"{font_pt}pt",
             labelTextColor=c["fg"],
             colCount=columns,
@@ -2290,6 +2861,8 @@ class PlotHost(QWidget):
             self._glw.addItem(legend, row=legend_row, col=plot_col)
             try:
                 self._glw.ci.layout.setRowStretchFactor(legend_row, 0)
+                if legend_row > 0:
+                    self._glw.ci.layout.setRowSpacing(legend_row - 1, gap_px)
             except Exception:
                 pass
         else:
@@ -2298,7 +2871,7 @@ class PlotHost(QWidget):
                 legend.anchor(
                     itemPos=(1, 0) if "right" in location else (0, 0),
                     parentPos=(1, 0) if "right" in location else (0, 0),
-                    offset=self._legend_overlay_offset(location),
+                    offset=self._legend_overlay_offset(location, extra_px=gap_px),
                 )
             except Exception:
                 pass
@@ -2351,7 +2924,13 @@ class PlotHost(QWidget):
         """Réserver axe droit (Y) et hauteur bas (X) hors zone de tracé."""
         from plot_utils import format_scale_label
 
-        font = QFont("Segoe UI", max(7, int(round(float(bars.fontsize)))))
+        spec = self._spec
+        font = _tick_qfont(
+            max(7, int(round(float(bars.fontsize)))),
+            bold=bool(getattr(spec, "tick_bold", False)),
+            italic=bool(getattr(spec, "tick_italic", False)),
+            underline=bool(getattr(spec, "tick_underline", False)),
+        )
         metrics = QFontMetrics(font)
         label_w = 28
         for row, (_x_size, y_size) in enumerate(self._scale_bar_lengths):
@@ -2578,7 +3157,13 @@ class PlotHost(QWidget):
         qcolor = QColor(color)
         pen = QPen(qcolor, float(bars.linewidth))
         pen.setCosmetic(True)
-        font = QFont("Segoe UI", max(7, int(round(float(bars.fontsize)))))
+        spec = self._spec
+        font = _tick_qfont(
+            max(7, int(round(float(bars.fontsize)))),
+            bold=bool(getattr(spec, "tick_bold", False)),
+            italic=bool(getattr(spec, "tick_italic", False)),
+            underline=bool(getattr(spec, "tick_underline", False)),
+        )
         metrics = QFontMetrics(font)
         lengths = self._scale_bar_lengths
         if len(lengths) != len(self._plots):
@@ -2665,9 +3250,7 @@ class PlotHost(QWidget):
         line.setZValue(50)
         self._scale_bar_items.append((plot, line))
 
-        text = QGraphicsSimpleTextItem(label)
-        text.setFont(font)
-        text.setBrush(brush)
+        text = _scale_label_item(label, font, brush)
         text.setParentItem(axis)
         text.setZValue(50)
         text_h = float(metrics.height())
@@ -2711,9 +3294,7 @@ class PlotHost(QWidget):
         line.setZValue(50)
         self._scale_bar_items.append((plot, line))
 
-        text = QGraphicsSimpleTextItem(label)
-        text.setFont(font)
-        text.setBrush(brush)
+        text = _scale_label_item(label, font, brush)
         text.setParentItem(axis)
         text.setZValue(50)
         text_w = float(metrics.horizontalAdvance(label))

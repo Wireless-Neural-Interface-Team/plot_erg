@@ -77,6 +77,12 @@ class DrawAppearance:
         legend_font_size: float | None = None,
     ) -> DrawAppearance:
         """Construire depuis ``view_config.PanelStyle`` (+ taille légende optionnelle)."""
+        from view_config import (
+            resolved_stim_linewidth,
+            resolved_stim_offset_color,
+            resolved_stim_onset_color,
+        )
+
         lw = float(getattr(style, "line_width", 1.2))
         return cls(
             axis_label_font_size=float(getattr(style, "label_font_size", 9.0)),
@@ -89,9 +95,11 @@ class DrawAppearance:
                 else getattr(style, "label_font_size", 9.0)
             ),
             line_width=lw,
-            stim_linewidth=max(0.7, lw * 0.95),
+            stim_linewidth=resolved_stim_linewidth(style),
             grid=bool(getattr(style, "grid", True)),
             grid_alpha=float(getattr(style, "grid_alpha", DEFAULT_GRID_ALPHA)),
+            stim_onset_color=resolved_stim_onset_color(style),
+            stim_offset_color=resolved_stim_offset_color(style),
         )
 
     def layout_fonts(self) -> LayoutFonts:
@@ -173,17 +181,19 @@ def mark_stim_times(
     alpha: float = 0.55,
     linewidth: float | None = None,
     linestyle: str = "--",
+    color: str | None = None,
 ) -> None:
-    """Marqueurs d’onset (liste de temps) — continuous / montage."""
+    """Marqueurs de stimulation (liste de temps) — continuous / montage."""
     xs = [float(t) for t in times]
     if not xs:
         return
     app = appearance or DrawAppearance.for_pdf()
-    lw = float(linewidth) if linewidth is not None else max(0.55, float(app.stim_linewidth) * 0.7)
+    lw = float(linewidth) if linewidth is not None else float(app.stim_linewidth)
+    ink = str(color) if color else app.stim_onset_color
     if len(xs) == 1:
         ax.axvline(
             xs[0],
-            color=app.stim_onset_color,
+            color=ink,
             linestyle=linestyle,
             linewidth=lw,
             alpha=alpha,
@@ -194,7 +204,7 @@ def mark_stim_times(
         ymin=0.0,
         ymax=1.0,
         transform=ax.get_xaxis_transform(),
-        colors=app.stim_onset_color,
+        colors=ink,
         linestyles=linestyle,
         linewidths=lw,
         alpha=alpha,

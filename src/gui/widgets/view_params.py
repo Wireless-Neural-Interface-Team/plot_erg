@@ -26,8 +26,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from display_config import STIM_OFFSET_COLOR, STIM_ONSET_COLOR
 from gui.form_widgets import (
     AxisLimitRow,
+    ColorSwatchButton,
     FitWidthScrollArea,
     FontSizeFaceRow,
     configure_narrow_form,
@@ -190,10 +192,10 @@ class LocalViewParams(QWidget):
                 widget.valueChanged.connect(self._emit_changed)
             elif hasattr(widget, "currentIndexChanged"):
                 widget.currentIndexChanged.connect(self._emit_changed)
-            elif hasattr(widget, "toggled"):
-                widget.toggled.connect(self._emit_changed)
             elif hasattr(widget, "changed"):
                 widget.changed.connect(self._emit_changed)
+            elif hasattr(widget, "toggled"):
+                widget.toggled.connect(self._emit_changed)
             elif hasattr(widget, "textChanged"):
                 widget.textChanged.connect(self._emit_changed)
 
@@ -438,6 +440,14 @@ class LocalViewParams(QWidget):
         time_lay.setSpacing(6)
         time_lay.addWidget(self._scale_bar_time_manual)
         time_lay.addWidget(self._scale_bar_time_ms, 1)
+        bar_lw = float(getattr(style, "scale_bar_linewidth", 1.4) or 1.4)
+        self._scale_bar_linewidth = _spin(
+            0.2, 20.0, bar_lw, decimals=2, step=0.1, suffix=" pt"
+        )
+        self._scale_bar_linewidth.setToolTip(
+            "Épaisseur du trait noir des barres d’échelle flottantes "
+            "(temps et amplitude)."
+        )
         self._scale_bar_amp_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._scale_bar_time_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._show_scale_bars.toggled.connect(self._sync_scale_bar_inputs)
@@ -477,6 +487,7 @@ class LocalViewParams(QWidget):
         layout_form.addRow(self._show_scale_bars)
         layout_form.addRow("Amplitude barre :", amp_row)
         layout_form.addRow("Temps barre :", time_row)
+        layout_form.addRow("Épaisseur du trait :", self._scale_bar_linewidth)
         layout_form.addRow("Points max / courbe :", max_pts_row)
         form_layout.addWidget(layout_group)
 
@@ -575,7 +586,7 @@ class LocalViewParams(QWidget):
         loc_idx = self._legend_location.findData(legend.location)
         self._legend_location.setCurrentIndex(loc_idx if loc_idx >= 0 else 0)
         self._legend_font = FontSizeFaceRow(
-            4.0, 24.0, legend.font_size, legend.face, decimals=1, step=0.5
+            4.0, 50.0, legend.font_size, legend.face, decimals=1, step=0.5
         )
         self._legend_columns = _int_spin(1, 6, legend.columns)
         self._legend_gap = _spin(0.0, 1.0, legend.gap, decimals=2, step=0.02)
@@ -628,16 +639,35 @@ class LocalViewParams(QWidget):
             "aussi éditables dans le dock Enregistrements → Légende."
         )
         self._title_font = FontSizeFaceRow(
-            5.0, 24.0, style.title_font_size, style.title_face, decimals=1, step=0.5
+            5.0, 50.0, style.title_font_size, style.title_face, decimals=1, step=0.5
         )
         self._label_font = FontSizeFaceRow(
-            5.0, 24.0, style.label_font_size, style.label_face, decimals=1, step=0.5
+            5.0, 50.0, style.label_font_size, style.label_face, decimals=1, step=0.5
         )
         self._tick_font = FontSizeFaceRow(
-            4.0, 20.0, style.tick_font_size, style.tick_face, decimals=1, step=0.5
+            4.0, 50.0, style.tick_font_size, style.tick_face, decimals=1, step=0.5
         )
         self._line_width = _spin(
-            0.2, 8.0, style.line_width, decimals=2, step=0.1
+            0.2, 20.0, style.line_width, decimals=2, step=0.1
+        )
+        stim_lw = float(getattr(style, "stim_linewidth", 1.0) or 1.0)
+        self._stim_linewidth = _spin(0.2, 20.0, stim_lw, decimals=2, step=0.1)
+        self._stim_linewidth.setToolTip(
+            "Épaisseur (points) des pointillés de début et de fin de stimulation."
+        )
+        self._stim_onset_color = ColorSwatchButton(
+            str(getattr(style, "stim_onset_color", None) or STIM_ONSET_COLOR),
+            dialog_title="Couleur du début de stimulation",
+        )
+        self._stim_onset_color.setToolTip(
+            "Couleur des pointillés au début de chaque stimulation."
+        )
+        self._stim_offset_color = ColorSwatchButton(
+            str(getattr(style, "stim_offset_color", None) or STIM_OFFSET_COLOR),
+            dialog_title="Couleur de la fin de stimulation",
+        )
+        self._stim_offset_color.setToolTip(
+            "Couleur des pointillés à la fin de chaque stimulation."
         )
         self._grid = QCheckBox("Afficher la grille")
         self._grid.setChecked(bool(style.grid))
@@ -673,6 +703,9 @@ class LocalViewParams(QWidget):
         style_form.addRow(self._show_borders)
         style_form.addRow(self._ticks_inside)
         style_form.addRow(self._stim_markers)
+        style_form.addRow("Épaisseur du trait de stimulation :", self._stim_linewidth)
+        style_form.addRow("Couleur début de stimulation :", self._stim_onset_color)
+        style_form.addRow("Couleur fin de stimulation :", self._stim_offset_color)
         form_layout.addWidget(style_group)
 
     def _sync_scale_bar_inputs(self, *_args: Any) -> None:
@@ -685,6 +718,7 @@ class LocalViewParams(QWidget):
         self._scale_bar_time_ms.setEnabled(
             enabled and bool(self._scale_bar_time_manual.isChecked())
         )
+        self._scale_bar_linewidth.setEnabled(enabled)
 
     def _watch_widgets(self) -> list[Any]:
         widgets: list[Any] = [
@@ -710,6 +744,9 @@ class LocalViewParams(QWidget):
             self._label_font,
             self._tick_font,
             self._line_width,
+            self._stim_linewidth,
+            self._stim_onset_color,
+            self._stim_offset_color,
             self._grid,
             self._grid_alpha,
             self._show_borders,
@@ -719,6 +756,7 @@ class LocalViewParams(QWidget):
             self._scale_bar_amp,
             self._scale_bar_time_manual,
             self._scale_bar_time_ms,
+            self._scale_bar_linewidth,
             self._stim_markers,
             self._max_points,
         ]
@@ -868,6 +906,9 @@ class LocalViewParams(QWidget):
             label_face=self._label_font.face_value(),
             tick_face=self._tick_font.face_value(),
             line_width=float(self._line_width.value()),
+            stim_linewidth=float(self._stim_linewidth.value()),
+            stim_onset_color=self._stim_onset_color.color_value(),
+            stim_offset_color=self._stim_offset_color.color_value(),
             grid=bool(self._grid.isChecked()),
             grid_alpha=float(self._grid_alpha.value()),
             show_borders=bool(self._show_borders.isChecked()),
@@ -876,6 +917,7 @@ class LocalViewParams(QWidget):
             scale_bar_time_s=float(self._scale_bar_time_ms.value()) / 1000.0,
             scale_bar_amplitude_manual=bool(self._scale_bar_amp_manual.isChecked()),
             scale_bar_amplitude=float(self._scale_bar_amp.value()),
+            scale_bar_linewidth=float(self._scale_bar_linewidth.value()),
             ticks_inside=bool(self._ticks_inside.isChecked()),
             max_points_per_curve=int(self._max_points.value()),
             tight_layout=bool(self._settings.style.tight_layout),
