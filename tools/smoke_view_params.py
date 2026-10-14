@@ -23,14 +23,16 @@ from PySide6.QtWidgets import QApplication
 
 from gui.widgets.plot_host import PlotHost
 from make_synthetic_dataset import build_synthetic
-from panel_prepare import prepare_panel, screen_prepare_key
+from panel_prepare import prepare_panel, restyle_panel_spec, screen_prepare_key
 from panel_registry import PanelPlacement, RenderRequest
 from view_config import (
     AxisLimits,
     LegendSettings,
     PanelStyle,
+    TextFace,
     TextOverrides,
     ViewerSettings,
+    apply_local_display_settings,
 )
 
 
@@ -98,6 +100,26 @@ def _check_prepare(recording) -> None:
         _fail(f"épaisseur stim aperçu: {preview.stim_linewidth}")
     if abs(float(preview.series[0].linewidth) - 2.4) > 1e-6:
         _fail(f"épaisseur courbe aperçu: {preview.series[0].linewidth}")
+
+    # Override local (ex. édition de texte) : les pointillés de stim suivent le dock.
+    dock = replace(
+        base,
+        style=replace(base.style, stim_linewidth=4.5, stim_onset_color="#abcdef"),
+    )
+    frozen = replace(
+        base,
+        style=replace(base.style, stim_linewidth=1.0, line_width=3.3),
+        texts=TextOverrides(title="Titre figé"),
+    )
+    merged = apply_local_display_settings(dock, frozen, inherit_scale_bars=True)
+    if abs(float(merged.style.stim_linewidth) - 4.5) > 1e-6:
+        _fail(f"override local bloque l’épaisseur stim: {merged.style.stim_linewidth}")
+    if str(merged.style.stim_onset_color).lower() != "#abcdef":
+        _fail(f"override local bloque la couleur stim: {merged.style.stim_onset_color}")
+    if abs(float(merged.style.line_width) - 3.3) > 1e-6:
+        _fail("l’épaisseur de courbe locale a été écrasée par le dock")
+    if merged.texts.title != "Titre figé":
+        _fail("le titre local a été perdu")
 
     no_marks = replace(base, continuous_mark_stims=False)
     if _roles(prepare_panel(_request(recording, "full_recording", no_marks))) & {
@@ -212,6 +234,88 @@ def _check_prepare(recording) -> None:
     if montage_title.title != "Mon titre" or montage_title.xlabel != "t custom":
         _fail("titre / axe X montage ignorés")
 
+    # Textes et apparence — décalages titre, polices, libellés stim.
+    styled = replace(
+        base,
+        style=replace(
+            base.style,
+            title_dx_px=22.0,
+            title_dy_px=-8.0,
+            title_face=TextFace(bold=True),
+            label_face=TextFace(italic=True),
+            tick_face=TextFace(underline=True),
+            show_stim_labels=True,
+            stim_on_font_size=14.0,
+            stim_off_font_size=11.0,
+            stim_on_face=TextFace(bold=True),
+            stim_off_face=TextFace(italic=True),
+            stim_on_dx_px=7.0,
+            stim_on_dy_px=5.0,
+            stim_off_dx_px=-4.0,
+            stim_off_dy_px=9.0,
+        ),
+        texts=TextOverrides(stim_on="ON!", stim_off="OFF!"),
+        legend=replace(base.legend, location="upper right"),
+    )
+    styled_spec = prepare_panel(_request(recording, "full_recording", styled))
+    if abs(styled_spec.title_dx_px - 22.0) > 1e-6 or abs(styled_spec.title_dy_px - (-8.0)) > 1e-6:
+        _fail(
+            f"décalage titre aperçu ignoré: dx={styled_spec.title_dx_px} dy={styled_spec.title_dy_px}"
+        )
+    if not styled_spec.title_bold or not styled_spec.label_italic or not styled_spec.tick_underline:
+        _fail("faces titre / axes / ticks aperçu ignorées")
+    if styled_spec.legend_location != "upper right":
+        _fail(f"position légende aperçu ignorée: {styled_spec.legend_location}")
+    stim_labels = [
+        a for a in styled_spec.annotations if str(getattr(a, "kind", "")) == "stim_label"
+    ]
+    if not stim_labels:
+        _fail("libellés on/off absents en aperçu")
+    on_labels = [a for a in stim_labels if a.role == "stim_onset"]
+    off_labels = [a for a in stim_labels if a.role == "stim_offset"]
+    if not on_labels or str(on_labels[0].text) != "ON!":
+        _fail(f"texte début stim aperçu: {[a.text for a in on_labels]}")
+    if not off_labels or str(off_labels[0].text) != "OFF!":
+        _fail(f"texte fin stim aperçu: {[a.text for a in off_labels]}")
+    if abs(float(on_labels[0].fontsize) - 14.0) > 1e-6 or not on_labels[0].bold:
+        _fail(f"police début stim: size={on_labels[0].fontsize} bold={on_labels[0].bold}")
+    if abs(float(off_labels[0].fontsize) - 11.0) > 1e-6 or not off_labels[0].italic:
+        _fail(f"police fin stim: size={off_labels[0].fontsize} italic={off_labels[0].italic}")
+    if abs(float(on_labels[0].dx_px) - 7.0) > 1e-6 or abs(float(on_labels[0].dy_px) - 5.0) > 1e-6:
+        _fail(f"position début stim: dx={on_labels[0].dx_px} dy={on_labels[0].dy_px}")
+    if abs(float(off_labels[0].dx_px) - (-4.0)) > 1e-6 or abs(float(off_labels[0].dy_px) - 9.0) > 1e-6:
+        _fail(f"position fin stim: dx={off_labels[0].dx_px} dy={off_labels[0].dy_px}")
+
+    no_stim_labels = replace(
+        styled, style=replace(styled.style, show_stim_labels=False)
+    )
+    no_label_spec = prepare_panel(_request(recording, "full_recording", no_stim_labels))
+    if any(str(getattr(a, "kind", "")) == "stim_label" for a in no_label_spec.annotations):
+        _fail("show_stim_labels=False laisse des libellés en aperçu")
+    # Les pointillés doivent rester.
+    if "stim_onset" not in _roles(no_label_spec):
+        _fail("masquer les libellés a aussi retiré les pointillés")
+
+    empty_stim_text = replace(
+        styled, texts=TextOverrides(stim_on="", stim_off="")
+    )
+    empty_spec = prepare_panel(_request(recording, "full_recording", empty_stim_text))
+    if any(str(getattr(a, "kind", "")) == "stim_label" for a in empty_spec.annotations):
+        _fail("textes stim vides laissent des libellés en aperçu")
+
+    # restyle doit propager libellés / décalage titre sans rebuild.
+    restyled = restyle_panel_spec(
+        prepare_panel(_request(recording, "full_recording", base)),
+        _request(recording, "full_recording", styled),
+    )
+    if abs(restyled.title_dx_px - 22.0) > 1e-6:
+        _fail("restyle ignore le décalage titre")
+    restyle_labels = [
+        a for a in restyled.annotations if str(getattr(a, "kind", "")) == "stim_label"
+    ]
+    if not any(str(a.text) == "ON!" for a in restyle_labels):
+        _fail("restyle ignore le texte des libellés stim")
+
     bars = replace(
         base,
         style=replace(
@@ -222,6 +326,10 @@ def _check_prepare(recording) -> None:
             scale_bar_amplitude_manual=True,
             scale_bar_amplitude=50.0,
             scale_bar_linewidth=2.5,
+            scale_bar_dx_px=24.0,
+            scale_bar_dy_px=-16.0,
+            scale_bar_time_dx_px=-8.0,
+            scale_bar_time_dy_px=12.0,
             grid=False,
             grid_alpha=0.05,
         ),
@@ -231,11 +339,37 @@ def _check_prepare(recording) -> None:
         _fail("barres d’échelle aperçu ignorées")
     if abs(bar_spec.scale_bars.amplitude - 50.0) > 1e-9 or abs(bar_spec.scale_bars.linewidth - 2.5) > 1e-9:
         _fail("amplitude / épaisseur des barres d’échelle ignorées")
+    if abs(bar_spec.scale_bars.dx_px - 24.0) > 1e-9 or abs(bar_spec.scale_bars.dy_px - (-16.0)) > 1e-9:
+        _fail("position amplitude des barres d’échelle aperçu ignorée")
+    if abs(bar_spec.scale_bars.time_dx_px - (-8.0)) > 1e-9 or abs(bar_spec.scale_bars.time_dy_px - 12.0) > 1e-9:
+        _fail("position temps des barres d’échelle aperçu ignorée")
     if bar_spec.grid or abs(bar_spec.grid_alpha - 0.05) > 1e-9:
         _fail("grille aperçu ignorée")
     montage_bars = prepare_panel(_request(recording, "montage_continuous_raw", bars))
     if not montage_bars.scale_bars.enabled or montage_bars.grid:
         _fail("barres d’échelle ou grille montage ignorées")
+    if abs(montage_bars.scale_bars.dx_px - 24.0) > 1e-9 or abs(montage_bars.scale_bars.dy_px - (-16.0)) > 1e-9:
+        _fail("position amplitude des barres d’échelle montage ignorée")
+    if abs(montage_bars.scale_bars.time_dx_px - (-8.0)) > 1e-9 or abs(montage_bars.scale_bars.time_dy_px - 12.0) > 1e-9:
+        _fail("position temps des barres d’échelle montage ignorée")
+    # Sans champs temps dédiés : repli sur le décalage amplitude.
+    bars_fallback = replace(
+        base,
+        style=replace(
+            base.style,
+            show_scale_bars=True,
+            scale_bar_dx_px=10.0,
+            scale_bar_dy_px=-5.0,
+            scale_bar_time_dx_px=None,
+            scale_bar_time_dy_px=None,
+        ),
+    )
+    fallback_spec = prepare_panel(_request(recording, "full_recording", bars_fallback))
+    if (
+        abs(fallback_spec.scale_bars.time_dx_px - 10.0) > 1e-9
+        or abs(fallback_spec.scale_bars.time_dy_px - (-5.0)) > 1e-9
+    ):
+        _fail("repli position temps → amplitude ignoré")
 
     hidden = replace(base, legend=replace(base.legend, visible=False, frame=False, columns=3))
     if prepare_panel(_request(recording, "full_recording", hidden)).show_legend:
@@ -339,6 +473,53 @@ def _check_plot_host() -> None:
     if int(getattr(host._spec, "title_gap_px", 0) or 0) != 40:
         _fail("écart titre non conservé sur le spec dessiné")
 
+    # Police des ticks : taille + face doivent atteindre l'AxisItem et le wrap QPicture.
+    from panel_prepare import CurveSeries, PanelSpec as _PanelSpec
+
+    x = np.linspace(0.0, 1.0, 32)
+    y = np.sin(x * 6.0)
+    tick_spec = _PanelSpec(
+        title="Titre",
+        xlabel="Temps (s)",
+        ylabel="µV",
+        series=[
+            CurveSeries(
+                x=x, y=y, color="#1f77b4", label="trace", linewidth=1.2, row=0
+            )
+        ],
+        xlim=(0.0, 1.0),
+        ylim=(-2.0, 2.0),
+        layout_kind="single",
+        n_rows=1,
+        row_labels=["µV"],
+        row_ylims=[(-2.0, 2.0)],
+        row_kinds=["raw"],
+        show_borders=True,
+        ticks_inside=False,
+        show_legend=False,
+        grid=True,
+        tick_font_size=18.0,
+        tick_bold=True,
+        tick_italic=True,
+        tick_underline=True,
+    )
+    host.render_spec(tick_spec)
+    app.processEvents()
+    left = host.plot_items()[0].getAxis("left")
+    tick_font = left.style.get("tickFont")
+    if tick_font is None:
+        _fail("police des ticks absente sur l'axe")
+    if abs(float(tick_font.pointSizeF()) - 18.0) > 0.05:
+        _fail(f"taille des ticks ignorée: {tick_font.pointSizeF()}")
+    if not tick_font.bold() or not tick_font.italic() or not tick_font.underline():
+        _fail(
+            "face des ticks ignorée: "
+            f"bold={tick_font.bold()} italic={tick_font.italic()} "
+            f"underline={tick_font.underline()}"
+        )
+    if not getattr(left, "_erg_tick_face_picture", False):
+        _fail("wrap QPicture des ticks non installé (gras/italique perdus)")
+
     host.render_spec(spec(montage=True, borders=True, ticks_inside=False, gap=0.05, title_gap=0, dx=0))
     host.render_spec(spec(montage=True, borders=False, ticks_inside=True, gap=0.05, title_gap=0, dx=36))
     app.processEvents()
@@ -352,6 +533,79 @@ def _check_plot_host() -> None:
         _fail("décalage horizontal des titres montage non appliqué au rafraîchissement")
     print("plot host: ok")
     app.quit()
+
+
+def _check_montage_shared_ylim() -> None:
+    """Même échelle Y pour toutes les courbes tension ; le manuel reste prioritaire."""
+    recording = build_synthetic(label="shared-ylim", seed=9, n_channels=2, n_trials=2)
+    n_ch = int(recording.n_channels)
+    n_samp = int(recording.meta.n_samples)
+    t = np.linspace(0.0, 1.0, n_samp, dtype=np.float64)
+    wave = np.sin(2.0 * np.pi * 2.0 * t).astype(np.float32)
+    amp = np.zeros((n_ch, n_samp), dtype=np.float32)
+    amp[0] = 5.0 * wave
+    if n_ch > 1:
+        amp[1] = 100.0 * wave
+    recording.source = SimpleNamespace(
+        amplifier=amp, highpass=amp * 0.25, lowpass=amp * 0.5
+    )
+    shared = ViewerSettings(
+        continuous_streams=("raw", "hp"),
+        continuous_stream="raw",
+        montage_review_channels=2,
+        montage_shared_ylim=True,
+        preview_content="continuous",
+    )
+    spec = prepare_panel(_request(recording, "montage_continuous_raw", shared))
+    if spec.status != "ok" or len(spec.row_ylims) < 4:
+        _fail(f"échelle commune : spec {spec.status} ylims={spec.row_ylims}")
+    voltage = [ylim for ylim in spec.row_ylims[:4]]
+    if any(ylim is None for ylim in voltage):
+        _fail(f"échelle commune absente: {voltage}")
+    if any(ylim != voltage[0] for ylim in voltage[1:]):
+        _fail(f"les courbes n'ont pas la même échelle: {voltage}")
+    y0, y1 = voltage[0]
+    if y0 > -90.0 or y1 < 90.0:
+        _fail(f"l'échelle commune ne couvre pas le grand canal: {(y0, y1)}")
+    if (y1 - y0) < 40.0:
+        _fail(f"échelle encore normalisée sur le petit canal: {(y0, y1)}")
+
+    independent = replace(shared, montage_shared_ylim=False)
+    spec_off = prepare_panel(_request(recording, "montage_continuous_raw", independent))
+    if any(ylim is not None for ylim in spec_off.row_ylims[:4]):
+        _fail(f"sans l'option, l'échelle devrait rester automatique: {spec_off.row_ylims[:4]}")
+
+    restyled = restyle_panel_spec(
+        spec_off, _request(recording, "montage_continuous_raw", shared)
+    )
+    if restyled.row_ylims[:4] != spec.row_ylims[:4]:
+        _fail(
+            "restyle n'aligne pas les échelles: "
+            f"{restyled.row_ylims[:4]} vs {spec.row_ylims[:4]}"
+        )
+
+    manual = replace(
+        shared,
+        raw_ylim=AxisLimits(enabled=True, minimum=-12.0, maximum=12.0),
+    )
+    spec_manual = prepare_panel(_request(recording, "montage_continuous_raw", manual))
+    raw_rows = [
+        ylim
+        for kind, ylim in zip(spec_manual.row_kinds, spec_manual.row_ylims)
+        if str(kind) == "raw"
+    ]
+    hp_rows = [
+        ylim
+        for kind, ylim in zip(spec_manual.row_kinds, spec_manual.row_ylims)
+        if str(kind) == "hp"
+    ]
+    if not raw_rows or any(ylim != (-12.0, 12.0) for ylim in raw_rows):
+        _fail(f"l'échelle Y manuelle WIDE est écrasée: {raw_rows}")
+    if not hp_rows or any(ylim is None or ylim != hp_rows[0] for ylim in hp_rows):
+        _fail(f"HIGH devrait partager une échelle auto: {hp_rows}")
+    if hp_rows[0] == (-12.0, 12.0):
+        _fail("HIGH a repris l'échelle manuelle de WIDE")
+    print("montage shared ylim: ok")
 
 
 def _check_param_profiles() -> None:
@@ -396,6 +650,7 @@ def _check_param_profiles() -> None:
 
     panel._line_width.setValue(2.2)
     panel._montage_row_height.setValue(80)
+    panel._montage_shared_ylim.setChecked(True)
     panel._curve_low_box.setChecked(True)
     panel._text_title.setText("Titre montage")
     panel.set_content_mode("stimulation", 4, emit=False)
@@ -420,6 +675,8 @@ def _check_param_profiles() -> None:
         _fail("le seuil de déclenchement (traitement commun) a été séparé")
     if panel._montage_review_group.isVisible():
         _fail("la revue montage réapparaît dans l’aperçu")
+    if back.montage_shared_ylim:
+        _fail("l'échelle commune du montage a fuité dans l'aperçu")
 
     panel.set_view_mode("montage", emit=False)
     app.processEvents()
@@ -434,6 +691,8 @@ def _check_param_profiles() -> None:
         _fail("retour montage : courbes mélangées avec l’aperçu")
     if int(again.montage_row_min_height_px) != 80:
         _fail("retour montage : hauteur de ligne perdue")
+    if not again.montage_shared_ylim:
+        _fail("retour montage : échelle commune perdue")
     stored_preview = panel.settings_for("preview")
     if abs(stored_preview.style.line_width - 4.0) > 1e-6:
         _fail("le profil aperçu stocké a été écrasé par le montage")
@@ -447,6 +706,7 @@ def _check_param_profiles() -> None:
 def main() -> int:
     recording = _recording()
     _check_prepare(recording)
+    _check_montage_shared_ylim()
     _check_param_profiles()
     _check_plot_host()
     print("smoke_view_params: ok")

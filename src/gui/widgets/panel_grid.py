@@ -205,6 +205,18 @@ class PanelGrid(QScrollArea):
                 continue
             self._apply_panel_height(widget, placement)
 
+    def apply_fitted_height(self, placement: PanelPlacement, height: int) -> None:
+        """Hauteur réelle mesurée après dessin (montage trop court → rognage)."""
+        widget = self._panels.get(placement.key)
+        if widget is None:
+            return
+        fitted = max(140, int(height))
+        previous = getattr(widget, "fitted_height_px", None)
+        widget.fitted_height_px = fitted  # type: ignore[attr-defined]
+        if previous is not None and abs(int(previous) - fitted) <= 2:
+            return
+        self._apply_panel_height(widget, placement)
+
     def set_graph_height(self, graph_height: int) -> None:
         """Hauteur des panneaux hors montage (RMS, spikes, résumés…)."""
         height = max(140, int(graph_height))
@@ -238,6 +250,11 @@ class PanelGrid(QScrollArea):
 
     def _apply_panel_height(self, widget: object, placement: PanelPlacement) -> None:
         height = self._panel_min_height(placement)
+        fitted = getattr(widget, "fitted_height_px", None)
+        if fitted is not None and str(placement.panel).startswith("montage_"):
+            # Mesure après dessin : le bas (légende, dernier canal) ne doit
+            # pas être rogné quand les lignes sont plus hautes que le budget.
+            height = max(height, int(fitted))
         widget.setMinimumHeight(height)  # type: ignore[attr-defined]
         # Hauteur fixe pour tous les graphs (scroll si la fenêtre est plus petite).
         # fill (legacy) : Expanding pour occuper le viewport.

@@ -45,6 +45,7 @@ from view_config import (
     PanelStyle,
     TextOverrides,
     ViewerSettings,
+    resolved_scale_bar_time_offset_px,
 )
 
 # Réexport pour params_panel et autres imports historiques.
@@ -448,6 +449,45 @@ class LocalViewParams(QWidget):
             "Épaisseur du trait noir des barres d’échelle flottantes "
             "(temps et amplitude)."
         )
+        self._scale_bar_dx = _int_spin(
+            -400,
+            400,
+            int(round(float(getattr(style, "scale_bar_dx_px", 0.0) or 0.0))),
+            suffix=" px",
+        )
+        self._scale_bar_dx.setToolTip(
+            "Décalage horizontal de l’échelle amplitude (axe vertical). "
+            "0 = position par défaut. "
+            "Positif décale vers la droite, négatif vers la gauche."
+        )
+        self._scale_bar_dy = _int_spin(
+            -400,
+            400,
+            int(round(float(getattr(style, "scale_bar_dy_px", 0.0) or 0.0))),
+            suffix=" px",
+        )
+        self._scale_bar_dy.setToolTip(
+            "Décalage vertical de l’échelle amplitude (axe vertical). "
+            "0 = position par défaut. "
+            "Positif monte la barre, négatif la descend."
+        )
+        _time_dx0, _time_dy0 = resolved_scale_bar_time_offset_px(style)
+        self._scale_bar_time_dx = _int_spin(
+            -400, 400, int(round(float(_time_dx0))), suffix=" px"
+        )
+        self._scale_bar_time_dx.setToolTip(
+            "Décalage horizontal de l’échelle temps (axe horizontal). "
+            "0 = position par défaut. "
+            "Positif décale vers la droite, négatif vers la gauche."
+        )
+        self._scale_bar_time_dy = _int_spin(
+            -400, 400, int(round(float(_time_dy0))), suffix=" px"
+        )
+        self._scale_bar_time_dy.setToolTip(
+            "Décalage vertical de l’échelle temps (axe horizontal). "
+            "0 = position par défaut. "
+            "Positif monte la barre, négatif la descend."
+        )
         self._scale_bar_amp_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._scale_bar_time_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._show_scale_bars.toggled.connect(self._sync_scale_bar_inputs)
@@ -488,6 +528,10 @@ class LocalViewParams(QWidget):
         layout_form.addRow("Amplitude barre :", amp_row)
         layout_form.addRow("Temps barre :", time_row)
         layout_form.addRow("Épaisseur du trait :", self._scale_bar_linewidth)
+        layout_form.addRow("Temps — horizontal :", self._scale_bar_time_dx)
+        layout_form.addRow("Temps — vertical :", self._scale_bar_time_dy)
+        layout_form.addRow("Amplitude — horizontal :", self._scale_bar_dx)
+        layout_form.addRow("Amplitude — vertical :", self._scale_bar_dy)
         layout_form.addRow("Points max / courbe :", max_pts_row)
         form_layout.addWidget(layout_group)
 
@@ -641,6 +685,24 @@ class LocalViewParams(QWidget):
         self._title_font = FontSizeFaceRow(
             5.0, 50.0, style.title_font_size, style.title_face, decimals=1, step=0.5
         )
+        self._title_dx = _int_spin(
+            -400,
+            400,
+            int(round(float(getattr(style, "title_dx_px", 0.0) or 0.0))),
+            suffix=" px",
+        )
+        self._title_dx.setToolTip(
+            "Décalage horizontal du titre de graphique. Positif = droite."
+        )
+        self._title_dy = _int_spin(
+            -400,
+            400,
+            int(round(float(getattr(style, "title_dy_px", 0.0) or 0.0))),
+            suffix=" px",
+        )
+        self._title_dy.setToolTip(
+            "Décalage vertical du titre de graphique. Positif = haut."
+        )
         self._label_font = FontSizeFaceRow(
             5.0, 50.0, style.label_font_size, style.label_face, decimals=1, step=0.5
         )
@@ -669,6 +731,70 @@ class LocalViewParams(QWidget):
         self._stim_offset_color.setToolTip(
             "Couleur des pointillés à la fin de chaque stimulation."
         )
+        self._text_stim_on = QLineEdit(str(texts.stim_on if texts.stim_on is not None else "on"))
+        self._text_stim_on.setPlaceholderText("on")
+        self._text_stim_on.setToolTip(
+            "Texte au-dessus du trait de début de stimulation. Vide = masquer."
+        )
+        self._text_stim_off = QLineEdit(
+            str(texts.stim_off if texts.stim_off is not None else "off")
+        )
+        self._text_stim_off.setPlaceholderText("off")
+        self._text_stim_off.setToolTip(
+            "Texte au-dessus du trait de fin de stimulation. Vide = masquer."
+        )
+        self._stim_on_font = FontSizeFaceRow(
+            4.0,
+            50.0,
+            float(getattr(style, "stim_on_font_size", 8.0) or 8.0),
+            getattr(style, "stim_on_face", None),
+            decimals=1,
+            step=0.5,
+        )
+        self._stim_off_font = FontSizeFaceRow(
+            4.0,
+            50.0,
+            float(getattr(style, "stim_off_font_size", 8.0) or 8.0),
+            getattr(style, "stim_off_face", None),
+            decimals=1,
+            step=0.5,
+        )
+        self._stim_on_dx = _int_spin(
+            -400,
+            400,
+            int(round(float(getattr(style, "stim_on_dx_px", 0.0) or 0.0))),
+            suffix=" px",
+        )
+        self._stim_on_dx.setToolTip(
+            "Décalage horizontal du libellé « on ». Positif = droite."
+        )
+        self._stim_on_dy = _int_spin(
+            -400,
+            400,
+            int(round(float(getattr(style, "stim_on_dy_px", 0.0) or 0.0))),
+            suffix=" px",
+        )
+        self._stim_on_dy.setToolTip(
+            "Décalage vertical du libellé « on ». Positif = haut."
+        )
+        self._stim_off_dx = _int_spin(
+            -400,
+            400,
+            int(round(float(getattr(style, "stim_off_dx_px", 0.0) or 0.0))),
+            suffix=" px",
+        )
+        self._stim_off_dx.setToolTip(
+            "Décalage horizontal du libellé « off ». Positif = droite."
+        )
+        self._stim_off_dy = _int_spin(
+            -400,
+            400,
+            int(round(float(getattr(style, "stim_off_dy_px", 0.0) or 0.0))),
+            suffix=" px",
+        )
+        self._stim_off_dy.setToolTip(
+            "Décalage vertical du libellé « off ». Positif = haut."
+        )
         self._grid = QCheckBox("Afficher la grille")
         self._grid.setChecked(bool(style.grid))
         self._grid_alpha = _spin(
@@ -689,12 +815,22 @@ class LocalViewParams(QWidget):
         self._stim_markers.setToolTip(
             "Lignes en pointillés au début (et à la fin) de stimulation sur les graphiques."
         )
+        self._show_stim_labels = QCheckBox("Libellés on / off sur les traits")
+        self._show_stim_labels.setChecked(
+            bool(getattr(style, "show_stim_labels", True))
+        )
+        self._show_stim_labels.setToolTip(
+            "Afficher les textes « on » et « off » juste sous le haut des traits "
+            "de début et de fin de stimulation."
+        )
         style_form.addRow("Titre :", self._text_title)
         style_form.addRow("Axe X :", self._text_xlabel)
         style_form.addRow("Axe Y :", self._text_ylabel)
         style_form.addRow(self._text_series_suffix)
         style_form.addRow("Légendes :", self._text_legend_labels)
         style_form.addRow("Police du titre :", self._title_font)
+        style_form.addRow("Titre — horizontal :", self._title_dx)
+        style_form.addRow("Titre — vertical :", self._title_dy)
         style_form.addRow("Police des axes :", self._label_font)
         style_form.addRow("Police des ticks :", self._tick_font)
         style_form.addRow("Épaisseur de trait :", self._line_width)
@@ -706,6 +842,17 @@ class LocalViewParams(QWidget):
         style_form.addRow("Épaisseur du trait de stimulation :", self._stim_linewidth)
         style_form.addRow("Couleur début de stimulation :", self._stim_onset_color)
         style_form.addRow("Couleur fin de stimulation :", self._stim_offset_color)
+        style_form.addRow(self._show_stim_labels)
+        style_form.addRow("Texte début (on) :", self._text_stim_on)
+        style_form.addRow("Police début (on) :", self._stim_on_font)
+        style_form.addRow("Début — horizontal :", self._stim_on_dx)
+        style_form.addRow("Début — vertical :", self._stim_on_dy)
+        style_form.addRow("Texte fin (off) :", self._text_stim_off)
+        style_form.addRow("Police fin (off) :", self._stim_off_font)
+        style_form.addRow("Fin — horizontal :", self._stim_off_dx)
+        style_form.addRow("Fin — vertical :", self._stim_off_dy)
+        self._show_stim_labels.toggled.connect(self._sync_stim_label_inputs)
+        self._sync_stim_label_inputs()
         form_layout.addWidget(style_group)
 
     def _sync_scale_bar_inputs(self, *_args: Any) -> None:
@@ -719,6 +866,24 @@ class LocalViewParams(QWidget):
             enabled and bool(self._scale_bar_time_manual.isChecked())
         )
         self._scale_bar_linewidth.setEnabled(enabled)
+        self._scale_bar_dx.setEnabled(enabled)
+        self._scale_bar_dy.setEnabled(enabled)
+        self._scale_bar_time_dx.setEnabled(enabled)
+        self._scale_bar_time_dy.setEnabled(enabled)
+
+    def _sync_stim_label_inputs(self, *_args: Any) -> None:
+        enabled = bool(self._show_stim_labels.isChecked())
+        for widget in (
+            self._text_stim_on,
+            self._text_stim_off,
+            self._stim_on_font,
+            self._stim_off_font,
+            self._stim_on_dx,
+            self._stim_on_dy,
+            self._stim_off_dx,
+            self._stim_off_dy,
+        ):
+            widget.setEnabled(enabled)
 
     def _watch_widgets(self) -> list[Any]:
         widgets: list[Any] = [
@@ -740,13 +905,24 @@ class LocalViewParams(QWidget):
             self._text_ylabel,
             self._text_series_suffix,
             self._text_legend_labels,
+            self._text_stim_on,
+            self._text_stim_off,
             self._title_font,
+            self._title_dx,
+            self._title_dy,
             self._label_font,
             self._tick_font,
+            self._stim_on_font,
+            self._stim_off_font,
+            self._stim_on_dx,
+            self._stim_on_dy,
+            self._stim_off_dx,
+            self._stim_off_dy,
             self._line_width,
             self._stim_linewidth,
             self._stim_onset_color,
             self._stim_offset_color,
+            self._show_stim_labels,
             self._grid,
             self._grid_alpha,
             self._show_borders,
@@ -757,6 +933,10 @@ class LocalViewParams(QWidget):
             self._scale_bar_time_manual,
             self._scale_bar_time_ms,
             self._scale_bar_linewidth,
+            self._scale_bar_dx,
+            self._scale_bar_dy,
+            self._scale_bar_time_dx,
+            self._scale_bar_time_dy,
             self._stim_markers,
             self._max_points,
         ]
@@ -881,6 +1061,8 @@ class LocalViewParams(QWidget):
                 self._text_legend_labels.setPlainText("\n".join(texts.legend_labels))
             else:
                 self._text_legend_labels.setPlainText("")
+            self._text_stim_on.setText(str(getattr(texts, "stim_on", "on") or ""))
+            self._text_stim_off.setText(str(getattr(texts, "stim_off", "off") or ""))
         finally:
             self._updating = False
         self._emit_changed()
@@ -905,10 +1087,21 @@ class LocalViewParams(QWidget):
             title_face=self._title_font.face_value(),
             label_face=self._label_font.face_value(),
             tick_face=self._tick_font.face_value(),
+            title_dx_px=float(self._title_dx.value()),
+            title_dy_px=float(self._title_dy.value()),
             line_width=float(self._line_width.value()),
             stim_linewidth=float(self._stim_linewidth.value()),
             stim_onset_color=self._stim_onset_color.color_value(),
             stim_offset_color=self._stim_offset_color.color_value(),
+            show_stim_labels=bool(self._show_stim_labels.isChecked()),
+            stim_on_font_size=self._stim_on_font.size_value(),
+            stim_off_font_size=self._stim_off_font.size_value(),
+            stim_on_face=self._stim_on_font.face_value(),
+            stim_off_face=self._stim_off_font.face_value(),
+            stim_on_dx_px=float(self._stim_on_dx.value()),
+            stim_on_dy_px=float(self._stim_on_dy.value()),
+            stim_off_dx_px=float(self._stim_off_dx.value()),
+            stim_off_dy_px=float(self._stim_off_dy.value()),
             grid=bool(self._grid.isChecked()),
             grid_alpha=float(self._grid_alpha.value()),
             show_borders=bool(self._show_borders.isChecked()),
@@ -918,6 +1111,10 @@ class LocalViewParams(QWidget):
             scale_bar_amplitude_manual=bool(self._scale_bar_amp_manual.isChecked()),
             scale_bar_amplitude=float(self._scale_bar_amp.value()),
             scale_bar_linewidth=float(self._scale_bar_linewidth.value()),
+            scale_bar_dx_px=float(self._scale_bar_dx.value()),
+            scale_bar_dy_px=float(self._scale_bar_dy.value()),
+            scale_bar_time_dx_px=float(self._scale_bar_time_dx.value()),
+            scale_bar_time_dy_px=float(self._scale_bar_time_dy.value()),
             ticks_inside=bool(self._ticks_inside.isChecked()),
             max_points_per_curve=int(self._max_points.value()),
             tight_layout=bool(self._settings.style.tight_layout),
@@ -934,6 +1131,8 @@ class LocalViewParams(QWidget):
             ylabel=self._text_ylabel.text().strip(),
             legend_labels=legend_lines,
             show_series_suffix=bool(self._text_series_suffix.isChecked()),
+            stim_on=self._text_stim_on.text(),
+            stim_off=self._text_stim_off.text(),
         )
         analysis = self._analysis_from_ui()
         kwargs: dict[str, Any] = {

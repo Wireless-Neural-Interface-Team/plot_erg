@@ -48,6 +48,9 @@ from view_config import (
     continuous_sync_offset_s,
     included_channel_indices,
     resolved_scale_bar_linewidth,
+    resolved_scale_bar_offset_px,
+    resolved_scale_bar_time_offset_px,
+    resolved_range_bar_color,
     resolved_stim_linewidth,
     resolved_stim_offset_color,
     resolved_stim_onset_color,
@@ -181,12 +184,42 @@ def _bottom_margin_for(
     return min(0.55, max(base, needed))
 
 
+def _scale_bar_margin_extra(
+    style: object | None,
+    *,
+    fig_width_in: float,
+    fig_height_in: float,
+    dpi: float = 100.0,
+) -> tuple[float, float]:
+    """Extra (right_shrink, bottom_grow) en fraction de figure pour le décalage.
+
+    Un ``dx`` positif élargit la marge droite ; un ``dy`` négatif (vers le bas)
+    élargit la marge basse — pour que les barres restent dans la figure.
+    """
+    if style is None or not bool(getattr(style, "show_scale_bars", False)):
+        return (0.0, 0.0)
+    amp_dx, _amp_dy = resolved_scale_bar_offset_px(style)
+    _time_dx, time_dy = resolved_scale_bar_time_offset_px(style)
+    dpi = float(dpi) if float(dpi) > 0 else 100.0
+    fig_w_px = max(1.0, float(fig_width_in) * dpi)
+    fig_h_px = max(1.0, float(fig_height_in) * dpi)
+    # Uniquement le décalage qui ferait sortir les barres (pas de pad si 0).
+    right_px = max(0.0, float(amp_dx))
+    bottom_px = max(0.0, -float(time_dy))
+    if right_px > 0.0:
+        right_px += 8.0
+    if bottom_px > 0.0:
+        bottom_px += 8.0
+    return (min(0.25, right_px / fig_w_px), min(0.30, bottom_px / fig_h_px))
+
+
 def _apply_uniform_axes_box(
     figure: Any,
     *,
     show_scale_bars: bool = False,
     montage: bool = False,
     legend: LegendSettings | None = None,
+    style: object | None = None,
 ) -> None:
     """Imposer la même boîte d’axes (largeur pixel identique) à toute la figure."""
     _disable_layout_engine(figure)
@@ -201,6 +234,14 @@ def _apply_uniform_axes_box(
         fig_h = float(figure.get_figheight())
     except Exception:
         fig_h = 4.0
+    try:
+        fig_w = float(figure.get_figwidth())
+    except Exception:
+        fig_w = 6.0
+    try:
+        dpi = float(getattr(figure, "dpi", 100.0) or 100.0)
+    except Exception:
+        dpi = 100.0
     bottom = _bottom_margin_for(
         montage=montage,
         show_scale_bars=show_scale_bars,
@@ -209,9 +250,29 @@ def _apply_uniform_axes_box(
         n_legend_entries=_count_legend_entries(figure),
         fig_height_in=fig_h,
     )
+    right_extra, bottom_extra = _scale_bar_margin_extra(
+        style if style is not None else None,
+        fig_width_in=fig_w,
+        fig_height_in=fig_h,
+        dpi=dpi,
+    )
+    if show_scale_bars and (right_extra or bottom_extra):
+        right = max(_AXES_LEFT + 0.35, right - right_extra)
+        bottom = min(0.55, bottom + bottom_extra)
+    left = _AXES_LEFT
+    title_top, title_left, title_right = _title_margin_extra(
+        style if style is not None else None,
+        fig_width_in=fig_w,
+        fig_height_in=fig_h,
+        dpi=dpi,
+    )
+    if title_top or title_left or title_right:
+        top = max(bottom + 0.20, top - title_top)
+        left = min(right - 0.35, left + title_left)
+        right = max(left + 0.35, right - title_right)
     try:
         figure.subplots_adjust(
-            left=_AXES_LEFT,
+            left=left,
             right=right,
             top=top,
             bottom=bottom,
@@ -220,6 +281,27 @@ def _apply_uniform_axes_box(
     except Exception:
         pass
     _fit_below_legend(figure, legend)
+
+
+def _title_margin_extra(
+    style: object | None,
+    *,
+    fig_width_in: float,
+    fig_height_in: float,
+    dpi: float = 100.0,
+) -> tuple[float, float, float]:
+    """Extra (top_shrink, left_grow, right_shrink) pour un titre décalé."""
+    if style is None:
+        return (0.0, 0.0, 0.0)
+    from plot_utils import title_offset_margin_fractions
+
+    return title_offset_margin_fractions(
+        float(getattr(style, "title_dx_px", 0.0) or 0.0),
+        float(getattr(style, "title_dy_px", 0.0) or 0.0),
+        fig_width_in=fig_width_in,
+        fig_height_in=fig_height_in,
+        dpi=dpi,
+    )
 
 
 def _fit_below_legend(figure: Any, legend: LegendSettings | None) -> None:
@@ -364,8 +446,8 @@ class RenderRequest:
     probe_layout: Any | None = None
     impedance_sessions: list[ImpedanceSession] = field(default_factory=list)
     # Zones de zoom à surligner sur la vue complète (définies par l’utilisateur).
-    # Chaque entrée : (t0_s, t1_s, label). Vide = aucune bande de zoom.
-    highlight_zooms: tuple[tuple[float, float, str], ...] = ()
+    # Chaque entrée : (t0_s, t1_s, label, color_hex). Vide = aucune bande de zoom.
+    highlight_zooms: tuple[tuple[float, float, str, str], ...] = ()
     # True = garder zoom/pan utilisateur après le redessin (ex. bascule Stim).
     preserve_view: bool = False
 
@@ -397,11 +479,13 @@ class RenderRequest:
         ]
 
     def section_window(self) -> tuple[float, float] | None:
-        """Limites X de la section demandée, ou None si indisponible."""
-        reference = self.reference
-        if reference is None:
-            return None
-        # Zoom personnalisé défini sur le placement (prioritaire sur l’échelle X globale).
+        """Limites X de la section demandée, ou None si indisponible.
+
+        Un zoom personnalisé sur le placement est toujours prioritaire sur
+        ``settings.x_limits`` (aperçu / dock) — même sans enregistrement de
+        référence : ne jamais retomber sur l’échelle X de l’aperçu.
+        """
+        # Zoom personnalisé : ne dépend pas de ``reference`` pour le cas continuous.
         if self.placement.has_custom_zoom:
             t0 = float(self.placement.zoom_t0_s)
             t1 = float(self.placement.zoom_t1_s)
@@ -411,6 +495,9 @@ class RenderRequest:
             # Zooms saisis « relatifs à la stim » = déjà en t_rel.
             # Toujours borner à t_rel : sinon xlim trop large → courbes tronquées à droite.
             if str(self.panel).startswith("analysis_"):
+                reference = self.reference
+                if reference is None:
+                    return t0, t1
                 if self.placement.zoom_absolute:
                     stim_index = self.settings.analysis.trigger_index()
                     converted = _absolute_range_to_relative(
@@ -424,10 +511,16 @@ class RenderRequest:
                         return clipped
                 t_rel = reference.t_rel
                 if t_rel.size == 0:
-                    return None
+                    return t0, t1
                 return float(t_rel[0]), float(t_rel[-1])
             return t0, t1
-        # Échelle X manuelle : s’applique aux graphs temporels sans zoom dédié.
+
+        reference = self.reference
+        if reference is None:
+            # Sans zoom custom ni référence : éventuellement l’échelle X manuelle.
+            return self.settings.x_limits.as_tuple()
+
+        # Échelle X manuelle : graphs temporels sans zoom dédié uniquement.
         # Panels en t_rel (analyse / spikes) : ignorer si hors plage relative
         # (souvent des bornes continuous en temps fichier).
         manual_x = self.settings.x_limits.as_tuple()
@@ -791,9 +884,13 @@ def _scale_bar_lengths(
 
     y_size: float | None = None
     if y_unit is not None and y_span > 0:
+        # Manuel = µV seulement (spin « amplitude ») ; Hz / ms → auto.
         y_size = resolve_scale_bar_length(
             y_span,
-            manual=bool(getattr(style, "scale_bar_amplitude_manual", False)),
+            manual=(
+                bool(getattr(style, "scale_bar_amplitude_manual", False))
+                and y_unit == "µV"
+            ),
             value=float(getattr(style, "scale_bar_amplitude", 100.0) or 100.0),
         )
     return (x_size, y_size)
@@ -840,6 +937,8 @@ def _apply_scale_bars(
         clear_floating_scale_bars(ax)
         return
     x_size, y_size = _scale_bar_lengths(style, x_unit=x_unit, y_unit=y_unit, ax=ax)
+    dx_px, dy_px = resolved_scale_bar_offset_px(style)
+    time_dx_px, time_dy_px = resolved_scale_bar_time_offset_px(style)
     draw_floating_scale_bars(
         ax,
         x_unit=x_unit,
@@ -852,6 +951,10 @@ def _apply_scale_bars(
         # est réservée pour ça (sinon le libellé Y reste dans la zone de tracé).
         gutter=True,
         face=style.tick_face,
+        dx_px=dx_px,
+        dy_px=dy_px,
+        x_dx_px=time_dx_px,
+        x_dy_px=time_dy_px,
     )
 
 
@@ -910,6 +1013,7 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
         show_scale_bars=show_bars,
         montage=len(axes) > 1,
         legend=request.legend,
+        style=style,
     )
     if not show_bars:
         for ax in axes:
@@ -923,6 +1027,8 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
     last = len(axes) - 1
     fontsize = float(style.tick_font_size)
     linewidth = resolved_scale_bar_linewidth(style)
+    dx_px, dy_px = resolved_scale_bar_offset_px(style)
+    time_dx_px, time_dy_px = resolved_scale_bar_time_offset_px(style)
 
     def _units_for_row(row: int) -> tuple[str | None, str | None]:
         if row < len(row_kinds):
@@ -962,6 +1068,8 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
                 linewidth=linewidth,
                 gutter=True,
                 face=style.tick_face,
+                dx_px=dx_px,
+                dy_px=dy_px,
             )
         else:
             clear_floating_scale_bars(ax)
@@ -978,6 +1086,8 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
                 clear=False,
                 below=True,
                 face=style.tick_face,
+                dx_px=time_dx_px,
+                dy_px=time_dy_px,
             )
 
 
@@ -990,6 +1100,7 @@ def _apply_axis_style(
 ) -> None:
     ax.title.set_fontsize(style.title_font_size)
     apply_text_face(ax.title, style.title_face)
+    _apply_axis_title_offset(ax, style)
     ax.xaxis.label.set_fontsize(style.label_font_size)
     ax.yaxis.label.set_fontsize(style.label_font_size)
     apply_text_face(ax.xaxis.label, style.label_face)
@@ -1018,8 +1129,31 @@ def _apply_axis_style(
         _apply_figure_title_style(figure, style)
 
 
+def _title_offset_px(style: PanelStyle | object) -> tuple[float, float]:
+    """Décalage (dx, dy) du titre de graphique, en pixels."""
+    return (
+        float(getattr(style, "title_dx_px", 0.0) or 0.0),
+        float(getattr(style, "title_dy_px", 0.0) or 0.0),
+    )
+
+
+def _apply_axis_title_offset(ax: Any, style: PanelStyle | object) -> None:
+    """Position du titre d’axe selon ``title_dx_px`` / ``title_dy_px``."""
+    from plot_utils import apply_title_pixel_offset
+
+    dx, dy = _title_offset_px(style)
+    apply_title_pixel_offset(
+        getattr(ax, "title", None),
+        getattr(ax, "figure", None),
+        dx_px=dx,
+        dy_px=dy,
+    )
+
+
 def _apply_figure_title_style(figure: Any, style: PanelStyle) -> None:
     """Style du ``suptitle`` (montages) aligné sur la police de titre."""
+    from plot_utils import apply_title_pixel_offset
+
     sup = getattr(figure, "_suptitle", None)
     if sup is None:
         return
@@ -1028,6 +1162,8 @@ def _apply_figure_title_style(figure: Any, style: PanelStyle) -> None:
     except Exception:
         pass
     apply_text_face(sup, style.title_face)
+    dx, dy = _title_offset_px(style)
+    apply_title_pixel_offset(sup, figure, dx_px=dx, dy_px=dy)
 
 
 def _dedupe(handles: Sequence[Any], labels: Sequence[str]) -> tuple[list[Any], list[str]]:
@@ -1140,6 +1276,7 @@ def _apply_text_overrides(figure: Any, request: RenderRequest) -> None:
             axes[0].set_title(title)
             axes[0].title.set_fontsize(style.title_font_size)
             apply_text_face(axes[0].title, style.title_face)
+            _apply_axis_title_offset(axes[0], style)
     if xlabel:
         axes[-1].set_xlabel(xlabel)
         axes[-1].xaxis.label.set_fontsize(style.label_font_size)
@@ -1163,15 +1300,20 @@ def _apply_text_overrides(figure: Any, request: RenderRequest) -> None:
             apply_text_face(axes[0].yaxis.label, style.label_face)
 
 
-_ZOOM_SPAN_COLORS = ("#22c55e", "#eab308", "#38bdf8", "#a78bfa", "#fb7185")
-
-
 def highlight_zooms_from_placements(
     placements: Sequence[PanelPlacement],
-) -> tuple[tuple[float, float, str], ...]:
+    *,
+    range_bars: Sequence[Any] | None = None,
+) -> tuple[tuple[float, float, str, str], ...]:
     """Extraire les fenêtres de zoom relatives (surlignage sur graphs d’analyse)."""
+    color_by_id: dict[str, str] = {}
+    if range_bars:
+        for index, bar in enumerate(range_bars):
+            bar_id = str(getattr(bar, "bar_id", "") or "").strip()
+            if bar_id:
+                color_by_id[bar_id] = resolved_range_bar_color(bar, index)
     seen: set[tuple[float, float]] = set()
-    out: list[tuple[float, float, str]] = []
+    out: list[tuple[float, float, str, str]] = []
     for placement in placements:
         if not placement.has_custom_zoom:
             continue
@@ -1185,13 +1327,50 @@ def highlight_zooms_from_placements(
             continue
         seen.add(key)
         label = placement.zoom_label.strip() or f"Zoom [{key[0]:g} … {key[1]:g} s]"
-        out.append((key[0], key[1], label))
+        instance = str(placement.instance_id or "")
+        bar_id = instance.rsplit(":", 1)[-1].strip() if instance else ""
+        color = color_by_id.get(bar_id) or resolved_range_bar_color(None, len(out))
+        out.append((key[0], key[1], label, color))
     return tuple(out)
 
 
 def _wants_zoom_spans(request: RenderRequest) -> bool:
     """Bandes de zoom uniquement sur la vue complète, jamais sur un panneau déjà zoomé."""
     return request.section == "full" and not request.placement.has_custom_zoom
+
+
+def _stim_edge_label_kwargs(request: RenderRequest) -> dict[str, Any]:
+    """Textes / styles des libellés on/off pour ``_draw_onset_offset_lines``."""
+    texts = getattr(request.settings, "texts", None)
+    style = request.style
+    if not bool(getattr(style, "show_stim_labels", True)):
+        return {"onset_text": None, "offset_text": None}
+    onset_face = getattr(style, "stim_on_face", None)
+    offset_face = getattr(style, "stim_off_face", None)
+    onset_text = str(getattr(texts, "stim_on", "on") if texts is not None else "on")
+    offset_text = str(getattr(texts, "stim_off", "off") if texts is not None else "off")
+    return {
+        "onset_text": onset_text if onset_text.strip() else None,
+        "offset_text": offset_text if offset_text.strip() else None,
+        "onset_label_style": {
+            "color": resolved_stim_onset_color(style),
+            "fontsize": float(getattr(style, "stim_on_font_size", 8.0) or 8.0),
+            "bold": bool(getattr(onset_face, "bold", False)),
+            "italic": bool(getattr(onset_face, "italic", False)),
+            "underline": bool(getattr(onset_face, "underline", False)),
+            "dx_px": float(getattr(style, "stim_on_dx_px", 0.0) or 0.0),
+            "dy_px": float(getattr(style, "stim_on_dy_px", 0.0) or 0.0),
+        },
+        "offset_label_style": {
+            "color": resolved_stim_offset_color(style),
+            "fontsize": float(getattr(style, "stim_off_font_size", 8.0) or 8.0),
+            "bold": bool(getattr(offset_face, "bold", False)),
+            "italic": bool(getattr(offset_face, "italic", False)),
+            "underline": bool(getattr(offset_face, "underline", False)),
+            "dx_px": float(getattr(style, "stim_off_dx_px", 0.0) or 0.0),
+            "dy_px": float(getattr(style, "stim_off_dy_px", 0.0) or 0.0),
+        },
+    }
 
 
 def _reference_markers(ax: Any, request: RenderRequest, *, with_spans: bool) -> None:
@@ -1206,11 +1385,17 @@ def _reference_markers(ax: Any, request: RenderRequest, *, with_spans: bool) -> 
         end_markers=markers,
         label_in_legend=True,
         appearance=_appearance(request),
+        **_stim_edge_label_kwargs(request),
     )
     if not with_spans:
         return
-    for index, (t0, t1, label) in enumerate(request.highlight_zooms):
-        color = _ZOOM_SPAN_COLORS[index % len(_ZOOM_SPAN_COLORS)]
+    for index, entry in enumerate(request.highlight_zooms):
+        t0, t1, label = entry[0], entry[1], entry[2]
+        color = (
+            str(entry[3]).strip()
+            if len(entry) >= 4 and str(entry[3]).strip()
+            else resolved_range_bar_color(None, index)
+        )
         ax.axvspan(
             float(t0),
             float(t1),
@@ -1490,8 +1675,14 @@ def _render_full_recording(figure: Any, request: RenderRequest) -> str:
         streams = [placed]
     else:
         streams = list(request.settings.resolved_continuous_streams()) or ["raw"]
-    window = request.section_window() if request.placement.has_custom_zoom else None
-    if window is None:
+    # Custom zoom → jamais retomber sur x_limits de l’aperçu.
+    if request.placement.has_custom_zoom:
+        window = request.section_window()
+        if window is None:
+            t0 = float(request.placement.zoom_t0_s)
+            t1 = float(request.placement.zoom_t1_s)
+            window = (t0, t1) if t0 <= t1 else (t1, t0)
+    else:
         window = request.settings.x_limits.as_tuple()
     n_streams = max(1, len(streams))
     axes = figure.subplots(n_streams, 1, sharex=True, squeeze=False)[:, 0]
@@ -1501,6 +1692,7 @@ def _render_full_recording(figure: Any, request: RenderRequest) -> str:
         show_scale_bars=bool(getattr(request.style, "show_scale_bars", False)),
         montage=n_streams > 1,
         legend=request.legend,
+        style=request.style,
     )
     max_pts = int(request.style.max_points_per_curve)
     drawn = 0
@@ -1884,6 +2076,7 @@ def _render_spike_panel(ax: Any, request: RenderRequest) -> str:
                 end_markers=request.end_markers(),
                 label_in_legend=False,
                 appearance=_appearance(request),
+                **_stim_edge_label_kwargs(request),
             )
         ax.set_title(
             f"{request.channel_name} — {panel_label(panel)}{mode_note}"
@@ -2412,7 +2605,11 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
     axes = figure.subplots(rows, 1, sharex=True, squeeze=False)[:, 0]
     show_bars = bool(getattr(request.style, "show_scale_bars", False))
     _apply_uniform_axes_box(
-        figure, show_scale_bars=show_bars, montage=True, legend=request.legend
+        figure,
+        show_scale_bars=show_bars,
+        montage=True,
+        legend=request.legend,
+        style=request.style,
     )
     drawn = 0
     lines_by_row: list[list[Any]] = []
@@ -2495,6 +2692,7 @@ def _render_montage(figure: Any, request: RenderRequest) -> str:
                 end_markers=request.end_markers(),
                 label_in_legend=False,
                 appearance=draw_app,
+                **_stim_edge_label_kwargs(request),
             )
         ax.set_xlim(window[0], window[1])
         _apply_stream_ylim(ax, request.settings, stream)
@@ -2758,6 +2956,14 @@ def _try_shrink_continuous_montage(figure: Any, request: RenderRequest) -> str |
         fig_h = float(figure.get_figheight())
     except Exception:
         fig_h = 4.0
+    try:
+        fig_w = float(figure.get_figwidth())
+    except Exception:
+        fig_w = 6.0
+    try:
+        dpi = float(getattr(figure, "dpi", 100.0) or 100.0)
+    except Exception:
+        dpi = 100.0
     bottom_margin = _bottom_margin_for(
         montage=True,
         show_scale_bars=show_bars,
@@ -2766,6 +2972,15 @@ def _try_shrink_continuous_montage(figure: Any, request: RenderRequest) -> str |
         n_legend_entries=_count_legend_entries(figure),
         fig_height_in=fig_h,
     )
+    right_extra, bottom_extra = _scale_bar_margin_extra(
+        request.style,
+        fig_width_in=fig_w,
+        fig_height_in=fig_h,
+        dpi=dpi,
+    )
+    if show_bars and (right_extra or bottom_extra):
+        right_margin = max(_AXES_LEFT + 0.35, right_margin - right_extra)
+        bottom_margin = min(0.55, bottom_margin + bottom_extra)
     try:
         import matplotlib.gridspec as gridspec
 
@@ -2784,7 +2999,11 @@ def _try_shrink_continuous_montage(figure: Any, request: RenderRequest) -> str |
         _fit_below_legend(figure, request.legend)
     except Exception:
         _apply_uniform_axes_box(
-            figure, show_scale_bars=show_bars, montage=True, legend=request.legend
+            figure,
+            show_scale_bars=show_bars,
+            montage=True,
+            legend=request.legend,
+            style=request.style,
         )
 
     selected = int(request.channel_index)
@@ -3071,7 +3290,11 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
     axes = figure.subplots(rows, 1, sharex=share_x, squeeze=False)[:, 0]
     show_bars = bool(getattr(request.style, "show_scale_bars", False))
     _apply_uniform_axes_box(
-        figure, show_scale_bars=show_bars, montage=True, legend=request.legend
+        figure,
+        show_scale_bars=show_bars,
+        montage=True,
+        legend=request.legend,
+        style=request.style,
     )
 
     sync_mode = request.settings.time_sync
@@ -3201,6 +3424,7 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
                     end_markers=request.end_markers(),
                     label_in_legend=False,
                     appearance=draw_app,
+                    **_stim_edge_label_kwargs(request),
                 )
             _apply_montage_row_ylim(ax, kind, request.settings)
             if stream_x is not None:
@@ -3239,6 +3463,7 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
                     end_markers=request.end_markers(),
                     label_in_legend=False,
                     appearance=draw_app,
+                    **_stim_edge_label_kwargs(request),
                 )
 
         if channel_drawn == 0:
@@ -3482,6 +3707,7 @@ def _apply_stim_marker_linewidth(
     onset_color: str | None = None,
     offset_color: str | None = None,
     known_colors: set[str] | None = None,
+    figure: Any | None = None,
 ) -> None:
     """Met à jour épaisseur et couleur des pointillés de stimulation déjà dessinés."""
     from matplotlib.colors import to_hex
@@ -3506,20 +3732,23 @@ def _apply_stim_marker_linewidth(
     def _is_stim(color: Any) -> bool:
         return _hex(color) in stim_colors
 
+    def _restyle_line(line: Any) -> None:
+        if not _is_stim(line.get_color()):
+            return
+        xs = line.get_xdata()
+        if len(xs) >= 2 and abs(float(xs[0]) - float(xs[-1])) > 1e-9:
+            return
+        line.set_linewidth(width)
+        style_name = str(line.get_linestyle())
+        ink = _hex(line.get_color())
+        if offset and style_name in {"-.", "dashdot"} and ink != "#c2410c":
+            line.set_color(offset_color)
+        elif onset and style_name in {"--", "dashed"} and ink != "#c2410c":
+            line.set_color(onset_color)
+
     for ax in axes:
         for line in ax.get_lines():
-            if not _is_stim(line.get_color()):
-                continue
-            xs = line.get_xdata()
-            if len(xs) >= 2 and abs(float(xs[0]) - float(xs[-1])) > 1e-9:
-                continue
-            line.set_linewidth(width)
-            style_name = str(line.get_linestyle())
-            ink = _hex(line.get_color())
-            if offset and style_name in {"-.", "dashdot"} and ink != "#c2410c":
-                line.set_color(offset_color)
-            elif onset and style_name in {"--", "dashed"} and ink != "#c2410c":
-                line.set_color(onset_color)
+            _restyle_line(line)
         for coll in getattr(ax, "collections", ()):
             try:
                 colors = coll.get_edgecolors()
@@ -3528,6 +3757,15 @@ def _apply_stim_marker_linewidth(
             if colors is None or len(colors) == 0 or not _is_stim(colors[0]):
                 continue
             coll.set_linewidths(width)
+    # Pointillés montage d’un seul tenant : artistes au niveau figure.
+    if figure is not None:
+        for artist in list(getattr(figure, "artists", ()) or ()):
+            if not hasattr(artist, "get_xdata") or not hasattr(artist, "set_linewidth"):
+                continue
+            try:
+                _restyle_line(artist)
+            except Exception:
+                continue
 
 
 def _refresh_panel_style(figure: Any, request: RenderRequest) -> str:
@@ -3545,6 +3783,7 @@ def _refresh_panel_style(figure: Any, request: RenderRequest) -> str:
         onset_color=onset_color,
         offset_color=offset_color,
         known_colors=known,
+        figure=figure,
     )
     figure._erg_stim_colors = tuple(known | {onset_color, offset_color})
     row_channels = getattr(figure, "_erg_montage_row_channels", None)
@@ -3633,6 +3872,7 @@ def _refresh_panel_style(figure: Any, request: RenderRequest) -> str:
             show_scale_bars=bool(getattr(request.style, "show_scale_bars", False)),
             montage=False,
             legend=request.legend,
+            style=request.style,
         )
     _apply_text_overrides(figure, request)
     return status
@@ -3647,6 +3887,27 @@ def _render_panel_from_prepare(
 
     spec = prepare_panel(request)
     status = draw_panel_spec(figure, spec, request)
+    # draw_panel_spec ne gère pas l’échelle flottante : appliquer ici.
+    panel = request.panel
+    if panel not in {"mea_layout", "summary_rms_table"}:
+        is_montage = (
+            panel in _MONTAGE_SPECS
+            or panel in {"montage_continuous_raw", "full_recording"}
+            or str(getattr(spec, "layout_kind", "")) == "montage"
+        )
+        if is_montage:
+            _apply_montage_scale_bars(figure, request)
+        else:
+            axes = list(getattr(figure, "axes", []) or [])
+            if axes:
+                _apply_scale_bars(axes[0], request.style, panel=panel)
+            _apply_uniform_axes_box(
+                figure,
+                show_scale_bars=bool(getattr(request.style, "show_scale_bars", False)),
+                montage=False,
+                legend=request.legend,
+                style=request.style,
+            )
     figure._erg_structure_key = fingerprint
     figure._erg_from_prepare = True
     figure._erg_status = status
@@ -3770,6 +4031,7 @@ def render_panel(figure: Any, request: RenderRequest) -> str:
             show_scale_bars=bool(getattr(request.style, "show_scale_bars", False)),
             montage=False,
             legend=request.legend,
+            style=request.style,
         )
     _apply_text_overrides(figure, request)
     figure._erg_structure_key = fingerprint

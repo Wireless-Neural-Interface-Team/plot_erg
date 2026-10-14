@@ -21,6 +21,8 @@ from view_config import (
     included_channel_indices,
     montage_row_axis_label,
     resolved_scale_bar_linewidth,
+    resolved_scale_bar_offset_px,
+    resolved_scale_bar_time_offset_px,
     resolved_stim_linewidth,
     resolved_stim_offset_color,
     resolved_stim_onset_color,
@@ -70,9 +72,9 @@ class HistSeries:
 
 @dataclass
 class AnnotationSpec:
-    """Lightweight annotation (vline / text / hline)."""
+    """Lightweight annotation (vline / text / hline / stim_label)."""
 
-    kind: str  # "vline" | "hline" | "text" | "span"
+    kind: str  # "vline" | "hline" | "text" | "span" | "stim_label"
     x: float = 0.0
     y: float = 0.0
     x2: float = 0.0
@@ -83,6 +85,13 @@ class AnnotationSpec:
     label: str = ""
     # ``stim_onset`` / ``stim_offset`` : recolorables sans reconstruire les courbes.
     role: str = ""
+    # Style des libellés « on » / « off » (kind == "stim_label").
+    fontsize: float = 8.0
+    bold: bool = False
+    italic: bool = False
+    underline: bool = False
+    dx_px: float = 0.0
+    dy_px: float = 0.0
 
 
 # Courbes en µV sur lesquelles le seuil de spike a un sens visuel.
@@ -151,20 +160,152 @@ def _show_continuous_stim_marks(request: Any) -> bool:
     return bool(getattr(legend, "show_reference_markers", True))
 
 
+def _show_stim_labels(request: Any) -> bool:
+    """Case « Libellés on / off » du style d’affichage."""
+    style = getattr(request, "style", None)
+    return bool(getattr(style, "show_stim_labels", True))
+
+
+def _stim_label_style(
+    request: Any, *, which: str
+) -> tuple[str, str, float, bool, bool, bool, float, float]:
+    """``(texte, couleur, fontsize, bold, italic, underline, dx_px, dy_px)``."""
+    onset_color, offset_color = _stim_line_colors(request)
+    texts = getattr(getattr(request, "settings", None), "texts", None)
+    style = getattr(request, "style", None)
+    if which == "off":
+        text = str(getattr(texts, "stim_off", "off") if texts is not None else "off")
+        color = offset_color
+        fontsize = float(getattr(style, "stim_off_font_size", 8.0) or 8.0)
+        face = getattr(style, "stim_off_face", None)
+        dx = float(getattr(style, "stim_off_dx_px", 0.0) or 0.0)
+        dy = float(getattr(style, "stim_off_dy_px", 0.0) or 0.0)
+    else:
+        text = str(getattr(texts, "stim_on", "on") if texts is not None else "on")
+        color = onset_color
+        fontsize = float(getattr(style, "stim_on_font_size", 8.0) or 8.0)
+        face = getattr(style, "stim_on_face", None)
+        dx = float(getattr(style, "stim_on_dx_px", 0.0) or 0.0)
+        dy = float(getattr(style, "stim_on_dy_px", 0.0) or 0.0)
+    bold, italic, underline = _face_flags(face)
+    return text, color, fontsize, bold, italic, underline, dx, dy
+
+
+def _stim_label_annotation(
+    request: Any,
+    *,
+    x: float,
+    row: int,
+    which: str,
+) -> AnnotationSpec | None:
+    """Libellé au-dessus d’un trait de stim ; ``None`` si masqué / texte vide."""
+    if not _show_stim_labels(request):
+        return None
+    text, color, fontsize, bold, italic, underline, dx, dy = _stim_label_style(
+        request, which=which
+    )
+    if not str(text).strip():
+        return None
+    role = "stim_offset" if which == "off" else "stim_onset"
+    return AnnotationSpec(
+        kind="stim_label",
+        x=float(x),
+        text=str(text),
+        color=color,
+        row=int(row),
+        role=role,
+        fontsize=float(fontsize),
+        bold=bool(bold),
+        italic=bool(italic),
+        underline=bool(underline),
+        dx_px=float(dx),
+        dy_px=float(dy),
+    )
+
+
+def _stim_label_already_present(
+    annotations: Sequence[AnnotationSpec], *, x: float, which: str
+) -> bool:
+    """True si un libellé on/off existe déjà pour cette stimulation."""
+    target = round(float(x), 6)
+    want_role = "stim_offset" if which == "off" else "stim_onset"
+    for ann in annotations:
+        if str(getattr(ann, "kind", "") or "") != "stim_label":
+            continue
+        if str(getattr(ann, "role", "") or "") != want_role:
+            continue
+        if round(float(ann.x), 6) == target:
+            return True
+    return False
+
+
+def _append_stim_vline_with_label(
+    annotations: list[AnnotationSpec],
+    request: Any,
+    *,
+    x: float,
+    row: int,
+    which: str,
+    color: str,
+    with_label: bool = True,
+) -> None:
+    """Pointillé de stim ; libellé une seule fois par stimulation (pas par canal)."""
+    role = "stim_offset" if which == "off" else "stim_onset"
+    annotations.append(
+        AnnotationSpec(
+            kind="vline",
+            x=float(x),
+            color=color,
+            row=int(row),
+            role=role,
+        )
+    )
+    if not with_label:
+        return
+    if _stim_label_already_present(annotations, x=float(x), which=which):
+        return
+    label = _stim_label_annotation(request, x=float(x), row=int(row), which=which)
+    if label is not None:
+        annotations.append(label)
+
+
 def _restyle_stim_annotations(
     annotations: list[AnnotationSpec], request: Any
 ) -> list[AnnotationSpec]:
-    """Recolorier les pointillés déjà préparés (chemin restyle, sans relecture)."""
+    """Recolorier les pointillés et régénérer les libellés on/off.
+
+    Un seul libellé par stimulation (même ``x`` / rôle), placé sur la ligne
+    du haut — pas une copie par canal.
+    """
     onset, offset = _stim_line_colors(request)
     restyled: list[AnnotationSpec] = []
+    # (x arrondi, which) → (x réel, row min)
+    unique_edges: dict[tuple[float, str], tuple[float, int]] = {}
     for ann in annotations:
         role = str(getattr(ann, "role", "") or "")
+        kind = str(getattr(ann, "kind", "") or "")
+        if kind == "stim_label":
+            continue
         if role == "stim_onset":
             restyled.append(replace(ann, color=onset))
+            which = "on"
         elif role == "stim_offset":
             restyled.append(replace(ann, color=offset))
+            which = "off"
         else:
             restyled.append(ann)
+            continue
+        x = float(ann.x)
+        row = int(ann.row or 0)
+        key = (round(x, 6), which)
+        prev = unique_edges.get(key)
+        if prev is None or row < prev[1]:
+            unique_edges[key] = (x, row)
+    for which_key, (x, row) in unique_edges.items():
+        which = which_key[1]
+        label = _stim_label_annotation(request, x=x, row=row, which=which)
+        if label is not None:
+            restyled.append(label)
     return restyled
 
 
@@ -182,6 +323,12 @@ class ScaleBarSpec:
     linewidth: float = 1.4
     fontsize: float = 8.0
     color: str = "#111827"
+    # Décalage échelle amplitude / axe vertical (+dx droite, +dy haut).
+    dx_px: float = 0.0
+    dy_px: float = 0.0
+    # Décalage échelle temps / axe horizontal (+dx droite, +dy haut).
+    time_dx_px: float = 0.0
+    time_dy_px: float = 0.0
 
 
 SeriesItem = CurveSeries | ScatterSeries | HistSeries
@@ -212,6 +359,8 @@ class PanelSpec:
     row_channels: list[int] = field(default_factory=list)
     row_keys: list[tuple[int, str]] = field(default_factory=list)
     row_highlight: list[bool] = field(default_factory=list)
+    # Hauteur minimale d’une ligne montage (px). 0 = ne pas imposer.
+    row_min_height_px: int = 0
     status_message: str = ""
     grid: bool = True
     grid_alpha: float = 0.35
@@ -221,6 +370,9 @@ class PanelSpec:
     stim_linewidth: float = 1.0
     # Écart titre ↔ courbe (aperçu, px). 0 = défaut pyqtgraph.
     title_gap_px: int = 0
+    # Décalage du titre de graphique (px) : +dx droite, +dy haut.
+    title_dx_px: float = 0.0
+    title_dy_px: float = 0.0
     # Affichage (ViewerSettings → PlotHost) — polices / bordures / légende.
     title_font_size: float = 10.0
     label_font_size: float = 9.0
@@ -436,6 +588,10 @@ def restyle_panel_spec(spec: PanelSpec, request: Any) -> PanelSpec:
                 new_ylims.append(_ylim_tuple(settings, "rms"))
             else:
                 new_ylims.append(None)
+        if panel == "montage_continuous_raw":
+            new_ylims = _apply_montage_shared_ylims(
+                settings, list(out.row_kinds), new_ylims, out.series
+            )
         out.row_ylims = new_ylims
     if panel == "montage_continuous_raw" and out.row_channels and out.row_kinds:
         refreshed = _montage_continuous_axis_labels(
@@ -576,6 +732,8 @@ def _apply_display_settings(spec: PanelSpec, request: Any) -> None:
         spec.title_font_size = float(getattr(style, "title_font_size", 10.0) or 10.0)
         spec.label_font_size = float(getattr(style, "label_font_size", 9.0) or 9.0)
         spec.tick_font_size = float(getattr(style, "tick_font_size", 8.0) or 8.0)
+        spec.title_dx_px = float(getattr(style, "title_dx_px", 0.0) or 0.0)
+        spec.title_dy_px = float(getattr(style, "title_dy_px", 0.0) or 0.0)
         (
             spec.title_bold,
             spec.title_italic,
@@ -673,6 +831,8 @@ def _scale_bar_spec(request: Any, *, panel: str) -> ScaleBarSpec:
         x_unit, y_unit = ("ms", "µV")
     if x_unit is None and y_unit is None:
         return ScaleBarSpec(enabled=False)
+    dx_px, dy_px = resolved_scale_bar_offset_px(style)
+    time_dx_px, time_dy_px = resolved_scale_bar_time_offset_px(style)
     return ScaleBarSpec(
         enabled=True,
         x_unit=x_unit,
@@ -683,6 +843,10 @@ def _scale_bar_spec(request: Any, *, panel: str) -> ScaleBarSpec:
         amplitude=float(getattr(style, "scale_bar_amplitude", 100.0) or 100.0),
         linewidth=resolved_scale_bar_linewidth(style),
         fontsize=float(getattr(style, "tick_font_size", 8.0) or 8.0),
+        dx_px=dx_px,
+        dy_px=dy_px,
+        time_dx_px=time_dx_px,
+        time_dy_px=time_dy_px,
     )
 
 
@@ -866,6 +1030,91 @@ def _series_label(
     return str(label)
 
 
+def _series_y_bounds(item: SeriesItem) -> tuple[float, float] | None:
+    """Min / max finis de l’ordonnée d’une série, ou ``None`` si vide."""
+    if isinstance(item, HistSeries):
+        arr = np.asarray(item.counts, dtype=np.float64).ravel()
+    else:
+        arr = np.asarray(getattr(item, "y", None), dtype=np.float64).ravel()
+    if arr.size == 0:
+        return None
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        return None
+    return float(np.min(finite)), float(np.max(finite))
+
+
+def _shared_ylim_bounds(
+    y_lo: float, y_hi: float, *, non_negative: bool
+) -> tuple[float, float]:
+    """Échelle commune : étendue des données, plancher à 0 pour les taux / histogrammes."""
+    lo = float(y_lo)
+    hi = float(y_hi)
+    if non_negative:
+        lo = 0.0
+        hi = max(hi, 1.0)
+    if hi > lo:
+        return (lo, hi)
+    pad = max(abs(lo) * 0.05, 1.0)
+    return (lo - pad, lo + pad)
+
+
+def _apply_montage_shared_ylims(
+    settings: Any,
+    row_kinds: Sequence[str],
+    row_ylims: Sequence[tuple[float, float] | None],
+    series: Sequence[SeriesItem],
+) -> list[tuple[float, float] | None]:
+    """Une échelle Y commune aux courbes auto d’un même type.
+
+    WIDE, HIGH et LOW partagent la même étendue en µV. Les autres graphs
+    (RMS, PSTH, spike scope…) partagent une échelle entre canaux du même type.
+    Une échelle déjà fixée (manuelle) n’est pas remplacée.
+    """
+    out = list(row_ylims)
+    if not bool(getattr(settings, "montage_shared_ylim", False)):
+        return out
+    groups: dict[str, list[int]] = {}
+    for row, kind in enumerate(row_kinds):
+        kind_s = str(kind)
+        if kind_s == "raster":
+            continue
+        if row < len(out) and out[row] is not None:
+            continue
+        key = "voltage" if kind_s in _VOLTAGE_TRACE_KINDS else kind_s
+        groups.setdefault(key, []).append(row)
+    if not groups:
+        return out
+    spans: dict[str, tuple[float, float]] = {}
+    for item in series:
+        row = int(getattr(item, "row", 0) or 0)
+        if row < 0 or row >= len(row_kinds):
+            continue
+        kind_s = str(row_kinds[row])
+        key = "voltage" if kind_s in _VOLTAGE_TRACE_KINDS else kind_s
+        if key not in groups:
+            continue
+        bounds = _series_y_bounds(item)
+        if bounds is None:
+            continue
+        prev = spans.get(key)
+        if prev is None:
+            spans[key] = bounds
+        else:
+            spans[key] = (min(prev[0], bounds[0]), max(prev[1], bounds[1]))
+    nonneg = frozenset({"psth", "trial_rate", "isi", "rms"})
+    for key, rows in groups.items():
+        span = spans.get(key)
+        if span is None:
+            continue
+        ylim = _shared_ylim_bounds(span[0], span[1], non_negative=key in nonneg)
+        for row in rows:
+            while len(out) <= row:
+                out.append(None)
+            out[row] = ylim
+    return out
+
+
 def _ylim_tuple(settings: Any, stream: str) -> tuple[float, float] | None:
     if settings is None:
         return None
@@ -919,8 +1168,14 @@ def _prepare_full_recording(request: Any) -> PanelSpec:
         streams = [placed]
     else:
         streams = list(request.settings.resolved_continuous_streams()) or ["raw"]
-    window = request.section_window() if request.placement.has_custom_zoom else None
-    if window is None:
+    # Custom zoom → jamais retomber sur x_limits de l’aperçu.
+    if request.placement.has_custom_zoom:
+        window = request.section_window()
+        if window is None:
+            t0 = float(request.placement.zoom_t0_s)
+            t1 = float(request.placement.zoom_t1_s)
+            window = (t0, t1) if t0 <= t1 else (t1, t0)
+    else:
         window = request.settings.x_limits.as_tuple()
     max_pts = _max_points(request)
     lw = _line_width(request)
@@ -1010,14 +1265,15 @@ def _prepare_full_recording(request: Any) -> PanelSpec:
                         if not (float(window[0]) <= file_t <= float(window[1])):
                             continue
                     is_offset = role == "offset"
-                    annotations.append(
-                        AnnotationSpec(
-                            kind="vline",
-                            x=float(stim_x),
-                            color=offset_color if is_offset else onset_color,
-                            row=row,
-                            role="stim_offset" if is_offset else "stim_onset",
-                        )
+                    _append_stim_vline_with_label(
+                        annotations,
+                        request,
+                        x=float(stim_x),
+                        row=row,
+                        which="off" if is_offset else "on",
+                        color=offset_color if is_offset else onset_color,
+                        # Une seule fois au-dessus du graph (1ʳᵉ ligne de flux).
+                        with_label=(row == 0),
                     )
         if stream_drawn and str(stream) in _VOLTAGE_TRACE_KINDS:
             annotations.extend(
@@ -1229,7 +1485,10 @@ def _stim_markers_rel(
     *,
     rows: Sequence[int] | None = None,
 ) -> list[AnnotationSpec]:
-    """Vlines onset (t=0) / fin de stim — une copie par ligne (montage multi-rangées)."""
+    """Vlines onset (t=0) / fin de stim — une copie par ligne (montage multi-rangées).
+
+    Les libellés on/off ne sont posés qu’une fois, sur la première ligne.
+    """
     out: list[AnnotationSpec] = []
     if not getattr(request.legend, "show_reference_markers", True):
         return out
@@ -1237,21 +1496,26 @@ def _stim_markers_rel(
     if not row_ids:
         return out
     onset_color, offset_color = _stim_line_colors(request)
+    label_row = int(row_ids[0])
     for row in row_ids:
         for marker in request.end_markers():
-            out.append(
-                AnnotationSpec(
-                    kind="vline",
-                    x=float(marker),
-                    color=offset_color,
-                    row=row,
-                    role="stim_offset",
-                )
+            _append_stim_vline_with_label(
+                out,
+                request,
+                x=float(marker),
+                row=row,
+                which="off",
+                color=offset_color,
+                with_label=(row == label_row),
             )
-        out.append(
-            AnnotationSpec(
-                kind="vline", x=0.0, color=onset_color, row=row, role="stim_onset"
-            )
+        _append_stim_vline_with_label(
+            out,
+            request,
+            x=0.0,
+            row=row,
+            which="on",
+            color=onset_color,
+            with_label=(row == label_row),
         )
     return out
 
@@ -2247,18 +2511,22 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
         stim_marks = _continuous_stim_marks(recordings, str(sync_mode), stream_x)
         if stim_marks:
             onset_color, offset_color = _stim_line_colors(request)
-            for row_i, kind in enumerate(row_kinds):
-                if kind not in _MONTAGE_STREAM_KINDS:
-                    continue
+            stream_rows = [
+                row_i
+                for row_i, kind in enumerate(row_kinds)
+                if kind in _MONTAGE_STREAM_KINDS
+            ]
+            label_row = stream_rows[0] if stream_rows else None
+            for row_i in stream_rows:
                 for stim_x, role in stim_marks:
-                    annotations.append(
-                        AnnotationSpec(
-                            kind="vline",
-                            x=float(stim_x),
-                            color=offset_color if role == "offset" else onset_color,
-                            row=row_i,
-                            role="stim_offset" if role == "offset" else "stim_onset",
-                        )
+                    _append_stim_vline_with_label(
+                        annotations,
+                        request,
+                        x=float(stim_x),
+                        row=row_i,
+                        which="off" if role == "offset" else "on",
+                        color=offset_color if role == "offset" else onset_color,
+                        with_label=(row_i == label_row),
                     )
     elif mode != "continuous":
         marker_rows = [
@@ -2267,6 +2535,10 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
             if kind in {"raw", "hp", "lp", "rms", "psth", "raster"}
         ]
         annotations.extend(_stim_markers_rel(request, rows=marker_rows))
+
+    row_ylims = _apply_montage_shared_ylims(
+        request.settings, row_kinds, row_ylims, series
+    )
 
     return PanelSpec(
         title=f"{panel_label(request.panel)} — page {len(channel_indices)} canaux",
@@ -2285,7 +2557,14 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
         row_channels=row_channels,
         row_keys=row_keys,
         row_highlight=row_highlight,
+        row_min_height_px=_montage_row_min_height_px(request),
     )
+
+
+def _montage_row_min_height_px(request: Any) -> int:
+    """Hauteur mini d’une ligne, lue sur les réglages (défaut 36 px)."""
+    settings = getattr(request, "settings", None)
+    return max(36, int(getattr(settings, "montage_row_min_height_px", 36) or 36))
 
 
 def _prepare_montage_triggered(request: Any) -> PanelSpec:
@@ -2399,6 +2678,7 @@ def _prepare_montage_triggered(request: Any) -> PanelSpec:
         row_channels=row_channels,
         row_keys=row_keys,
         row_highlight=row_highlight,
+        row_min_height_px=_montage_row_min_height_px(request),
     )
 
 
@@ -2472,14 +2752,14 @@ def _prepare_montage_second_to_third(request: Any) -> PanelSpec:
             x_max = hi if x_max is None else max(x_max, hi)
             if index == 0:
                 onset_color, _offset_color = _stim_line_colors(request)
-                annotations.append(
-                    AnnotationSpec(
-                        kind="vline",
-                        x=0.0,
-                        color=onset_color,
-                        row=row,
-                        role="stim_onset",
-                    )
+                _append_stim_vline_with_label(
+                    annotations,
+                    request,
+                    x=0.0,
+                    row=row,
+                    which="on",
+                    color=onset_color,
+                    with_label=(row == 0),
                 )
                 annotations.append(
                     AnnotationSpec(kind="vline", x=float(third_s), color="#c2410c", row=row)
@@ -2521,6 +2801,7 @@ def _prepare_montage_second_to_third(request: Any) -> PanelSpec:
         row_channels=row_channels,
         row_keys=row_keys,
         row_highlight=row_highlight,
+        row_min_height_px=_montage_row_min_height_px(request),
     )
 
 

@@ -20,6 +20,7 @@ from typing import Literal, Sequence
 from display_config import (
     STIM_OFFSET_COLOR,
     STIM_ONSET_COLOR,
+    ZOOM_RANGE_COLORS,
     PlotDisplaySettings,
     SectionPanels,
     ZoomMode,
@@ -165,6 +166,7 @@ class TimeRangeBar:
 
     Si ``relative_to_stim`` est True, ``t0_s`` / ``t1_s`` sont relatifs au début
     de stimulation (t=0). Sinon ce sont des temps absolus sur l’enregistrement.
+    ``color`` vide → palette ``ZOOM_RANGE_COLORS`` selon l’index d’affichage.
     """
 
     t0_s: float
@@ -172,6 +174,7 @@ class TimeRangeBar:
     label: str = ""
     bar_id: str = ""
     relative_to_stim: bool = False
+    color: str = ""
 
     def ordered(self) -> tuple[float, float]:
         a, b = float(self.t0_s), float(self.t1_s)
@@ -179,6 +182,9 @@ class TimeRangeBar:
 
     def with_bounds(self, t0_s: float, t1_s: float) -> TimeRangeBar:
         return replace(self, t0_s=float(t0_s), t1_s=float(t1_s))
+
+    def with_color(self, color: str) -> TimeRangeBar:
+        return replace(self, color=str(color or "").strip())
 
 
 @dataclass(frozen=True)
@@ -316,12 +322,26 @@ class PanelStyle:
     title_face: TextFace = field(default_factory=TextFace)
     label_face: TextFace = field(default_factory=TextFace)
     tick_face: TextFace = field(default_factory=TextFace)
+    # Décalage du titre de graphique (px) : +dx droite, +dy haut.
+    title_dx_px: float = 0.0
+    title_dy_px: float = 0.0
     line_width: float = 1.2
     # Épaisseur (points) des pointillés de début / fin de stimulation.
     stim_linewidth: float = 1.0
     # Couleur des pointillés de début (onset) et de fin (offset) de stimulation.
     stim_onset_color: str = STIM_ONSET_COLOR
     stim_offset_color: str = STIM_OFFSET_COLOR
+    # Libellés « on » / « off » au-dessus des traits de stimulation.
+    show_stim_labels: bool = True
+    stim_on_font_size: float = 8.0
+    stim_off_font_size: float = 8.0
+    stim_on_face: TextFace = field(default_factory=TextFace)
+    stim_off_face: TextFace = field(default_factory=TextFace)
+    # Décalage des libellés (px) : +dx droite, +dy haut.
+    stim_on_dx_px: float = 0.0
+    stim_on_dy_px: float = 0.0
+    stim_off_dx_px: float = 0.0
+    stim_off_dy_px: float = 0.0
     grid: bool = True
     grid_alpha: float = 0.3
     # Cadre (spines) autour de la zone de tracé.
@@ -339,6 +359,13 @@ class PanelStyle:
     scale_bar_amplitude: float = 100.0
     # Épaisseur (points) du trait noir des barres d’échelle flottantes.
     scale_bar_linewidth: float = 1.4
+    # Décalage de l’échelle amplitude / axe vertical (px). +dx droite, +dy haut.
+    scale_bar_dx_px: float = 0.0
+    scale_bar_dy_px: float = 0.0
+    # Décalage de l’échelle temps / axe horizontal (px). None = même décalage
+    # que l’amplitude (compatibilité avec les réglages qui n’avaient qu’une paire).
+    scale_bar_time_dx_px: float | None = None
+    scale_bar_time_dy_px: float | None = None
     # Max points drawn per curve (min/max envelope decimation above this).
     # UI range is 500…200000 ; défaut = milieu de la plage.
     max_points_per_curve: int = 100_250
@@ -356,9 +383,18 @@ class TextOverrides:
     legend_labels: tuple[str, ...] = ()
     # Si False, masque les suffixes du type « — trial-averaged », « — RMS », …
     show_series_suffix: bool = True
+    # Libellés au-dessus des traits de début / fin de stimulation (vides = masquer).
+    stim_on: str = "on"
+    stim_off: str = "off"
 
     def resolved_legend_labels(self) -> tuple[str, ...]:
         return tuple(str(label) for label in self.legend_labels)
+
+    def resolved_stim_on(self) -> str:
+        return str(self.stim_on)
+
+    def resolved_stim_off(self) -> str:
+        return str(self.stim_off)
 
 
 @dataclass(frozen=True)
@@ -393,7 +429,8 @@ class ViewerSettings:
     spike_overlay_alpha: float = 0.4
     # Ligne horizontale du seuil de détection sur les courbes en µV et le spike scope.
     show_spike_threshold: bool = False
-    # Échelle X manuelle (temps, s) — prioritaire sur la section / le zoom placement.
+    # Échelle X manuelle (temps, s) — graphs *sans* zoom placement uniquement.
+    # Un ``PanelPlacement`` avec custom zoom ignore toujours ``x_limits``.
     x_limits: AxisLimits = field(
         default_factory=lambda: AxisLimits(enabled=False, minimum=-0.1, maximum=0.4)
     )
@@ -440,6 +477,9 @@ class ViewerSettings:
     montage_row_min_height_px: int = 52
     # Titres d’axes du montage : « A-002 LOW » si True, « A-002 » si False.
     montage_show_kind_label: bool = True
+    # Revue montage : une seule échelle Y (µV) pour toutes les courbes WIDE / HIGH / LOW
+    # de la page. False : chaque ligne suit l’amplitude de son canal.
+    montage_shared_ylim: bool = False
     # Décalage des titres de canal à côté des courbes (px).
     # +x rapproche le titre de la courbe, +y le monte.
     montage_label_dx_px: float = 0.0
@@ -515,6 +555,8 @@ class ViewerSettings:
 
 def copy_scale_bar_style(target: PanelStyle, source: PanelStyle) -> PanelStyle:
     """Recopier uniquement les champs d’échelle flottante de ``source`` vers ``target``."""
+    amp_dx, amp_dy = resolved_scale_bar_offset_px(source)
+    time_dx, time_dy = resolved_scale_bar_time_offset_px(source)
     return replace(
         target,
         show_scale_bars=bool(source.show_scale_bars),
@@ -523,7 +565,73 @@ def copy_scale_bar_style(target: PanelStyle, source: PanelStyle) -> PanelStyle:
         scale_bar_amplitude_manual=bool(source.scale_bar_amplitude_manual),
         scale_bar_amplitude=float(source.scale_bar_amplitude),
         scale_bar_linewidth=resolved_scale_bar_linewidth(source),
+        scale_bar_dx_px=amp_dx,
+        scale_bar_dy_px=amp_dy,
+        scale_bar_time_dx_px=time_dx,
+        scale_bar_time_dy_px=time_dy,
     )
+
+
+def copy_stim_marker_style(target: PanelStyle, source: PanelStyle) -> PanelStyle:
+    """Recopier épaisseur / couleurs / libellés des pointillés de stimulation."""
+    return replace(
+        target,
+        stim_linewidth=resolved_stim_linewidth(source),
+        stim_onset_color=resolved_stim_onset_color(source),
+        stim_offset_color=resolved_stim_offset_color(source),
+        show_stim_labels=bool(getattr(source, "show_stim_labels", True)),
+        stim_on_font_size=float(getattr(source, "stim_on_font_size", 8.0) or 8.0),
+        stim_off_font_size=float(getattr(source, "stim_off_font_size", 8.0) or 8.0),
+        stim_on_face=getattr(source, "stim_on_face", TextFace()) or TextFace(),
+        stim_off_face=getattr(source, "stim_off_face", TextFace()) or TextFace(),
+        stim_on_dx_px=_scale_bar_offset_one(source, "stim_on_dx_px"),
+        stim_on_dy_px=_scale_bar_offset_one(source, "stim_on_dy_px"),
+        stim_off_dx_px=_scale_bar_offset_one(source, "stim_off_dx_px"),
+        stim_off_dy_px=_scale_bar_offset_one(source, "stim_off_dy_px"),
+    )
+
+
+def copy_global_display_style(target: PanelStyle, source: PanelStyle) -> PanelStyle:
+    """Réglages Affichage globaux : échelle flottante + marqueurs de stim."""
+    return copy_stim_marker_style(copy_scale_bar_style(target, source), source)
+
+
+def _scale_bar_offset_one(style: object, name: str, *, default: float = 0.0) -> float:
+    raw = getattr(style, name, default)
+    if raw is None:
+        return float(default)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return float(default)
+    if value != value:
+        return float(default)
+    return value
+
+
+def resolved_scale_bar_offset_px(style: object) -> tuple[float, float]:
+    """Décalage (dx, dy) de l’échelle amplitude (axe vertical), en pixels.
+
+    ``dx`` positif vers la droite, ``dy`` positif vers le haut.
+    """
+    return (
+        _scale_bar_offset_one(style, "scale_bar_dx_px"),
+        _scale_bar_offset_one(style, "scale_bar_dy_px"),
+    )
+
+
+def resolved_scale_bar_time_offset_px(style: object) -> tuple[float, float]:
+    """Décalage (dx, dy) de l’échelle temps (axe horizontal), en pixels.
+
+    Si ``scale_bar_time_dx_px`` / ``scale_bar_time_dy_px`` sont ``None``,
+    reprend le décalage amplitude (anciens réglages à une seule paire).
+    """
+    amp_dx, amp_dy = resolved_scale_bar_offset_px(style)
+    raw_dx = getattr(style, "scale_bar_time_dx_px", None)
+    raw_dy = getattr(style, "scale_bar_time_dy_px", None)
+    dx = amp_dx if raw_dx is None else _scale_bar_offset_one(style, "scale_bar_time_dx_px")
+    dy = amp_dy if raw_dy is None else _scale_bar_offset_one(style, "scale_bar_time_dy_px")
+    return (dx, dy)
 
 
 def resolved_scale_bar_linewidth(style: object) -> float:
@@ -583,6 +691,18 @@ def resolved_stim_offset_color(style: object) -> str:
     )
 
 
+def default_zoom_range_color(index: int) -> str:
+    """Couleur par défaut de la n-ième plage / zone de zoom."""
+    palette = ZOOM_RANGE_COLORS or ("#16a34a",)
+    return palette[int(index) % len(palette)]
+
+
+def resolved_range_bar_color(bar: object, index: int = 0) -> str:
+    """Couleur d’une plage : champ ``color`` valide, sinon palette par index."""
+    fallback = default_zoom_range_color(index)
+    return _resolved_hex_color(getattr(bar, "color", None), fallback)
+
+
 def apply_local_display_settings(
     base: ViewerSettings,
     local: ViewerSettings,
@@ -597,13 +717,14 @@ def apply_local_display_settings(
     graphs. Sans ceci, un redraw réinjecte les axes / la sync de la fenêtre
     parente et ignore le panneau local.
 
-    ``inherit_scale_bars=True`` : l’échelle flottante vient de ``base`` (dock
-    Affichage), pas du style local figé — évite qu’une édition de texte / un
-    override partiel bloque le toggle global sur certains graphs.
+    ``inherit_scale_bars=True`` : l’échelle flottante et les pointillés de
+    stimulation viennent de ``base`` (dock Affichage), pas du style local
+    figé — évite qu’une édition de texte / un override partiel bloque ces
+    réglages globaux sur certains graphs.
     """
     style = local.style
     if inherit_scale_bars:
-        style = copy_scale_bar_style(style, base.style)
+        style = copy_global_display_style(style, base.style)
     kwargs: dict[str, object] = {
         "legend": local.legend,
         "style": style,

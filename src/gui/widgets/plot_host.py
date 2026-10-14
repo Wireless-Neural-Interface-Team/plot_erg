@@ -6,6 +6,7 @@ remains the PDF / export drawing path.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -16,11 +17,14 @@ from PySide6.QtGui import (
     QBrush,
     QColor,
     QFont,
+    QFontInfo,
     QFontMetrics,
+    QPainter,
     QPainterPath,
     QPen,
     QTextCharFormat,
     QTextCursor,
+    QTransform,
 )
 from PySide6.QtWidgets import (
     QGraphicsItem,
@@ -48,6 +52,7 @@ from panel_prepare import (
 )
 from plot_utils import preview_title_row_layout
 
+
 INTERACTION_HINT = (
     "Clic texte = éditer · Ctrl+molette = zoom · clic milieu/droit = pan · "
     "double-clic = reset"
@@ -60,12 +65,53 @@ _COALESCE_MS = 16
 _CHANNEL_HIGHLIGHT = "#fff7ed"
 _MONTAGE_AXIS_WIDTH_MIN = 36  # px — largeur mini ticks Y (échelle X uniforme)
 _MONTAGE_AXIS_WIDTH_MAX = 96
+# Espacement vertical identique entre lignes de données montage.
+_MONTAGE_DATA_ROW_SPACING_PX = 0
+# Axe X partagé sous le stack (hors lignes de courbes → ViewBox égales).
+_MONTAGE_X_AXIS_HEIGHT_PX = 30
+# Hauteur bas des PlotItem de données (bordure seule, sans ticks/xlabel).
+_MONTAGE_DATA_BOTTOM_AXIS_PX = 0
 # Gouttières hors ViewBox : échelle Y à droite, X sous le dernier graph.
 _SCALE_BAR_PAD_PX = 6
 _SCALE_BAR_RIGHT_GUTTER_PX = 58
 # Place pour bâton temps + libellé (+ xlabel éventuel) sous le dernier graph.
 _SCALE_BAR_BOTTOM_GUTTER_PX = 48
 _MONTAGE_STREAM_KINDS = frozenset({"raw", "hp", "lp"})
+
+
+def _scale_bar_pair_px(bars: ScaleBarSpec, dx_name: str, dy_name: str) -> tuple[float, float]:
+    """Lire une paire de décalages (dx, dy) en pixels. +dx droite, +dy haut."""
+    try:
+        dx = float(getattr(bars, dx_name, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        dx = 0.0
+    try:
+        dy = float(getattr(bars, dy_name, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        dy = 0.0
+    if dx != dx:
+        dx = 0.0
+    if dy != dy:
+        dy = 0.0
+    return (dx, dy)
+
+
+def _scale_bar_offset_px(bars: ScaleBarSpec) -> tuple[float, float]:
+    """Décalage de l’échelle amplitude (axe vertical)."""
+    return _scale_bar_pair_px(bars, "dx_px", "dy_px")
+
+
+def _scale_bar_time_offset_px(bars: ScaleBarSpec) -> tuple[float, float]:
+    """Décalage de l’échelle temps (axe horizontal)."""
+    return _scale_bar_pair_px(bars, "time_dx_px", "time_dy_px")
+
+
+def _uncrop_scale_axis(axis: Any) -> None:
+    """Laisser les barres dépasser la gouttière quand on les décale."""
+    try:
+        axis.setFlag(QGraphicsItem.GraphicsItemFlag.ItemClipsChildrenToShape, False)
+    except Exception:
+        pass
 
 
 def _montage_shares_x(spec: PanelSpec) -> bool:
@@ -75,7 +121,9 @@ def _montage_shares_x(spec: PanelSpec) -> bool:
         return True
     return all(str(kind) in _MONTAGE_STREAM_KINDS for kind in kinds)
 
-TextRole = Literal["title", "xlabel", "ylabel", "legend", "annotation"]
+TextRole = Literal[
+    "title", "xlabel", "ylabel", "legend", "annotation", "stim_on", "stim_off"
+]
 
 
 @dataclass(frozen=True)
@@ -83,6 +131,19 @@ class _TextPinKey:
     role: TextRole
     axes_index: int
     item_index: int = 0
+
+
+@dataclass
+class _StimLabelItem:
+    """Libellé on/off en overlay scène, au-dessus de toutes les courbes."""
+
+    item: QGraphicsSimpleTextItem
+    plot: pg.PlotItem
+    x: float
+    dx_px: float
+    dy_px: float
+    fontsize: float = 8.0
+    color: str = "#111827"
 
 
 @dataclass
@@ -103,6 +164,14 @@ class _EditableText:
             return str(getattr(axis, "labelText", "") or "")
         if isinstance(item, pg.LabelItem):
             return str(item.text or "")
+        if isinstance(item, QGraphicsSimpleTextItem):
+            return str(item.text())
+        if isinstance(item, pg.TextItem):
+            inner = getattr(item, "textItem", None)
+            if inner is not None:
+                to_plain = getattr(inner, "toPlainText", None)
+                if callable(to_plain):
+                    return str(to_plain())
         to_plain = getattr(item, "toPlainText", None)
         if callable(to_plain):
             return str(to_plain())
@@ -119,6 +188,19 @@ class _EditableText:
             axis.labelText = str(text)
             try:
                 axis._updateLabel()
+            except Exception:
+                pass
+            return
+        if isinstance(item, QGraphicsSimpleTextItem):
+            try:
+                item.setText(str(text))
+            except Exception:
+                pass
+            return
+        if isinstance(item, pg.TextItem):
+            # Garder couleur / police déjà appliquées via setFont.
+            try:
+                item.setText(str(text))
             except Exception:
                 pass
             return
@@ -268,6 +350,35 @@ def _montage_label_column_extra(spec: Any) -> int:
 
 
 _LABEL_FAMILY = "Segoe UI"
+_LABEL_FAMILY_FALLBACKS: tuple[str, ...] = (
+    "Segoe UI",
+    "Arial",
+    "Helvetica",
+    "DejaVu Sans",
+    "Sans Serif",
+)
+
+
+def _resolved_label_family() -> str:
+    """Première famille disponible (Segoe UI peut manquer hors Windows)."""
+    for family in _LABEL_FAMILY_FALLBACKS:
+        info = QFontInfo(QFont(family))
+        resolved = str(info.family() or "").strip()
+        if resolved and info.exactMatch():
+            return family
+        if resolved and family.lower() in resolved.lower():
+            return family
+    try:
+        from PySide6.QtWidgets import QApplication
+
+        app = QApplication.instance()
+        if app is not None:
+            family = str(app.font().family() or "").strip()
+            if family:
+                return family
+    except Exception:
+        pass
+    return _LABEL_FAMILY
 
 
 def _html_text(text: str) -> str:
@@ -280,12 +391,30 @@ def _face_qfont(
     size_pt: float, *, bold: bool = False, italic: bool = False, underline: bool = False
 ) -> QFont:
     """Police explicite : sans famille, Qt ignore gras et italique dans le HTML."""
-    font = QFont(_LABEL_FAMILY)
+    font = QFont(_resolved_label_family())
+    font.setStyleHint(QFont.StyleHint.SansSerif)
+    try:
+        font.setStyleStrategy(
+            QFont.StyleStrategy.PreferAntialias
+            | QFont.StyleStrategy.PreferQuality
+        )
+    except Exception:
+        pass
     font.setPointSizeF(max(5.0, float(size_pt)))
     font.setWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
     font.setBold(bool(bold))
     font.setItalic(bool(italic))
     font.setUnderline(bool(underline))
+    if bold or italic:
+        info = QFontInfo(font)
+        if (bold and not info.bold()) or (italic and not info.italic()):
+            for family in _LABEL_FAMILY_FALLBACKS:
+                font.setFamily(family)
+                font.setBold(bool(bold))
+                font.setItalic(bool(italic))
+                info = QFontInfo(font)
+                if ((not bold) or info.bold()) and ((not italic) or info.italic()):
+                    break
     return font
 
 
@@ -578,68 +707,67 @@ def _scale_label_item(label: str, font: QFont, brush: QBrush) -> QGraphicsSimple
     return text
 
 
-def _paint_tick_underlines(axis: Any, painter: Any, text_specs: Any) -> None:
-    """Souligner les valeurs de ticks : ``QPainter.drawText`` les coupe au cadre."""
-    style = getattr(axis, "style", None)
-    font = style.get("tickFont") if isinstance(style, dict) else None
-    if font is None or not font.underline() or not text_specs:
-        return
-    metrics = QFontMetrics(font)
-    try:
-        pen = QPen(axis.textPen())
-        pen.setWidthF(max(1.0, float(metrics.lineWidth())))
-        pen.setCosmetic(True)
-        painter.setPen(pen)
-    except Exception:
-        return
-    try:
-        painter.setClipping(False)
-    except Exception:
-        pass
+def _tick_text_top_left(
+    rect: Any, flags: int, text: str, metrics: QFontMetrics
+) -> tuple[float, float, float]:
+    """``(left, top, advance)`` du libellé de tick dans ``rect``."""
     align_right = int(Qt.AlignmentFlag.AlignRight)
     align_hcenter = int(Qt.AlignmentFlag.AlignHCenter)
     align_vcenter = int(Qt.AlignmentFlag.AlignVCenter)
     align_bottom = int(Qt.AlignmentFlag.AlignBottom)
-    descent = max(1, int(metrics.underlinePos()))
-    for rect, flags, text in text_specs:
-        shown = str(text or "")
-        if not shown:
-            continue
-        fl = int(flags)
-        advance = float(metrics.horizontalAdvance(shown))
-        height = float(metrics.height())
-        if fl & align_vcenter:
-            top = float(rect.center().y()) - height / 2.0
-        elif fl & align_bottom:
-            top = float(rect.bottom()) - height
-        else:
-            top = float(rect.top())
-        if fl & align_right:
-            left = float(rect.right()) - advance
-        elif fl & align_hcenter:
-            left = float(rect.center().x()) - advance / 2.0
-        else:
-            left = float(rect.left())
-        y = top + float(metrics.ascent()) + float(descent)
-        painter.drawLine(QPointF(left, y), QPointF(left + advance, y))
+    fl = int(flags)
+    advance = float(metrics.horizontalAdvance(text))
+    height = float(metrics.height())
+    if fl & align_vcenter:
+        top = float(rect.center().y()) - height / 2.0
+    elif fl & align_bottom:
+        top = float(rect.bottom()) - height
+    else:
+        top = float(rect.top())
+    if fl & align_right:
+        left = float(rect.right()) - advance
+    elif fl & align_hcenter:
+        left = float(rect.center().x()) - advance / 2.0
+    else:
+        left = float(rect.left())
+    return left, top, advance
 
 
-def _paint_tick_labels(axis: Any, painter: Any, text_specs: Any) -> None:
-    """Dessiner les graduations sur le painter réel, pas dans le QPicture."""
+def _draw_tick_labels_into_picture(
+    axis: Any, painter: Any, text_specs: Any
+) -> None:
+    """Glyphes en contours dans le QPicture : gras / italique / souligné survivent.
+
+    ``QPainter.drawText`` enregistré dans un ``QPicture`` perd le graisse et
+    l'italique au replay. ``QPainterPath.addText`` bake la forme des glyphes.
+    On ne monkey-patch **pas** ``paint`` (vtable C++ / PySide peu fiable) :
+    seul ``drawPicture``, appelé depuis le ``paint`` Python de pyqtgraph.
+    """
     if not text_specs:
         return
     style = getattr(axis, "style", None)
     font = style.get("tickFont") if isinstance(style, dict) else None
     if font is None:
         return
+    draw_font = QFont(font)
+    draw_font.setUnderline(False)
+    metrics = QFontMetrics(draw_font)
+    try:
+        brush = QBrush(axis.textPen().color())
+    except Exception:
+        brush = QBrush(QColor("#111827"))
+    want_underline = bool(font.underline())
+    underline_pen: QPen | None = None
+    if want_underline:
+        underline_pen = QPen(brush.color())
+        underline_pen.setWidthF(max(1.0, float(metrics.lineWidth())))
+        underline_pen.setCosmetic(True)
+    descent = max(1, int(metrics.underlinePos())) if want_underline else 0
     painter.save()
     try:
-        draw_font = QFont(font)
-        # Le trait est ajouté à part : ``drawText`` le coupe au cadre de l'axe.
-        draw_font.setUnderline(False)
-        painter.setFont(draw_font)
         try:
-            painter.setPen(axis.textPen())
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
         except Exception:
             pass
         try:
@@ -648,32 +776,39 @@ def _paint_tick_labels(axis: Any, painter: Any, text_specs: Any) -> None:
             pass
         for rect, flags, text in text_specs:
             shown = str(text or "")
-            if shown:
-                painter.drawText(rect, int(flags), shown)
-        if font.underline():
-            painter.setClipping(False)
-            _paint_tick_underlines(axis, painter, text_specs)
+            if not shown:
+                continue
+            left, top, advance = _tick_text_top_left(
+                rect, int(flags), shown, metrics
+            )
+            baseline = top + float(metrics.ascent())
+            path = QPainterPath()
+            path.addText(QPointF(left, baseline), draw_font, shown)
+            painter.fillPath(path, brush)
+            if underline_pen is not None:
+                y = baseline + float(descent)
+                painter.setPen(underline_pen)
+                painter.drawLine(QPointF(left, y), QPointF(left + advance, y))
     finally:
         painter.restore()
 
 
-def _ensure_tick_underline_painter(axis: Any) -> None:
-    """Graduations hors QPicture : le cache perd gras, italique et souligné."""
-    if getattr(axis, "_erg_tick_underline", False):
+def _ensure_tick_face_painter(axis: Any) -> None:
+    """Enregistrer gras / italique / souligné des ticks dans le QPicture d'axe."""
+    if getattr(axis, "_erg_tick_face_picture", False):
         return
     original_draw = axis.drawPicture
-    original_paint = axis.paint
 
-    def draw_picture(painter: Any, axis_spec: Any, tick_specs: Any, text_specs: Any) -> None:
-        axis._erg_text_specs = text_specs
+    def draw_picture(
+        painter: Any, axis_spec: Any, tick_specs: Any, text_specs: Any
+    ) -> None:
+        # Traits d'axe sans drawText (sinon le QPicture perd la face).
         original_draw(painter, axis_spec, tick_specs, [])
-
-    def paint(painter: Any, opt: Any, widget: Any = None) -> None:
-        original_paint(painter, opt, widget)
-        _paint_tick_labels(axis, painter, getattr(axis, "_erg_text_specs", None))
+        _draw_tick_labels_into_picture(axis, painter, text_specs)
 
     axis.drawPicture = draw_picture
-    axis.paint = paint
+    axis._erg_tick_face_picture = True
+    # Ancien flag éventuel (wrap paint) : ne plus s'y fier.
     axis._erg_tick_underline = True
 
 
@@ -691,7 +826,7 @@ def _apply_plot_tick_font(
     font = _tick_qfont(tick_pt, bold=bold, italic=italic, underline=underline)
     for name in ("left", "bottom", "top", "right"):
         axis = plot.getAxis(name)
-        _ensure_tick_underline_painter(axis)
+        _ensure_tick_face_painter(axis)
         axis.setStyle(tickFont=font)
 
 
@@ -796,8 +931,11 @@ class PlotHost(QWidget):
         self._spec: PanelSpec | None = None
         self._plots: list[pg.PlotItem] = []
         self._text_items: list[pg.TextItem] = []
+        self._stim_labels: list[_StimLabelItem] = []
         self._row_labels: list[pg.LabelItem] = []
         self._montage_title_label: pg.LabelItem | None = None
+        # Axe X partagé sous les courbes montage (ticks + xlabel hors ViewBox).
+        self._montage_x_axis_plot: pg.PlotItem | None = None
         # Index de grille de la 1ʳᵉ ligne de données (1 si titre montage dédié).
         self._data_row0 = 0
         self._editable: list[_EditableText] = []
@@ -962,8 +1100,9 @@ class PlotHost(QWidget):
         ticks = list(getattr(spec, "x_ticks", ()) or []) if spec is not None else []
         if not ticks or not self._plots:
             return
+        target = self._montage_x_axis_plot or self._plots[0]
         try:
-            self._plots[0].getAxis("bottom").setTicks([ticks])
+            target.getAxis("bottom").setTicks([ticks])
         except Exception:
             pass
 
@@ -1089,6 +1228,223 @@ class PlotHost(QWidget):
             self._bind_montage_row_label_anchors()
         return self._finish_draw(spec, is_montage=is_montage, n_rows=n_rows)
 
+    def _apply_montage_row_minimums(self, spec: PanelSpec) -> None:
+        """Chaque ligne de courbe : même hauteur mini + même écart vertical."""
+        row_min = max(0, int(getattr(spec, "row_min_height_px", 0) or 0))
+        layout = getattr(getattr(self._glw, "ci", None), "layout", None)
+        if layout is None or not hasattr(layout, "setRowMinimumHeight"):
+            return
+        try:
+            row_count = int(layout.rowCount())
+        except Exception:
+            row_count = 0
+        for row in range(row_count):
+            try:
+                layout.setRowMinimumHeight(row, 0)
+            except Exception:
+                return
+        n_plots = len(self._plots)
+        row0 = int(self._data_row0)
+        # Écarts entre lignes de données identiques (pas le gap légende).
+        try:
+            layout.setVerticalSpacing(_MONTAGE_DATA_ROW_SPACING_PX)
+        except Exception:
+            pass
+        for index in range(max(0, n_plots - 1)):
+            try:
+                layout.setRowSpacing(
+                    row0 + index, _MONTAGE_DATA_ROW_SPACING_PX
+                )
+            except Exception:
+                pass
+        if row_min <= 0:
+            return
+        for index in range(n_plots):
+            try:
+                layout.setRowMinimumHeight(row0 + index, row_min)
+            except Exception:
+                return
+
+    def _collapse_montage_data_bottom_axes(self) -> None:
+        """Retirer ticks/xlabel des lignes de courbes (hauteur ViewBox uniforme)."""
+        for plot in self._plots:
+            bottom = plot.getAxis("bottom")
+            self._clear_bottom_axis_label(bottom, collapse=True)
+            try:
+                bottom.setStyle(showValues=False, tickLength=0)
+            except Exception:
+                try:
+                    bottom.setStyle(showValues=False)
+                except Exception:
+                    pass
+            try:
+                bottom.setHeight(_MONTAGE_DATA_BOTTOM_AXIS_PX)
+            except Exception:
+                pass
+
+    def _montage_x_axis_grid_row(self, n_rows: int) -> int:
+        return int(n_rows) + int(self._data_row0)
+
+    def _ensure_montage_x_axis_row(
+        self, spec: PanelSpec, *, n_rows: int, plot_col: int
+    ) -> None:
+        """Ligne d’axe X sous le stack : ticks + xlabel hors des ViewBox."""
+        c = self._colors
+        grid_row = self._montage_x_axis_grid_row(n_rows)
+        plot = self._montage_x_axis_plot
+        if plot is not None:
+            pos = getattr(getattr(self._glw, "ci", None), "items", {}).get(plot)
+            if not (isinstance(pos, tuple) and len(pos) >= 1 and int(pos[0]) == grid_row):
+                self._discard_layout_item(plot)
+                self._montage_x_axis_plot = None
+                plot = None
+        if plot is None:
+            self._free_grid_cell(grid_row, plot_col)
+            plot = self._glw.addPlot(row=grid_row, col=plot_col)
+            self._montage_x_axis_plot = plot
+            plot.setMenuEnabled(False)
+            vb = plot.getViewBox()
+            try:
+                vb.enableAutoRange(enable=False)
+                vb.setDefaultPadding(0.0)
+                vb.setMouseEnabled(x=False, y=False)
+                vb.setMenuEnabled(False)
+            except Exception:
+                pass
+            plot.hideAxis("left")
+            plot.hideAxis("right")
+            plot.hideAxis("top")
+            plot.showAxis("bottom", True)
+            try:
+                plot.setTitle(None)
+            except Exception:
+                pass
+            try:
+                self._glw.ci.layout.setRowStretchFactor(grid_row, 0)
+                if hasattr(self._glw.ci.layout, "setRowFixedHeight"):
+                    self._glw.ci.layout.setRowFixedHeight(
+                        grid_row, _MONTAGE_X_AXIS_HEIGHT_PX
+                    )
+                else:
+                    self._glw.ci.layout.setRowMinimumHeight(
+                        grid_row, _MONTAGE_X_AXIS_HEIGHT_PX
+                    )
+            except Exception:
+                pass
+        if self._plots:
+            try:
+                plot.setXLink(self._plots[0])
+            except Exception:
+                pass
+        bottom = plot.getAxis("bottom")
+        show_borders = bool(spec.show_borders)
+        spine_pen = (
+            pg.mkPen(c["spine"], width=0.8) if show_borders else pg.mkPen(None)
+        )
+        bottom.setPen(spine_pen)
+        bottom.setTextPen(pg.mkPen(c["fg"]))
+        ticks_inside = bool(spec.ticks_inside)
+        try:
+            bottom.setStyle(
+                showValues=True,
+                tickLength=(-6 if ticks_inside else 6),
+            )
+        except Exception:
+            bottom.setStyle(showValues=True)
+        _apply_plot_tick_font(plot, spec, montage=True)
+        try:
+            bottom.setHeight(None)
+        except Exception:
+            pass
+        label_pt = max(5, int(round(float(spec.label_font_size or 9.0))))
+        if spec.xlabel:
+            plot.setLabel(
+                "bottom",
+                spec.xlabel,
+                color=c["fg"],
+                **{"font-size": f"{label_pt}pt"},
+            )
+            _apply_label_face(
+                getattr(bottom, "label", None),
+                bold=bool(spec.label_bold),
+                italic=bool(spec.label_italic),
+                underline=bool(getattr(spec, "label_underline", False)),
+            )
+            label_item = getattr(bottom, "label", None)
+            if label_item is not None:
+                self._editable.append(
+                    _EditableText(
+                        label_item, "xlabel", axes_index=max(0, n_rows - 1), item_index=0
+                    )
+                )
+        else:
+            self._clear_bottom_axis_label(bottom, collapse=False)
+        try:
+            # Hauteur de la ligne de chrome : ticks (+ xlabel).
+            needed = _MONTAGE_X_AXIS_HEIGHT_PX
+            if spec.xlabel:
+                needed = max(needed, _MONTAGE_X_AXIS_HEIGHT_PX + 14)
+            plot.setMaximumHeight(needed + 8)
+            plot.setMinimumHeight(needed)
+            layout = self._glw.ci.layout
+            if hasattr(layout, "setRowFixedHeight"):
+                layout.setRowFixedHeight(grid_row, needed + 4)
+            else:
+                layout.setRowMinimumHeight(grid_row, needed)
+            layout.setRowStretchFactor(grid_row, 0)
+            # Petit écart fixe après la dernière courbe (identique quel que soit n).
+            if n_rows > 0:
+                layout.setRowSpacing(
+                    int(self._data_row0) + n_rows - 1,
+                    _MONTAGE_DATA_ROW_SPACING_PX,
+                )
+        except Exception:
+            pass
+
+    def montage_needed_glw_height_px(self) -> int | None:
+        """Hauteur de vue nécessaire pour montrer toutes les lignes et la légende.
+
+        ``None`` si ce n’est pas un montage. La valeur peut dépasser la vue
+        actuelle : le panneau doit alors grandir, sinon le bas est rogné.
+        """
+        spec = self._spec
+        if spec is None or spec.layout_kind != "montage" or not self._plots:
+            return None
+        self._apply_montage_row_minimums(spec)
+        layout = getattr(getattr(self._glw, "ci", None), "layout", None)
+        needed = 0.0
+        if layout is not None:
+            try:
+                layout.activate()
+            except Exception:
+                pass
+            try:
+                hint = layout.effectiveSizeHint(Qt.SizeHint.MinimumSize)
+                needed = float(hint.height())
+            except Exception:
+                needed = 0.0
+        bottom = 0.0
+        items = [self._plots[-1]]
+        if self._montage_x_axis_plot is not None:
+            items.append(self._montage_x_axis_plot)
+        if self._legend_item is not None:
+            items.append(self._legend_item)
+        for item in items:
+            try:
+                bottom = max(bottom, float(item.sceneBoundingRect().bottom()))
+            except Exception:
+                pass
+        view_h = float(self._glw.height())
+        if bottom > view_h + 0.5:
+            # Le contenu dépasse la vue : garder une marge pour la légende.
+            needed = max(needed, bottom + 10.0)
+        elif bottom > 0.0:
+            needed = max(needed, bottom)
+        if needed <= 0.0:
+            return None
+        gap = needed - int(needed)
+        return int(needed) + (1 if gap > 0.01 else 0)
+
     def _bind_montage_row_label_anchors(self) -> None:
         """Lier chaque libellé au ViewBox de sa ligne (centrage vertical exact)."""
         for label, plot in zip(self._row_labels, self._plots):
@@ -1165,6 +1521,7 @@ class PlotHost(QWidget):
         self._scale_bar_lengths = []
         self._remove_legend()
         self._text_items.clear()
+        self._clear_stim_labels()
         self._editable.clear()
         # Keep montage row labels / axis shims; re-register edit targets.
         if is_montage:
@@ -1220,6 +1577,13 @@ class PlotHost(QWidget):
         # Autoscale / limites après affichage des courbes (pas pendant le build).
         self._queue_limits_after_paint(spec)
         self._apply_labels(spec, is_montage=is_montage)
+        if is_montage:
+            # Axe X hors stack avant légende / barres : sinon la dernière
+            # ligne grossit et l’espacement ViewBox n’est plus uniforme.
+            self._collapse_montage_data_bottom_axes()
+            self._ensure_montage_x_axis_row(
+                spec, n_rows=n_rows, plot_col=self._plot_col
+            )
         self._apply_scale_bars(spec, is_montage=is_montage)
         if spec.show_legend and legend_entries:
             self._place_legend(
@@ -1230,6 +1594,7 @@ class PlotHost(QWidget):
             )
         self._reapply_text_pins()
         if is_montage:
+            self._apply_montage_row_minimums(spec)
             self._bind_montage_row_label_anchors()
             # Après layout (gouttières échelle / légende) : recentrer les libellés.
             QTimer.singleShot(0, self._bind_montage_row_label_anchors)
@@ -1663,10 +2028,13 @@ class PlotHost(QWidget):
             if row_map is not None and row_map.get(col) is item:
                 del row_map[col]
         ci.items.pop(item, None)
-        try:
-            item.geometryChanged.disconnect(ci._updateItemBorder)
-        except Exception:
-            pass
+        # PySide6: disconnect déjà fait → RuntimeWarning, pas une exception.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            try:
+                item.geometryChanged.disconnect(ci._updateItemBorder)
+            except Exception:
+                pass
         border = ci.itemBorders.pop(item, None)
         if border is not None:
             try:
@@ -1782,11 +2150,13 @@ class PlotHost(QWidget):
         self._clear_scale_bar_items()
         self._scale_bar_lengths = []
         self._legend_item = None
+        self._clear_stim_labels()
         self._empty_graphics_layout()
         self._plots.clear()
         self._text_items.clear()
         self._row_labels.clear()
         self._montage_title_label = None
+        self._montage_x_axis_plot = None
         self._data_row0 = 0
         self._editable.clear()
         self._geometry_key = None
@@ -2178,6 +2548,8 @@ class PlotHost(QWidget):
                     movable=False,
                 )
                 plot.addItem(region)
+            elif ann.kind == "stim_label":
+                self._add_stim_label(plot, ann, row=row)
             elif ann.kind == "text":
                 text = pg.TextItem(ann.text or "", color=ann.color, anchor=(0.5, 0.5))
                 plot.addItem(text)
@@ -2185,13 +2557,191 @@ class PlotHost(QWidget):
                 text.setPos(0.0, 0.0)
                 self._text_items.append(text)
         self._arm_stim_spans()
+        self._reposition_stim_labels()
+
+    def _clear_stim_labels(self) -> None:
+        """Retirer les overlays on/off de la scène."""
+        scene = None
+        try:
+            scene = self._glw.scene()
+        except Exception:
+            scene = None
+        for entry in self._stim_labels:
+            try:
+                item = entry.item
+                if scene is not None and item.scene() is scene:
+                    scene.removeItem(item)
+                elif item.scene() is not None:
+                    item.scene().removeItem(item)
+            except Exception:
+                pass
+        self._stim_labels.clear()
+        self._apply_stim_label_band_margin(0)
+
+    def _add_stim_label(self, plot: pg.PlotItem, ann: Any, *, row: int) -> None:
+        """Libellé « on » / « off » au-dessus de toutes les courbes (hors ViewBox)."""
+        label_text = str(getattr(ann, "text", "") or "")
+        if not label_text.strip():
+            return
+        role_raw = str(getattr(ann, "role", "") or "")
+        edit_role: TextRole = (
+            "stim_off" if role_raw == "stim_offset" else "stim_on"
+        )
+        color = str(getattr(ann, "color", "") or "#111827")
+        fontsize = max(4.0, float(getattr(ann, "fontsize", 8.0) or 8.0))
+        bold = bool(getattr(ann, "bold", False))
+        italic = bool(getattr(ann, "italic", False))
+        underline = bool(getattr(ann, "underline", False))
+        dx_px = float(getattr(ann, "dx_px", 0.0) or 0.0)
+        dy_px = float(getattr(ann, "dy_px", 0.0) or 0.0)
+        font = _face_qfont(
+            fontsize, bold=bold, italic=italic, underline=underline
+        )
+        text = QGraphicsSimpleTextItem(label_text)
+        text.setFont(font)
+        try:
+            text.setBrush(QBrush(pg.mkColor(color)))
+        except Exception:
+            text.setBrush(QBrush(QColor(color)))
+        try:
+            text.setZValue(2000)
+        except Exception:
+            pass
+        try:
+            text.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+        except Exception:
+            pass
+        try:
+            self._glw.scene().addItem(text)
+        except Exception:
+            return
+        # Ancre X sur le 1er plot (haut de la pile), pour rester au-dessus de tout.
+        anchor_plot = self._plots[0] if self._plots else plot
+        item_index = len(self._stim_labels)
+        self._stim_labels.append(
+            _StimLabelItem(
+                item=text,
+                plot=anchor_plot,
+                x=float(ann.x),
+                dx_px=dx_px,
+                dy_px=dy_px,
+                fontsize=fontsize,
+                color=color,
+            )
+        )
+        self._editable.append(
+            _EditableText(text, edit_role, axes_index=row, item_index=item_index)
+        )
+
+    def _stim_label_pad_px(self, entries: list[_StimLabelItem] | None = None) -> float:
+        """Hauteur (px) de la bande au-dessus des courbes pour les libellés."""
+        items = entries if entries is not None else self._stim_labels
+        pad = 0.0
+        for entry in items:
+            try:
+                rect = entry.item.boundingRect()
+                text_h = max(float(rect.height()), float(entry.fontsize) * 1.35)
+            except Exception:
+                text_h = max(12.0, float(entry.fontsize) * 1.35)
+            need = text_h + 6.0 + max(0.0, float(entry.dy_px))
+            pad = max(pad, need)
+        return pad
+
+    def _title_offset_margin_px(self) -> tuple[int, int, int]:
+        """``(left, top, right)`` réservés pour le décalage du titre."""
+        spec = self._spec
+        if spec is None:
+            return (0, 0, 0)
+        dx = int(round(float(getattr(spec, "title_dx_px", 0.0) or 0.0)))
+        dy = int(round(float(getattr(spec, "title_dy_px", 0.0) or 0.0)))
+        return (max(0, -dx), max(0, dy), max(0, dx))
+
+    def _apply_stim_label_band_margin(self, height_px: float | None = None) -> None:
+        """Marges du layout GLW : libellés stim + décalage du titre.
+
+        ``height_px`` force la bande stim (``0`` = pas de libellés). ``None`` =
+        recalculer depuis les libellés présents. Le pad titre est toujours
+        fusionné pour ne pas écraser un décalage d’aperçu.
+        """
+        if height_px is None:
+            stim_top = (
+                int(round(self._stim_label_pad_px())) if self._stim_labels else 0
+            )
+        else:
+            stim_top = max(0, int(round(float(height_px))))
+        title_left, title_top, title_right = self._title_offset_margin_px()
+        top = max(stim_top, title_top)
+        try:
+            layout = self._glw.ci.layout
+            layout.setContentsMargins(title_left, top, title_right, 0)
+        except Exception:
+            try:
+                self._glw.setContentsMargins(title_left, top, title_right, 0)
+            except Exception:
+                pass
+
+    def _stim_label_stack_top_scene_y(self) -> float | None:
+        """Y scène du haut du contenu (titre ou 1ʳᵉ courbe) — sous la bande libellés."""
+        tops: list[float] = []
+        if self._montage_title_label is not None:
+            try:
+                tops.append(
+                    float(self._montage_title_label.sceneBoundingRect().top())
+                )
+            except Exception:
+                pass
+        if self._plots:
+            try:
+                tops.append(
+                    float(self._plots[0].getViewBox().sceneBoundingRect().top())
+                )
+            except Exception:
+                pass
+        if not tops:
+            return None
+        return min(tops)
+
+    def _reposition_stim_labels(self) -> None:
+        """Placer les libellés dans la marge haute, au-dessus de toutes les courbes."""
+        if not self._stim_labels:
+            self._apply_stim_label_band_margin(0)
+            return
+        self._apply_stim_label_band_margin()
+        stack_top = self._stim_label_stack_top_scene_y()
+        if stack_top is None:
+            return
+        for entry in self._stim_labels:
+            try:
+                mapped = self._stim_span_scene_point(entry.plot, float(entry.x))
+                if mapped is None:
+                    vb = entry.plot.getViewBox()
+                    rect = vb.sceneBoundingRect()
+                    (x0, x1), _y = vb.viewRange()
+                    if not np.isfinite([x0, x1]).all() or float(x0) == float(x1):
+                        entry.item.hide()
+                        continue
+                    frac = (float(entry.x) - float(x0)) / (float(x1) - float(x0))
+                    scene_x = float(rect.left()) + frac * float(rect.width())
+                else:
+                    scene_x = float(mapped[0])
+                br = entry.item.boundingRect()
+                text_w = float(br.width())
+                text_h = float(br.height())
+                # Qt : y vers le bas. dy positif = vers le haut de l’écran.
+                x = scene_x - 0.5 * text_w + float(entry.dx_px)
+                y = float(stack_top) - text_h - 2.0 - float(entry.dy_px)
+                entry.item.setPos(QPointF(x, y))
+                entry.item.show()
+            except Exception:
+                continue
 
     def _arm_stim_spans(self) -> None:
         """Brancher le trait continu et le positionner dès que la géométrie existe."""
-        if not self._stim_span_specs:
+        if not self._stim_span_specs and not self._stim_labels:
             self._clear_stim_spans()
             return
-        self._ensure_stim_span_item()
+        if self._stim_span_specs:
+            self._ensure_stim_span_item()
         self._connect_stim_spans()
         self._schedule_stim_span_update()
 
@@ -2235,23 +2785,39 @@ class PlotHost(QWidget):
     def _connect_stim_spans(self) -> None:
         self._disconnect_stim_spans()
         seen: set[int] = set()
-        for _x, _color, rows in self._stim_span_specs:
-            for row in rows:
-                if row < 0 or row >= len(self._plots) or row in seen:
-                    continue
-                seen.add(row)
-                vb = self._plots[row].getViewBox()
+        rows: list[int] = []
+        for _x, _color, span_rows in self._stim_span_specs:
+            rows.extend(int(r) for r in span_rows)
+        for entry in self._stim_labels:
+            try:
+                rows.append(self._plots.index(entry.plot))
+            except ValueError:
+                vb = entry.plot.getViewBox()
                 try:
                     vb.sigRangeChanged.connect(self._schedule_stim_span_update)
                     self._stim_span_connected.append(vb)
-                except Exception:
-                    continue
-                try:
                     vb.sigResized.connect(self._schedule_stim_span_update)
                 except Exception:
                     pass
+        for row in rows:
+            if row < 0 or row >= len(self._plots) or row in seen:
+                continue
+            seen.add(row)
+            vb = self._plots[row].getViewBox()
+            try:
+                vb.sigRangeChanged.connect(self._schedule_stim_span_update)
+                self._stim_span_connected.append(vb)
+            except Exception:
+                continue
+            try:
+                vb.sigResized.connect(self._schedule_stim_span_update)
+            except Exception:
+                pass
 
     def _schedule_stim_span_update(self, *_args: Any) -> None:
+        # Les libellés on/off suivent le haut de la vue à chaque pan / zoom.
+        if self._stim_labels:
+            self._reposition_stim_labels()
         if not self._stim_span_specs:
             return
         if not self._stim_span_timer.isActive():
@@ -2461,6 +3027,8 @@ class PlotHost(QWidget):
             self._fit_montage_left_axis_widths(self._spec)
             self._update_stim_spans()
             self._schedule_stim_span_update()
+        # Libellés hors ViewBox (bande layout) — les pointillés restent dans les courbes.
+        self._reposition_stim_labels()
         # Longueurs auto basées sur le vrai viewRange (pas celui d’avant l’autoscale).
         self._resync_scale_bar_lengths()
         self._refresh_scale_bars()
@@ -2559,6 +3127,8 @@ class PlotHost(QWidget):
             self._editable.append(
                 _EditableText(title_item, "title", axes_index=0, item_index=0)
             )
+            self._apply_montage_title_row_height(spec)
+            self._apply_title_pixel_offset(title_item, spec)
         elif self._plots:
             self._plots[0].setTitle(
                 spec.title or "", color=c["title"], size=title_size
@@ -2575,6 +3145,8 @@ class PlotHost(QWidget):
                     _EditableText(title_item, "title", axes_index=0, item_index=0)
                 )
             self._apply_preview_title_gap(self._plots[0], spec)
+            if title_item is not None:
+                self._apply_title_pixel_offset(title_item, spec)
         for row, plot in enumerate(self._plots):
             if not is_montage:
                 ylabel = ""
@@ -2605,12 +3177,12 @@ class PlotHost(QWidget):
                         )
             is_last = row == len(self._plots) - 1
             bottom = plot.getAxis("bottom")
+            if is_montage:
+                # Xlabel / ticks sur la ligne d’axe partagée (ViewBox égales).
+                self._clear_bottom_axis_label(bottom, collapse=True)
+                continue
             if not is_last:
-                if is_montage:
-                    # Sinon une ligne qui a été la dernière garde « Temps ».
-                    self._clear_bottom_axis_label(bottom)
-                else:
-                    bottom.setStyle(showValues=False)
+                bottom.setStyle(showValues=False)
                 continue
             bottom.setStyle(showValues=True)
             if spec.xlabel:
@@ -2633,8 +3205,6 @@ class PlotHost(QWidget):
                             label_item, "xlabel", axes_index=row, item_index=0
                         )
                     )
-            elif is_montage:
-                self._clear_bottom_axis_label(bottom, collapse=False)
 
         # Center placeholder-like text annotations that had pos 0,0
         for text in self._text_items:
@@ -2645,6 +3215,33 @@ class PlotHost(QWidget):
                     text.setPos(0.5 * (x0 + x1), 0.5 * (y0 + y1))
             except Exception:
                 pass
+        self._reposition_stim_labels()
+
+    def _apply_title_pixel_offset(self, title_item: Any, spec: PanelSpec) -> None:
+        """Décaler le titre en pixels (+dx droite, +dy haut).
+
+        Utilise une transform sur le ``LabelItem``. Les marges du layout
+        (voir ``_apply_title_layout_margins``) réservent la place pour que le
+        titre reste dans le widget.
+        """
+        if title_item is None:
+            return
+        dx = float(getattr(spec, "title_dx_px", 0.0) or 0.0)
+        dy = float(getattr(spec, "title_dy_px", 0.0) or 0.0)
+        try:
+            title_item.setFlag(
+                title_item.GraphicsItemFlag.ItemClipsChildrenToShape, False
+            )
+        except Exception:
+            pass
+        try:
+            # Scène pyqtgraph : Y positif vers le bas → inverser dy.
+            if dx or dy:
+                title_item.setTransform(QTransform.fromTranslate(dx, -dy))
+            else:
+                title_item.resetTransform()
+        except Exception:
+            pass
 
     def _apply_preview_title_gap(self, plot: pg.PlotItem, spec: PanelSpec) -> None:
         """Écarter ou rapprocher le titre de la courbe (aperçu, hors montage)."""
@@ -2658,7 +3255,10 @@ class PlotHost(QWidget):
         except Exception:
             text_h = 14.0
         row_h, spacing = preview_title_row_layout(
-            text_h, int(getattr(spec, "title_gap_px", 0) or 0)
+            text_h,
+            int(getattr(spec, "title_gap_px", 0) or 0),
+            title_dx_px=float(getattr(spec, "title_dx_px", 0.0) or 0.0),
+            title_dy_px=float(getattr(spec, "title_dy_px", 0.0) or 0.0),
         )
         try:
             title.setMaximumHeight(row_h)
@@ -2666,6 +3266,41 @@ class PlotHost(QWidget):
             layout.setRowSpacing(0, spacing)
         except Exception:
             pass
+        # Marges titre sur le GLW (pas le PlotItem) : sinon transform + marge
+        # interne s’annulent et le titre ne bouge pas à l’écran.
+        self._apply_stim_label_band_margin(
+            0 if not self._stim_labels else None
+        )
+
+    def _apply_montage_title_row_height(self, spec: PanelSpec) -> None:
+        """Hauteur de la ligne de titre montage (marges via le layout GLW)."""
+        if self._montage_title_label is None:
+            return
+        layout = getattr(getattr(self._glw, "ci", None), "layout", None)
+        if layout is None:
+            return
+        text_h = 14.0
+        try:
+            text_h = max(
+                1.0, float(self._montage_title_label.itemRect().height())
+            )
+        except Exception:
+            text_h = 14.0
+        row_h, _spacing = preview_title_row_layout(
+            text_h,
+            0,
+            title_dx_px=float(getattr(spec, "title_dx_px", 0.0) or 0.0),
+            title_dy_px=float(getattr(spec, "title_dy_px", 0.0) or 0.0),
+        )
+        try:
+            self._montage_title_label.setMaximumHeight(row_h)
+            layout.setRowFixedHeight(0, row_h)
+            layout.setRowMinimumHeight(0, row_h)
+        except Exception:
+            pass
+        self._apply_stim_label_band_margin(
+            0 if not self._stim_labels else None
+        )
 
     def _clear_bottom_axis_label(self, axis: Any, *, collapse: bool = True) -> None:
         """Retirer le titre d’axe X. ``collapse`` enlève aussi la hauteur réservée."""
@@ -2856,12 +3491,18 @@ class PlotHost(QWidget):
             sample = pg.PlotDataItem(pen=pg.mkPen(color, width=2.0))
             legend.addItem(sample, name)
         if below or not self._plots:
-            legend_row = int(n_rows) + int(self._data_row0)
+            # Sous l’axe X partagé (montage) pour ne pas élargir la dernière courbe.
+            footer = 1 if (
+                str(spec.layout_kind or "") == "montage"
+                and self._montage_x_axis_plot is not None
+            ) else 0
+            legend_row = int(n_rows) + int(self._data_row0) + footer
             self._free_grid_cell(legend_row, plot_col)
             self._glw.addItem(legend, row=legend_row, col=plot_col)
             try:
                 self._glw.ci.layout.setRowStretchFactor(legend_row, 0)
                 if legend_row > 0:
+                    # Gap légende après l’axe X / dernière ligne — pas entre canaux.
                     self._glw.ci.layout.setRowSpacing(legend_row - 1, gap_px)
             except Exception:
                 pass
@@ -2932,14 +3573,29 @@ class PlotHost(QWidget):
             underline=bool(getattr(spec, "tick_underline", False)),
         )
         metrics = QFontMetrics(font)
+        amp_dx, _amp_dy = _scale_bar_offset_px(bars)
+        _time_dx, time_dy = _scale_bar_time_offset_px(bars)
+        pad = float(_SCALE_BAR_PAD_PX)
         label_w = 28
+        label_h = int(metrics.height())
         for row, (_x_size, y_size) in enumerate(self._scale_bar_lengths):
             _x_unit, y_unit = self._scale_bar_units_for_row(bars, row)
             if y_size is not None and y_unit is not None:
                 lab = format_scale_label(float(y_size), str(y_unit))
                 label_w = max(label_w, int(metrics.horizontalAdvance(lab)) + 14)
-        right_w = max(_SCALE_BAR_RIGHT_GUTTER_PX, label_w)
+        # Élargir la gouttière pour que bâton + libellé restent dans le panneau.
+        # +dx amplitude → plus de place à droite ; dx négatif : le bâton entre dans la courbe.
+        right_needed = int(round(pad + max(0.0, amp_dx) + pad + max(0, label_w - 14) + 8))
+        right_w = max(_SCALE_BAR_RIGHT_GUTTER_PX, label_w, right_needed)
+        # +dy temps (haut) : le bâton monte vers la courbe ; -dy : descendre → plus bas.
+        bottom_needed = int(
+            round(pad + max(0.0, -time_dy) + pad + float(label_h) + 4.0)
+        )
+        bottom_h = max(_SCALE_BAR_BOTTOM_GUTTER_PX, bottom_needed)
         n = len(self._plots)
+        is_montage = bool(
+            spec is not None and str(getattr(spec, "layout_kind", "")) == "montage"
+        )
         for row, plot in enumerate(self._plots):
             plot.showAxis("right", True)
             ra = plot.getAxis("right")
@@ -2951,14 +3607,51 @@ class PlotHost(QWidget):
             ra.setPen(pg.mkPen(None))
             ra.setTextPen(pg.mkPen(None))
             ra.setWidth(right_w)
+            _uncrop_scale_axis(ra)
             ba = plot.getAxis("bottom")
-            if row == n - 1 and bars.x_unit is not None:
-                ba.setHeight(_SCALE_BAR_BOTTOM_GUTTER_PX)
+            if is_montage:
+                try:
+                    ba.setHeight(_MONTAGE_DATA_BOTTOM_AXIS_PX)
+                except Exception:
+                    pass
+            elif row == n - 1 and bars.x_unit is not None:
+                ba.setHeight(bottom_h)
+                _uncrop_scale_axis(ba)
             else:
                 try:
                     ba.setHeight(None)
                 except Exception:
                     ba.setHeight(15)
+        if (
+            is_montage
+            and bars.x_unit is not None
+            and self._montage_x_axis_plot is not None
+        ):
+            x_plot = self._montage_x_axis_plot
+            x_ba = x_plot.getAxis("bottom")
+            try:
+                x_ba.setStyle(showValues=False, tickLength=0)
+            except Exception:
+                try:
+                    x_ba.setStyle(showValues=False)
+                except Exception:
+                    pass
+            x_ba.setPen(pg.mkPen(None))
+            x_ba.setTextPen(pg.mkPen(None))
+            x_ba.setHeight(bottom_h)
+            _uncrop_scale_axis(x_ba)
+            try:
+                needed = bottom_h + 8
+                x_plot.setMinimumHeight(needed)
+                x_plot.setMaximumHeight(needed + 12)
+                grid_row = self._montage_x_axis_grid_row(n)
+                layout = self._glw.ci.layout
+                if hasattr(layout, "setRowFixedHeight"):
+                    layout.setRowFixedHeight(grid_row, needed)
+                else:
+                    layout.setRowMinimumHeight(grid_row, needed)
+            except Exception:
+                pass
 
     def _apply_scale_bars(self, spec: PanelSpec, *, is_montage: bool = False) -> None:
         bars = getattr(spec, "scale_bars", None)
@@ -2976,6 +3669,21 @@ class PlotHost(QWidget):
             for axis_name in ("left", "bottom", "right", "top"):
                 try:
                     plot.getAxis(axis_name).setPen(pg.mkPen(None))
+                except Exception:
+                    pass
+        # Axe X partagé (montage) : même règle — barres flottantes sans ticks.
+        if is_montage and self._montage_x_axis_plot is not None:
+            x_plot = self._montage_x_axis_plot
+            try:
+                x_plot.getAxis("bottom").setStyle(showValues=False, tickLength=0)
+            except Exception:
+                try:
+                    x_plot.getAxis("bottom").setStyle(showValues=False)
+                except Exception:
+                    pass
+            for axis_name in ("left", "bottom", "right", "top"):
+                try:
+                    x_plot.getAxis(axis_name).setPen(pg.mkPen(None))
                 except Exception:
                     pass
         self._scale_bar_lengths = self._resolve_scale_bar_lengths(bars)
@@ -3013,17 +3721,31 @@ class PlotHost(QWidget):
                     axis.setTextPen(text_pen)
                 except Exception:
                     pass
-            # Ticks Y numériques ; ticks X sur la dernière ligne seulement.
+            # Ticks Y numériques ; ticks X sur l’axe partagé (montage) ou dernière ligne.
             plot.getAxis("left").setStyle(showValues=True)
-            plot.getAxis("bottom").setStyle(showValues=(row == n - 1))
-            try:
-                plot.getAxis("bottom").setHeight(None)
-            except Exception:
-                pass
+            if is_montage:
+                plot.getAxis("bottom").setStyle(showValues=False)
+                try:
+                    plot.getAxis("bottom").setHeight(_MONTAGE_DATA_BOTTOM_AXIS_PX)
+                except Exception:
+                    pass
+            else:
+                plot.getAxis("bottom").setStyle(showValues=(row == n - 1))
+                try:
+                    plot.getAxis("bottom").setHeight(None)
+                except Exception:
+                    pass
             try:
                 plot.showAxis("right", show_right)
                 if not show_right:
                     plot.getAxis("right").setWidth(0)
+            except Exception:
+                pass
+        if is_montage and self._montage_x_axis_plot is not None:
+            try:
+                self._ensure_montage_x_axis_row(
+                    spec, n_rows=n, plot_col=self._plot_col
+                )
             except Exception:
                 pass
 
@@ -3172,6 +3894,8 @@ class PlotHost(QWidget):
             self._reserve_scale_bar_gutters(bars)
 
         pad = float(_SCALE_BAR_PAD_PX)
+        amp_dx, amp_dy = _scale_bar_offset_px(bars)
+        time_dx, time_dy = _scale_bar_time_offset_px(bars)
         n = len(self._plots)
         for row, plot in enumerate(self._plots):
             try:
@@ -3196,6 +3920,8 @@ class PlotHost(QWidget):
                     font=font,
                     metrics=metrics,
                     pad=pad,
+                    dx=amp_dx,
+                    dy=amp_dy,
                 )
 
             if (
@@ -3204,8 +3930,9 @@ class PlotHost(QWidget):
                 and x_unit is not None
                 and row == n - 1
             ):
+                x_host = self._montage_x_axis_plot or plot
                 self._draw_x_scale_in_gutter(
-                    plot,
+                    x_host,
                     x_size=float(x_size),
                     x_span=x_span,
                     label=format_scale_label(float(x_size), str(x_unit)),
@@ -3214,6 +3941,8 @@ class PlotHost(QWidget):
                     font=font,
                     metrics=metrics,
                     pad=pad,
+                    dx=time_dx,
+                    dy=time_dy,
                 )
 
     def _draw_y_scale_in_gutter(
@@ -3228,6 +3957,8 @@ class PlotHost(QWidget):
         font: QFont,
         metrics: QFontMetrics,
         pad: float,
+        dx: float = 0.0,
+        dy: float = 0.0,
     ) -> None:
         """Bâton + libellé Y dans l’axe droit (à côté du graph)."""
         axis = plot.getAxis("right")
@@ -3239,11 +3970,24 @@ class PlotHost(QWidget):
         if h < 4.0 or w < 4.0:
             return
         # Longueur pixel strictement proportionnelle à y_size / y_span
-        # (pas de clamp : sinon le libellé ne correspond plus au bâton).
+        # (pas de clamp sur la longueur : sinon le libellé ne correspond plus).
         bar_h = max(1.0, (float(y_size) / float(y_span)) * h)
-        y_a = 0.5 * (h - min(bar_h, h))
+        bar_h = min(bar_h, h)
+        # Qt : y vers le bas. dy positif (haut) diminue y.
+        y_a = 0.5 * (h - bar_h) - float(dy)
         y_b = y_a + bar_h
-        x_line = pad
+        if y_a < 0.0:
+            y_b -= y_a
+            y_a = 0.0
+        if y_b > h:
+            y_a -= y_b - h
+            y_b = h
+            y_a = max(0.0, y_a)
+        text_w = float(metrics.horizontalAdvance(label))
+        text_h = float(metrics.height())
+        # Garder bâton + libellé dans la gouttière droite (élargie si besoin).
+        x_line = pad + float(dx)
+        x_line = max(0.0, min(x_line, max(0.0, w - pad - text_w)))
         line = QGraphicsLineItem(x_line, y_a, x_line, y_b)
         line.setPen(pen)
         line.setParentItem(axis)
@@ -3253,8 +3997,9 @@ class PlotHost(QWidget):
         text = _scale_label_item(label, font, brush)
         text.setParentItem(axis)
         text.setZValue(50)
-        text_h = float(metrics.height())
-        text.setPos(QPointF(x_line + pad, 0.5 * (y_a + y_b) - 0.5 * text_h))
+        text_x = min(x_line + pad, max(0.0, w - text_w))
+        text_y = max(0.0, min(0.5 * (y_a + y_b) - 0.5 * text_h, h - text_h))
+        text.setPos(QPointF(text_x, text_y))
         self._scale_bar_items.append((plot, text))
 
     def _draw_x_scale_in_gutter(
@@ -3269,6 +4014,8 @@ class PlotHost(QWidget):
         font: QFont,
         metrics: QFontMetrics,
         pad: float,
+        dx: float = 0.0,
+        dy: float = 0.0,
     ) -> None:
         """Bâton + libellé X dans l’axe bas (sous le graph)."""
         axis = plot.getAxis("bottom")
@@ -3281,13 +4028,28 @@ class PlotHost(QWidget):
             return
         # Longueur pixel = x_size / x_span (libellé = vraie valeur données).
         bar_w = max(1.0, (float(x_size) / float(x_span)) * w)
+        text_w = float(metrics.horizontalAdvance(label))
+        text_h = float(metrics.height())
         x_right = w - pad
         x_left = x_right - bar_w
         if x_left < pad:
             # Ancrage à gauche si la barre dépasse : garder bar_w exact.
             x_left = pad
             x_right = x_left + bar_w
-        y_line = pad
+        x_left += float(dx)
+        x_right += float(dx)
+        # Recentrer dans [0, w] si le décalage dépasse encore la gouttière.
+        if x_left < 0.0:
+            x_right -= x_left
+            x_left = 0.0
+        if x_right > w:
+            x_left -= x_right - w
+            x_right = w
+            x_left = max(0.0, x_left)
+        # Qt : y vers le bas. dy positif (haut) rapproche la barre du graph.
+        y_line = pad - float(dy)
+        y_max = max(pad, h - pad - text_h)
+        y_line = max(0.0, min(y_line, y_max))
         line = QGraphicsLineItem(x_left, y_line, x_right, y_line)
         line.setPen(pen)
         line.setParentItem(axis)
@@ -3297,13 +4059,9 @@ class PlotHost(QWidget):
         text = _scale_label_item(label, font, brush)
         text.setParentItem(axis)
         text.setZValue(50)
-        text_w = float(metrics.horizontalAdvance(label))
-        text.setPos(
-            QPointF(
-                0.5 * (x_left + x_right) - 0.5 * text_w,
-                y_line + pad,
-            )
-        )
+        text_x = max(0.0, min(0.5 * (x_left + x_right) - 0.5 * text_w, w - text_w))
+        text_y = max(0.0, min(y_line + pad, h - text_h))
+        text.setPos(QPointF(text_x, text_y))
         self._scale_bar_items.append((plot, text))
 
     # ----------------------------------------------------------- text editing

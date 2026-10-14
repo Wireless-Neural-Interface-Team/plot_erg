@@ -1,4 +1,4 @@
-"""Barres de plage temporelle déplaçables (toolbar + contrôleur pyqtgraph)."""
+"""Barres de plage temporelle déplaçables (toolbar + liste + contrôleur pyqtgraph)."""
 
 from __future__ import annotations
 
@@ -7,22 +7,24 @@ import uuid
 from dataclasses import replace
 from typing import Any, Sequence
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtWidgets import (
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from view_config import TimeRangeBar
-
-_BAR_COLORS = ("#16a34a", "#2563eb", "#ca8a04", "#dc2626", "#7c3aed")
+from gui.form_widgets import ColorSwatchButton, make_double_spin
+from view_config import TimeRangeBar, default_zoom_range_color, resolved_range_bar_color
 
 
 def _qt_alive(obj: Any) -> bool:
@@ -68,25 +70,146 @@ def _full_width_button(text: str, parent: QWidget) -> QPushButton:
     return btn
 
 
-class RangeBarToolbar(QWidget):
-    """Boutons pour ajouter / supprimer / activer une plage et lancer le traitement.
+class _RangeBarRow(QFrame):
+    """Une plage / zoom : couleur, nom, [t0, t1], type abs/rel."""
 
-    Empilé verticalement dans un GroupBox pour rester lisible dans le panneau
-    latéral étroit (Inspecter / Analyse) — plus de texte coupé.
-    """
+    activated = Signal(int)
+    changed = Signal(int, object)  # index, TimeRangeBar
+
+    def __init__(self, index: int, bar: TimeRangeBar, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._index = int(index)
+        self._bar = replace(bar)
+        self._updating = False
+        self.setObjectName("rangeBarRow")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        color = resolved_range_bar_color(bar, index)
+        self._color = ColorSwatchButton(
+            color,
+            dialog_title="Couleur de la zone de zoom",
+            parent=self,
+        )
+        self._color.setToolTip("Couleur de cette plage / fenêtre zoom")
+        self._color.changed.connect(self._emit_changed)
+
+        self._label = QLineEdit(bar.label.strip() or f"Plage {index + 1}", self)
+        self._label.setPlaceholderText("Nom")
+        self._label.setMinimumWidth(0)
+        self._label.editingFinished.connect(self._emit_changed)
+
+        kind = "rel. stim" if bar.relative_to_stim else "abs."
+        self._kind = QLabel(kind, self)
+        self._kind.setObjectName("hintLabel")
+        self._kind.setToolTip(
+            "Relatif au début de stimulation"
+            if bar.relative_to_stim
+            else "Temps absolu sur l’enregistrement"
+        )
+
+        t0, t1 = bar.ordered()
+        self._t0 = make_double_spin(-1e6, 1e6, t0, decimals=3, step=0.01, suffix=" s")
+        self._t1 = make_double_spin(-1e6, 1e6, t1, decimals=3, step=0.01, suffix=" s")
+        self._t0.setToolTip("Début de la plage")
+        self._t1.setToolTip("Fin de la plage")
+        self._t0.valueChanged.connect(self._emit_changed)
+        self._t1.valueChanged.connect(self._emit_changed)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(4)
+        top.addWidget(self._color, 0)
+        top.addWidget(self._label, 1)
+        top.addWidget(self._kind, 0)
+
+        times = QHBoxLayout()
+        times.setContentsMargins(0, 0, 0, 0)
+        times.setSpacing(4)
+        times.addWidget(self._t0, 1)
+        times.addWidget(QLabel("→", self), 0)
+        times.addWidget(self._t1, 1)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+        layout.addLayout(top)
+        layout.addLayout(times)
+
+    def mousePressEvent(self, event: Any) -> None:  # noqa: D102
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.activated.emit(self._index)
+        super().mousePressEvent(event)
+
+    def set_active(self, active: bool) -> None:
+        self.setProperty("activeRange", bool(active))
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def set_bar(self, index: int, bar: TimeRangeBar, *, active: bool) -> None:
+        self._index = int(index)
+        self._bar = replace(bar)
+        self._updating = True
+        try:
+            self._color.blockSignals(True)
+            self._color.set_color(resolved_range_bar_color(bar, index))
+            self._color.blockSignals(False)
+            self._label.blockSignals(True)
+            self._label.setText(bar.label.strip() or f"Plage {index + 1}")
+            self._label.blockSignals(False)
+            self._kind.setText("rel. stim" if bar.relative_to_stim else "abs.")
+            t0, t1 = bar.ordered()
+            self._t0.blockSignals(True)
+            self._t1.blockSignals(True)
+            self._t0.setValue(t0)
+            self._t1.setValue(t1)
+            self._t0.blockSignals(False)
+            self._t1.blockSignals(False)
+        finally:
+            self._updating = False
+        self.set_active(active)
+
+    def _current_bar(self) -> TimeRangeBar:
+        t0 = float(self._t0.value())
+        t1 = float(self._t1.value())
+        if t1 < t0:
+            t0, t1 = t1, t0
+        label = self._label.text().strip() or f"Plage {self._index + 1}"
+        return replace(
+            self._bar,
+            t0_s=t0,
+            t1_s=t1,
+            label=label,
+            color=self._color.color_value(),
+        )
+
+    def _emit_changed(self, *_args: Any) -> None:
+        if self._updating:
+            return
+        bar = self._current_bar()
+        self._bar = bar
+        self.changed.emit(self._index, bar)
+
+
+class RangeBarToolbar(QWidget):
+    """Liste des plages / zooms + actions (ajouter, supprimer, appliquer)."""
 
     addRequested = Signal()
     addRelativeRequested = Signal()
     removeRequested = Signal()
     activeChanged = Signal(int)
+    colorChanged = Signal(str)
+    barEdited = Signal(int, object)  # index, TimeRangeBar
     processRequested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setMinimumWidth(0)
-        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        self._rows: list[_RangeBarRow] = []
+        self._updating_list = False
 
-        box = QGroupBox("Plages", self)
+        box = QGroupBox("Plages / zooms", self)
         box_layout = QVBoxLayout(box)
         box_layout.setContentsMargins(8, 10, 8, 8)
         box_layout.setSpacing(6)
@@ -98,7 +221,7 @@ class RangeBarToolbar(QWidget):
         self._active.setMaximum(1)
         self._active.setValue(1)
         self._active.setFixedWidth(52)
-        self._active.setToolTip("Plage active (utilisée pour le zoom / traitement)")
+        self._active.setToolTip("Plage active (surlignage / suppression)")
         self._active.valueChanged.connect(lambda v: self.activeChanged.emit(int(v) - 1))
 
         active_label = QLabel("Active", box)
@@ -111,6 +234,28 @@ class RangeBarToolbar(QWidget):
         header.addWidget(active_label)
         header.addWidget(self._active)
 
+        self._list_host = QWidget(box)
+        self._list_layout = QVBoxLayout(self._list_host)
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._list_layout.setSpacing(4)
+        self._list_layout.addStretch(1)
+
+        self._list_scroll = QScrollArea(box)
+        self._list_scroll.setWidgetResizable(True)
+        self._list_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._list_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self._list_scroll.setMinimumHeight(72)
+        self._list_scroll.setMaximumHeight(220)
+        self._list_scroll.setWidget(self._list_host)
+
+        self._empty_label = QLabel(
+            "Aucune plage — ajoutez-en une, puis « Appliquer les zooms ».",
+            box,
+        )
+        self._empty_label.setObjectName("hintLabel")
+        self._empty_label.setWordWrap(True)
+
         btn_add = _full_width_button("+ Absolue", box)
         btn_add.setToolTip(
             "Ajouter une plage centrée (10 % du graph visible), "
@@ -121,7 +266,7 @@ class RangeBarToolbar(QWidget):
         btn_add_rel = _full_width_button("+ Rel. stim", box)
         btn_add_rel.setToolTip(
             "Ajouter une plage [t₀, t₁] relative au début de stimulation — "
-            "puis « Appliquer les zooms » pour ouvrir la fenêtre"
+            "puis « Appliquer les zooms » pour ouvrir une fenêtre par plage"
         )
         btn_add_rel.clicked.connect(self.addRelativeRequested.emit)
 
@@ -132,9 +277,8 @@ class RangeBarToolbar(QWidget):
         btn_process = _full_width_button("Appliquer les zooms", box)
         btn_process.setObjectName("primaryButton")
         btn_process.setToolTip(
-            "Ouvrir les zooms du canal dans une fenêtre dédiée "
-            "(continuous : tous flux / plages ; moyenne / stimulation : "
-            "graphs d’analyse cochés) — ne relance pas le traitement F5"
+            "Ouvrir une fenêtre de zoom par plage "
+            "(uniquement la portion zoomée — pas la courbe aperçu complète)"
         )
         btn_process.clicked.connect(self.processRequested.emit)
 
@@ -149,6 +293,8 @@ class RangeBarToolbar(QWidget):
         actions.setColumnStretch(1, 1)
 
         box_layout.addLayout(header)
+        box_layout.addWidget(self._empty_label)
+        box_layout.addWidget(self._list_scroll, 1)
         box_layout.addLayout(actions)
         box_layout.addWidget(btn_process)
 
@@ -156,6 +302,25 @@ class RangeBarToolbar(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(box)
+
+        # Compat API (couleur active via la ligne sélectionnée).
+        self._color = ColorSwatchButton(
+            default_zoom_range_color(0),
+            dialog_title="Couleur de la zone de zoom",
+            parent=box,
+        )
+        self._color.hide()
+        self._color.changed.connect(self._emit_color)
+
+    def _emit_color(self) -> None:
+        self.colorChanged.emit(self._color.color_value())
+
+    def set_active_color(self, color: str, *, enabled: bool = True) -> None:
+        """Synchroniser le nuancier legacy (sans émettre)."""
+        self._color.blockSignals(True)
+        self._color.set_color(str(color or default_zoom_range_color(0)))
+        self._color.setEnabled(bool(enabled))
+        self._color.blockSignals(False)
 
     def set_bar_count(self, count: int, active_index: int = 0) -> None:
         n = max(0, int(count))
@@ -166,6 +331,47 @@ class RangeBarToolbar(QWidget):
         if n > 0:
             self._active.setValue(max(1, min(n, int(active_index) + 1)))
         self._active.blockSignals(False)
+        self._color.setEnabled(n > 0)
+        self._empty_label.setVisible(n == 0)
+        self._list_scroll.setVisible(n > 0)
+
+    def set_bars(self, bars: Sequence[TimeRangeBar], active_index: int = 0) -> None:
+        """Rebuild / sync the editable list of zooms."""
+        bars = tuple(bars)
+        n = len(bars)
+        active = max(0, min(n - 1, int(active_index))) if n else 0
+        self._updating_list = True
+        try:
+            while len(self._rows) > n:
+                row = self._rows.pop()
+                self._list_layout.removeWidget(row)
+                row.deleteLater()
+            while len(self._rows) < n:
+                index = len(self._rows)
+                row = _RangeBarRow(index, bars[index], self._list_host)
+                row.activated.connect(self._on_row_activated)
+                row.changed.connect(self._on_row_changed)
+                self._list_layout.insertWidget(index, row)
+                self._rows.append(row)
+            for index, bar in enumerate(bars):
+                self._rows[index].set_bar(index, bar, active=(index == active))
+            self.set_bar_count(n, active)
+            if n:
+                self.set_active_color(
+                    resolved_range_bar_color(bars[active], active), enabled=True
+                )
+        finally:
+            self._updating_list = False
+
+    def _on_row_activated(self, index: int) -> None:
+        if self._updating_list:
+            return
+        self.activeChanged.emit(int(index))
+
+    def _on_row_changed(self, index: int, bar: TimeRangeBar) -> None:
+        if self._updating_list:
+            return
+        self.barEdited.emit(int(index), bar)
 
 
 class RangeBarControllerPg(QObject):
@@ -229,7 +435,6 @@ class RangeBarControllerPg(QObject):
         if self._t_max <= self._t_min:
             self._t_max = self._t_min + 1.0
 
-
     def set_bars(self, bars: Sequence[TimeRangeBar], *, active_index: int = 0) -> None:
         self._bars = [replace(b) for b in bars]
         self._active_index = max(0, min(max(0, len(self._bars) - 1), int(active_index)))
@@ -258,12 +463,12 @@ class RangeBarControllerPg(QObject):
                 t1_s=b,
                 label=f"Plage {n}",
                 bar_id=uuid.uuid4().hex[:8],
+                color=default_zoom_range_color(n - 1),
             )
         )
         self._active_index = len(self._bars) - 1
         self._redraw_items()
         self.barsChanged.emit(self.bars)
-
 
     def attach(self, host: Any, axes: Sequence[Any] | Any | None = None) -> None:
         """Attach to a PlotHost (``axes`` ignored — kept for API parity)."""
@@ -356,7 +561,7 @@ class RangeBarControllerPg(QObject):
             for index, bar in enumerate(self._bars):
                 t0, t1 = bar.ordered()
                 t0_d, t1_d = float(t0) - off, float(t1) - off
-                color = _BAR_COLORS[index % len(_BAR_COLORS)]
+                color = resolved_range_bar_color(bar, index)
                 active = index == self._active_index
                 brush_color = pg.mkColor(color)
                 brush_color.setAlpha(60 if active else 30)

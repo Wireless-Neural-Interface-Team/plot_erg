@@ -307,6 +307,15 @@ QLabel#hintLabel {{
     font-size: 11px;
     font-weight: 400;
 }}
+QFrame#rangeBarRow {{
+    background-color: {SCOPE_BG};
+    border: 1px solid {CHROME_BORDER};
+    border-radius: 3px;
+}}
+QFrame#rangeBarRow[activeRange=\"true\"] {{
+    border: 1px solid {SCOPE_ACCENT};
+    background-color: {SCOPE_BG};
+}}
 QLabel#warningLabel {{
     color: #6b3a00;
     background-color: #f5e6b8;

@@ -347,14 +347,41 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
         for tick_label in list(ax.get_xticklabels()) + list(ax.get_yticklabels()):
             _apply_spec_text_face(tick_label, spec, role="tick")
 
+    _reserve_space_above_for_stim_labels(figure, axes_flat, spec)
+
     if spec.title:
+        from plot_utils import apply_title_pixel_offset, title_offset_margin_fractions
+
+        dx = float(getattr(spec, "title_dx_px", 0.0) or 0.0)
+        dy = float(getattr(spec, "title_dy_px", 0.0) or 0.0)
+        if dx or dy:
+            try:
+                fig_w = float(figure.get_figwidth())
+                fig_h = float(figure.get_figheight())
+                dpi = float(getattr(figure, "dpi", 100.0) or 100.0)
+            except Exception:
+                fig_w, fig_h, dpi = 6.0, 4.0, 100.0
+            top_s, left_g, right_s = title_offset_margin_fractions(
+                dx, dy, fig_width_in=fig_w, fig_height_in=fig_h, dpi=dpi
+            )
+            try:
+                subs = figure.subplotpars
+                figure.subplots_adjust(
+                    left=min(subs.right - 0.35, float(subs.left) + left_g),
+                    right=max(subs.left + 0.35, float(subs.right) - right_s),
+                    top=max(float(subs.bottom) + 0.20, float(subs.top) - top_s),
+                )
+            except Exception:
+                pass
         figure.suptitle(
             spec.title,
             fontsize=float(spec.title_font_size),
             fontweight="bold" if spec.title_bold else "normal",
             fontstyle="italic" if spec.title_italic else "normal",
         )
-        _apply_spec_text_face(getattr(figure, "_suptitle", None), spec, role="title")
+        sup = getattr(figure, "_suptitle", None)
+        _apply_spec_text_face(sup, spec, role="title")
+        apply_title_pixel_offset(sup, figure, dx_px=dx, dy_px=dy)
 
     if spec.show_legend and legend_labels:
         handles = [artist for _label, artist in legend_labels]
@@ -484,6 +511,8 @@ def _draw_annotation(
         )
     elif ann.kind == "span":
         ax.axvspan(float(ann.x), float(ann.x2), color=ann.color, alpha=0.15)
+    elif ann.kind == "stim_label" and ann.text:
+        _draw_stim_label(ax, ann)
     elif ann.kind == "text" and ann.text:
         ax.text(
             0.5,
@@ -495,3 +524,74 @@ def _draw_annotation(
             color=ann.color,
             fontsize=9,
         )
+
+
+def _stim_label_pad_px(spec: PanelSpec) -> float:
+    pad = 0.0
+    for ann in spec.annotations:
+        if str(getattr(ann, "kind", "") or "") != "stim_label":
+            continue
+        if not str(getattr(ann, "text", "") or "").strip():
+            continue
+        fs = max(4.0, float(getattr(ann, "fontsize", 8.0) or 8.0))
+        need = fs * 1.35 + 6.0 + max(0.0, float(getattr(ann, "dy_px", 0.0) or 0.0))
+        pad = max(pad, need)
+    return pad
+
+
+def _reserve_space_above_for_stim_labels(
+    figure: Any, axes: list[Any], spec: PanelSpec
+) -> None:
+    """Marge figure au-dessus des axes — sans toucher aux ylim (ni aux pointillés)."""
+    pad_px = _stim_label_pad_px(spec)
+    if pad_px <= 0.0 or not axes:
+        return
+    try:
+        fig_h = float(figure.get_figheight())
+        dpi = float(getattr(figure, "dpi", 100.0) or 100.0)
+    except Exception:
+        return
+    fig_h_px = max(1.0, fig_h * dpi)
+    pad_frac = min(0.25, pad_px / fig_h_px)
+    try:
+        subs = figure.subplotpars
+        new_top = max(float(subs.bottom) + 0.25, float(subs.top) - pad_frac)
+        figure.subplots_adjust(top=new_top)
+    except Exception:
+        pass
+
+
+def _draw_stim_label(ax: Any, ann: AnnotationSpec) -> None:
+    """Libellé « on » / « off » juste au-dessus du cadre des axes (hors courbes)."""
+    from matplotlib.transforms import ScaledTranslation, blended_transform_factory
+
+    from panel_registry import apply_text_face
+    from view_config import TextFace
+
+    fig = ax.figure
+    dpi = float(getattr(fig, "dpi", 100.0) or 100.0)
+    dx = float(getattr(ann, "dx_px", 0.0) or 0.0)
+    dy = float(getattr(ann, "dy_px", 0.0) or 0.0)
+    # y=1 + va=bottom : au-dessus des axes ; les vlines restent dans le cadre.
+    base = blended_transform_factory(ax.transData, ax.transAxes)
+    offset = ScaledTranslation(dx / dpi, dy / dpi, fig.dpi_scale_trans)
+    text = ax.text(
+        float(ann.x),
+        1.0,
+        str(ann.text),
+        transform=base + offset,
+        ha="center",
+        va="bottom",
+        color=ann.color,
+        fontsize=max(4.0, float(getattr(ann, "fontsize", 8.0) or 8.0)),
+        clip_on=False,
+        zorder=20,
+    )
+    apply_text_face(
+        text,
+        TextFace(
+            bold=bool(getattr(ann, "bold", False)),
+            italic=bool(getattr(ann, "italic", False)),
+            underline=bool(getattr(ann, "underline", False)),
+        ),
+    )

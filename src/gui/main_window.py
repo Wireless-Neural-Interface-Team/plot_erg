@@ -1306,9 +1306,9 @@ class ViewerWindow(QMainWindow):
             need_rms = need_rms or rms
             need_spikes = need_spikes or spikes
             need_overlay = need_overlay or overlay
-        # Fenêtre zoom : coches Canal locales (indépendantes de l’aperçu).
-        zoom = getattr(win, "_zoom_window", None)
-        if zoom is not None:
+        # Fenêtres zoom : coches Canal locales (indépendantes de l’aperçu).
+        zoom_windows = getattr(win, "_zoom_windows", None) or {}
+        for zoom in list(zoom_windows.values()):
             z_analysis = zoom.local_settings().analysis
             z_rms, z_spikes, z_overlay = self._analysis_extra_flags(z_analysis)
             need_rms = need_rms or z_rms
@@ -1558,7 +1558,10 @@ class ViewerWindow(QMainWindow):
             channel_index=int(window.channel_index),
             channel_name=window.channel_name,
             settings=window.local_settings(),
-            highlight_zooms=highlight_zooms_from_placements(window.placements),
+            highlight_zooms=highlight_zooms_from_placements(
+                window.placements,
+                range_bars=window.local_settings().range_bars,
+            ),
         )
 
     def _on_preview_analysis_curves_changed(self, analysis: object) -> None:
@@ -1635,7 +1638,7 @@ class ViewerWindow(QMainWindow):
         channel_index: int,
         channel_name: str,
         settings: ViewerSettings,
-        highlight_zooms: tuple[tuple[float, float, str], ...] = (),
+        highlight_zooms: tuple[tuple[float, float, str, str], ...] = (),
     ) -> RenderRequest:
         """Construire une requête de rendu à partir des enregistrements prêts."""
         return self._render_requests.build(

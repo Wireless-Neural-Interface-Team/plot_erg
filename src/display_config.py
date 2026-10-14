@@ -123,6 +123,14 @@ MUTED_AXIS_TEXT = "#64748b"
 CHANNEL_HIGHLIGHT_FACE = "#fff7ed"
 ZERO_LINE_COLOR = "#6b7280"
 ARTIFACT_LINE_COLOR = "#2563eb"
+# Palette par défaut des plages / zones de zoom (barres + surlignage).
+ZOOM_RANGE_COLORS: tuple[str, ...] = (
+    "#16a34a",
+    "#2563eb",
+    "#ca8a04",
+    "#dc2626",
+    "#7c3aed",
+)
 
 
 def resolve_recording_plot_colors(

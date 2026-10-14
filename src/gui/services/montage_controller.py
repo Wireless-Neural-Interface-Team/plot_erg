@@ -123,10 +123,16 @@ class MontageController:
 
     @staticmethod
     def total_height_px(n_visible: int, settings: Any) -> int:
-        """Hauteur du montage (canaux×kinds × ligne + chrome panneau)."""
+        """Hauteur du montage (canaux×kinds × ligne + chrome panneau).
+
+        Le chrome couvre ce qui n’est pas une ligne de courbe : en-tête du
+        panneau, barre d’outils, hint, titre, légende et marge basse. Une
+        valeur trop basse rogne le bas (derniers canaux / légende) dès que
+        les lignes deviennent hautes.
+        """
         rows = max(1, int(n_visible)) * MontageController.kind_count(settings)
         min_row = max(36, int(getattr(settings, "montage_row_min_height_px", 36) or 36))
-        chrome = 96
+        chrome = 240
         return max(220, rows * min_row + chrome)
 
     @staticmethod

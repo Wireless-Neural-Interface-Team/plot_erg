@@ -299,6 +299,26 @@ def main() -> int:
     report.check("aperçu: titre gras", spec is not None and bool(spec.title_bold))
     report.check("aperçu: taille labels", spec is not None and abs(spec.label_font_size - 13.0) < 0.05)
     report.check("aperçu: taille graduations", spec is not None and abs(spec.tick_font_size - 11.0) < 0.05)
+    params._tick_font.set_size_value(17.0)
+    params._tick_font.set_face_value(TextFace(bold=True, italic=True, underline=True))
+    _settle(app, window)
+    spec = _preview_spec(window)
+    host = _preview_host(window)[1]
+    axis = host.plot_items()[0].getAxis("left") if host and host.plot_items() else None
+    tick_font = axis.style.get("tickFont") if axis is not None else None
+    report.check(
+        "aperçu: police ticks sur l'axe",
+        tick_font is not None
+        and abs(float(tick_font.pointSizeF()) - 17.0) < 0.05
+        and bool(tick_font.bold())
+        and bool(tick_font.italic())
+        and bool(tick_font.underline()),
+        str(tick_font),
+    )
+    report.check(
+        "aperçu: wrap QPicture ticks",
+        axis is not None and bool(getattr(axis, "_erg_tick_face_picture", False)),
+    )
 
     params._grid.setChecked(False)
     params._grid_alpha.setValue(0.65)
@@ -406,12 +426,93 @@ def main() -> int:
         str(getattr(spec, "stim_linewidth", None)),
     )
 
+    params._title_dx.setValue(18)
+    params._title_dy.setValue(-10)
+    params._label_font.set_face_value(TextFace(italic=True))
+    params._tick_font.set_face_value(TextFace(underline=True))
+    params._show_stim_labels.setChecked(True)
+    params._text_stim_on.setText("ON!")
+    params._text_stim_off.setText("OFF!")
+    params._stim_on_font.set_size_value(13.0)
+    params._stim_on_font.set_face_value(TextFace(bold=True))
+    params._stim_off_font.set_size_value(10.0)
+    params._stim_off_font.set_face_value(TextFace(italic=True))
+    params._stim_on_dx.setValue(6)
+    params._stim_on_dy.setValue(4)
+    params._stim_off_dx.setValue(-5)
+    params._stim_off_dy.setValue(8)
+    _settle(app, window)
+    spec = _preview_spec(window)
+    report.check(
+        "aperçu: décalage titre",
+        spec is not None
+        and abs(float(spec.title_dx_px) - 18.0) < 0.05
+        and abs(float(spec.title_dy_px) - (-10.0)) < 0.05,
+        f"dx={getattr(spec, 'title_dx_px', None)} dy={getattr(spec, 'title_dy_px', None)}",
+    )
+    report.check("aperçu: axes italiques", spec is not None and bool(spec.label_italic))
+    report.check("aperçu: ticks soulignés", spec is not None and bool(spec.tick_underline))
+    stim_labels = [
+        a for a in (spec.annotations if spec else [])
+        if str(getattr(a, "kind", "")) == "stim_label"
+    ]
+    on_lbl = [a for a in stim_labels if getattr(a, "role", "") == "stim_onset"]
+    off_lbl = [a for a in stim_labels if getattr(a, "role", "") == "stim_offset"]
+    report.check(
+        "aperçu: libellé début stim",
+        bool(on_lbl) and str(on_lbl[0].text) == "ON!",
+        str([getattr(a, "text", None) for a in on_lbl]),
+    )
+    report.check(
+        "aperçu: libellé fin stim",
+        bool(off_lbl) and str(off_lbl[0].text) == "OFF!",
+        str([getattr(a, "text", None) for a in off_lbl]),
+    )
+    report.check(
+        "aperçu: police / position début stim",
+        bool(on_lbl)
+        and abs(float(on_lbl[0].fontsize) - 13.0) < 0.05
+        and bool(on_lbl[0].bold)
+        and abs(float(on_lbl[0].dx_px) - 6.0) < 0.05
+        and abs(float(on_lbl[0].dy_px) - 4.0) < 0.05,
+        str(on_lbl[0] if on_lbl else None),
+    )
+    report.check(
+        "aperçu: police / position fin stim",
+        bool(off_lbl)
+        and abs(float(off_lbl[0].fontsize) - 10.0) < 0.05
+        and bool(off_lbl[0].italic)
+        and abs(float(off_lbl[0].dx_px) - (-5.0)) < 0.05
+        and abs(float(off_lbl[0].dy_px) - 8.0) < 0.05,
+        str(off_lbl[0] if off_lbl else None),
+    )
+    params._show_stim_labels.setChecked(False)
+    _settle(app, window)
+    spec = _preview_spec(window)
+    leftover = [
+        a for a in (spec.annotations if spec else [])
+        if str(getattr(a, "kind", "")) == "stim_label"
+    ]
+    report.check("aperçu: libellés stim masqués", not leftover, str(leftover))
+    roles = {str(getattr(a, "role", "") or "") for a in (spec.annotations if spec else [])}
+    report.check(
+        "aperçu: pointillés gardés sans libellés",
+        "stim_onset" in roles and "stim_offset" in roles,
+        str(sorted(roles)),
+    )
+    params._show_stim_labels.setChecked(True)
+    _settle(app, window)
+
     params._show_scale_bars.setChecked(True)
     params._scale_bar_time_manual.setChecked(True)
     params._scale_bar_time_ms.setValue(250)
     params._scale_bar_amp_manual.setChecked(True)
     params._scale_bar_amp.setValue(50)
     params._scale_bar_linewidth.setValue(2.5)
+    params._scale_bar_dx.setValue(30)
+    params._scale_bar_dy.setValue(-12)
+    params._scale_bar_time_dx.setValue(18)
+    params._scale_bar_time_dy.setValue(-6)
     _settle(app, window)
     spec = _preview_spec(window)
     bars = getattr(spec, "scale_bars", None) if spec else None
@@ -429,6 +530,18 @@ def main() -> int:
         "aperçu: épaisseur barre d'échelle",
         bars is not None and abs(float(bars.linewidth) - 2.5) < 0.05,
         str(getattr(bars, "linewidth", None)),
+    )
+    report.check(
+        "aperçu: position barre amplitude",
+        bars is not None and abs(float(bars.dx_px) - 30.0) < 0.05 and abs(float(bars.dy_px) - (-12.0)) < 0.05,
+        f"dx={getattr(bars, 'dx_px', None)} dy={getattr(bars, 'dy_px', None)}",
+    )
+    report.check(
+        "aperçu: position barre temps",
+        bars is not None
+        and abs(float(bars.time_dx_px) - 18.0) < 0.05
+        and abs(float(bars.time_dy_px) - (-6.0)) < 0.05,
+        f"time_dx={getattr(bars, 'time_dx_px', None)} time_dy={getattr(bars, 'time_dy_px', None)}",
     )
 
     params._preview_title_gap.setValue(36)
@@ -665,6 +778,10 @@ def main() -> int:
     params._show_scale_bars.setChecked(True)
     params._scale_bar_time_manual.setChecked(True)
     params._scale_bar_time_ms.setValue(100)
+    params._scale_bar_dx.setValue(-20)
+    params._scale_bar_dy.setValue(18)
+    params._scale_bar_time_dx.setValue(-14)
+    params._scale_bar_time_dy.setValue(22)
     _settle(app, window)
     mspec = _montage_spec(window)
     report.check("montage: grille masquée", mspec is not None and mspec.grid is False)
@@ -672,6 +789,22 @@ def main() -> int:
     report.check(
         "montage: barres d'échelle",
         mspec is not None and mspec.scale_bars.enabled and abs(mspec.scale_bars.time_s - 0.1) < 1e-6,
+    )
+    report.check(
+        "montage: position barre amplitude",
+        mspec is not None
+        and abs(float(mspec.scale_bars.dx_px) - (-20.0)) < 0.05
+        and abs(float(mspec.scale_bars.dy_px) - 18.0) < 0.05,
+        f"dx={getattr(mspec.scale_bars, 'dx_px', None) if mspec else None} "
+        f"dy={getattr(mspec.scale_bars, 'dy_px', None) if mspec else None}",
+    )
+    report.check(
+        "montage: position barre temps",
+        mspec is not None
+        and abs(float(mspec.scale_bars.time_dx_px) - (-14.0)) < 0.05
+        and abs(float(mspec.scale_bars.time_dy_px) - 22.0) < 0.05,
+        f"time_dx={getattr(mspec.scale_bars, 'time_dx_px', None) if mspec else None} "
+        f"time_dy={getattr(mspec.scale_bars, 'time_dy_px', None) if mspec else None}",
     )
 
     params._montage_channels.setValue(7)
@@ -727,10 +860,28 @@ def main() -> int:
         bool(back_ylims) and back_ylims[0] == (-80.0, 120.0),
         str(back_ylims),
     )
+    back_bars = getattr(spec, "scale_bars", None) if spec is not None else None
+    report.check(
+        "retour: position échelle aperçu restaurée",
+        back_bars is not None
+        and abs(float(back_bars.dx_px) - 30.0) < 0.05
+        and abs(float(back_bars.dy_px) - (-12.0)) < 0.05
+        and abs(float(back_bars.time_dx_px) - 18.0) < 0.05
+        and abs(float(back_bars.time_dy_px) - (-6.0)) < 0.05,
+        f"dx={getattr(back_bars, 'dx_px', None)} dy={getattr(back_bars, 'dy_px', None)} "
+        f"time_dx={getattr(back_bars, 'time_dx_px', None)} "
+        f"time_dy={getattr(back_bars, 'time_dy_px', None)}",
+    )
     back = params.settings_for("montage")
     report.check(
         "profil montage conservé",
-        back.texts.title == "Titre montage" and abs(back.style.line_width - 2.2) < 0.05 and back.montage_channels == 7,
+        back.texts.title == "Titre montage"
+        and abs(back.style.line_width - 2.2) < 0.05
+        and back.montage_channels == 7
+        and abs(back.style.scale_bar_dx_px - (-20.0)) < 0.05
+        and abs(back.style.scale_bar_dy_px - 18.0) < 0.05
+        and abs(float(back.style.scale_bar_time_dx_px or 0.0) - (-14.0)) < 0.05
+        and abs(float(back.style.scale_bar_time_dy_px or 0.0) - 22.0) < 0.05,
         f"title={back.texts.title} lw={back.style.line_width} ch={back.montage_channels}",
     )
     report.check("aperçu: groupe montage de nouveau masqué", not params._montage_review_group.isVisible())
@@ -796,7 +947,7 @@ def main() -> int:
         and abs(built_m.threshold - 1.75) < 1e-6,
     )
     report.check(
-        "traitement: PSTH du montage ≠ PSTH de l'aperçu",
+        "traitement: PSTH du montage != PSTH de l'aperçu",
         abs(built_m.psth_bin_window_s - 0.2) > 1e-6,
         str(built_m.psth_bin_window_s),
     )

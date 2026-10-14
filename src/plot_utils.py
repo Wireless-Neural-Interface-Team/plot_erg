@@ -13,19 +13,114 @@ import numpy as np
 _SCALE_BAR_ATTR = "_erg_scale_bar"
 
 
-def preview_title_row_layout(text_height_px: float, gap_px: int) -> tuple[int, int]:
+def preview_title_row_layout(
+    text_height_px: float,
+    gap_px: int,
+    *,
+    title_dx_px: float = 0.0,
+    title_dy_px: float = 0.0,
+) -> tuple[int, int]:
     """Hauteur de la ligne de titre et espace sous cette ligne (aperçu canal).
 
     Pyqtgraph fige le titre dans une bande de 30 px, texte centré. ``gap_px``
     vaut 0 pour garder cet écart. Une valeur positive ajoute des pixels sous
     la bande. Une valeur négative réduit l’espace sous le texte, pixel pour
     pixel (la bande rétrécit de deux pixels par unité, car le texte est centré).
+
+    ``title_dy_px`` négatif (titre plus bas) augmente l’écart sous la bande
+    pour éviter le chevauchement avec la courbe. Le pad pour un ``dy`` positif
+    (titre plus haut) et pour ``dx`` est géré via les marges du layout /
+    de la figure, pas ici.
     """
+    del title_dx_px  # pad horizontal hors bandeau (marges plot / figure)
     delta = int(gap_px)
     if delta >= 0:
-        return 30, delta
-    text_px = max(1, int(math.ceil(float(text_height_px))))
-    return max(text_px, 30 + 2 * delta), 0
+        row_h, spacing = 30, delta
+    else:
+        text_px = max(1, int(math.ceil(float(text_height_px))))
+        row_h, spacing = max(text_px, 30 + 2 * delta), 0
+    dy = int(round(float(title_dy_px or 0.0)))
+    if dy < 0:
+        # Titre descendu vers la courbe : pousser le graphe pour libérer la place.
+        spacing += -dy
+    return row_h, spacing
+
+
+def title_offset_margin_fractions(
+    dx_px: float,
+    dy_px: float,
+    *,
+    fig_width_in: float,
+    fig_height_in: float,
+    dpi: float = 100.0,
+) -> tuple[float, float, float]:
+    """Réserve de marge figure pour un titre décalé.
+
+    Retourne ``(top_shrink, left_grow, right_shrink)`` en fraction de figure.
+    Un ``dy`` positif (titre plus haut) réduit ``top`` ; un ``dx`` positif
+    réduit ``right`` ; un ``dx`` négatif augmente ``left``.
+    """
+    dpi = float(dpi) if float(dpi) > 0 else 100.0
+    fig_w_px = max(1.0, float(fig_width_in) * dpi)
+    fig_h_px = max(1.0, float(fig_height_in) * dpi)
+    top_px = max(0.0, float(dy_px or 0.0))
+    left_px = max(0.0, -float(dx_px or 0.0))
+    right_px = max(0.0, float(dx_px or 0.0))
+    if top_px > 0.0:
+        top_px += 4.0
+    if left_px > 0.0:
+        left_px += 4.0
+    if right_px > 0.0:
+        right_px += 4.0
+    return (
+        min(0.28, top_px / fig_h_px),
+        min(0.22, left_px / fig_w_px),
+        min(0.22, right_px / fig_w_px),
+    )
+
+
+def apply_title_pixel_offset(
+    text: Any,
+    figure: Any,
+    *,
+    dx_px: float = 0.0,
+    dy_px: float = 0.0,
+) -> None:
+    """Décaler un titre matplotlib (``Axes.title`` / ``suptitle``) en pixels.
+
+    ``dx_px`` positif vers la droite, ``dy_px`` positif vers le haut.
+    Réapplique depuis la transform de base du texte (pas d’empilement).
+    """
+    if text is None or figure is None:
+        return
+    dx = float(dx_px or 0.0)
+    dy = float(dy_px or 0.0)
+    base = getattr(text, "_erg_title_base_transform", None)
+    if base is None:
+        try:
+            base = text.get_transform()
+        except Exception:
+            return
+        try:
+            text._erg_title_base_transform = base  # noqa: SLF001
+        except Exception:
+            pass
+    if not dx and not dy:
+        try:
+            text.set_transform(base)
+        except Exception:
+            pass
+        return
+    from matplotlib.transforms import ScaledTranslation
+
+    dpi = float(getattr(figure, "dpi", 100.0) or 100.0)
+    try:
+        text.set_transform(
+            base
+            + ScaledTranslation(dx / dpi, dy / dpi, figure.dpi_scale_trans)
+        )
+    except Exception:
+        pass
 
 
 def place_montage_row_label(
@@ -292,6 +387,10 @@ def draw_floating_scale_bars(
     gutter: bool = False,
     below: bool = True,
     face: Any = None,
+    dx_px: float = 0.0,
+    dy_px: float = 0.0,
+    x_dx_px: float | None = None,
+    x_dy_px: float | None = None,
 ) -> None:
     """Barres d’échelle flottantes (temps + amplitude).
 
@@ -302,6 +401,9 @@ def draw_floating_scale_bars(
     de données — ainsi les barres restent hors des courbes.
     ``gutter=True`` place l’échelle Y à droite de la zone de tracé.
     ``below=True`` (défaut) place l’échelle X sous le graphique.
+    ``dx_px`` / ``dy_px`` décalent l’échelle amplitude (axe vertical).
+    ``x_dx_px`` / ``x_dy_px`` décalent l’échelle temps (axe horizontal) ;
+    s’ils sont ``None``, on réutilise ``dx_px`` / ``dy_px``.
     """
     if clear:
         clear_floating_scale_bars(ax)
@@ -323,6 +425,40 @@ def draw_floating_scale_bars(
 
     from matplotlib.lines import Line2D
     from matplotlib.transforms import ScaledTranslation, blended_transform_factory
+
+    fig = getattr(ax, "figure", None)
+
+    def _px(value: Any, *, fallback: float = 0.0) -> float:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return float(fallback)
+        if out != out:
+            return float(fallback)
+        return out
+
+    amp_dx = _px(dx_px)
+    amp_dy = _px(dy_px)
+    time_dx = amp_dx if x_dx_px is None else _px(x_dx_px)
+    time_dy = amp_dy if x_dy_px is None else _px(x_dy_px)
+
+    def _with_px_shift(
+        transform: Any,
+        *,
+        shift_dx: float,
+        shift_dy: float,
+        extra_dy_in: float = 0.0,
+    ) -> Any:
+        if fig is None or (shift_dx == 0.0 and shift_dy == 0.0 and extra_dy_in == 0.0):
+            return transform
+        dpi = float(getattr(fig, "dpi", 100.0) or 100.0)
+        if dpi <= 0.0:
+            dpi = 100.0
+        return transform + ScaledTranslation(
+            shift_dx / dpi,
+            extra_dy_in + shift_dy / dpi,
+            fig.dpi_scale_trans,
+        )
 
     x_len = (
         float(x_size)
@@ -348,7 +484,11 @@ def draw_floating_scale_bars(
 
     if show_y:
         # X fixe (axes) · Y en données → bâton vertical, longueur = y_len.
-        trans_y = blended_transform_factory(ax.transAxes, ax.transData)
+        trans_y = _with_px_shift(
+            blended_transform_factory(ax.transAxes, ax.transData),
+            shift_dx=amp_dx,
+            shift_dy=amp_dy,
+        )
         y_mid = 0.5 * (float(ylim[0]) + float(ylim[1]))
         y0 = y_mid - 0.5 * y_len
         y1 = y0 + y_len
@@ -373,20 +513,23 @@ def draw_floating_scale_bars(
 
     if show_x:
         # X en données · Y = bord bas des axes + décalage fixe (points).
-        fig = ax.figure
         trans_base = blended_transform_factory(ax.transData, ax.transAxes)
         if below:
             # Sous le graph, hors zone de tracé (décalage fixe en points).
-            trans_line = trans_base + ScaledTranslation(
-                0, -14 / 72, fig.dpi_scale_trans
+            trans_line = _with_px_shift(
+                trans_base, shift_dx=time_dx, shift_dy=time_dy, extra_dy_in=-14 / 72
             )
-            trans_label = trans_base + ScaledTranslation(
-                0, -28 / 72, fig.dpi_scale_trans
+            trans_label = _with_px_shift(
+                trans_base, shift_dx=time_dx, shift_dy=time_dy, extra_dy_in=-28 / 72
             )
             y_ref = 0.0
         else:
-            trans_line = trans_base
-            trans_label = trans_base
+            trans_line = _with_px_shift(
+                trans_base, shift_dx=time_dx, shift_dy=time_dy
+            )
+            trans_label = _with_px_shift(
+                trans_base, shift_dx=time_dx, shift_dy=time_dy
+            )
             y_ref = 0.08
         x_right = float(xlim[1]) - 0.02 * x_span
         x_left = x_right - x_len

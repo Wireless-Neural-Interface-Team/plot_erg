@@ -9,7 +9,7 @@ import time
 from dataclasses import replace
 from typing import Any, Sequence
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -41,7 +41,7 @@ from view_config import (
     ViewerSettings,
     apply_local_display_settings,
     continuous_sync_offset_s,
-    copy_scale_bar_style,
+    copy_global_display_style,
 )
 
 
@@ -79,6 +79,10 @@ def _patch_text_overrides(texts: TextOverrides, result: dict[str, Any] | Any) ->
         return replace(texts, xlabel=value.strip())
     if role == "ylabel":
         return replace(texts, ylabel=value.strip())
+    if role == "stim_on":
+        return replace(texts, stim_on=value)
+    if role == "stim_off":
+        return replace(texts, stim_off=value)
     if role == "legend":
         labels = list(texts.legend_labels)
         while len(labels) <= item_index:
@@ -196,6 +200,14 @@ def _axis_keeps_rendered_ylim(
     previous: RenderRequest | None = None,
 ) -> bool:
     """True → garder le ylim du rendu (pas le zoom interactif sauvegardé)."""
+    if (
+        str(request.panel) == "montage_continuous_raw"
+        and previous is not None
+    ):
+        prev_shared = bool(getattr(previous.settings, "montage_shared_ylim", False))
+        cur_shared = bool(getattr(request.settings, "montage_shared_ylim", False))
+        if prev_shared != cur_shared:
+            return True
     row_kinds = getattr(figure, "_erg_montage_row_kinds", None)
     if (
         str(request.panel) == "montage_continuous_raw"
@@ -552,7 +564,7 @@ class PanelCanvas(QFrame):
         # Propager l’échelle flottante locale dans la requête de base, sinon
         # ``_with_style_overrides`` (inherit) la réécraserait avec le dock.
         if self._last_request is not None and self._style_overrides is not None:
-            merged = copy_scale_bar_style(
+            merged = copy_global_display_style(
                 self._last_request.settings.style,
                 self._style_overrides.style,
             )
@@ -565,12 +577,12 @@ class PanelCanvas(QFrame):
         self.styleChanged.emit(self.placement)
 
     def sync_scale_bars_from(self, style: PanelStyle | Any) -> None:
-        """Aligner un override local sur l’échelle flottante globale (dock)."""
+        """Aligner un override local sur l’échelle / les stim du dock Affichage."""
         if self._style_overrides is None:
             return
         self._style_overrides = replace(
             self._style_overrides,
-            style=copy_scale_bar_style(self._style_overrides.style, style),
+            style=copy_global_display_style(self._style_overrides.style, style),
         )
 
     def _on_host_x_autoscale(self, xlim: object) -> None:
@@ -650,7 +662,7 @@ class PanelCanvas(QFrame):
         # Garder l’override aligné pour les prochains rendus / le dialogue Style.
         self._style_overrides = replace(
             self._style_overrides,
-            style=copy_scale_bar_style(
+            style=copy_global_display_style(
                 self._style_overrides.style, request.settings.style
             ),
         )
@@ -707,7 +719,35 @@ class PanelCanvas(QFrame):
         self._last_render_s = time.perf_counter() - started
         self._dirty = False
         self._set_status(status, f"{self._last_render_s * 1000:.0f} ms")
+        if str(self.placement.panel).startswith("montage_"):
+            # Le layout pyqtgraph n’a sa géométrie finale qu’au tick suivant.
+            QTimer.singleShot(0, self._fit_montage_height)
         return status
+
+    def _grid_host(self) -> Any | None:
+        parent = self.parentWidget()
+        while parent is not None:
+            if callable(getattr(parent, "apply_fitted_height", None)):
+                return parent
+            parent = parent.parentWidget()
+        return None
+
+    def _fit_montage_height(self) -> None:
+        """Agrandir le panneau si les canaux demandés ne tiennent pas."""
+        if not str(self.placement.panel).startswith("montage_"):
+            return
+        needed_glw = self._plot.montage_needed_glw_height_px()
+        if needed_glw is None:
+            return
+        glw = getattr(self._plot, "_glw", None)
+        glw_h = int(glw.height()) if glw is not None else 0
+        if glw_h <= 0:
+            return
+        required = max(140, int(needed_glw) + int(self.height()) - glw_h)
+        grid = self._grid_host()
+        if grid is None:
+            return
+        grid.apply_fitted_height(self.placement, required)
 
     def _set_status(self, status: str, text: str) -> None:
         self._status = status
@@ -920,7 +960,12 @@ def _zoom_placement_visible(
 
 
 class DetachedZoomWindow(QDialog):
-    """Zooms d’un canal regroupés : grille + Paramètres locaux (Canal / Affichage)."""
+    """Zooms d’une plage : grille + Paramètres locaux (Canal / Affichage).
+
+    Affiche uniquement la portion zoomée (``PanelPlacement`` custom zoom) —
+    jamais la courbe aperçu complète. Les réglages locaux sont scopés zoom
+    (pas d’échelle X héritée de l’aperçu).
+    """
 
     closed = Signal()
     refreshRequested = Signal(object)  # DetachedZoomWindow
@@ -932,17 +977,23 @@ class DetachedZoomWindow(QDialog):
         settings: ViewerSettings,
         *,
         panel_height: int = 400,
+        zoom_key: str = "",
+        zoom_label: str = "",
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        from gui.services.view_scopes import settings_for_zoom_window
+
         self.channel_name = str(channel_name)
-        self.settings = settings
+        self.zoom_key = str(zoom_key or "")
+        self.zoom_label = str(zoom_label or "").strip() or "Zoom"
+        self.settings = settings_for_zoom_window(settings)
         # Liste complète fournie par l’aperçu ; le filtrage Canal est local.
         self._all_placements: tuple[PanelPlacement, ...] = tuple(placements)
         self._placements: tuple[PanelPlacement, ...] = ()
         self._panel_height = max(160, int(panel_height))
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.setWindowTitle(f"{self.channel_name} — Zooms")
+        self.setWindowTitle(self._window_title())
         self.setWindowFlag(Qt.WindowType.Window, True)
         self.resize(1100, max(560, self._panel_height + 220))
 
@@ -961,7 +1012,7 @@ class DetachedZoomWindow(QDialog):
         tab_bar.setExpanding(True)
 
         self.params = LocalViewParams(
-            settings,
+            self.settings,
             show_sync=True,
             show_display_extras=True,
             show_canal_tab=True,
@@ -1006,9 +1057,12 @@ class DetachedZoomWindow(QDialog):
         self.grid.renderFinished.connect(self._on_render_finished)
         self._configure_grid()
 
+    def _window_title(self) -> str:
+        return f"{self.channel_name} — {self.zoom_label}"
+
     def _header_text(self) -> str:
         n = len(self._placements)
-        return f"{self.channel_name} — {n} zoom(s)"
+        return f"{self.channel_name} — {self.zoom_label} ({n})"
 
     def _visible_placements(self) -> tuple[PanelPlacement, ...]:
         analysis = self.params.settings().analysis
@@ -1048,12 +1102,15 @@ class DetachedZoomWindow(QDialog):
         placements: Sequence[PanelPlacement],
         *,
         panel_height: int | None = None,
+        zoom_label: str | None = None,
     ) -> None:
         """Mettre à jour la grille sans recréer la fenêtre."""
         self._all_placements = tuple(placements)
         if panel_height is not None:
             self._panel_height = max(160, int(panel_height))
-        self.setWindowTitle(f"{self.channel_name} — Zooms")
+        if zoom_label is not None:
+            self.zoom_label = str(zoom_label).strip() or self.zoom_label
+        self.setWindowTitle(self._window_title())
         self._configure_grid()
 
     @property

@@ -1,8 +1,14 @@
 """Paramètres d’affichage et de traitement, selon le coût d’un changement.
 
-L’aperçu canal et la revue montage ont chacun un profil d’affichage :
-mêmes noms de réglages, valeurs indépendantes. Le dock montre le profil
-de la vue active.
+Deux profils dock indépendants (mêmes noms, valeurs séparées) :
+
+- **preview** — aperçu canal (grille centrale)
+- **montage** — revue montage
+
+Les fenêtres zoom ont leur propre scope (``LocalViewParams`` / ``settings_for_zoom_window``).
+Les plages / zooms (``TimeRangeBar``) vivent sur l’aperçu canal, pas dans ce dock.
+
+Le dock montre le profil de la vue active.
 
 - *Canal* — courbes et échelles Y du profil actif, plus le traitement commun
   (filtres, spikes, RMS, détection) → :attr:`configChanged` / Traiter (F5).
@@ -58,10 +64,12 @@ from view_config import (
     AnalysisSettings,
     AnalysisStream,
     AxisLimits,
+    TextFace,
     TextOverrides,
     LegendSettings,
     PanelStyle,
     ViewerSettings,
+    resolved_scale_bar_time_offset_px,
 )
 
 _EDGE_CHOICES = (
@@ -451,6 +459,30 @@ class ParamsPanel(QWidget):
             "Épaisseur du trait noir des barres d’échelle flottantes "
             "(temps et amplitude)."
         )
+        self._scale_bar_dx = _int_spin(-400, 400, 0, suffix=" px")
+        self._scale_bar_dx.setToolTip(
+            "Décalage horizontal de l’échelle amplitude (axe vertical). "
+            "0 = position par défaut. "
+            "Positif décale vers la droite, négatif vers la gauche."
+        )
+        self._scale_bar_dy = _int_spin(-400, 400, 0, suffix=" px")
+        self._scale_bar_dy.setToolTip(
+            "Décalage vertical de l’échelle amplitude (axe vertical). "
+            "0 = position par défaut. "
+            "Positif monte la barre, négatif la descend."
+        )
+        self._scale_bar_time_dx = _int_spin(-400, 400, 0, suffix=" px")
+        self._scale_bar_time_dx.setToolTip(
+            "Décalage horizontal de l’échelle temps (axe horizontal). "
+            "0 = position par défaut. "
+            "Positif décale vers la droite, négatif vers la gauche."
+        )
+        self._scale_bar_time_dy = _int_spin(-400, 400, 0, suffix=" px")
+        self._scale_bar_time_dy.setToolTip(
+            "Décalage vertical de l’échelle temps (axe horizontal). "
+            "0 = position par défaut. "
+            "Positif monte la barre, négatif la descend."
+        )
         self._scale_bar_amp_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._scale_bar_time_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._show_scale_bars.toggled.connect(self._sync_scale_bar_inputs)
@@ -487,6 +519,10 @@ class ParamsPanel(QWidget):
         self._layout_form.addRow("Amplitude barre :", amp_row)
         self._layout_form.addRow("Temps barre :", time_row)
         self._layout_form.addRow("Épaisseur du trait :", self._scale_bar_linewidth)
+        self._layout_form.addRow("Temps — horizontal :", self._scale_bar_time_dx)
+        self._layout_form.addRow("Temps — vertical :", self._scale_bar_time_dy)
+        self._layout_form.addRow("Amplitude — horizontal :", self._scale_bar_dx)
+        self._layout_form.addRow("Amplitude — vertical :", self._scale_bar_dy)
         self._layout_form.addRow("Points max / courbe :", max_pts_row)
 
         # Revue montage continue uniquement.
@@ -512,6 +548,18 @@ class ParamsPanel(QWidget):
         )
         self._montage_row_height.setToolTip(self._montage_row_tooltip)
         review_form.addRow("Hauteur de ligne :", self._montage_row_height)
+        self._montage_shared_ylim = QCheckBox("Même échelle pour toutes les courbes")
+        self._montage_shared_ylim.setChecked(False)
+        self._montage_shared_ylim_tooltip = (
+            "Les courbes WIDE, HIGH et LOW de la page partagent la même échelle Y, "
+            "calculée sur l’amplitude la plus grande des canaux visibles. "
+            "Une petite courbe reste petite. "
+            "Sans cette option, chaque canal est ajusté sur sa propre amplitude. "
+            "Une échelle Y manuelle (Canal) reste prioritaire pour son type de courbe. "
+            "RMS, PSTH et spikes partagent une échelle entre canaux du même type."
+        )
+        self._montage_shared_ylim.setToolTip(self._montage_shared_ylim_tooltip)
+        review_form.addRow(self._montage_shared_ylim)
         self._montage_show_kind_label = QCheckBox(
             "Type à côté du canal (WIDE, LOW, HIGH…)"
         )
@@ -611,11 +659,16 @@ class ParamsPanel(QWidget):
         self._time_sync.currentIndexChanged.connect(lambda _i: self._emit_view())
         self._show_scale_bars.toggled.connect(lambda _c: self._emit_view())
         self._montage_show_kind_label.toggled.connect(lambda _c: self._emit_view())
+        self._montage_shared_ylim.toggled.connect(lambda _c: self._emit_view())
         self._scale_bar_amp_manual.toggled.connect(lambda _c: self._emit_view())
         self._scale_bar_time_manual.toggled.connect(lambda _c: self._emit_view())
         self._scale_bar_amp.valueChanged.connect(lambda _v: self._emit_view())
         self._scale_bar_time_ms.valueChanged.connect(lambda _v: self._emit_view())
         self._scale_bar_linewidth.valueChanged.connect(lambda _v: self._emit_view())
+        self._scale_bar_dx.valueChanged.connect(lambda _v: self._emit_view())
+        self._scale_bar_dy.valueChanged.connect(lambda _v: self._emit_view())
+        self._scale_bar_time_dx.valueChanged.connect(lambda _v: self._emit_view())
+        self._scale_bar_time_dy.valueChanged.connect(lambda _v: self._emit_view())
 
         self._add_style_groups(page_layout)
         page_layout.addStretch(1)
@@ -632,6 +685,24 @@ class ParamsPanel(QWidget):
             enabled and bool(self._scale_bar_time_manual.isChecked())
         )
         self._scale_bar_linewidth.setEnabled(enabled)
+        self._scale_bar_dx.setEnabled(enabled)
+        self._scale_bar_dy.setEnabled(enabled)
+        self._scale_bar_time_dx.setEnabled(enabled)
+        self._scale_bar_time_dy.setEnabled(enabled)
+
+    def _sync_stim_label_inputs(self, *_args: Any) -> None:
+        enabled = bool(self._show_stim_labels.isChecked())
+        for widget in (
+            self._text_stim_on,
+            self._text_stim_off,
+            self._stim_on_font,
+            self._stim_off_font,
+            self._stim_on_dx,
+            self._stim_on_dy,
+            self._stim_off_dx,
+            self._stim_off_dy,
+        ):
+            widget.setEnabled(enabled)
 
     # ---------------------------------------------------- style (dans Affichage)
 
@@ -701,6 +772,14 @@ class ParamsPanel(QWidget):
             "aussi éditables dans le dock Enregistrements → Légende."
         )
         self._title_font = FontSizeFaceRow(5.0, 50.0, 10.0, decimals=1, step=0.5)
+        self._title_dx = _int_spin(-400, 400, 0, suffix=" px")
+        self._title_dx.setToolTip(
+            "Décalage horizontal du titre de graphique. Positif = droite."
+        )
+        self._title_dy = _int_spin(-400, 400, 0, suffix=" px")
+        self._title_dy.setToolTip(
+            "Décalage vertical du titre de graphique. Positif = haut."
+        )
         self._label_font = FontSizeFaceRow(5.0, 50.0, 9.0, decimals=1, step=0.5)
         self._tick_font = FontSizeFaceRow(4.0, 50.0, 8.0, decimals=1, step=0.5)
         self._line_width = _spin(0.2, 20.0, 1.2, decimals=2, step=0.1)
@@ -719,6 +798,34 @@ class ParamsPanel(QWidget):
         )
         self._stim_offset_color.setToolTip(
             "Couleur des pointillés à la fin de chaque stimulation."
+        )
+        self._text_stim_on = QLineEdit("on")
+        self._text_stim_on.setPlaceholderText("on")
+        self._text_stim_on.setToolTip(
+            "Texte au-dessus du trait de début de stimulation. Vide = masquer."
+        )
+        self._text_stim_off = QLineEdit("off")
+        self._text_stim_off.setPlaceholderText("off")
+        self._text_stim_off.setToolTip(
+            "Texte au-dessus du trait de fin de stimulation. Vide = masquer."
+        )
+        self._stim_on_font = FontSizeFaceRow(4.0, 50.0, 8.0, decimals=1, step=0.5)
+        self._stim_off_font = FontSizeFaceRow(4.0, 50.0, 8.0, decimals=1, step=0.5)
+        self._stim_on_dx = _int_spin(-400, 400, 0, suffix=" px")
+        self._stim_on_dx.setToolTip(
+            "Décalage horizontal du libellé « on ». Positif = droite."
+        )
+        self._stim_on_dy = _int_spin(-400, 400, 0, suffix=" px")
+        self._stim_on_dy.setToolTip(
+            "Décalage vertical du libellé « on ». Positif = haut."
+        )
+        self._stim_off_dx = _int_spin(-400, 400, 0, suffix=" px")
+        self._stim_off_dx.setToolTip(
+            "Décalage horizontal du libellé « off ». Positif = droite."
+        )
+        self._stim_off_dy = _int_spin(-400, 400, 0, suffix=" px")
+        self._stim_off_dy.setToolTip(
+            "Décalage vertical du libellé « off ». Positif = haut."
         )
         self._grid = QCheckBox("Afficher la grille")
         self._grid.setChecked(True)
@@ -741,12 +848,20 @@ class ParamsPanel(QWidget):
             "Sur les traces continues, décochez aussi "
             "« Marqueurs de stimulation sur les traces » pour les masquer."
         )
+        self._show_stim_labels = QCheckBox("Libellés on / off sur les traits")
+        self._show_stim_labels.setChecked(True)
+        self._show_stim_labels.setToolTip(
+            "Afficher les textes « on » et « off » juste sous le haut des traits "
+            "de début et de fin de stimulation."
+        )
         style_form.addRow("Titre :", self._text_title)
         style_form.addRow("Axe X :", self._text_xlabel)
         style_form.addRow("Axe Y :", self._text_ylabel)
         style_form.addRow(self._text_series_suffix)
         style_form.addRow("Légendes :", self._text_legend_labels)
         style_form.addRow("Police du titre :", self._title_font)
+        style_form.addRow("Titre — horizontal :", self._title_dx)
+        style_form.addRow("Titre — vertical :", self._title_dy)
         style_form.addRow("Police des axes :", self._label_font)
         style_form.addRow("Police des ticks :", self._tick_font)
         style_form.addRow("Épaisseur de trait :", self._line_width)
@@ -758,6 +873,17 @@ class ParamsPanel(QWidget):
         style_form.addRow("Épaisseur du trait de stimulation :", self._stim_linewidth)
         style_form.addRow("Couleur début de stimulation :", self._stim_onset_color)
         style_form.addRow("Couleur fin de stimulation :", self._stim_offset_color)
+        style_form.addRow(self._show_stim_labels)
+        style_form.addRow("Texte début (on) :", self._text_stim_on)
+        style_form.addRow("Police début (on) :", self._stim_on_font)
+        style_form.addRow("Début — horizontal :", self._stim_on_dx)
+        style_form.addRow("Début — vertical :", self._stim_on_dy)
+        style_form.addRow("Texte fin (off) :", self._text_stim_off)
+        style_form.addRow("Police fin (off) :", self._stim_off_font)
+        style_form.addRow("Fin — horizontal :", self._stim_off_dx)
+        style_form.addRow("Fin — vertical :", self._stim_off_dy)
+        self._show_stim_labels.toggled.connect(self._sync_stim_label_inputs)
+        self._sync_stim_label_inputs()
 
         page_layout.addWidget(legend_group)
         page_layout.addWidget(style_group)
@@ -772,6 +898,7 @@ class ParamsPanel(QWidget):
             self._show_borders,
             self._ticks_inside,
             self._stim_markers,
+            self._show_stim_labels,
         ):
             box.toggled.connect(lambda _c: self._emit_view())
         self._legend_location.currentIndexChanged.connect(lambda _i: self._emit_view())
@@ -780,6 +907,12 @@ class ParamsPanel(QWidget):
             self._line_width,
             self._stim_linewidth,
             self._grid_alpha,
+            self._title_dx,
+            self._title_dy,
+            self._stim_on_dx,
+            self._stim_on_dy,
+            self._stim_off_dx,
+            self._stim_off_dy,
         ):
             spin.valueChanged.connect(lambda _v: self._emit_view())
         self._stim_onset_color.changed.connect(self._emit_view)
@@ -789,10 +922,18 @@ class ParamsPanel(QWidget):
             self._title_font,
             self._label_font,
             self._tick_font,
+            self._stim_on_font,
+            self._stim_off_font,
         ):
             font_row.changed.connect(self._emit_view)
         self._legend_columns.valueChanged.connect(lambda _v: self._emit_view())
-        for line in (self._text_title, self._text_xlabel, self._text_ylabel):
+        for line in (
+            self._text_title,
+            self._text_xlabel,
+            self._text_ylabel,
+            self._text_stim_on,
+            self._text_stim_off,
+        ):
             line.textChanged.connect(lambda _t: self._emit_view())
         self._text_legend_labels.textChanged.connect(self._emit_view)
 
@@ -1513,12 +1654,18 @@ class ParamsPanel(QWidget):
             self._scale_bar_time_manual.setChecked(bool(style.scale_bar_time_manual))
             self._scale_bar_time_ms.setValue(float(style.scale_bar_time_s) * 1000.0)
             self._scale_bar_linewidth.setValue(float(style.scale_bar_linewidth))
+            self._scale_bar_dx.setValue(int(round(float(style.scale_bar_dx_px))))
+            self._scale_bar_dy.setValue(int(round(float(style.scale_bar_dy_px))))
+            time_dx, time_dy = resolved_scale_bar_time_offset_px(style)
+            self._scale_bar_time_dx.setValue(int(round(float(time_dx))))
+            self._scale_bar_time_dy.setValue(int(round(float(time_dy))))
             self._sync_scale_bar_inputs()
             self._max_points.setValue(int(style.max_points_per_curve))
             self._montage_review_channels.setValue(int(settings.montage_review_channels))
             self._montage_review_page = max(0, int(settings.montage_review_page))
             self._montage_row_height.setValue(int(settings.montage_row_min_height_px))
             self._montage_show_kind_label.setChecked(bool(settings.montage_show_kind_label))
+            self._montage_shared_ylim.setChecked(bool(settings.montage_shared_ylim))
             self._montage_label_dx.setValue(int(round(float(settings.montage_label_dx_px))))
             self._montage_label_dy.setValue(int(round(float(settings.montage_label_dy_px))))
             self._montage_channels.setValue(int(settings.montage_channels))
@@ -1541,16 +1688,52 @@ class ParamsPanel(QWidget):
             self._text_legend_labels.setPlainText(
                 "\n".join(texts.legend_labels) if texts.legend_labels else ""
             )
+            self._text_stim_on.setText(str(getattr(texts, "stim_on", "on") or ""))
+            self._text_stim_off.setText(str(getattr(texts, "stim_off", "off") or ""))
             self._title_font.set_size_value(float(style.title_font_size))
             self._title_font.set_face_value(style.title_face)
+            self._title_dx.setValue(
+                int(round(float(getattr(style, "title_dx_px", 0.0) or 0.0)))
+            )
+            self._title_dy.setValue(
+                int(round(float(getattr(style, "title_dy_px", 0.0) or 0.0)))
+            )
             self._label_font.set_size_value(float(style.label_font_size))
             self._label_font.set_face_value(style.label_face)
             self._tick_font.set_size_value(float(style.tick_font_size))
             self._tick_font.set_face_value(style.tick_face)
+            self._stim_on_font.set_size_value(
+                float(getattr(style, "stim_on_font_size", 8.0) or 8.0)
+            )
+            self._stim_on_font.set_face_value(
+                getattr(style, "stim_on_face", None) or TextFace()
+            )
+            self._stim_off_font.set_size_value(
+                float(getattr(style, "stim_off_font_size", 8.0) or 8.0)
+            )
+            self._stim_off_font.set_face_value(
+                getattr(style, "stim_off_face", None) or TextFace()
+            )
+            self._stim_on_dx.setValue(
+                int(round(float(getattr(style, "stim_on_dx_px", 0.0) or 0.0)))
+            )
+            self._stim_on_dy.setValue(
+                int(round(float(getattr(style, "stim_on_dy_px", 0.0) or 0.0)))
+            )
+            self._stim_off_dx.setValue(
+                int(round(float(getattr(style, "stim_off_dx_px", 0.0) or 0.0)))
+            )
+            self._stim_off_dy.setValue(
+                int(round(float(getattr(style, "stim_off_dy_px", 0.0) or 0.0)))
+            )
             self._line_width.setValue(float(style.line_width))
             self._stim_linewidth.setValue(float(style.stim_linewidth))
             self._stim_onset_color.set_color(str(style.stim_onset_color))
             self._stim_offset_color.set_color(str(style.stim_offset_color))
+            self._show_stim_labels.setChecked(
+                bool(getattr(style, "show_stim_labels", True))
+            )
+            self._sync_stim_label_inputs()
             self._grid.setChecked(bool(style.grid))
             self._grid_alpha.setValue(float(style.grid_alpha))
             self._show_borders.setChecked(bool(style.show_borders))
@@ -1696,10 +1879,21 @@ class ParamsPanel(QWidget):
             title_face=self._title_font.face_value(),
             label_face=self._label_font.face_value(),
             tick_face=self._tick_font.face_value(),
+            title_dx_px=float(self._title_dx.value()),
+            title_dy_px=float(self._title_dy.value()),
             line_width=float(self._line_width.value()),
             stim_linewidth=float(self._stim_linewidth.value()),
             stim_onset_color=self._stim_onset_color.color_value(),
             stim_offset_color=self._stim_offset_color.color_value(),
+            show_stim_labels=bool(self._show_stim_labels.isChecked()),
+            stim_on_font_size=self._stim_on_font.size_value(),
+            stim_off_font_size=self._stim_off_font.size_value(),
+            stim_on_face=self._stim_on_font.face_value(),
+            stim_off_face=self._stim_off_font.face_value(),
+            stim_on_dx_px=float(self._stim_on_dx.value()),
+            stim_on_dy_px=float(self._stim_on_dy.value()),
+            stim_off_dx_px=float(self._stim_off_dx.value()),
+            stim_off_dy_px=float(self._stim_off_dy.value()),
             grid=self._grid.isChecked(),
             grid_alpha=float(self._grid_alpha.value()),
             show_borders=self._show_borders.isChecked(),
@@ -1710,6 +1904,10 @@ class ParamsPanel(QWidget):
             scale_bar_amplitude_manual=bool(self._scale_bar_amp_manual.isChecked()),
             scale_bar_amplitude=float(self._scale_bar_amp.value()),
             scale_bar_linewidth=float(self._scale_bar_linewidth.value()),
+            scale_bar_dx_px=float(self._scale_bar_dx.value()),
+            scale_bar_dy_px=float(self._scale_bar_dy.value()),
+            scale_bar_time_dx_px=float(self._scale_bar_time_dx.value()),
+            scale_bar_time_dy_px=float(self._scale_bar_time_dy.value()),
             max_points_per_curve=int(self._max_points.value()),
         )
         legend_lines = tuple(
@@ -1724,6 +1922,8 @@ class ParamsPanel(QWidget):
             ylabel=self._text_ylabel.text().strip(),
             legend_labels=legend_lines,
             show_series_suffix=bool(self._text_series_suffix.isChecked()),
+            stim_on=self._text_stim_on.text(),
+            stim_off=self._text_stim_off.text(),
         )
         flags = self.pipeline_visibility_flags()
         content = str(self._content_mode or "continuous")
@@ -1771,6 +1971,7 @@ class ParamsPanel(QWidget):
             preview_title_gap_px=int(self._preview_title_gap.value()),
             montage_row_min_height_px=int(self._montage_row_height.value()),
             montage_show_kind_label=bool(self._montage_show_kind_label.isChecked()),
+            montage_shared_ylim=bool(self._montage_shared_ylim.isChecked()),
             montage_label_dx_px=float(self._montage_label_dx.value()),
             montage_label_dy_px=float(self._montage_label_dy.value()),
             time_sync=str(self._time_sync.currentData() or "recording_start"),  # type: ignore[arg-type]

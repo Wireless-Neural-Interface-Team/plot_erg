@@ -37,7 +37,7 @@ class RenderRequestFactory:
         channel_index: int,
         channel_name: str,
         settings: ViewerSettings,
-        highlight_zooms: tuple[tuple[float, float, str], ...] = (),
+        highlight_zooms: tuple[tuple[float, float, str, str], ...] = (),
         preserve_view: bool | None = None,
     ) -> RenderRequest:
         host = self._host

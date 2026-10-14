@@ -129,6 +129,94 @@ def _legend_fonts(appearance: DrawAppearance | None = None) -> LayoutFonts:
     return app.layout_fonts()
 
 
+def _draw_stim_edge_label(
+    ax: Any,
+    x: float,
+    text: str,
+    *,
+    color: str,
+    fontsize: float = 8.0,
+    bold: bool = False,
+    italic: bool = False,
+    underline: bool = False,
+    dx_px: float = 0.0,
+    dy_px: float = 0.0,
+) -> None:
+    """Libellé au-dessus d’un trait de stimulation (coord. données × haut des axes)."""
+    if not str(text).strip():
+        return
+    from matplotlib.transforms import ScaledTranslation, blended_transform_factory
+
+    fig = ax.figure
+    dpi = float(getattr(fig, "dpi", 100.0) or 100.0)
+    base = blended_transform_factory(ax.transData, ax.transAxes)
+    offset = ScaledTranslation(
+        float(dx_px) / dpi, float(dy_px) / dpi, fig.dpi_scale_trans
+    )
+    artist = ax.text(
+        float(x),
+        1.0,
+        str(text),
+        transform=base + offset,
+        ha="center",
+        va="bottom",
+        color=color,
+        fontsize=max(4.0, float(fontsize)),
+        clip_on=False,
+        zorder=20,
+    )
+    try:
+        from panel_registry import apply_text_face
+        from view_config import TextFace
+
+        apply_text_face(
+            artist, TextFace(bold=bold, italic=italic, underline=underline)
+        )
+    except Exception:
+        try:
+            artist.set_fontweight("bold" if bold else "normal")
+            artist.set_fontstyle("italic" if italic else "normal")
+        except Exception:
+            pass
+
+
+def _reserve_axes_top_for_stim_labels(
+    ax: Any,
+    styles: Sequence[dict[str, Any]],
+) -> None:
+    """Réduire légèrement la boîte d’axes pour laisser les libellés au-dessus.
+
+    Ne modifie pas les ylim : les pointillés restent strictement dans les courbes.
+    """
+    pad_px = 0.0
+    for style in styles:
+        fs = float(style.get("fontsize", 8.0) or 8.0)
+        dy = float(style.get("dy_px", 0.0) or 0.0)
+        pad_px = max(pad_px, max(4.0, fs) * 1.35 + 6.0 + max(0.0, dy))
+    if pad_px <= 0.0:
+        return
+    fig = ax.figure
+    try:
+        fig_h = float(fig.get_figheight())
+        dpi = float(getattr(fig, "dpi", 100.0) or 100.0)
+        pos = ax.get_position()
+    except Exception:
+        return
+    fig_h_px = max(1.0, fig_h * dpi)
+    pad_frac = min(0.2, pad_px / fig_h_px)
+    try:
+        ax.set_position(
+            [
+                float(pos.x0),
+                float(pos.y0),
+                float(pos.width),
+                max(0.12, float(pos.height) - pad_frac),
+            ]
+        )
+    except Exception:
+        pass
+
+
 def _draw_onset_offset_lines(
     ax: Any,
     *,
@@ -136,10 +224,17 @@ def _draw_onset_offset_lines(
     end_line_specs: Optional[Sequence[tuple[float, str]]] = None,
     label_in_legend: bool = False,
     appearance: DrawAppearance | None = None,
+    onset_text: str | None = "on",
+    offset_text: str | None = "off",
+    onset_label_style: dict[str, Any] | None = None,
+    offset_label_style: dict[str, Any] | None = None,
 ) -> None:
     """Draw onset (t=0) and trigger-offset markers without zoom spans."""
     app = appearance or DrawAppearance.for_pdf()
     lw = float(app.stim_linewidth)
+    on_style = dict(onset_label_style or {})
+    off_style = dict(offset_label_style or {})
+    label_styles: list[dict[str, Any]] = []
     ax.axvline(
         0.0,
         linestyle="--",
@@ -147,6 +242,18 @@ def _draw_onset_offset_lines(
         color=app.stim_onset_color,
         label=("Stimulation (onset)" if label_in_legend else "_nolegend_"),
     )
+    if onset_text is not None and str(onset_text).strip():
+        style = {
+            "color": str(on_style.get("color") or app.stim_onset_color),
+            "fontsize": float(on_style.get("fontsize", 8.0) or 8.0),
+            "bold": bool(on_style.get("bold", False)),
+            "italic": bool(on_style.get("italic", False)),
+            "underline": bool(on_style.get("underline", False)),
+            "dx_px": float(on_style.get("dx_px", 0.0) or 0.0),
+            "dy_px": float(on_style.get("dy_px", 0.0) or 0.0),
+        }
+        _draw_stim_edge_label(ax, 0.0, str(onset_text), **style)
+        label_styles.append(style)
     if end_line_specs:
         for idx, (value, label) in enumerate(end_line_specs):
             ax.axvline(
@@ -156,6 +263,20 @@ def _draw_onset_offset_lines(
                 color=app.stim_offset_color,
                 label=(label if label_in_legend and idx == 0 else "_nolegend_"),
             )
+            if offset_text is not None and str(offset_text).strip():
+                style = {
+                    "color": str(off_style.get("color") or app.stim_offset_color),
+                    "fontsize": float(off_style.get("fontsize", 8.0) or 8.0),
+                    "bold": bool(off_style.get("bold", False)),
+                    "italic": bool(off_style.get("italic", False)),
+                    "underline": bool(off_style.get("underline", False)),
+                    "dx_px": float(off_style.get("dx_px", 0.0) or 0.0),
+                    "dy_px": float(off_style.get("dy_px", 0.0) or 0.0),
+                }
+                _draw_stim_edge_label(ax, float(value), str(offset_text), **style)
+                label_styles.append(style)
+        if label_styles:
+            _reserve_axes_top_for_stim_labels(ax, label_styles)
         return
     labeled = False
     for value in end_markers:
@@ -170,7 +291,21 @@ def _draw_onset_offset_lines(
                 else "_nolegend_"
             ),
         )
+        if offset_text is not None and str(offset_text).strip():
+            style = {
+                "color": str(off_style.get("color") or app.stim_offset_color),
+                "fontsize": float(off_style.get("fontsize", 8.0) or 8.0),
+                "bold": bool(off_style.get("bold", False)),
+                "italic": bool(off_style.get("italic", False)),
+                "underline": bool(off_style.get("underline", False)),
+                "dx_px": float(off_style.get("dx_px", 0.0) or 0.0),
+                "dy_px": float(off_style.get("dy_px", 0.0) or 0.0),
+            }
+            _draw_stim_edge_label(ax, float(value), str(offset_text), **style)
+            label_styles.append(style)
         labeled = True
+    if label_styles:
+        _reserve_axes_top_for_stim_labels(ax, label_styles)
 
 
 def mark_stim_times(
