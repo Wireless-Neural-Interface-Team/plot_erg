@@ -254,6 +254,70 @@ def _bench_continuous_require_ready() -> None:
     _time("prefetch + require_ready hit", after_prefetch)
 
 
+def _bench_continuous_disk_peek() -> None:
+    """HIGH/LOW ready on disk only: envelope must not force a full-row RAM copy."""
+    print("continuous_trace disk peek (no full-row copy):")
+    from types import SimpleNamespace
+
+    from dataset_builder import LazyFilterBank, _FilteredDiskStore
+    from erg_cache import FilteredStreamLayout
+    from intan_rhx_dsp import IntanDspSettings, build_intan_filter_sos
+
+    recording = build_synthetic(label="perf-disk-peek", seed=3, n_channels=2)
+    n_ch, n_samp = 2, 2_000_000
+    amp = np.random.default_rng(4).standard_normal((n_ch, n_samp)).astype(np.float32)
+    dsp = IntanDspSettings(
+        fs=20_000.0,
+        hp_filter_order=2,
+        hp_filter_type="bessel",
+        hp_filter_cutoff_hz=250.0,
+        lp_filter_order=2,
+        lp_filter_type="bessel",
+        lp_filter_cutoff_hz=250.0,
+    )
+    _notch, hp_sos, lp_sos = build_intan_filter_sos(dsp)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        layout = FilteredStreamLayout(root=Path(tmp) / "_filter_peek")
+        store = _FilteredDiskStore(layout, n_ch, n_samp, with_notch=False)
+        # Simulate a previously filtered channel sitting only on disk.
+        store.write("hp", 0, amp[0], flush=True)
+        assert store.is_ready("hp", 0)
+
+        bank = LazyFilterBank(
+            amp,
+            dsp,
+            "hp",
+            filter_sos=hp_sos,
+            notch_sos=_notch,
+            disk_store=store,
+            max_cached_channels=1,
+        )
+        recording.source = SimpleNamespace(amplifier=amp, highpass=bank, lowpass=amp)
+        recording.meta = replace(recording.meta, fs=20_000.0)
+
+        def peek_envelope() -> None:
+            assert bank.peek(0) is not None
+            assert 0 not in bank._cache  # peek must not promote disk→LRU
+            t, y = recording.continuous_trace(
+                "hp", 0, max_points=4_000, require_ready=True
+            )
+            assert y.size > 0
+            assert y.size <= 4_000 + 2
+            assert 0 not in bank._cache
+
+        def wide_envelope() -> None:
+            t, y = recording.continuous_trace("raw", 0, max_points=4_000)
+            assert y.size > 0
+            assert y.size <= 4_000 + 2
+
+        elapsed = _time("HIGH disk peek + envelope 2e6", peek_envelope)
+        _time("WIDE memmap envelope 2e6", wide_envelope)
+        # UI budget: a full-row float32 copy of 2e6 samples alone is already heavy.
+        assert elapsed < 2.5, f"disk peek envelope too slow: {elapsed:.2f}s"
+        store.close()
+
+
 def _bench_panel_prepare_pyqtgraph() -> None:
     print("panel_prepare + PlotHost (offscreen):")
     from PySide6.QtWidgets import QApplication
@@ -355,6 +419,7 @@ def main() -> int:
     _bench_redraw()
     _bench_montage_visibility()
     _bench_continuous_require_ready()
+    _bench_continuous_disk_peek()
     _bench_batch_flush_store()
     try:
         _bench_filter_disk_roundtrip()

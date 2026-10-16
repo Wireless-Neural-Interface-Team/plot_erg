@@ -385,6 +385,9 @@ def _psth_mean_hz(
 
     The PSTH is evaluated at each sample step (derived from t_rel).
     t_range_s: if (t0, t1), process only this interval (out-of-range spikes excluded).
+
+    Edge bins use the effective kernel support (truncated window) so the rate is
+    not systematically underestimated near ``t0`` / ``t1``.
     """
     if t_range_s is not None:
         t0, t1 = float(t_range_s[0]), float(t_range_s[1])
@@ -414,10 +417,19 @@ def _psth_mean_hz(
     else:
         counts = np.zeros(edges.size - 1, dtype=np.float64)
     window_bins = max(1, int(round(float(bin_width_s) / dt)))
-    kernel = np.ones(window_bins, dtype=np.float64)
-    sliding_counts = np.convolve(counts, kernel, mode="same")
-    effective_window_s = float(window_bins) * dt
-    rate = sliding_counts / (max(n_trials, 1) * effective_window_s)
+    n_bins = int(counts.size)
+    # Centered sliding window via cumsum; clip to the histogram range and
+    # divide by the effective support so edge bins are not under/over-scaled.
+    half = window_bins // 2
+    cs = np.concatenate(([0.0], np.cumsum(counts, dtype=np.float64)))
+    idx = np.arange(n_bins, dtype=np.int64)
+    lo = np.clip(idx - half, 0, n_bins)
+    hi = np.clip(idx - half + window_bins, 0, n_bins)
+    sliding_counts = cs[hi] - cs[lo]
+    effective_bins = (hi - lo).astype(np.float64)
+    rate = sliding_counts / (
+        max(n_trials, 1) * np.maximum(effective_bins, 1.0) * dt
+    )
     centers = (edges[:-1] + edges[1:]) * 0.5
     return centers, rate
 
@@ -819,21 +831,28 @@ def _extract_spike_waveforms(
     *,
     pre_ms: float = SPIKE_OVERLAY_DEFAULT_PRE_MS,
     post_ms: float = SPIKE_OVERLAY_DEFAULT_POST_MS,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray | None]:
     """HIGH snippets aligned on detection for the spike overlay panel.
 
     Buffer is ``[t - pre_ms, t + post_ms)``. Returns
-    ``(t_ms, waveforms, t_rel_s)`` with t=0 at the threshold-crossing sample.
+    ``(t_ms, waveforms, t_rel_s, total_count, exact_mean)`` with t=0 at the
+    threshold-crossing sample.
+
+    ``waveforms`` may be subsampled for display (cap
+    ``MAX_OVERLAY_SNIPPETS_PER_CHANNEL``), but ``exact_mean`` and ``total_count``
+    always cover every valid detection.
     """
     fs = float(source.fs)
     pre_n = max(0, int(math.ceil(max(0.0, float(pre_ms)) * fs / 1000.0)))
     post_n = max(1, int(math.ceil(max(0.0, float(post_ms)) * fs / 1000.0)))
     win_len = pre_n + post_n
     t_ms = (np.arange(-pre_n, post_n, dtype=np.float64) / fs) * 1e3
-    empty = (
+    empty: tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray | None] = (
         t_ms,
         np.empty((0, win_len), dtype=np.float32),
         np.empty(0, dtype=np.float64),
+        0,
+        None,
     )
     row = np.asarray(source.high_trace_for_channel(ch), dtype=np.float32).ravel()
     n_samples = int(row.shape[0])
@@ -859,22 +878,45 @@ def _extract_spike_waveforms(
         return empty
 
     centers_all = np.concatenate(centers_list)
-    t_rel_keep = np.concatenate(t_rel_list)
-    # Cap early to avoid allocating huge overlays.
+    t_rel_all = np.concatenate(t_rel_list)
+    total = int(centers_all.size)
+    offsets = np.arange(win_len, dtype=np.int64)
+
     from processed_dataset import MAX_OVERLAY_SNIPPETS_PER_CHANNEL as _MAX_OV
 
     max_keep = int(_MAX_OV)
-    if centers_all.size > max_keep:
-        picks = np.linspace(0, centers_all.size - 1, max_keep).astype(np.int64)
-        centers_all = centers_all[picks]
-        t_rel_keep = t_rel_keep[picks]
+    if total <= max_keep:
+        starts = centers_all - pre_n
+        index = starts[:, None] + offsets[None, :]
+        waves = np.asarray(row[index], dtype=np.float32)
+        exact_mean = np.mean(np.asarray(waves, dtype=np.float64), axis=0).astype(
+            np.float32
+        )
+        return t_ms, waves, np.asarray(t_rel_all, dtype=np.float64), total, exact_mean
 
-    starts = centers_all - pre_n
-    # Build a (n_spikes, win_len) view via advanced indexing.
-    offsets = np.arange(win_len, dtype=np.int64)
+    # Exact mean over all detections (chunked), then subsample for display only.
+    acc = np.zeros(win_len, dtype=np.float64)
+    chunk = 512
+    for i in range(0, total, chunk):
+        batch = centers_all[i : i + chunk]
+        starts = batch - pre_n
+        index = starts[:, None] + offsets[None, :]
+        acc += np.asarray(row[index], dtype=np.float64).sum(axis=0)
+    exact_mean = (acc / float(total)).astype(np.float32)
+
+    picks = np.linspace(0, total - 1, max_keep).astype(np.int64)
+    display_centers = centers_all[picks]
+    display_t_rel = t_rel_all[picks]
+    starts = display_centers - pre_n
     index = starts[:, None] + offsets[None, :]
     waves = np.asarray(row[index], dtype=np.float32)
-    return t_ms, waves, np.asarray(t_rel_keep, dtype=np.float64)
+    return (
+        t_ms,
+        waves,
+        np.asarray(display_t_rel, dtype=np.float64),
+        total,
+        exact_mean,
+    )
 
 
 def _spike_overlay_xticks(t_min_ms: float, t_max_ms: float) -> list[float]:

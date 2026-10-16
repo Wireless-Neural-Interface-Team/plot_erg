@@ -130,6 +130,10 @@ class ChannelEnsureRequest:
     need_overlay: bool = True
     # Warm HP/LP rows on the worker thread (never on the Qt UI thread).
     need_filters: bool = True
+    # Subset of streams / RMS kinds actually shown (None → defaults).
+    mean_streams: tuple[str, ...] | None = None
+    rms_kinds: tuple[str, ...] | None = None
+    filter_streams: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -146,11 +150,21 @@ class _EnsureJob:
     need_spikes: bool = True
     need_overlay: bool = True
     need_filters: bool = True
+    mean_streams: tuple[str, ...] | None = None
+    rms_kinds: tuple[str, ...] | None = None
+    filter_streams: tuple[str, ...] | None = None
 
     def key(self) -> tuple[int, int]:
         return (id(self.recording), int(self.channel))
 
     def merge_needs(self, other: "_EnsureJob") -> "_EnsureJob":
+        def _merge_opt(
+            left: tuple[str, ...] | None, right: tuple[str, ...] | None
+        ) -> tuple[str, ...] | None:
+            if left is None or right is None:
+                return None
+            return tuple(dict.fromkeys((*left, *right)))
+
         return _EnsureJob(
             recording=self.recording,
             config=other.config,
@@ -162,6 +176,9 @@ class _EnsureJob:
             need_spikes=self.need_spikes or other.need_spikes,
             need_overlay=self.need_overlay or other.need_overlay,
             need_filters=self.need_filters or other.need_filters,
+            mean_streams=_merge_opt(self.mean_streams, other.mean_streams),
+            rms_kinds=_merge_opt(self.rms_kinds, other.rms_kinds),
+            filter_streams=_merge_opt(self.filter_streams, other.filter_streams),
         )
 
     @property
@@ -185,17 +202,32 @@ def _jobs_from_requests(requests: Sequence[ChannelEnsureRequest]) -> list[_Ensur
                     need_spikes=bool(request.need_spikes),
                     need_overlay=bool(request.need_overlay),
                     need_filters=bool(getattr(request, "need_filters", True)),
+                    mean_streams=getattr(request, "mean_streams", None),
+                    rms_kinds=getattr(request, "rms_kinds", None),
+                    filter_streams=getattr(request, "filter_streams", None),
                 )
             )
     return jobs
 
 
-def _warm_filters(recording: Any, channel: int) -> None:
+def _warm_filters(
+    recording: Any,
+    channel: int,
+    streams: Sequence[str] | None = None,
+) -> None:
     """Run LazyFilterBank.prefetch for one channel (worker thread only)."""
     source = getattr(recording, "source", None)
     if source is None:
         return
-    for bank_name in ("highpass", "lowpass"):
+    wanted = {str(s) for s in (streams or ("hp", "lp")) if str(s) in {"hp", "lp"}}
+    if not wanted:
+        return
+    bank_names = []
+    if "hp" in wanted:
+        bank_names.append("highpass")
+    if "lp" in wanted:
+        bank_names.append("lowpass")
+    for bank_name in bank_names:
         bank = getattr(source, bank_name, None)
         prefetch = getattr(bank, "prefetch", None)
         if callable(prefetch):
@@ -369,7 +401,11 @@ class ChannelEnsureWorker(QThread):
 
                     try:
                         if job.need_filters:
-                            _warm_filters(job.recording, job.channel)
+                            _warm_filters(
+                                job.recording,
+                                job.channel,
+                                job.filter_streams,
+                            )
                         computed: list[int] = []
                         if job.products_requested:
                             computed = ensure_channels(
@@ -382,6 +418,8 @@ class ChannelEnsureWorker(QThread):
                                 need_rms=job.need_rms,
                                 need_spikes=job.need_spikes,
                                 need_overlay=job.need_overlay,
+                                mean_streams=job.mean_streams,
+                                rms_kinds=job.rms_kinds,
                             )
                         else:
                             computed = [job.channel]

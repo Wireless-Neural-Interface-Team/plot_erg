@@ -61,6 +61,11 @@ PREPARE_MPL_PANELS: frozenset[str] = frozenset(
         "full_recording",
         "montage_continuous_raw",
         "montage_second_to_third_lp",
+        "mea_layout",
+        "impedance",
+        "summary_rms",
+        "summary_rms_table",
+        "summary_impedance",
         *(_MONTAGE_TRIGGERED.keys()),
     }
 )
@@ -68,6 +73,55 @@ PREPARE_MPL_PANELS: frozenset[str] = frozenset(
 
 def uses_prepare_mpl(panel: str) -> bool:
     return str(panel or "") in PREPARE_MPL_PANELS
+
+
+def _draw_table_spec(figure: Any, spec: PanelSpec, status: str) -> str:
+    """Render ``layout_kind=table`` panels (summary RMS table, etc.)."""
+    ax = figure.add_subplot(111)
+    ax.set_axis_off()
+    headers = [str(h) for h in (spec.table_headers or [])]
+    rows = [[str(cell) for cell in row] for row in (spec.table_rows or [])]
+    if not headers and not rows:
+        message = spec.status_message or spec.title or status
+        ax.text(
+            0.5,
+            0.5,
+            message,
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=10,
+            color="#64748b",
+            wrap=True,
+        )
+        figure._erg_status = status
+        return status
+    col_labels = headers or None
+    cell_text = rows or [[""] * max(1, len(headers))]
+    table = ax.table(
+        cellText=cell_text,
+        colLabels=col_labels,
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(max(6.0, float(spec.tick_font_size or 8.0)))
+    table.scale(1.0, 1.35)
+    highlight = int(getattr(spec, "table_highlight_row", -1) or -1)
+    header_offset = 1 if col_labels else 0
+    if 0 <= highlight < len(rows):
+        for col in range(len(cell_text[highlight])):
+            cell = table[(highlight + header_offset, col)]
+            cell.set_facecolor(_CHANNEL_HIGHLIGHT)
+    if spec.title:
+        figure.suptitle(
+            spec.title,
+            fontsize=float(spec.title_font_size or 10.0),
+            fontweight="bold" if spec.title_bold else "normal",
+            fontstyle="italic" if spec.title_italic else "normal",
+        )
+    figure._erg_status = status
+    return status
 
 
 def _apply_spec_text_face(
@@ -128,7 +182,9 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
 
     status = str(spec.status or "ok")
     if spec.layout_kind == "placeholder" or (
-        status in {"unavailable", "pending", "empty"} and not spec.series
+        status in {"unavailable", "pending", "empty", "error"}
+        and not spec.series
+        and str(spec.layout_kind) != "table"
     ):
         ax = figure.add_subplot(111)
         message = spec.status_message or spec.title or status
@@ -146,6 +202,9 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
         ax.set_axis_off()
         figure._erg_status = status
         return status
+
+    if str(spec.layout_kind) == "table":
+        return _draw_table_spec(figure, spec, status)
 
     is_montage = str(spec.layout_kind) == "montage"
     n_rows = max(1, int(spec.n_rows or 1))
@@ -286,6 +345,11 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
             ylim = spec.row_ylims[row]
         elif row == 0 and spec.ylim is not None and not is_montage:
             ylim = spec.ylim
+        if bool(getattr(spec, "y_log", False)) and not is_montage:
+            try:
+                ax.set_yscale("log")
+            except Exception:
+                pass
         if ylim is not None:
             ax.set_ylim(float(ylim[0]), float(ylim[1]))
         else:
@@ -310,6 +374,14 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
         elif not share_x:
             ax.relim()
             ax.autoscale_view(scalex=True, scaley=False)
+        if row == (n_rows - 1 if is_montage else 0) and getattr(spec, "x_ticks", None):
+            ticks = list(spec.x_ticks or [])
+            if ticks:
+                try:
+                    ax.set_xticks([float(x) for x, _label in ticks])
+                    ax.set_xticklabels([str(label) for _x, label in ticks])
+                except Exception:
+                    pass
         label_text = ""
         if row < len(spec.row_labels) and spec.row_labels[row]:
             label_text = str(spec.row_labels[row])
@@ -348,6 +420,7 @@ def draw_panel_spec(figure: Any, spec: PanelSpec, request: Any | None = None) ->
             _apply_spec_text_face(tick_label, spec, role="tick")
 
     _reserve_space_above_for_stim_labels(figure, axes_flat, spec)
+    _reserve_space_below_for_zone_labels(figure, axes_flat, spec)
 
     if spec.title:
         from plot_utils import apply_title_pixel_offset, title_offset_margin_fractions
@@ -513,6 +586,8 @@ def _draw_annotation(
         ax.axvspan(float(ann.x), float(ann.x2), color=ann.color, alpha=0.15)
     elif ann.kind == "stim_label" and ann.text:
         _draw_stim_label(ax, ann)
+    elif ann.kind == "zone_label" and ann.text:
+        _draw_zone_label(ax, ann)
     elif ann.kind == "text" and ann.text:
         ax.text(
             0.5,
@@ -561,6 +636,42 @@ def _reserve_space_above_for_stim_labels(
         pass
 
 
+def _zone_label_pad_px(spec: PanelSpec) -> float:
+    pad = 0.0
+    for ann in spec.annotations:
+        if str(getattr(ann, "kind", "") or "") != "zone_label":
+            continue
+        if not str(getattr(ann, "text", "") or "").strip():
+            continue
+        fs = max(4.0, float(getattr(ann, "fontsize", 8.0) or 8.0))
+        dy = float(getattr(ann, "dy_px", 0.0) or 0.0)
+        need = fs * 1.35 + 6.0 + max(0.0, -dy)
+        pad = max(pad, need)
+    return pad
+
+
+def _reserve_space_below_for_zone_labels(
+    figure: Any, axes: list[Any], spec: PanelSpec
+) -> None:
+    """Marge figure sous les axes pour les libellés Zone (miroir on/off)."""
+    pad_px = _zone_label_pad_px(spec)
+    if pad_px <= 0.0 or not axes:
+        return
+    try:
+        fig_h = float(figure.get_figheight())
+        dpi = float(getattr(figure, "dpi", 100.0) or 100.0)
+    except Exception:
+        return
+    fig_h_px = max(1.0, fig_h * dpi)
+    pad_frac = min(0.25, pad_px / fig_h_px)
+    try:
+        subs = figure.subplotpars
+        new_bottom = min(float(subs.top) - 0.25, float(subs.bottom) + pad_frac)
+        figure.subplots_adjust(bottom=new_bottom)
+    except Exception:
+        pass
+
+
 def _draw_stim_label(ax: Any, ann: AnnotationSpec) -> None:
     """Libellé « on » / « off » juste au-dessus du cadre des axes (hors courbes)."""
     from matplotlib.transforms import ScaledTranslation, blended_transform_factory
@@ -582,6 +693,42 @@ def _draw_stim_label(ax: Any, ann: AnnotationSpec) -> None:
         transform=base + offset,
         ha="center",
         va="bottom",
+        color=ann.color,
+        fontsize=max(4.0, float(getattr(ann, "fontsize", 8.0) or 8.0)),
+        clip_on=False,
+        zorder=20,
+    )
+    apply_text_face(
+        text,
+        TextFace(
+            bold=bool(getattr(ann, "bold", False)),
+            italic=bool(getattr(ann, "italic", False)),
+            underline=bool(getattr(ann, "underline", False)),
+        ),
+    )
+
+
+def _draw_zone_label(ax: Any, ann: AnnotationSpec) -> None:
+    """Libellé « Zone N » juste sous le cadre des axes (miroir de on/off)."""
+    from matplotlib.transforms import ScaledTranslation, blended_transform_factory
+
+    from panel_registry import apply_text_face
+    from view_config import TextFace
+
+    fig = ax.figure
+    dpi = float(getattr(fig, "dpi", 100.0) or 100.0)
+    dx = float(getattr(ann, "dx_px", 0.0) or 0.0)
+    dy = float(getattr(ann, "dy_px", 0.0) or 0.0)
+    # y=0 + va=top : sous les axes (comme on/off au-dessus).
+    base = blended_transform_factory(ax.transData, ax.transAxes)
+    offset = ScaledTranslation(dx / dpi, dy / dpi, fig.dpi_scale_trans)
+    text = ax.text(
+        float(ann.x),
+        0.0,
+        str(ann.text),
+        transform=base + offset,
+        ha="center",
+        va="top",
         color=ann.color,
         fontsize=max(4.0, float(getattr(ann, "fontsize", 8.0) or 8.0)),
         clip_on=False,

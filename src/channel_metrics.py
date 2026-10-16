@@ -94,11 +94,16 @@ def mean_rms_profile_from_row(
     dsp: Any,
     trigger_index: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Mean RMS profile for one already-materialized high-pass row."""
-    if valid_triggers.size == 0 or t1_s <= t0_s:
+    """Mean RMS profile for one already-materialized high-pass row.
+
+    ``t0_s`` / ``t1_s`` are inclusive sample times (typically ``t_rel[0]`` and
+    ``t_rel[-1]``), matching the peri-stimulus mean window length.
+    """
+    if valid_triggers.size == 0 or t1_s < t0_s:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     start_off = int(round(float(t0_s) * fs))
-    end_off = int(round(float(t1_s) * fs))
+    # Inclusive upper bound: last sample at t1_s must be included.
+    end_off = int(round(float(t1_s) * fs)) + 1
     if end_off <= start_off:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     n_samples = int(np.asarray(row).shape[-1])
@@ -143,7 +148,10 @@ def mean_rms_profile_from_source_window(
     *,
     hp_row: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Mean RMS profile in [t0_s, t1_s], averaged over triggers.
+    """Mean RMS profile on inclusive ``[t0_s, t1_s]``, averaged over triggers.
+
+    ``t0_s`` / ``t1_s`` are sample times (typically ``t_rel[0]`` / ``t_rel[-1]``)
+    so the profile length matches the peri-stimulus mean window.
 
     When ``trigger_index`` is set, only that stimulation is used (no averaging).
     When ``hp_row`` is provided with a single ``channel_index``, the row is used
@@ -152,7 +160,7 @@ def mean_rms_profile_from_source_window(
     ``rms_window_s`` overrides ``source.intan_dsp.rms_window_s`` for this call.
     """
     dsp = _dsp_with_rms_window(source.intan_dsp, rms_window_s)
-    if source.valid_triggers.size == 0 or t1_s <= t0_s:
+    if source.valid_triggers.size == 0 or t1_s < t0_s:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
 
     if hp_row is not None and channel_index is not None:
@@ -168,7 +176,7 @@ def mean_rms_profile_from_source_window(
 
     fs = float(source.fs)
     start_off = int(round(float(t0_s) * fs))
-    end_off = int(round(float(t1_s) * fs))
+    end_off = int(round(float(t1_s) * fs)) + 1
     if end_off <= start_off:
         return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
     n_channels = int(source.highpass.shape[0])

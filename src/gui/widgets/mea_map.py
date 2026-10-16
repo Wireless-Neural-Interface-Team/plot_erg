@@ -35,7 +35,7 @@ _SELECTED_EDGE = QColor("#dc2626")
 _HOVER_EDGE = QColor("#2563eb")
 _LABEL_COLOR = QColor("#0f172a")
 _HIDDEN_LABEL = QColor("#94a3b8")
-_BACKGROUND = QColor("#f8fafc")
+_BACKGROUND = QColor("#ffffff")
 _CLUSTER_FILL = QColor(226, 232, 240, 90)
 _CLUSTER_EDGE = QColor("#cbd5e1")
 

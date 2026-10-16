@@ -121,7 +121,9 @@ class PanelGrid(QScrollArea):
         self._timer.stop()
         self._pending.clear()
         self._columns = max(1, int(columns))
-        self._panel_height = max(140, int(panel_height))
+        new_height = max(140, int(panel_height))
+        shrinking = new_height < int(self._panel_height)
+        self._panel_height = new_height
         self._uniform = bool(uniform)
         # fill et uniform sont exclusifs : uniform = hauteur figée (montage).
         self._fill = bool(fill) and not self._uniform
@@ -150,6 +152,13 @@ class PanelGrid(QScrollArea):
                 self._panels[placement.key] = canvas
             else:
                 widget = self._panels[placement.key]
+                # Budget en baisse : oublier le fit grow-only (moins de kinds).
+                if (
+                    shrinking
+                    and str(placement.panel).startswith("montage_")
+                    and hasattr(widget, "fitted_height_px")
+                ):
+                    widget.fitted_height_px = None  # type: ignore[attr-defined]
                 update = getattr(widget, "update_placement", None)
                 if callable(update):
                     update(placement)
@@ -188,14 +197,11 @@ class PanelGrid(QScrollArea):
                 self._fill = False
         if fill is not None:
             self._fill = bool(fill) and not self._uniform
-        if (
-            height == self._panel_height
-            and panels is None
-            and uniform is None
-            and fill is None
-        ):
-            return
+        # Budget en baisse (ex. décocher WIDE) : oublier le fit grow-only
+        # pour que les lignes ne restent pas étirées dans l’ancien panneau.
+        shrinking = height < int(self._panel_height)
         self._panel_height = height
+        # Toujours réappliquer aux widgets (hauteur liée à la taille d’échelle).
         wanted = set(panels) if panels is not None else None
         for placement in self._order:
             if wanted is not None and placement.panel not in wanted:
@@ -203,6 +209,9 @@ class PanelGrid(QScrollArea):
             widget = self._panels.get(placement.key)
             if widget is None:
                 continue
+            if shrinking and str(placement.panel).startswith("montage_"):
+                if hasattr(widget, "fitted_height_px"):
+                    widget.fitted_height_px = None  # type: ignore[attr-defined]
             self._apply_panel_height(widget, placement)
 
     def apply_fitted_height(self, placement: PanelPlacement, height: int) -> None:
@@ -217,11 +226,31 @@ class PanelGrid(QScrollArea):
             return
         self._apply_panel_height(widget, placement)
 
+    def apply_fitted_width(self, placement: PanelPlacement, width: int) -> None:
+        """Largeur calée sur temps + taille temps (échelle s/px ou ms/px)."""
+        widget = self._panels.get(placement.key)
+        if widget is None:
+            return
+        fitted = max(200, int(width))
+        previous = getattr(widget, "fitted_width_px", None)
+        widget.fitted_width_px = fitted  # type: ignore[attr-defined]
+        if previous is not None and abs(int(previous) - fitted) <= 2:
+            return
+        self._apply_panel_width(widget, placement)
+
+    def _apply_panel_width(self, widget: object, placement: PanelPlacement) -> None:
+        fitted = getattr(widget, "fitted_width_px", None)
+        if fitted is None:
+            widget.setMinimumWidth(0)  # type: ignore[attr-defined]
+            widget.setMaximumWidth(16777215)  # type: ignore[attr-defined]
+            return
+        width = max(200, int(fitted))
+        widget.setMinimumWidth(width)  # type: ignore[attr-defined]
+        widget.setMaximumWidth(width)  # type: ignore[attr-defined]
+
     def set_graph_height(self, graph_height: int) -> None:
         """Hauteur des panneaux hors montage (RMS, spikes, résumés…)."""
         height = max(140, int(graph_height))
-        if height == self._graph_height:
-            return
         self._graph_height = height
         for placement in self._order:
             if str(placement.panel).startswith("montage_"):
@@ -251,10 +280,13 @@ class PanelGrid(QScrollArea):
     def _apply_panel_height(self, widget: object, placement: PanelPlacement) -> None:
         height = self._panel_min_height(placement)
         fitted = getattr(widget, "fitted_height_px", None)
-        if fitted is not None and str(placement.panel).startswith("montage_"):
-            # Mesure après dessin : le bas (légende, dernier canal) ne doit
-            # pas être rogné quand les lignes sont plus hautes que le budget.
-            height = max(height, int(fitted))
+        if fitted is not None:
+            if str(placement.panel).startswith("montage_"):
+                # Montage : ne pas descendre sous le budget de grille.
+                height = max(height, int(fitted))
+            else:
+                # Échelle flottante : hauteur exacte pour le gain µV/px.
+                height = max(140, int(fitted))
         widget.setMinimumHeight(height)  # type: ignore[attr-defined]
         # Hauteur fixe pour tous les graphs (scroll si la fenêtre est plus petite).
         # fill (legacy) : Expanding pour occuper le viewport.
@@ -417,13 +449,13 @@ class PanelGrid(QScrollArea):
             widget.invalidate()  # type: ignore[attr-defined]
             widget.mark_pending()  # type: ignore[attr-defined]
 
-    def sync_scale_bars_from(self, style: Any) -> None:
-        """Propager l’échelle flottante globale vers les overrides locaux."""
+    def sync_scale_bars_from(self, style_or_settings: Any) -> None:
+        """Propager légende / hauteur / échelle du dock vers les overrides locaux."""
         for widget in self._panels.values():
             sync = getattr(widget, "sync_scale_bars_from", None)
             if callable(sync):
                 try:
-                    sync(style)
+                    sync(style_or_settings)
                 except Exception:
                     pass
 

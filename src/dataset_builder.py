@@ -58,7 +58,6 @@ from impedance_tracking import collect_impedance_sessions
 from intan_rhx_dsp import IntanDspSettings, build_intan_filter_sos
 from memmap_io import close_memmap, load_readonly_memmap, open_writable_memmap
 from processed_dataset import (
-    MAX_OVERLAY_SNIPPETS_PER_CHANNEL,
     ChannelData,
     DerivedArrays,
     OverlaySnippets,
@@ -540,12 +539,33 @@ class LazyFilterBank:
         if store is not None:
             store.close()
 
+    def peek(self, ch: int) -> np.ndarray | None:
+        """Return a ready row without ``sosfilt`` and without a forced disk→RAM copy.
+
+        Prefer the RAM LRU; otherwise a memmap view from disk (``copy=False``).
+        Used by the UI continuous envelope so painting HIGH/LOW never freezes
+        on a full-channel memcpy. Returns ``None`` if the channel is not ready.
+        """
+        ch = int(ch)
+        with self._lock:
+            cached = self._cache.get(ch)
+            if cached is not None:
+                self._cache.move_to_end(ch)
+                return cached
+        if self._disk is not None:
+            return self._disk.read_ready(self._kind, ch, copy=False)
+        return None
+
     def __getitem__(self, index: int | tuple[Any, ...]) -> np.ndarray:
-        # Support ``bank[ch, start:end]`` like a 2D ndarray (filters the row, then slices).
+        # Support ``bank[ch, start:end]`` like a 2D ndarray.
+        # Prefer a ready peek (RAM / disk view) so stim slices do not force a
+        # full-row disk→RAM copy or a redundant sosfilt on the UI thread.
         if isinstance(index, tuple):
             if not index:
                 raise IndexError("Empty index")
-            row = self._row(int(index[0]), flush_disk=False)
+            ch = int(index[0])
+            peeked = self.peek(ch)
+            row = peeked if peeked is not None else self._row(ch, flush_disk=False)
             return row[index[1:]] if len(index) > 1 else row
         return self._row(int(index), flush_disk=False)
 
@@ -664,7 +684,16 @@ def _segment(
     progress.start_stage("segment")
     fs = float(raw_meta["fs"])
     n_samples = int(raw_meta["n_samples"])
-    triggers, t_rel, pre_n, post_n, n_valid, n_total, end_rising_s = resolve_recording_windows(
+    (
+        triggers,
+        t_rel,
+        pre_n,
+        post_n,
+        n_valid,
+        n_total,
+        end_rising_s,
+        section_duration_s,
+    ) = resolve_recording_windows(
         config=config,
         n_samples=n_samples,
         fs=fs,
@@ -679,10 +708,8 @@ def _segment(
         pre_s=float(pre_n) / fs,
         post_s=float(post_n) / fs,
         end_rising_s=end_rising_s,
-        section_count=int(config.section_count) if config.edge == "none" else None,
-        section_duration_s=(
-            float(pre_n + post_n) / fs if config.edge == "none" else None
-        ),
+        section_count=int(n_total) if config.edge == "none" else None,
+        section_duration_s=section_duration_s,
     )
     progress.finish_stage(message=info.describe())
     return np.asarray(triggers, dtype=np.int64), np.asarray(t_rel, dtype=np.float64), info
@@ -842,6 +869,53 @@ def build_recording(
     return recording, report
 
 
+def _normalize_stream_names(streams: Sequence[str] | None) -> tuple[str, ...]:
+    """``None`` → tous les flux ; séquence vide → aucun."""
+    if streams is None:
+        return tuple(STREAM_NAMES)
+    ordered: list[str] = []
+    for name in streams:
+        key = str(name).strip().lower()
+        if key in STREAM_NAMES and key not in ordered:
+            ordered.append(key)
+    return tuple(ordered)
+
+
+def _normalize_rms_kinds(kinds: Sequence[str] | None) -> tuple[str, ...]:
+    """``None`` → mean/first/second ; séquence vide → aucun."""
+    allowed = ("mean", "first", "second")
+    if kinds is None:
+        return allowed
+    ordered: list[str] = []
+    for kind in kinds:
+        key = str(kind).strip().lower()
+        if key in allowed and key not in ordered:
+            ordered.append(key)
+    return tuple(ordered)
+
+
+def _means_missing(data: ChannelData, streams: Sequence[str]) -> bool:
+    if not getattr(data, "means_ready", True):
+        return True
+    means = getattr(data, "means", None) or {}
+    for stream in streams:
+        curve = means.get(stream)
+        if curve is None:
+            return True
+    return False
+
+
+def _rms_missing(data: ChannelData, kinds: Sequence[str]) -> bool:
+    if not getattr(data, "rms_ready", True):
+        return True
+    profiles = getattr(data, "rms_profiles", None) or {}
+    for kind in kinds:
+        values = profiles.get(kind)
+        if values is None:
+            return True
+    return False
+
+
 def ensure_channels(
     recording: ProcessedRecording,
     channels: Sequence[int],
@@ -853,17 +927,22 @@ def ensure_channels(
     need_rms: bool = True,
     need_spikes: bool = True,
     need_overlay: bool = True,
+    mean_streams: Sequence[str] | None = None,
+    rms_kinds: Sequence[str] | None = None,
 ) -> list[int]:
     """Compute derived products for the requested channel indices.
 
     Returns the list of channels that were (re)computed.
     Products can be selected so opening a simple average view does not pay
-    for spike overlays, and vice versa.
+    for spike overlays, and vice versa. ``mean_streams`` / ``rms_kinds``
+    further limit work to what the current view actually shows.
     """
     source = recording.source
     if source is None:
         raise RuntimeError("Recording has no live streams; cannot compute channels on demand.")
 
+    streams = _normalize_stream_names(mean_streams) if need_means else ()
+    kinds = _normalize_rms_kinds(rms_kinds) if need_rms else ()
     wanted = sorted({int(ch) for ch in channels if 0 <= int(ch) < recording.n_channels})
     if not force:
         still: list[int] = []
@@ -875,9 +954,9 @@ def ensure_channels(
             if data is None:
                 still.append(ch)
                 continue
-            if need_means and not getattr(data, "means_ready", True):
+            if need_means and _means_missing(data, streams):
                 still.append(ch)
-            elif need_rms and not getattr(data, "rms_ready", True):
+            elif need_rms and _rms_missing(data, kinds):
                 still.append(ch)
             elif need_spikes and not getattr(data, "spikes_ready", True):
                 still.append(ch)
@@ -930,6 +1009,8 @@ def ensure_channels(
             need_rms=need_rms,
             need_spikes=need_spikes,
             need_overlay=need_overlay,
+            mean_streams=streams,
+            rms_kinds=kinds,
             existing=existing,
         )
 
@@ -984,6 +1065,8 @@ def _compute_channel_data(
     need_rms: bool = True,
     need_spikes: bool = True,
     need_overlay: bool = True,
+    mean_streams: Sequence[str] | None = None,
+    rms_kinds: Sequence[str] | None = None,
     existing: ChannelData | None = None,
 ) -> ChannelData:
     from channel_metrics import (
@@ -993,31 +1076,45 @@ def _compute_channel_data(
     from draw_primitives import _extract_spike_waveforms
     from intan_rhx_dsp import mean_rms_intan_channel
 
-    # Filter HP/LP once — shared by means, spikes and overlay.
-    need_hp = need_means or need_spikes or need_overlay or need_rms
-    need_lp = need_means
-    raw_row = np.asarray(source.amplifier[ch], dtype=np.float32) if need_means else None
+    streams = _normalize_stream_names(mean_streams) if need_means else ()
+    kinds = _normalize_rms_kinds(rms_kinds) if need_rms else ()
+
+    # Filter HP/LP only when a displayed product actually needs them.
+    need_hp = (
+        need_rms
+        or need_spikes
+        or need_overlay
+        or (need_means and "hp" in streams)
+    )
+    need_lp = need_means and "lp" in streams
+    need_raw = need_means and "raw" in streams
+    raw_row = np.asarray(source.amplifier[ch], dtype=np.float32) if need_raw else None
     hp_row = np.asarray(source.highpass[ch], dtype=np.float32) if need_hp else None
     lp_row = np.asarray(source.lowpass[ch], dtype=np.float32) if need_lp else None
 
-    if need_means and raw_row is not None and hp_row is not None and lp_row is not None:
-        means = {
-            "raw": _mean_one_channel(raw_row, triggers, pre_n, post_n),
-            "hp": _mean_one_channel(hp_row, triggers, pre_n, post_n),
-            "lp": _mean_one_channel(lp_row, triggers, pre_n, post_n),
-        }
-    elif existing is not None and existing.means:
+    if existing is not None and existing.means:
         means = dict(existing.means)
     else:
         means = {}
+    if need_means:
+        row_by_stream = {"raw": raw_row, "hp": hp_row, "lp": lp_row}
+        for stream in streams:
+            row = row_by_stream.get(stream)
+            if row is None:
+                continue
+            means[stream] = _mean_one_channel(row, triggers, pre_n, post_n)
 
     rms_profiles: dict[str, np.ndarray] = {}
     rms_time = np.empty(0, dtype=np.float64)
+    if existing is not None:
+        rms_profiles = dict(existing.rms_profiles)
+        rms_time = np.asarray(existing.rms_time, dtype=np.float64)
     if need_rms and hp_row is not None:
         t0 = float(t_rel[0]) if t_rel.size else 0.0
         t1 = float(t_rel[-1]) if t_rel.size else 0.0
-        rms_kinds = {"mean": None, "first": 0, "second": 1}
-        for kind, trigger_index in rms_kinds.items():
+        kind_trigger = {"mean": None, "first": 0, "second": 1}
+        for kind in kinds:
+            trigger_index = kind_trigger[kind]
             axis, values = mean_rms_profile_from_source_window(
                 source,
                 t0,
@@ -1030,9 +1127,6 @@ def _compute_channel_data(
             if axis.size and rms_time.size == 0:
                 rms_time = np.asarray(axis, dtype=np.float64)
             rms_profiles[kind] = np.asarray(values, dtype=np.float32)
-    elif existing is not None:
-        rms_profiles = dict(existing.rms_profiles)
-        rms_time = np.asarray(existing.rms_time, dtype=np.float64)
 
     if need_spikes or need_overlay or need_rms:
         if hp_row is not None:
@@ -1065,7 +1159,7 @@ def _compute_channel_data(
         trains = []
 
     if need_overlay:
-        t_ms, waves, times = _extract_spike_waveforms(
+        t_ms, waves, times, total, overlay_mean = _extract_spike_waveforms(
             source,
             ch,
             trains,
@@ -1074,16 +1168,9 @@ def _compute_channel_data(
         )
         waves = np.asarray(waves, dtype=np.float32)
         times = np.asarray(times, dtype=np.float32)
-        total = int(waves.shape[0])
-        overlay_mean = (
-            np.mean(np.asarray(waves, dtype=np.float64), axis=0).astype(np.float32)
-            if total
-            else None
-        )
-        if total > MAX_OVERLAY_SNIPPETS_PER_CHANNEL:
-            picks = np.linspace(0, total - 1, MAX_OVERLAY_SNIPPETS_PER_CHANNEL).astype(np.int64)
-            waves = waves[picks]
-            times = times[picks]
+        total = int(total)
+        if overlay_mean is not None:
+            overlay_mean = np.asarray(overlay_mean, dtype=np.float32)
         overlay_t_ms = np.asarray(t_ms, dtype=np.float64)
     elif existing is not None:
         overlay_t_ms = np.asarray(existing.overlay_t_ms, dtype=np.float64)

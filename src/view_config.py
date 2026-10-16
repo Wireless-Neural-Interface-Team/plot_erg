@@ -39,6 +39,74 @@ from panel_catalog import (
 
 SectionKey = Literal["full", "zoom_onset", "zoom_trigger_end"]
 
+# Flux tension affichés (WIDE / HIGH / LOW).
+_ANALYSIS_STREAMS = ("raw", "hp", "lp")
+
+
+def preview_needs_means(preview_content: str) -> bool:
+    """True seulement pour la moyenne d’essais.
+
+    Le mode ``stimulation`` lit des fenêtres memmap (``trigger_window``) :
+    pas besoin de précalculer les moyennes.
+    """
+    return str(preview_content or "").strip() == "average"
+
+
+def analysis_display_streams(analysis: object | None) -> tuple[str, ...]:
+    """Flux WIDE/HIGH/LOW cochés pour l’affichage courant."""
+    if analysis is None:
+        return ("raw",)
+    streams: list[str] = []
+    if bool(getattr(analysis, "show_raw", False)):
+        streams.append("raw")
+    if bool(getattr(analysis, "show_hp", False)):
+        streams.append("hp")
+    if bool(getattr(analysis, "show_lp", False)):
+        streams.append("lp")
+    return tuple(streams) if streams else ("raw",)
+
+
+def display_filter_streams(
+    *,
+    preview_content: str | None = None,
+    analysis: object | None = None,
+    continuous_streams: Sequence[str] | None = None,
+) -> tuple[str, ...]:
+    """Flux filtrés (hp/lp) à chauffer pour la vue affichée — jamais le raw."""
+    mode = str(preview_content or "").strip()
+    if mode in {"average", "stimulation"}:
+        wanted = analysis_display_streams(analysis)
+    elif continuous_streams is not None:
+        wanted = tuple(
+            str(s) for s in continuous_streams if str(s) in _ANALYSIS_STREAMS
+        )
+    else:
+        wanted = analysis_display_streams(analysis)
+    return tuple(s for s in wanted if s in {"hp", "lp"})
+
+
+def display_mean_streams(analysis: object | None) -> tuple[str, ...]:
+    """Flux pour lesquels calculer la moyenne d’essais (mode average)."""
+    return analysis_display_streams(analysis)
+
+
+def display_rms_kinds(
+    *,
+    preview_content: str | None = None,
+    analysis: object | None = None,
+) -> tuple[str, ...]:
+    """Kinds RMS réellement lus par la vue (mean / first / second)."""
+    mode = str(preview_content or "").strip()
+    if mode == "stimulation" and analysis is not None:
+        idx = int(getattr(analysis, "stim_index", 0) or 0)
+        if idx == 0:
+            return ("first",)
+        if idx == 1:
+            return ("second",)
+        # Indices > 1 : le panneau retombe sur le profil « mean » stocké.
+        return ("mean",)
+    return ("mean",)
+
 
 def included_channel_indices(
     n_channels: int,
@@ -160,6 +228,27 @@ def continuous_sync_offset_s(
     return float(times[0])
 
 
+def continuous_anchor_offset_s(
+    stim_times_s: Sequence[float],
+    mode: TimeSyncMode,
+    *,
+    stim_index: int | None = None,
+    anchor_to_stim: bool = False,
+) -> float:
+    """Offset continuous pour lecture memmap / axe affiché.
+
+    Quand ``anchor_to_stim`` est vrai (zoom / axe X relatif à un essai), ancre
+    sur ``stim_index`` comme les courbes stimulation / moyenne. Sinon délègue à
+    ``continuous_sync_offset_s``.
+    """
+    if anchor_to_stim and stim_index is not None:
+        times = [float(t) for t in stim_times_s]
+        idx = int(stim_index)
+        if 0 <= idx < len(times):
+            return times[idx]
+    return continuous_sync_offset_s(stim_times_s, mode)
+
+
 @dataclass(frozen=True)
 class TimeRangeBar:
     """Paire de barres temporelles [t0, t1] pour zoom / plage de traitement.
@@ -207,7 +296,8 @@ class AnalysisSettings:
     # Spikes : mêmes coches Pipeline.
     show_psth: bool = False
     show_trial_rate: bool = False
-    show_raster: bool = False
+    show_raster: bool = False  # raster compact (une ligne, style montage)
+    show_raster_trials: bool = False  # raster / essai (une ligne par essai)
     # Résumés : aperçu canal (tous modes).
     show_summary_rms: bool = False  # mean RMS par enregistrement (profil)
     show_summary_rms_table: bool = False  # mean RMS par canal (table)
@@ -237,15 +327,15 @@ class AnalysisSettings:
 
 
     def selected_spike_panels(self) -> tuple[str, ...]:
-        """PSTH / FR par essai / raster — tous modes d’aperçu."""
+        """PSTH / FR par essai / rasters — tous modes d’aperçu."""
         panels: list[str] = []
         if self.show_psth:
             panels.append("analysis_psth")
         if self.show_trial_rate:
             panels.append("analysis_trial_rate")
         if self.show_raster:
-            # Compact style montage (eventplot) + raster tous essais.
             panels.append("analysis_raster_channel")
+        if self.show_raster_trials:
             panels.append("analysis_raster")
         return tuple(panels)
 
@@ -342,6 +432,12 @@ class PanelStyle:
     stim_on_dy_px: float = 0.0
     stim_off_dx_px: float = 0.0
     stim_off_dy_px: float = 0.0
+    # Libellés « Zone N » sous les plages de zoom (bas du graphique).
+    show_zone_labels: bool = True
+    zone_font_size: float = 8.0
+    zone_face: TextFace = field(default_factory=TextFace)
+    zone_dx_px: float = 0.0
+    zone_dy_px: float = 0.0
     grid: bool = True
     grid_alpha: float = 0.3
     # Cadre (spines) autour de la zone de tracé.
@@ -351,12 +447,18 @@ class PanelStyle:
     # Barres d’échelle flottantes (temps / amplitude) à la place des graduations
     # numériques sur les bords — style montage EEG / traces.
     show_scale_bars: bool = False
-    # Longueurs manuelles (sinon auto ~18 % du span visible). La taille pixel
-    # des bâtons suit le zoom : valeur fixe en unités de données.
+    # Longueurs manuelles (sinon auto ~18 % du span visible). Par défaut la
+    # taille pixel des bâtons suit le zoom (valeur fixe en unités de données).
     scale_bar_time_manual: bool = False
     scale_bar_time_s: float = 0.1
     scale_bar_amplitude_manual: bool = False
     scale_bar_amplitude: float = 100.0
+    # Longueur pixel du bâton d’amplitude. Avec amplitude manuelle, fixe le
+    # gain Y : ``span = amplitude × hauteur_plot / taille_px`` (ex. 50 µV = 80 px).
+    scale_bar_amplitude_length_manual: bool = False
+    scale_bar_amplitude_length_px: float = 40.0
+    scale_bar_time_length_manual: bool = False
+    scale_bar_time_length_px: float = 40.0
     # Épaisseur (points) du trait noir des barres d’échelle flottantes.
     scale_bar_linewidth: float = 1.4
     # Décalage de l’échelle amplitude / axe vertical (px). +dx droite, +dy haut.
@@ -438,8 +540,9 @@ class ViewerSettings:
     raw_ylim: AxisLimits = field(default_factory=AxisLimits)
     hp_ylim: AxisLimits = field(default_factory=AxisLimits)
     lp_ylim: AxisLimits = field(default_factory=AxisLimits)
+    # Désactivé par défaut : autoscale sur les données (évite de tronquer > 20 µV).
     rms_ylim: AxisLimits = field(
-        default_factory=lambda: AxisLimits(enabled=True, minimum=0.0, maximum=20.0)
+        default_factory=lambda: AxisLimits(enabled=False, minimum=0.0, maximum=20.0)
     )
     legend: LegendSettings = field(default_factory=LegendSettings)
     style: PanelStyle = field(default_factory=PanelStyle)
@@ -503,7 +606,10 @@ class ViewerSettings:
         bars = self.range_bars
         if not bars:
             return None
-        index = max(0, min(len(bars) - 1, int(self.active_range_index)))
+        index = int(self.active_range_index)
+        if index < 0:
+            return None
+        index = max(0, min(len(bars) - 1, index))
         return bars[index]
 
     def zoom_onset_window(self) -> tuple[float, float]:
@@ -564,12 +670,123 @@ def copy_scale_bar_style(target: PanelStyle, source: PanelStyle) -> PanelStyle:
         scale_bar_time_s=float(source.scale_bar_time_s),
         scale_bar_amplitude_manual=bool(source.scale_bar_amplitude_manual),
         scale_bar_amplitude=float(source.scale_bar_amplitude),
+        scale_bar_amplitude_length_manual=bool(
+            getattr(source, "scale_bar_amplitude_length_manual", False)
+        ),
+        scale_bar_amplitude_length_px=float(
+            getattr(source, "scale_bar_amplitude_length_px", 40.0) or 40.0
+        ),
+        scale_bar_time_length_manual=bool(
+            getattr(source, "scale_bar_time_length_manual", False)
+        ),
+        scale_bar_time_length_px=float(
+            getattr(source, "scale_bar_time_length_px", 40.0) or 40.0
+        ),
         scale_bar_linewidth=resolved_scale_bar_linewidth(source),
         scale_bar_dx_px=amp_dx,
         scale_bar_dy_px=amp_dy,
         scale_bar_time_dx_px=time_dx,
         scale_bar_time_dy_px=time_dy,
     )
+
+
+def scale_bar_ref_height_px(settings: object, *, montage: bool = False) -> float:
+    """Hauteur de plot de référence (px) pour le gain lié à l’échelle."""
+    if settings is None:
+        return 0.0
+    if montage:
+        return float(
+            max(36, int(getattr(settings, "montage_row_min_height_px", 36) or 36))
+        )
+    return float(max(1, int(getattr(settings, "graph_height_px", 400) or 400)))
+
+
+def scale_bar_drives_widget_height(settings: object) -> bool:
+    """True si amplitude + taille px manuelles : le widget doit suivre le gain."""
+    if settings is None:
+        return False
+    style = getattr(settings, "style", None)
+    if style is None:
+        style = settings
+    if not bool(getattr(style, "show_scale_bars", False)):
+        return False
+    if not bool(getattr(style, "scale_bar_amplitude_manual", False)):
+        return False
+    if not bool(getattr(style, "scale_bar_amplitude_length_manual", False)):
+        return False
+    try:
+        amp = float(getattr(style, "scale_bar_amplitude", 0.0) or 0.0)
+        length = float(getattr(style, "scale_bar_amplitude_length_px", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return bool(amp > 0.0 and length > 0.0 and amp == amp and length == length)
+
+
+def scale_bar_view_height_for_span(
+    data_span: float,
+    settings: object,
+) -> int | None:
+    """Hauteur de zone de tracé (px) pour que ``amplitude`` occupe ``amp_length_px``.
+
+    ``height = data_span × amp_length_px / amplitude``.
+    Le ylim reste celui des données (autoscale) ; le widget grandit pour tout voir.
+    """
+    if not scale_bar_drives_widget_height(settings):
+        return None
+    style = getattr(settings, "style", None)
+    if style is None:
+        style = settings
+    try:
+        amp = float(getattr(style, "scale_bar_amplitude", 0.0) or 0.0)
+        length = float(getattr(style, "scale_bar_amplitude_length_px", 0.0) or 0.0)
+        span = float(data_span)
+    except (TypeError, ValueError):
+        return None
+    if not (amp > 0.0 and length > 0.0 and span > 0.0):
+        return None
+    if amp != amp or length != length or span != span:
+        return None
+    height = span * (length / amp)
+    if not (height > 0.0) or height != height:
+        return None
+    return max(40, int(round(height)))
+
+
+def linked_scale_bar_y_limits(
+    settings: object,
+    *,
+    height_px: float | None = None,
+    montage: bool = False,
+) -> tuple[float, float] | None:
+    """Ylim symétrique si on fixe la hauteur (export / fallback).
+
+    Préférer ``scale_bar_view_height_for_span`` à l’écran : le widget s’adapte
+    et le ylim suit les données (pas de rognage).
+    """
+    if not scale_bar_drives_widget_height(settings):
+        return None
+    style = getattr(settings, "style", None)
+    if style is None:
+        style = settings
+    try:
+        amp = float(getattr(style, "scale_bar_amplitude", 0.0) or 0.0)
+        length = float(getattr(style, "scale_bar_amplitude_length_px", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if height_px is None:
+        height_px = scale_bar_ref_height_px(settings, montage=montage)
+    try:
+        height = float(height_px)
+    except (TypeError, ValueError):
+        return None
+    if not (amp > 0.0 and length > 0.0 and height > 0.0):
+        return None
+    if amp != amp or length != length or height != height:
+        return None
+    half = 0.5 * amp * (height / length)
+    if not (half > 0.0) or half != half:
+        return None
+    return (-half, half)
 
 
 def copy_stim_marker_style(target: PanelStyle, source: PanelStyle) -> PanelStyle:
@@ -588,6 +805,11 @@ def copy_stim_marker_style(target: PanelStyle, source: PanelStyle) -> PanelStyle
         stim_on_dy_px=_scale_bar_offset_one(source, "stim_on_dy_px"),
         stim_off_dx_px=_scale_bar_offset_one(source, "stim_off_dx_px"),
         stim_off_dy_px=_scale_bar_offset_one(source, "stim_off_dy_px"),
+        show_zone_labels=bool(getattr(source, "show_zone_labels", True)),
+        zone_font_size=float(getattr(source, "zone_font_size", 8.0) or 8.0),
+        zone_face=getattr(source, "zone_face", TextFace()) or TextFace(),
+        zone_dx_px=_scale_bar_offset_one(source, "zone_dx_px"),
+        zone_dy_px=_scale_bar_offset_one(source, "zone_dy_px"),
     )
 
 
@@ -697,6 +919,17 @@ def default_zoom_range_color(index: int) -> str:
     return palette[int(index) % len(palette)]
 
 
+def default_zone_label(index: int) -> str:
+    """Libellé par défaut de la n-ième plage : « Zone » + numéro (1-based)."""
+    return f"Zone {int(index) + 1}"
+
+
+def resolved_zone_label(bar: object, index: int = 0) -> str:
+    """Texte affiché sous une zone de zoom (nom éditable, sinon Zone N)."""
+    raw = str(getattr(bar, "label", "") or "").strip()
+    return raw or default_zone_label(index)
+
+
 def resolved_range_bar_color(bar: object, index: int = 0) -> str:
     """Couleur d’une plage : champ ``color`` valide, sinon palette par index."""
     fallback = default_zoom_range_color(index)
@@ -717,16 +950,20 @@ def apply_local_display_settings(
     graphs. Sans ceci, un redraw réinjecte les axes / la sync de la fenêtre
     parente et ignore le panneau local.
 
-    ``inherit_scale_bars=True`` : l’échelle flottante et les pointillés de
-    stimulation viennent de ``base`` (dock Affichage), pas du style local
-    figé — évite qu’une édition de texte / un override partiel bloque ces
-    réglages globaux sur certains graphs.
+    ``inherit_scale_bars=True`` : échelle flottante, pointillés de stim, légende
+    et hauteur de graph viennent de ``base`` (dock Affichage), pas du snapshot
+    local figé — évite qu’une édition de texte / un override partiel bloque
+    ces réglages globaux sur certains graphs.
     """
     style = local.style
+    legend = local.legend
+    graph_height_px = int(local.graph_height_px)
     if inherit_scale_bars:
         style = copy_global_display_style(style, base.style)
+        legend = base.legend
+        graph_height_px = int(base.graph_height_px)
     kwargs: dict[str, object] = {
-        "legend": local.legend,
+        "legend": legend,
         "style": style,
         "texts": local.texts,
         "psth_bin_window_s": local.psth_bin_window_s,
@@ -739,7 +976,7 @@ def apply_local_display_settings(
         "time_sync": local.time_sync,
         "trigger_polarity": local.trigger_polarity,
         "trigger_threshold": local.trigger_threshold,
-        "graph_height_px": int(local.graph_height_px),
+        "graph_height_px": graph_height_px,
     }
     if include_analysis:
         kwargs["analysis"] = local.analysis

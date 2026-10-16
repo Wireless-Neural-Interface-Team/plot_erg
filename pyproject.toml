@@ -16,6 +16,11 @@ dependencies = [
   "pyqtgraph>=0.13,<1",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=7.4,<9",
+]
+
 [project.scripts]
 plot-erg = "gui.launcher:launch_gui"
 intan-trigger-plotter = "cli:main"

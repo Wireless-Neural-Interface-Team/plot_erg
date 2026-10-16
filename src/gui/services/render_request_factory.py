@@ -24,7 +24,7 @@ def impedance_sessions(entries: Sequence[Any]) -> list[Any]:
 
 
 class RenderRequestFactory:
-    """Construit des RenderRequest ; lit probe / preserve_view sur l’hôte."""
+    """Construit des RenderRequest ; lit probe / preserve_view via le pont hôte."""
 
     def __init__(self, host: Any) -> None:
         self._host = host
@@ -42,10 +42,11 @@ class RenderRequestFactory:
     ) -> RenderRequest:
         host = self._host
         if preserve_view is None:
-            preserve_view = bool(getattr(host, "_preserve_view", False))
+            preserve_view = bool(getattr(host, "preserve_view", getattr(host, "_preserve_view", False)))
         entry_list = list(entries)
         # Couleurs Auto stables : index dans la table complète, pas parmi les seuls visibles.
-        all_entries = list(getattr(getattr(host, "recordings_panel", None), "entries", []) or [])
+        panel = getattr(host, "recordings_panel", None)
+        all_entries = list(getattr(panel, "entries", []) or [])
         if all_entries:
             id_to_index = {
                 int(getattr(entry, "row_id", -1)): i for i, entry in enumerate(all_entries)
@@ -58,6 +59,9 @@ class RenderRequestFactory:
         else:
             styles = [entry.style for entry in entry_list]
             color_indices = list(range(len(entry_list)))
+        probe = getattr(host, "probe_layout", None)
+        if probe is None:
+            probe = getattr(host, "_probe_layout", None)
         return RenderRequest(
             placement=placement,
             recordings=[entry.recording for entry in entry_list],
@@ -67,7 +71,7 @@ class RenderRequestFactory:
             channel_index=channel_index,
             channel_name=channel_name,
             settings=settings,
-            probe_layout=getattr(host, "_probe_layout", None),
+            probe_layout=probe,
             impedance_sessions=impedance_sessions(entry_list),
             highlight_zooms=highlight_zooms,
             preserve_view=bool(preserve_view),
@@ -82,9 +86,14 @@ class RenderRequestFactory:
     ) -> RenderRequest:
         host = self._host
         if settings is None:
-            settings = getattr(host, "_settings", None)
+            settings = getattr(host, "settings", None)
+            if settings is None:
+                settings = getattr(host, "_settings", None)
         if preserve_view is None:
-            preserve_view = bool(getattr(host, "_preserve_view", False))
+            preserve_view = bool(getattr(host, "preserve_view", getattr(host, "_preserve_view", False)))
+        probe = getattr(host, "probe_layout", None)
+        if probe is None:
+            probe = getattr(host, "_probe_layout", None)
         return RenderRequest(
             placement=placement,
             recordings=[],
@@ -94,15 +103,17 @@ class RenderRequestFactory:
             channel_index=0,
             channel_name="",
             settings=settings,
-            probe_layout=getattr(host, "_probe_layout", None),
+            probe_layout=probe,
             impedance_sessions=[],
             preserve_view=bool(preserve_view),
         )
 
     def make_request(self, placement: PanelPlacement) -> RenderRequest | None:
-        """Façade : délègue à ``host._make_request`` si présent."""
+        """Façade : délègue à ``host.make_request`` / ``host._make_request``."""
+        make = getattr(self._host, "make_request", None)
+        if callable(make):
+            return make(placement)
         make = getattr(self._host, "_make_request", None)
         if callable(make):
             return make(placement)
         return None
-

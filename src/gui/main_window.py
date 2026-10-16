@@ -72,6 +72,10 @@ from view_config import (
     ViewerSettings,
     WorkspaceLayout,
     apply_local_display_settings,
+    display_filter_streams,
+    display_mean_streams,
+    display_rms_kinds,
+    preview_needs_means,
 )
 
 _ORG = "plot_erg"
@@ -124,12 +128,15 @@ class ViewerWindow(QMainWindow):
         self._pending_progress: Any | None = None
         self._pending_open_entries: list[RecordingEntry] = []
 
-        # Services (assembleur mince) — flags redraw / montage via proxies.
+        # Services (assembleur mince) — pont public, sans ``host._privé`` ad hoc.
+        from gui.services.viewer_host import ViewerServiceBridge
+
+        self._service_bridge = ViewerServiceBridge(self)
         self._redraw = RedrawScheduler(self, on_redraw=self._redraw_active_tab)
-        self._pipeline = PipelineController(self)
+        self._pipeline = PipelineController(self._service_bridge)
         self._montage = MontageController(self)
-        self._render_requests = RenderRequestFactory(self)
-        self._export = ExportService(self)
+        self._render_requests = RenderRequestFactory(self._service_bridge)
+        self._export = ExportService(self._service_bridge, dialog_parent=self)
 
         self.setWindowTitle("plot_erg — Visionneuse Intan / ERG")
         self.resize(1600, 960)
@@ -670,7 +677,7 @@ class ViewerWindow(QMainWindow):
                         if isinstance(other, ViewTabPage) and other is not page:
                             other.grid.invalidate_all()
                 try:
-                    page.grid.sync_scale_bars_from(self._settings.style)
+                    page.grid.sync_scale_bars_from(self._settings)
                 except Exception:
                     pass
                 page.grid.schedule_render(self._make_request_or_blank, force=force)
@@ -704,6 +711,14 @@ class ViewerWindow(QMainWindow):
         self._apply_graph_height_to_tabs()
         if self._channel_inspect is not None:
             self._channel_inspect.apply_viewer_settings(self._settings)
+            height = max(160, int(self._settings.graph_height_px))
+            try:
+                self._channel_inspect.grid.set_panel_height(
+                    height, uniform=True, fill=False
+                )
+                self._channel_inspect.grid.set_graph_height(height)
+            except Exception:
+                pass
             self._channel_inspect.redraw(preserve_view=True)
             self._redraw_detached_windows()
 
@@ -720,13 +735,19 @@ class ViewerWindow(QMainWindow):
                 for p in tab.panels
             ):
                 continue
-            if int(tab.panel_height_px) == height:
-                continue
-            tabs[index] = replace(tab, panel_height_px=height)
-            changed = True
             page = self.tabs.widget(index)
             if isinstance(page, ViewTabPage):
+                # Toujours réappliquer : la taille d’échelle peut changer la
+                # hauteur même si ``panel_height_px`` était déjà à jour en mémoire.
                 page.grid.set_panel_height(height, uniform=True, fill=False)
+                page.grid.set_graph_height(height)
+                try:
+                    page.grid.sync_scale_bars_from(self._settings)
+                except Exception:
+                    pass
+            if int(tab.panel_height_px) != height:
+                tabs[index] = replace(tab, panel_height_px=height)
+                changed = True
         if changed:
             self._workspace = self._workspace.with_tabs(tabs)
 
@@ -791,14 +812,17 @@ class ViewerWindow(QMainWindow):
         if not neighbors:
             return
         need_means, need_rms, need_spikes, _need_overlay = self._view_product_needs()
-        # Always enqueue filter warm on the worker — never LazyFilterBank.prefetch here.
+        _ms, _rk, filter_streams = self._view_scope()
+        # Chauffer seulement les flux filtrés affichés — jamais sur le thread UI.
+        if not (need_means or need_rms or need_spikes or filter_streams):
+            return
         self._ensure_channels_for_indices(
             neighbors,
             need_means=need_means,
             need_rms=need_rms,
             need_spikes=need_spikes,
             need_overlay=False,
-            need_filters=True,
+            need_filters=bool(filter_streams),
             priority=False,
             background=True,
         )
@@ -1286,23 +1310,31 @@ class ViewerWindow(QMainWindow):
     def _preview_product_needs(
         self, window: ChannelAnalysisWindow | None = None
     ) -> tuple[bool, bool, bool, bool]:
-        """Produits requis par l’aperçu canal (mode + panels d’analyse)."""
+        """Produits requis par l’aperçu canal (mode + panels d’analyse).
+
+        ``stimulation`` n’exige pas les moyennes (fenêtres memmap).
+        ``continuous`` non plus. Seule la moyenne d’essais calcule ``means``.
+        """
         win = window if window is not None else self._channel_inspect
         if win is None:
             analysis = self._settings.analysis
             mode = str(self._settings.preview_content or "continuous")
             need_rms, need_spikes, need_overlay = self._analysis_extra_flags(analysis)
-            need_means = mode in {"average", "stimulation"}
+            need_means = preview_needs_means(mode)
             return need_means, need_rms, need_spikes, need_overlay
 
-        analysis = win.local_settings().analysis
+        local = win.local_settings()
+        analysis = local.analysis
+        mode = str(getattr(local, "preview_content", None) or win.preview_mode())
         need_rms, need_spikes, need_overlay = self._analysis_extra_flags(analysis)
-        need_means = bool(win.is_analysis_view())
+        need_means = preview_needs_means(mode)
         for placement in getattr(win, "_analysis_placements", ()) or ():
             means, rms, spikes, overlay = panel_product_needs(
                 getattr(placement, "panel", "")
             )
-            need_means = need_means or means
+            # analysis_raw/hp/lp → means seulement en mode moyenne.
+            if preview_needs_means(mode):
+                need_means = need_means or means
             need_rms = need_rms or rms
             need_spikes = need_spikes or spikes
             need_overlay = need_overlay or overlay
@@ -1314,17 +1346,39 @@ class ViewerWindow(QMainWindow):
             need_rms = need_rms or z_rms
             need_spikes = need_spikes or z_spikes
             need_overlay = need_overlay or z_overlay
-            if win.is_analysis_view():
+            if preview_needs_means(mode):
                 need_means = True
             for placement in getattr(zoom, "placements", ()) or ():
                 means, rms, spikes, overlay = panel_product_needs(
                     getattr(placement, "panel", "")
                 )
-                need_means = need_means or means
+                if preview_needs_means(mode):
+                    need_means = need_means or means
                 need_rms = need_rms or rms
                 need_spikes = need_spikes or spikes
                 need_overlay = need_overlay or overlay
         return need_means, need_rms, need_spikes, need_overlay
+
+    def _view_scope(self) -> tuple[tuple[str, ...] | None, tuple[str, ...], tuple[str, ...]]:
+        """``(mean_streams|None, rms_kinds, filter_streams)`` pour la vue affichée."""
+        settings = self._settings
+        analysis = settings.analysis
+        mode = str(settings.preview_content or "continuous")
+        if self._showing_channel_preview() and self._channel_inspect is not None:
+            local = self._channel_inspect.local_settings()
+            analysis = local.analysis
+            mode = str(getattr(local, "preview_content", None) or mode)
+            streams = local.resolved_continuous_streams()
+        else:
+            streams = settings.resolved_continuous_streams()
+        mean_streams = display_mean_streams(analysis) if preview_needs_means(mode) else None
+        rms_kinds = display_rms_kinds(preview_content=mode, analysis=analysis)
+        filters = display_filter_streams(
+            preview_content=mode,
+            analysis=analysis,
+            continuous_streams=streams,
+        )
+        return mean_streams, rms_kinds, filters
 
     def _view_product_needs(self) -> tuple[bool, bool, bool, bool]:
         """Produits à calculer pour ce qui est réellement affiché."""
@@ -1368,7 +1422,8 @@ class ViewerWindow(QMainWindow):
             return
         need_means = self._montage_review_needs_means()
         need_rms, need_spikes, need_overlay = self._montage_extra_flags()
-        need_filters = self._montage_needs_filters()
+        _mean_streams, _rms_kinds, filter_streams = self._view_scope()
+        need_filters = bool(filter_streams) or self._montage_needs_filters()
         if not (need_means or need_rms or need_spikes or need_overlay or need_filters):
             return
         # Page courante d’abord (affichage) ; le prefetch all-channels suit via
@@ -1381,7 +1436,7 @@ class ViewerWindow(QMainWindow):
             return
         self._ensure_channels_for_indices(
             indices,
-            need_means=need_means or need_rms or need_spikes,
+            need_means=need_means,
             need_rms=need_rms,
             need_spikes=need_spikes,
             need_overlay=need_overlay,
@@ -1488,17 +1543,25 @@ class ViewerWindow(QMainWindow):
         need_means, need_rms, need_spikes, need_overlay = self._preview_product_needs(
             window
         )
+        _ms, _rk, filter_streams = self._view_scope()
         needs_products = bool(need_means or need_rms or need_spikes or need_overlay)
+        needs_filters = bool(filter_streams)
         channel_ready = bool(
             hasattr(recording, "is_channel_ready")
             and recording.is_channel_ready(int(resolved))
         )
-        # Continuous / memmap : prêt sans ensure ; sinon selon les produits demandés.
-        if not needs_products:
+        # Continuous / stim raw : prêt sans ensure ; filtres hp/lp ou produits → worker.
+        if not needs_products and not needs_filters:
             channel_ready = True
+        elif needs_filters and not needs_products:
+            channel_ready = all(
+                recording.stream_ready(stream, int(resolved)) for stream in filter_streams
+            )
         window.set_channel_ready(channel_ready)
         window.show()
-        if needs_products and window.needs_channel_compute():
+        if (needs_products or needs_filters) and (
+            window.needs_channel_compute() or needs_filters and not channel_ready
+        ):
             self._ensure_channels_for_indices(
                 [int(resolved)],
                 then_redraw_window=window.window_id,
@@ -1506,6 +1569,7 @@ class ViewerWindow(QMainWindow):
                 need_rms=need_rms,
                 need_spikes=need_spikes,
                 need_overlay=need_overlay,
+                need_filters=needs_filters,
             )
         elif redraw:
             window.redraw(preserve_view=False)
@@ -1612,8 +1676,10 @@ class ViewerWindow(QMainWindow):
         need_means, need_rms, need_spikes, need_overlay = self._preview_product_needs(
             window
         )
+        _ms, _rk, filter_streams = self._view_scope()
         needs_products = bool(need_means or need_rms or need_spikes or need_overlay)
-        if needs_products:
+        needs_filters = bool(filter_streams)
+        if needs_products or needs_filters:
             self._ensure_channels_for_indices(
                 [int(window.channel_index)],
                 then_redraw_window=window.window_id,
@@ -1621,9 +1687,10 @@ class ViewerWindow(QMainWindow):
                 need_rms=need_rms,
                 need_spikes=need_spikes,
                 need_overlay=need_overlay,
+                need_filters=needs_filters,
             )
         else:
-            # Continuous / memmap : pas d’ensure, redraw immédiat.
+            # Continuous / stim brut memmap : pas d’ensure, redraw immédiat.
             window.set_channel_ready(True)
             window.redraw(preserve_view=bool(getattr(window, "_preserve_view", True)))
 
@@ -2056,8 +2123,9 @@ class ViewerWindow(QMainWindow):
     def ensure_selected_channels(self) -> None:
         self._pending_ensure_all = False
         need_means, need_rms, need_spikes, need_overlay = self._view_product_needs()
-        if not (need_means or need_rms or need_spikes or need_overlay):
-            self._set_status("Rien à calculer pour la vue affichée (traces continues).")
+        _ms, _rk, filter_streams = self._view_scope()
+        if not (need_means or need_rms or need_spikes or need_overlay or filter_streams):
+            self._set_status("Rien à calculer pour la vue affichée (traces continues brutes).")
             return
         channels = self._channels_for_current_view(all_channels=False)
         if not channels:
@@ -2069,6 +2137,7 @@ class ViewerWindow(QMainWindow):
             need_rms=need_rms,
             need_spikes=need_spikes,
             need_overlay=need_overlay,
+            need_filters=bool(filter_streams),
             priority=True,
             background=False,
         )
@@ -2076,9 +2145,10 @@ class ViewerWindow(QMainWindow):
     def ensure_all_channels(self) -> None:
         self._pending_ensure_all = True
         need_means, need_rms, need_spikes, need_overlay = self._view_product_needs()
-        if not (need_means or need_rms or need_spikes or need_overlay):
+        _ms, _rk, filter_streams = self._view_scope()
+        if not (need_means or need_rms or need_spikes or need_overlay or filter_streams):
             self._set_status(
-                "Rien à précalculer : la vue n’utilise que des traces continues."
+                "Rien à précalculer : la vue n’utilise que des traces continues brutes."
             )
             return
         self._start_channel_ensure(
@@ -2087,6 +2157,7 @@ class ViewerWindow(QMainWindow):
             need_rms=need_rms,
             need_spikes=need_spikes,
             need_overlay=need_overlay,
+            need_filters=bool(filter_streams),
             priority=False,
             background=True,
         )
@@ -2096,10 +2167,11 @@ class ViewerWindow(QMainWindow):
         if self._build_worker is not None and self._build_worker.isRunning():
             return
         need_means, need_rms, need_spikes, need_overlay = self._view_product_needs()
+        _ms, _rk, filter_streams = self._view_scope()
         channels = self._channels_for_current_view(all_channels=False)
         if not channels:
             return
-        # Continuous HP/LP still needs filter warm even when no products are required.
+        # Continuous / stim HP/LP : chauffer seulement les flux affichés.
         self._start_channel_ensure(
             channels,
             allow_empty_redraw=False,
@@ -2107,7 +2179,7 @@ class ViewerWindow(QMainWindow):
             need_rms=need_rms,
             need_spikes=need_spikes,
             need_overlay=need_overlay,
-            need_filters=True,
+            need_filters=bool(filter_streams),
             priority=True,
             background=self._ensure_background,
         )
@@ -2122,6 +2194,7 @@ class ViewerWindow(QMainWindow):
         if not allowed:
             return
         need_means, need_rms, need_spikes, need_overlay = self._view_product_needs()
+        _ms, _rk, filter_streams = self._view_scope()
         # Vue active d’abord (filtres + produits), puis les autres canaux cochés.
         viewed = [
             ch
@@ -2136,7 +2209,7 @@ class ViewerWindow(QMainWindow):
                 need_rms=need_rms,
                 need_spikes=need_spikes,
                 need_overlay=need_overlay,
-                need_filters=True,
+                need_filters=bool(filter_streams),
                 priority=True,
                 background=True,
             )
@@ -2151,6 +2224,7 @@ class ViewerWindow(QMainWindow):
                 need_rms=need_rms,
                 need_spikes=need_spikes,
                 need_overlay=need_overlay,
+                need_filters=bool(filter_streams),
                 priority=False,
                 background=True,
             )
@@ -2164,15 +2238,46 @@ class ViewerWindow(QMainWindow):
         need_spikes: bool,
         need_overlay: bool,
         need_filters: bool = True,
+        mean_streams: tuple[str, ...] | None = None,
+        rms_kinds: tuple[str, ...] | None = None,
+        filter_streams: tuple[str, ...] | None = None,
     ) -> list[ChannelEnsureRequest]:
         ready = self.recordings_panel.ready_entries()
+        scope_means, scope_rms, scope_filters = self._view_scope()
+        if mean_streams is None:
+            mean_streams = scope_means
+        if rms_kinds is None:
+            rms_kinds = scope_rms
+        if filter_streams is None:
+            filter_streams = scope_filters
+        warm_streams = tuple(filter_streams) if need_filters else ()
 
         def _filters_pending(recording: Any, ch: int) -> bool:
-            if not need_filters:
+            if not warm_streams:
                 return False
-            return not (
-                recording.stream_ready("hp", ch) and recording.stream_ready("lp", ch)
+            return any(
+                not recording.stream_ready(stream, ch) for stream in warm_streams
             )
+
+        def _means_incomplete(data: Any) -> bool:
+            if not need_means:
+                return False
+            if not getattr(data, "means_ready", True):
+                return True
+            if not mean_streams:
+                return False
+            means = getattr(data, "means", None) or {}
+            return any(means.get(stream) is None for stream in mean_streams)
+
+        def _rms_incomplete(data: Any) -> bool:
+            if not need_rms:
+                return False
+            if not getattr(data, "rms_ready", True):
+                return True
+            if not rms_kinds:
+                return False
+            profiles = getattr(data, "rms_profiles", None) or {}
+            return any(profiles.get(kind) is None for kind in rms_kinds)
 
         def _needs_work(recording: Any, ch: int) -> bool:
             if _filters_pending(recording, ch):
@@ -2185,9 +2290,9 @@ class ViewerWindow(QMainWindow):
             data = getattr(recording, "_channel_data", {}).get(ch)
             if data is None:
                 return True
-            if need_means and not getattr(data, "means_ready", True):
+            if _means_incomplete(data):
                 return True
-            if need_rms and not getattr(data, "rms_ready", True):
+            if _rms_incomplete(data):
                 return True
             if need_spikes and not getattr(data, "spikes_ready", True):
                 return True
@@ -2220,7 +2325,10 @@ class ViewerWindow(QMainWindow):
                     need_rms=need_rms,
                     need_spikes=need_spikes,
                     need_overlay=need_overlay,
-                    need_filters=need_filters,
+                    need_filters=bool(warm_streams),
+                    mean_streams=mean_streams if need_means else None,
+                    rms_kinds=rms_kinds if need_rms else None,
+                    filter_streams=warm_streams or None,
                 )
             )
         return requests
@@ -2485,88 +2593,7 @@ class ViewerWindow(QMainWindow):
         self._run_task(task, done, "Export du dataset traité…")
 
     def export_pdf_report(self) -> None:
-        ready = [
-            e
-            for e in self.recordings_panel.ready_entries()
-            if e.recording is not None and getattr(e.recording, "source", None) is not None
-        ]
-        entries = ready or [e for e in self.recordings_panel.entries if not e.is_processed]
-        if not entries:
-            QMessageBox.information(
-                self,
-                "Rapport PDF",
-                "Ajoutez et traitez au moins un enregistrement .rhs (F5) avant l’export PDF.",
-            )
-            return
-        if self._pdf_callback is None and not ready:
-            QMessageBox.information(
-                self, "Rapport PDF", "Le pipeline PDF est indisponible dans cette session."
-            )
-            return
-        default_name = f"{entries[0].display_label}.pdf"
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Enregistrer le rapport PDF",
-            str(entries[0].path.parent / default_name),
-            "PDF (*.pdf)",
-        )
-        if not path:
-            return
-        target = Path(path)
-        display = self._workspace.to_plot_display()
-        # Workspace vide (aperçu canal seul) → to_plot_display() = all_on ;
-        # zoom_mode() renverrait "none" et exclurait les zooms du PDF.
-        zoom_mode = self._workspace.zoom_mode()
-        if not any(tab.panels for tab in self._workspace.tabs):
-            zoom_mode = "both"
-        configs: list[AnalysisConfig] = []
-        recordings: list[Any] = []
-        for entry in entries:
-            configs.append(
-                replace(
-                    self._build_config(entry.path),
-                    save_dir=target.parent,
-                    pdf_title=target.stem,
-                    recording_label=entry.label or None,
-                    recording_style=entry.style,
-                    plot_display=display,
-                    zoom_mode=zoom_mode,
-                )
-            )
-            if entry.recording is not None and getattr(entry.recording, "source", None) is not None:
-                recordings.append(entry.recording)
-        callback = self._pdf_callback
-        selected = (
-            self._processing_channel_indices(recordings[0]) if recordings else None
-        )
-
-        def task() -> str:
-            if recordings and len(recordings) == len(configs):
-                from plotting import plot_processed_recordings_pdf
-
-                style = self.params_panel.viewer_settings().style
-                plot_processed_recordings_pdf(
-                    recordings,
-                    configs,
-                    output_dir=target.parent,
-                    channels=selected,
-                    stim_linewidth=float(style.stim_linewidth),
-                    stim_onset_color=str(style.stim_onset_color),
-                    stim_offset_color=str(style.stim_offset_color),
-                )
-            elif callback is not None:
-                callback(configs)
-            else:
-                raise RuntimeError("Aucun chemin PDF disponible.")
-            return str(target)
-
-        def done(result: Any) -> None:
-            self.status_panel.append_log(f"Rapport PDF écrit près de {result}")
-            QMessageBox.information(
-                self, "Rapport PDF", f"Rapport généré dans :\n{target.parent}"
-            )
-
-        self._export.run_pdf_task(task, done)
+        self._export.export_pdf_report(pdf_callback=self._pdf_callback)
 
     def save_view_images(self) -> None:
         self._export.save_view_images()

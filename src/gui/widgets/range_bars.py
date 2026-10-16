@@ -24,7 +24,14 @@ from PySide6.QtWidgets import (
 )
 
 from gui.form_widgets import ColorSwatchButton, make_double_spin
-from view_config import TimeRangeBar, default_zoom_range_color, resolved_range_bar_color
+from view_config import (
+    TextFace,
+    TimeRangeBar,
+    default_zone_label,
+    default_zoom_range_color,
+    resolved_range_bar_color,
+    resolved_zone_label,
+)
 
 
 def _qt_alive(obj: Any) -> bool:
@@ -94,9 +101,10 @@ class _RangeBarRow(QFrame):
         self._color.setToolTip("Couleur de cette plage / fenêtre zoom")
         self._color.changed.connect(self._emit_changed)
 
-        self._label = QLineEdit(bar.label.strip() or f"Plage {index + 1}", self)
-        self._label.setPlaceholderText("Nom")
+        self._label = QLineEdit(resolved_zone_label(bar, index), self)
+        self._label.setPlaceholderText(default_zone_label(index))
         self._label.setMinimumWidth(0)
+        self._label.setToolTip("Nom affiché sous la zone de zoom sur le graphique")
         self._label.editingFinished.connect(self._emit_changed)
 
         kind = "rel. stim" if bar.relative_to_stim else "abs."
@@ -155,7 +163,8 @@ class _RangeBarRow(QFrame):
             self._color.set_color(resolved_range_bar_color(bar, index))
             self._color.blockSignals(False)
             self._label.blockSignals(True)
-            self._label.setText(bar.label.strip() or f"Plage {index + 1}")
+            self._label.setText(resolved_zone_label(bar, index))
+            self._label.setPlaceholderText(default_zone_label(index))
             self._label.blockSignals(False)
             self._kind.setText("rel. stim" if bar.relative_to_stim else "abs.")
             t0, t1 = bar.ordered()
@@ -174,7 +183,7 @@ class _RangeBarRow(QFrame):
         t1 = float(self._t1.value())
         if t1 < t0:
             t0, t1 = t1, t0
-        label = self._label.text().strip() or f"Plage {self._index + 1}"
+        label = self._label.text().strip() or default_zone_label(self._index)
         return replace(
             self._bar,
             t0_s=t0,
@@ -217,11 +226,15 @@ class RangeBarToolbar(QWidget):
         self._count_label = QLabel("0 plage(s)", box)
         self._count_label.setObjectName("hintLabel")
         self._active = QSpinBox(box)
-        self._active.setMinimum(1)
+        self._active.setMinimum(0)
         self._active.setMaximum(1)
-        self._active.setValue(1)
+        self._active.setSpecialValueText("—")
+        self._active.setValue(0)
         self._active.setFixedWidth(52)
-        self._active.setToolTip("Plage active (surlignage / suppression)")
+        self._active.setToolTip(
+            "Plage active (surlignage / suppression). "
+            "« — » = aucune. Clic à côté d’une bande sur le graph pour tout désélectionner."
+        )
         self._active.valueChanged.connect(lambda v: self.activeChanged.emit(int(v) - 1))
 
         active_label = QLabel("Active", box)
@@ -325,13 +338,20 @@ class RangeBarToolbar(QWidget):
     def set_bar_count(self, count: int, active_index: int = 0) -> None:
         n = max(0, int(count))
         self._count_label.setText(f"{n} plage(s)")
+        active = int(active_index)
+        if n <= 0:
+            active = -1
+        elif active >= 0:
+            active = max(0, min(n - 1, active))
+        else:
+            active = -1
         self._active.blockSignals(True)
         self._active.setMaximum(max(1, n))
         self._active.setEnabled(n > 0)
-        if n > 0:
-            self._active.setValue(max(1, min(n, int(active_index) + 1)))
+        # 0 = « — » (aucune) ; 1…n = plage active.
+        self._active.setValue(0 if active < 0 else active + 1)
         self._active.blockSignals(False)
-        self._color.setEnabled(n > 0)
+        self._color.setEnabled(n > 0 and active >= 0)
         self._empty_label.setVisible(n == 0)
         self._list_scroll.setVisible(n > 0)
 
@@ -339,7 +359,13 @@ class RangeBarToolbar(QWidget):
         """Rebuild / sync the editable list of zooms."""
         bars = tuple(bars)
         n = len(bars)
-        active = max(0, min(n - 1, int(active_index))) if n else 0
+        active = int(active_index)
+        if n <= 0:
+            active = -1
+        elif active >= 0:
+            active = max(0, min(n - 1, active))
+        else:
+            active = -1
         self._updating_list = True
         try:
             while len(self._rows) > n:
@@ -356,10 +382,12 @@ class RangeBarToolbar(QWidget):
             for index, bar in enumerate(bars):
                 self._rows[index].set_bar(index, bar, active=(index == active))
             self.set_bar_count(n, active)
-            if n:
+            if n and active >= 0:
                 self.set_active_color(
                     resolved_range_bar_color(bars[active], active), enabled=True
                 )
+            elif n:
+                self.set_active_color(default_zoom_range_color(0), enabled=False)
         finally:
             self._updating_list = False
 
@@ -383,11 +411,12 @@ class RangeBarControllerPg(QObject):
     """
 
     barsChanged = Signal(object)  # tuple[TimeRangeBar, ...]
+    activeChanged = Signal(int)  # index local, -1 = aucune
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._bars: list[TimeRangeBar] = []
-        self._active_index = 0
+        self._active_index = -1
         self._host: Any | None = None
         self._regions: list[Any] = []
         self._lines: list[Any] = []
@@ -398,6 +427,12 @@ class RangeBarControllerPg(QObject):
         self._last_draw_s = 0.0
         self._motion_dirty = False
         self._updating = False
+        self._show_zone_labels = True
+        self._zone_font_size = 8.0
+        self._zone_face = TextFace()
+        self._zone_dx_px = 0.0
+        self._zone_dy_px = 0.0
+        self._scene_connected: list[Any] = []
 
     @property
     def bars(self) -> tuple[TimeRangeBar, ...]:
@@ -411,16 +446,19 @@ class RangeBarControllerPg(QObject):
     def is_dragging(self) -> bool:
         return self._drag is not None
 
-    def set_active_index(self, index: int) -> None:
+    def set_active_index(self, index: int, *, emit: bool = False) -> None:
         if not self._bars:
-            self._active_index = 0
-            return
-        if int(index) < 0:
-            self._active_index = -1
+            new_index = -1
+        elif int(index) < 0:
+            new_index = -1
+        else:
+            new_index = max(0, min(len(self._bars) - 1, int(index)))
+        changed = new_index != self._active_index
+        self._active_index = new_index
+        if changed:
             self._redraw_items()
-            return
-        self._active_index = max(0, min(len(self._bars) - 1, int(index)))
-        self._redraw_items()
+            if emit:
+                self.activeChanged.emit(int(self._active_index))
 
     def set_display_offset(self, offset_s: float) -> None:
         new_offset = float(offset_s)
@@ -437,7 +475,12 @@ class RangeBarControllerPg(QObject):
 
     def set_bars(self, bars: Sequence[TimeRangeBar], *, active_index: int = 0) -> None:
         self._bars = [replace(b) for b in bars]
-        self._active_index = max(0, min(max(0, len(self._bars) - 1), int(active_index)))
+        if not self._bars:
+            self._active_index = -1
+        elif int(active_index) < 0:
+            self._active_index = -1
+        else:
+            self._active_index = max(0, min(len(self._bars) - 1, int(active_index)))
         self._redraw_items()
 
     def add_bar(self, *, t0: float | None = None, t1: float | None = None) -> None:
@@ -461,7 +504,7 @@ class RangeBarControllerPg(QObject):
             TimeRangeBar(
                 t0_s=a,
                 t1_s=b,
-                label=f"Plage {n}",
+                label=default_zone_label(n - 1),
                 bar_id=uuid.uuid4().hex[:8],
                 color=default_zoom_range_color(n - 1),
             )
@@ -469,6 +512,36 @@ class RangeBarControllerPg(QObject):
         self._active_index = len(self._bars) - 1
         self._redraw_items()
         self.barsChanged.emit(self.bars)
+        self.activeChanged.emit(int(self._active_index))
+
+    def set_zone_label_style(self, style: Any | None) -> None:
+        """Police / placement des libellés « Zone N » (PanelStyle ou None)."""
+        if style is None:
+            show = True
+            fontsize = 8.0
+            face = TextFace()
+            dx = 0.0
+            dy = 0.0
+        else:
+            show = bool(getattr(style, "show_zone_labels", True))
+            fontsize = float(getattr(style, "zone_font_size", 8.0) or 8.0)
+            face = getattr(style, "zone_face", None) or TextFace()
+            dx = float(getattr(style, "zone_dx_px", 0.0) or 0.0)
+            dy = float(getattr(style, "zone_dy_px", 0.0) or 0.0)
+        changed = (
+            show != self._show_zone_labels
+            or abs(fontsize - self._zone_font_size) > 1e-9
+            or face != self._zone_face
+            or abs(dx - self._zone_dx_px) > 1e-9
+            or abs(dy - self._zone_dy_px) > 1e-9
+        )
+        self._show_zone_labels = show
+        self._zone_font_size = max(4.0, fontsize)
+        self._zone_face = face
+        self._zone_dx_px = dx
+        self._zone_dy_px = dy
+        if changed:
+            self._redraw_items()
 
     def attach(self, host: Any, axes: Sequence[Any] | Any | None = None) -> None:
         """Attach to a PlotHost (``axes`` ignored — kept for API parity)."""
@@ -478,11 +551,107 @@ class RangeBarControllerPg(QObject):
             return
         self._host = host
         self._redraw_items()
+        self._connect_scene_clicks()
 
     def detach(self) -> None:
+        self._disconnect_scene_clicks()
+        host = self._host
         self._clear_items()
+        if host is not None and _qt_alive(host):
+            clearer = getattr(host, "set_zone_labels", None)
+            if callable(clearer):
+                try:
+                    clearer(())
+                except Exception:
+                    pass
         self._host = None
         self._drag = None
+
+    def _disconnect_scene_clicks(self) -> None:
+        for scene in self._scene_connected:
+            try:
+                scene.sigMouseClicked.disconnect(self._on_scene_clicked)
+            except (TypeError, RuntimeError):
+                pass
+        self._scene_connected.clear()
+
+    def _connect_scene_clicks(self) -> None:
+        self._disconnect_scene_clicks()
+        host = self._ensure_host()
+        if host is None:
+            return
+        scenes: list[Any] = []
+        try:
+            glw = getattr(host, "_glw", None)
+            scene = glw.scene() if glw is not None else None
+            if scene is not None:
+                scenes.append(scene)
+        except Exception:
+            pass
+        for plot in self._plot_items():
+            try:
+                scene = plot.scene()
+            except Exception:
+                scene = None
+            if scene is not None and scene not in scenes:
+                scenes.append(scene)
+        for scene in scenes:
+            try:
+                scene.sigMouseClicked.connect(self._on_scene_clicked)
+                self._scene_connected.append(scene)
+            except Exception:
+                pass
+
+    def _bar_index_at_x(self, x_display: float) -> int | None:
+        """Index de plage contenant ``x`` (coords d’affichage), ou None."""
+        off = float(self._display_offset)
+        x = float(x_display)
+        for index, bar in enumerate(self._bars):
+            t0, t1 = bar.ordered()
+            a, b = float(t0) - off, float(t1) - off
+            if a > b:
+                a, b = b, a
+            if a <= x <= b:
+                return index
+        return None
+
+    def _on_scene_clicked(self, event: Any) -> None:
+        """Clic gauche hors bande → désélectionner ; sur une bande → activer."""
+        if self._updating or self._drag is not None or not self._bars:
+            return
+        try:
+            from PySide6.QtCore import Qt as _Qt
+
+            if event.button() != _Qt.MouseButton.LeftButton:
+                return
+            if bool(event.double()):
+                return
+            scene_pos = event.scenePos()
+        except Exception:
+            return
+        x_hit: float | None = None
+        for plot in self._plot_items():
+            if not _plot_alive(plot):
+                continue
+            try:
+                vb = plot.getViewBox()
+                rect = vb.sceneBoundingRect()
+                if not rect.contains(scene_pos):
+                    continue
+                view_pt = vb.mapSceneToView(scene_pos)
+                x_hit = float(view_pt.x())
+                break
+            except Exception:
+                continue
+        if x_hit is None:
+            return
+        hit = self._bar_index_at_x(x_hit)
+        if hit is None:
+            if self._active_index >= 0:
+                self.set_active_index(-1, emit=True)
+            return
+        if hit != self._active_index:
+            self.set_active_index(hit, emit=True)
 
     def _ensure_host(self) -> Any | None:
         host = self._host
@@ -541,12 +710,56 @@ class RangeBarControllerPg(QObject):
         self._regions.clear()
         self._lines.clear()
 
+    def _push_zone_labels_to_host(self) -> None:
+        """Overlays Zone sous le graph via PlotHost (même mécanique que on/off)."""
+        host = self._ensure_host()
+        if host is None:
+            return
+        setter = getattr(host, "set_zone_labels", None)
+        if not callable(setter):
+            return
+        face = self._zone_face
+        if not self._show_zone_labels or not self._bars:
+            try:
+                setter(())
+            except Exception:
+                pass
+            return
+        off = float(self._display_offset)
+        labels: list[tuple[float, str, str]] = []
+        for index, bar in enumerate(self._bars):
+            t0, t1 = bar.ordered()
+            mid = 0.5 * ((float(t0) - off) + (float(t1) - off))
+            text = resolved_zone_label(bar, index)
+            if not text.strip():
+                continue
+            color = resolved_range_bar_color(bar, index)
+            labels.append((mid, text, color))
+        try:
+            setter(
+                labels,
+                fontsize=float(self._zone_font_size),
+                bold=bool(getattr(face, "bold", False)),
+                italic=bool(getattr(face, "italic", False)),
+                underline=bool(getattr(face, "underline", False)),
+                dx_px=float(self._zone_dx_px),
+                dy_px=float(self._zone_dy_px),
+            )
+        except Exception:
+            pass
+
     def _redraw_items(self) -> None:
         self._clear_items()
         host = self._ensure_host()
         plots = self._plot_items()
         if not plots or not self._bars:
             if host is not None:
+                try:
+                    setter = getattr(host, "set_zone_labels", None)
+                    if callable(setter):
+                        setter(())
+                except Exception:
+                    pass
                 try:
                     host.draw_idle()
                 except Exception:
@@ -596,6 +809,7 @@ class RangeBarControllerPg(QObject):
                     )
         finally:
             self._updating = False
+        self._push_zone_labels_to_host()
         host = self._ensure_host()
         if host is not None:
             try:
@@ -607,7 +821,9 @@ class RangeBarControllerPg(QObject):
         if self._updating or not (0 <= index < len(self._bars)):
             return
         self._drag = (index, "region")
-        self._active_index = index
+        if index != self._active_index:
+            self._active_index = index
+            self.activeChanged.emit(int(index))
         now = time.perf_counter()
         if now - self._last_draw_s < 0.016:
             self._motion_dirty = True
@@ -621,9 +837,13 @@ class RangeBarControllerPg(QObject):
             return
         self._apply_region(index, region, emit=True)
         self._drag = None
-        if self._motion_dirty:
-            self._motion_dirty = False
-            self._redraw_items()
+        prev = self._active_index
+        self._active_index = index
+        if prev != index:
+            self.activeChanged.emit(int(index))
+        # Redraw : bornes finales + surlignage de la plage active.
+        self._motion_dirty = False
+        self._redraw_items()
 
     def _apply_region(self, index: int, region: Any, *, emit: bool) -> None:
         try:
@@ -654,5 +874,6 @@ class RangeBarControllerPg(QObject):
                     pass
         finally:
             self._updating = False
+        self._push_zone_labels_to_host()
         if emit:
             self.barsChanged.emit(self.bars)

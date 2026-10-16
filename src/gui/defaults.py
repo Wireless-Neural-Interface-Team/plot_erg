@@ -85,7 +85,7 @@ def viewer_settings_from_defaults(defaults: Mapping[str, Any] | None = None) -> 
             minimum=float(d.get("default_first_trigger_hp_ylim_min_uv", -200.0)),
             maximum=float(d.get("default_first_trigger_hp_ylim_max_uv", 200.0)),
         ),
-        rms_ylim=AxisLimits(enabled=True, minimum=0.0, maximum=20.0),
+        rms_ylim=AxisLimits(enabled=False, minimum=0.0, maximum=20.0),
         legend=LegendSettings(),
         style=PanelStyle(),
         montage_channels=12,

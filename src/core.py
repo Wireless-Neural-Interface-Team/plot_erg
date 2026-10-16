@@ -98,12 +98,14 @@ def no_trigger_sections_and_timebase(
     section_spec: SectionSpecKind,
     section_trigger_start_s: float,
     section_trigger_end_s: float,
-) -> tuple[np.ndarray, np.ndarray, int, int, int, float]:
+    pre_s: float,
+    post_s: float,
+) -> tuple[np.ndarray, np.ndarray, int, int, int, int, float]:
     """Split recording into equal sections; t=0 is the imaginary stimulation onset.
 
-    Each section is extracted in full. ``section_trigger_start_s`` / ``_end_s``
-    place t=0 and the stimulation-end marker inside the section; they do not
-    crop the plotted window.
+    Same display / analysis window as real stimulations: ``[-pre_s, +post_s]``
+    around each imaginary onset. ``section_trigger_start_s`` / ``_end_s`` only
+    place t=0 and the stimulation-end marker inside each section.
     """
     if n_samples < 2:
         raise RuntimeError("Recording too short for section averaging.")
@@ -133,17 +135,23 @@ def no_trigger_sections_and_timebase(
     start_n = int(round(float(section_trigger_start_s) * fs))
     start_n = max(0, min(start_n, section_len - 1))
     starts = np.arange(n_sections, dtype=np.int64) * section_len
-    triggers = starts + start_n
-    pre_n = int(start_n)
-    post_n = int(section_len - start_n)
-    if pre_n + post_n < 2:
-        raise RuntimeError("Section window too short (< 2 samples).")
-    if np.any(triggers - pre_n < 0) or np.any(triggers + post_n > n_samples):
-        raise RuntimeError(
-            "Section window extends beyond the recording for at least one section."
-        )
-    t_rel = np.arange(-pre_n, post_n, dtype=np.float64) / float(fs)
-    return triggers, t_rel, pre_n, post_n, n_sections, section_duration_resolved
+    trigger_indices = starts + start_n
+    valid_triggers, t_rel, pre_n, post_n = valid_triggers_and_timebase(
+        n_samples=n_samples,
+        trigger_indices=trigger_indices,
+        fs=fs,
+        pre_s=pre_s,
+        post_s=post_s,
+    )
+    return (
+        valid_triggers,
+        t_rel,
+        pre_n,
+        post_n,
+        int(valid_triggers.size),
+        int(n_sections),
+        section_duration_resolved,
+    )
 
 
 def resolve_recording_windows(
@@ -151,10 +159,23 @@ def resolve_recording_windows(
     n_samples: int,
     fs: float,
     analog_in0: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, int, int, int, int, float | None]:
-    """Return segmentation windows: triggers or fixed sections."""
+) -> tuple[np.ndarray, np.ndarray, int, int, int, int, float | None, float | None]:
+    """Return segmentation windows: triggers or fixed sections.
+
+    Returns
+    -------
+    triggers, t_rel, pre_n, post_n, n_valid, n_total, end_rising_s, section_duration_s
+    """
     if config.edge == "none":
-        starts, t_rel, pre_n, post_n, n_sections, _section_duration_s = no_trigger_sections_and_timebase(
+        (
+            triggers,
+            t_rel,
+            pre_n,
+            post_n,
+            n_valid,
+            n_total,
+            section_duration_s,
+        ) = no_trigger_sections_and_timebase(
             n_samples=n_samples,
             fs=fs,
             section_count=config.section_count,
@@ -162,11 +183,22 @@ def resolve_recording_windows(
             section_spec=config.section_spec,
             section_trigger_start_s=config.section_trigger_start_s,
             section_trigger_end_s=config.section_trigger_end_s,
+            pre_s=config.pre_s,
+            post_s=config.post_s,
         )
         end_rel_s = float(config.section_trigger_end_s) - float(config.section_trigger_start_s)
         if end_rel_s <= 0:
             end_rel_s = None
-        return starts, t_rel, pre_n, post_n, n_sections, n_sections, end_rel_s
+        return (
+            triggers,
+            t_rel,
+            pre_n,
+            post_n,
+            n_valid,
+            n_total,
+            end_rel_s,
+            float(section_duration_s),
+        )
 
     trigger_indices = detect_edges(analog_in0, threshold=config.threshold, edge=config.edge)
     if trigger_indices.size == 0:
@@ -190,6 +222,7 @@ def resolve_recording_windows(
         int(valid_triggers.size),
         int(trigger_indices.size),
         end_rising_rel_s,
+        None,
     )
 
 

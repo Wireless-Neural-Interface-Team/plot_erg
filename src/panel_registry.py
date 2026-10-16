@@ -45,6 +45,7 @@ from view_config import (
     TextFace,
     montage_row_axis_label,
     ViewerSettings,
+    continuous_anchor_offset_s,
     continuous_sync_offset_s,
     included_channel_indices,
     resolved_scale_bar_linewidth,
@@ -494,25 +495,17 @@ class RenderRequest:
             # Barres continues = temps absolu → convertir pour les panels d’analyse (t_rel).
             # Zooms saisis « relatifs à la stim » = déjà en t_rel.
             # Toujours borner à t_rel : sinon xlim trop large → courbes tronquées à droite.
-            if str(self.panel).startswith("analysis_"):
+            if _panel_expects_relative_x(self.panel):
                 reference = self.reference
                 if reference is None:
                     return t0, t1
                 if self.placement.zoom_absolute:
-                    stim_index = self.settings.analysis.trigger_index()
-                    converted = _absolute_range_to_relative(
-                        reference, t0, t1, stim_index=stim_index
-                    )
-                    if converted is not None:
-                        return converted
-                else:
-                    clipped = _clip_to_t_rel(reference, t0, t1)
-                    if clipped is not None:
-                        return clipped
-                t_rel = reference.t_rel
-                if t_rel.size == 0:
-                    return t0, t1
-                return float(t_rel[0]), float(t_rel[-1])
+                    converted = _zoom_absolute_to_relative(reference, t0, t1)
+                    # Hors essai : fenêtre vide — pas le repli « essai entier »
+                    # (sinon la fenêtre Plage N réaffiche toute la courbe).
+                    return converted if converted is not None else (1.0, 0.0)
+                clipped = _clip_to_t_rel(reference, t0, t1)
+                return clipped if clipped is not None else (1.0, 0.0)
             return t0, t1
 
         reference = self.reference
@@ -552,24 +545,16 @@ class RenderRequest:
         """Fenêtre de section résolue par enregistrement."""
         if (
             self.placement.has_custom_zoom
-            and str(self.panel).startswith("analysis_")
+            and _panel_expects_relative_x(self.panel)
             and self.placement.zoom_absolute
         ):
             t0 = float(self.placement.zoom_t0_s)
             t1 = float(self.placement.zoom_t1_s)
-            stim_index = self.settings.analysis.trigger_index()
             out: list[tuple[float, float] | None] = []
             for recording in self.recordings:
-                converted = _absolute_range_to_relative(
-                    recording, t0, t1, stim_index=stim_index
-                )
-                if converted is not None:
-                    out.append(converted)
-                    continue
-                t_rel = recording.t_rel
-                out.append(
-                    (float(t_rel[0]), float(t_rel[-1])) if t_rel.size else None
-                )
+                converted = _zoom_absolute_to_relative(recording, t0, t1)
+                # Hors essai : vide — pas le repli essai entier.
+                out.append(converted if converted is not None else (1.0, 0.0))
             return out
         if self.placement.has_custom_zoom or self.section != "zoom_trigger_end":
             window = self.section_window()
@@ -624,8 +609,8 @@ def _absolute_range_to_relative(
 ) -> tuple[float, float] | None:
     """Convertit une plage absolue (barres) en fenêtre relative à une stimulation.
 
-    Si ``stim_index`` est fourni (mode « une stimulation »), cette stim est la
-    référence. Sinon : première stim dans la plage, ou stim la plus proche du centre.
+    Si ``stim_index`` est fourni, cette stim est la référence. Sinon : première
+    stim dans la plage, ou stim la plus proche du centre.
     Le résultat est borné à ``t_rel`` (durée d’essai) pour éviter un xlim plus
     large que les spikes / traces disponibles.
     """
@@ -647,6 +632,23 @@ def _absolute_range_to_relative(
     return _clip_to_t_rel(recording, lo - ref, hi - ref)
 
 
+def _zoom_absolute_to_relative(
+    recording: ProcessedRecording,
+    t0_abs: float,
+    t1_abs: float,
+) -> tuple[float, float] | None:
+    """Abs → t_rel pour une *fenêtre de zoom* (plage dessinée sur le continuous).
+
+    Toujours ancré sur la stim **locale à la plage** (dans / plus proche), jamais
+    sur l’index « une stimulation » du mode aperçu. Sinon, en mode stimulation,
+    une plage autour de la stim 3 convertie vs stim 1 tombe hors essai → vide,
+    et moyenne / stim n’affichent pas les bonnes fenêtres relatives.
+    """
+    return _absolute_range_to_relative(
+        recording, t0_abs, t1_abs, stim_index=None
+    )
+
+
 def spike_scope_time_range(
     request: RenderRequest, recording: ProcessedRecording, index: int
 ) -> tuple[float, float] | None:
@@ -660,10 +662,7 @@ def spike_scope_time_range(
         if t1 < t0:
             t0, t1 = t1, t0
         if request.placement.zoom_absolute:
-            stim_index = request.settings.analysis.trigger_index()
-            converted = _absolute_range_to_relative(
-                recording, t0, t1, stim_index=stim_index
-            )
+            converted = _zoom_absolute_to_relative(recording, t0, t1)
             # Hors essai : aucune détection, pas le repli « essai entier ».
             return converted if converted is not None else (1.0, 0.0)
         clipped = _clip_to_t_rel(recording, t0, t1)
@@ -675,10 +674,8 @@ def spike_scope_time_range(
         if bool(bar.relative_to_stim):
             clipped = _clip_to_t_rel(recording, t0, t1)
             return clipped if clipped is not None else (1.0, 0.0)
-        stim_index = request.settings.analysis.trigger_index()
-        converted = _absolute_range_to_relative(
-            recording, t0, t1, stim_index=stim_index
-        )
+        # Plage absolue active → offset relatif à sa stim locale (pas l’index aperçu).
+        converted = _zoom_absolute_to_relative(recording, t0, t1)
         return converted if converted is not None else (1.0, 0.0)
     if index < len(windows) and windows[index] is not None:
         return windows[index]
@@ -838,7 +835,8 @@ def _scale_bar_units(panel: str) -> tuple[str | None, str | None]:
     if panel in {"analysis_trial_rate", "trial_rate"}:
         return (None, "Hz")
     if panel in {"analysis_isi", "isi", "first_isi", "second_isi"}:
-        return ("s", "ms")
+        # Histogramme ISI : X = intervalle (ms), Y = comptages (pas d’échelle Y).
+        return ("ms", None)
     if panel in {"analysis_raster", "analysis_raster_channel", "raster"}:
         return ("s", None)
     if panel in {
@@ -939,6 +937,16 @@ def _apply_scale_bars(
     x_size, y_size = _scale_bar_lengths(style, x_unit=x_unit, y_unit=y_unit, ax=ax)
     dx_px, dy_px = resolved_scale_bar_offset_px(style)
     time_dx_px, time_dy_px = resolved_scale_bar_time_offset_px(style)
+    y_length_px = None
+    if bool(getattr(style, "scale_bar_amplitude_length_manual", False)):
+        y_px = float(getattr(style, "scale_bar_amplitude_length_px", 0.0) or 0.0)
+        if y_px > 0:
+            y_length_px = y_px
+    x_length_px = None
+    if bool(getattr(style, "scale_bar_time_length_manual", False)):
+        x_px = float(getattr(style, "scale_bar_time_length_px", 0.0) or 0.0)
+        if x_px > 0:
+            x_length_px = x_px
     draw_floating_scale_bars(
         ax,
         x_unit=x_unit,
@@ -955,6 +963,12 @@ def _apply_scale_bars(
         dy_px=dy_px,
         x_dx_px=time_dx_px,
         x_dy_px=time_dy_px,
+        y_length_px=y_length_px,
+        x_length_px=x_length_px,
+        y_value_manual=bool(
+            getattr(style, "scale_bar_amplitude_manual", False) and y_unit == "µV"
+        ),
+        x_value_manual=bool(getattr(style, "scale_bar_time_manual", False)),
     )
 
 
@@ -1040,12 +1054,23 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
             if kind == "trial_rate":
                 return (None, "Hz")
             if kind == "isi":
-                return ("s", "ms")
+                return ("ms", None)
             if kind == "raster":
                 return ("s", None)
             if kind == "rms":
                 return ("s", "µV")
         return (panel_x, panel_y)
+
+    y_length_px = None
+    if bool(getattr(style, "scale_bar_amplitude_length_manual", False)):
+        y_px = float(getattr(style, "scale_bar_amplitude_length_px", 0.0) or 0.0)
+        if y_px > 0:
+            y_length_px = y_px
+    x_length_px = None
+    if bool(getattr(style, "scale_bar_time_length_manual", False)):
+        x_px = float(getattr(style, "scale_bar_time_length_px", 0.0) or 0.0)
+        if x_px > 0:
+            x_length_px = x_px
 
     for row, ax in enumerate(axes):
         hide_edge_scale(ax, keep_ylabel=True)
@@ -1070,10 +1095,15 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
                 face=style.tick_face,
                 dx_px=dx_px,
                 dy_px=dy_px,
+                y_length_px=y_length_px,
+                y_value_manual=bool(
+                    getattr(style, "scale_bar_amplitude_manual", False)
+                    and y_unit == "µV"
+                ),
             )
         else:
             clear_floating_scale_bars(ax)
-        # Temps : sous le dernier graph (unités de cette ligne — ms si overlay).
+        # Temps : sous le dernier graph (unités de cette ligne — ms si overlay/ISI).
         if row == last and x_unit is not None:
             draw_floating_scale_bars(
                 ax,
@@ -1088,6 +1118,8 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
                 face=style.tick_face,
                 dx_px=time_dx_px,
                 dy_px=time_dy_px,
+                x_length_px=x_length_px,
+                x_value_manual=bool(getattr(style, "scale_bar_time_manual", False)),
             )
 
 
@@ -1389,6 +1421,12 @@ def _reference_markers(ax: Any, request: RenderRequest, *, with_spans: bool) -> 
     )
     if not with_spans:
         return
+    style = request.style
+    show_zone = bool(getattr(style, "show_zone_labels", True))
+    zone_fs = float(getattr(style, "zone_font_size", 8.0) or 8.0)
+    zone_face = getattr(style, "zone_face", None)
+    zone_dx = float(getattr(style, "zone_dx_px", 0.0) or 0.0)
+    zone_dy = float(getattr(style, "zone_dy_px", 0.0) or 0.0)
     for index, entry in enumerate(request.highlight_zooms):
         t0, t1, label = entry[0], entry[1], entry[2]
         color = (
@@ -1396,13 +1434,36 @@ def _reference_markers(ax: Any, request: RenderRequest, *, with_spans: bool) -> 
             if len(entry) >= 4 and str(entry[3]).strip()
             else resolved_range_bar_color(None, index)
         )
+        zone_text = str(label or "").strip() or f"Zone {index + 1}"
         ax.axvspan(
             float(t0),
             float(t1),
             alpha=0.14,
             color=color,
-            label=str(label or f"Zoom {index + 1}"),
+            label=zone_text,
         )
+        if not show_zone or not zone_text:
+            continue
+        from matplotlib.transforms import ScaledTranslation, blended_transform_factory
+
+        mid = 0.5 * (float(t0) + float(t1))
+        fig = ax.figure
+        dpi = float(getattr(fig, "dpi", 100.0) or 100.0)
+        base = blended_transform_factory(ax.transData, ax.transAxes)
+        offset = ScaledTranslation(zone_dx / dpi, zone_dy / dpi, fig.dpi_scale_trans)
+        text = ax.text(
+            mid,
+            0.0,
+            zone_text,
+            transform=base + offset,
+            ha="center",
+            va="top",
+            color=color,
+            fontsize=max(4.0, zone_fs),
+            clip_on=False,
+            zorder=20,
+        )
+        apply_text_face(text, zone_face)
 
 
 def _filter_suffix(recording: ProcessedRecording, stream: str, request: RenderRequest) -> str:
@@ -1511,7 +1572,11 @@ def _panel_expects_relative_x(panel: str) -> bool:
 
 
 def _relative_stim_window(request: RenderRequest) -> tuple[float, float] | None:
-    """Fenêtre d’affichage en t_rel (spikes / RMS / analyse), jamais le temps fichier."""
+    """Fenêtre d’affichage en t_rel (spikes / RMS / analyse), jamais le temps fichier.
+
+    Alignée sur la fenêtre visible : zoom panneau → plage active → échelle X
+    manuelle → section — comme ``spike_scope_time_range``.
+    """
     reference = request.reference
     if reference is None:
         return None
@@ -1528,13 +1593,19 @@ def _relative_stim_window(request: RenderRequest) -> tuple[float, float] | None:
         if t1 < t0:
             t0, t1 = t1, t0
         if request.placement.zoom_absolute:
-            stim_index = request.settings.analysis.trigger_index()
-            converted = _absolute_range_to_relative(
-                reference, t0, t1, stim_index=stim_index
-            )
-            return converted if converted is not None else (rel0, rel1)
+            converted = _zoom_absolute_to_relative(reference, t0, t1)
+            # Hors essai : vide — ne pas élargir à tout ``t_rel``.
+            return converted if converted is not None else (1.0, 0.0)
         clipped = _clip_to_t_rel(reference, t0, t1)
-        return clipped if clipped is not None else (rel0, rel1)
+        return clipped if clipped is not None else (1.0, 0.0)
+    bar = request.settings.active_range_bar()
+    if bar is not None:
+        t0, t1 = bar.ordered()
+        if bool(bar.relative_to_stim):
+            clipped = _clip_to_t_rel(reference, t0, t1)
+            return clipped if clipped is not None else (1.0, 0.0)
+        converted = _zoom_absolute_to_relative(reference, t0, t1)
+        return converted if converted is not None else (1.0, 0.0)
     manual_x = request.settings.x_limits.as_tuple()
     if manual_x is not None:
         lo, hi = float(manual_x[0]), float(manual_x[1])
@@ -1676,6 +1747,8 @@ def _render_full_recording(figure: Any, request: RenderRequest) -> str:
     else:
         streams = list(request.settings.resolved_continuous_streams()) or ["raw"]
     # Custom zoom → jamais retomber sur x_limits de l’aperçu.
+    # Axe X auto → toute la courbe (downsample via max_points).
+    anchor_to_stim = False
     if request.placement.has_custom_zoom:
         window = request.section_window()
         if window is None:
@@ -1697,6 +1770,7 @@ def _render_full_recording(figure: Any, request: RenderRequest) -> str:
     max_pts = int(request.style.max_points_per_curve)
     drawn = 0
     sync_mode = request.settings.time_sync
+    stim_index = int(request.settings.analysis.stim_index)
     zoom_note = ""
     if request.placement.has_custom_zoom:
         zoom_note = (
@@ -1706,11 +1780,12 @@ def _render_full_recording(figure: Any, request: RenderRequest) -> str:
         zoom_note = f" — X [{window[0]:g} … {window[1]:g} s]"
     stim_note = " — stimulations marked" if request.settings.continuous_mark_stims else ""
     sync_note = " — sync trigger" if sync_mode == "trigger" else ""
-    time_label = (
-        "Time relative to trigger (s)"
-        if sync_mode == "trigger"
-        else "Time (s)"
-    )
+    if sync_mode == "trigger":
+        time_label = "Time relative to trigger (s)"
+    elif anchor_to_stim:
+        time_label = "Time relative to stimulation (s)"
+    else:
+        time_label = "Time (s)"
 
     # Zoom depuis barres continues = temps fichier ; sinon coords d’affichage.
     window_is_absolute = bool(
@@ -1718,8 +1793,11 @@ def _render_full_recording(figure: Any, request: RenderRequest) -> str:
     )
     ref_offset = 0.0
     if request.recordings:
-        ref_offset = continuous_sync_offset_s(
-            request.recordings[0].stimulation_times_s(), sync_mode
+        ref_offset = continuous_anchor_offset_s(
+            request.recordings[0].stimulation_times_s(),
+            sync_mode,
+            stim_index=stim_index,
+            anchor_to_stim=anchor_to_stim,
         )
 
     for row, stream in enumerate(streams):
@@ -1733,7 +1811,12 @@ def _render_full_recording(figure: Any, request: RenderRequest) -> str:
             ):
                 continue
             stims = recording.stimulation_times_s()
-            offset = continuous_sync_offset_s(stims, sync_mode)
+            offset = continuous_anchor_offset_s(
+                stims,
+                sync_mode,
+                stim_index=stim_index,
+                anchor_to_stim=anchor_to_stim,
+            )
             t_range = None
             if window is not None:
                 if window_is_absolute:
@@ -1768,7 +1851,7 @@ def _render_full_recording(figure: Any, request: RenderRequest) -> str:
             )
             stream_drawn += 1
             drawn += 1
-            if request.settings.continuous_mark_stims:
+            if request.settings.continuous_mark_stims and not anchor_to_stim:
                 stim_xs = []
                 for stim_t in stims:
                     stim_plot = float(stim_t) - offset
@@ -1788,6 +1871,21 @@ def _render_full_recording(figure: Any, request: RenderRequest) -> str:
                         appearance=_appearance(request),
                         alpha=0.55,
                     )
+        if (
+            request.settings.continuous_mark_stims
+            and anchor_to_stim
+            and stream_drawn
+            and request.legend.show_reference_markers
+        ):
+            from draw_primitives import _draw_onset_offset_lines
+
+            _draw_onset_offset_lines(
+                ax,
+                end_markers=request.end_markers(),
+                label_in_legend=False,
+                appearance=_appearance(request),
+                **_stim_edge_label_kwargs(request),
+            )
         if stream_drawn == 0:
             pending = any(
                 str(stream) in {"hp", "lp"}
@@ -1972,10 +2070,10 @@ def _render_rms(ax: Any, request: RenderRequest) -> str:
 
 
 def _spike_trains_for(request: RenderRequest, trigger_index: int | None) -> list[list[np.ndarray]]:
-    windows = request.per_recording_windows()
+    """Spikes filtrés sur la fenêtre affichée (zoom / plage active / section)."""
     trains: list[list[np.ndarray]] = []
     for index, recording in enumerate(request.recordings):
-        window = windows[index]
+        window = spike_scope_time_range(request, recording, index)
         trains.append(
             recording.spike_times(
                 request.channel_index,
@@ -2797,6 +2895,9 @@ def _montage_review_curve(
             t_range=t_range,
         )
         return np.asarray(t, dtype=np.float64), np.asarray(values, dtype=np.float64)
+    # Moyenne / stimulation : HP/LP seulement si déjà chauffés (pas de sosfilt UI).
+    if str(stream) in {"hp", "lp"} and not recording.stream_ready(stream, ch):
+        return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
     if mode == "stimulation":
         if stim_index >= int(getattr(recording, "n_trials", 0) or 0):
             return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
@@ -2809,10 +2910,11 @@ def _montage_review_curve(
     y = np.asarray(curve, dtype=np.float64)
     if t.size != y.size or y.size == 0:
         return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
+    # Enveloppe min/max (comme l’aperçu) : un stride seul amputerait les pics.
     if y.size > max_points > 0:
-        step = max(1, int(np.ceil(y.size / max_points)))
-        t = t[::step]
-        y = y[::step]
+        from plot_utils import decimate_envelope
+
+        t, y = decimate_envelope(t, y, max_points)
     return t, y
 
 
@@ -3152,8 +3254,11 @@ def _montage_draw_extra_row(
                 drawn += 1
             continue
 
+        spike_win = spike_scope_time_range(request, recording, index)
+        if spike_win is None:
+            spike_win = section_x
         trains = recording.spike_times(
-            ch, trigger_index=trigger_index, t_range_s=section_x
+            ch, trigger_index=trigger_index, t_range_s=spike_win
         )
         if kind == "raster":
             if not any(getattr(tr, "size", 0) for tr in trains):
@@ -3174,7 +3279,7 @@ def _montage_draw_extra_row(
 
         if kind == "psth":
             t_rel = np.asarray(recording.t_rel, dtype=np.float64)
-            if t_rel.size < 2 or section_x is None:
+            if t_rel.size < 2 or spike_win is None:
                 continue
             n_trials = max(1, len(trains) if trains else int(getattr(recording, "n_trials", 1) or 1))
             centers, rate = _psth_mean_hz(
@@ -3182,7 +3287,7 @@ def _montage_draw_extra_row(
                 t_rel,
                 n_trials,
                 float(request.settings.psth_bin_window_s),
-                t_range_s=section_x,
+                t_range_s=spike_win,
             )
             if centers.size < 2:
                 continue
@@ -3193,9 +3298,9 @@ def _montage_draw_extra_row(
             continue
 
         if kind == "trial_rate":
-            if section_x is None or not trains:
+            if spike_win is None or not trains:
                 continue
-            rates = _trial_mean_firing_rate_hz(trains, section_x)
+            rates = _trial_mean_firing_rate_hz(trains, spike_win)
             if rates.size == 0:
                 continue
             x = np.arange(1, rates.size + 1, dtype=np.float64)
@@ -3204,7 +3309,7 @@ def _montage_draw_extra_row(
             continue
 
         if kind == "isi":
-            _, d_isi = _isi_time_and_values_s(trains, isi_window_s=section_x)
+            _, d_isi = _isi_time_and_values_s(trains, isi_window_s=spike_win)
             if d_isi.size == 0:
                 continue
             # Histogramme compact (ms) pour rester lisible en ligne montage.
@@ -3298,17 +3403,21 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
     )
 
     sync_mode = request.settings.time_sync
-    offsets = [
-        continuous_sync_offset_s(recording.stimulation_times_s(), sync_mode)
-        for recording in recordings
-    ]
     selected = int(request.channel_index)
     global_x = request.settings.x_limits.as_tuple()
-    # Spikes / RMS : toujours t_rel (pas les x_limits continuous absolus).
+    # Spikes / RMS : toujours t_rel. Continuous : axe X manuel ou toute la courbe.
     section_x = _relative_stim_window(request)
-    stream_x = global_x if global_x is not None else (
-        section_x if mode != "continuous" else None
-    )
+    stream_x = global_x if mode == "continuous" else section_x
+    anchor_to_stim = False
+    offsets = [
+        continuous_anchor_offset_s(
+            recording.stimulation_times_s(),
+            sync_mode,
+            stim_index=stim_index,
+            anchor_to_stim=anchor_to_stim,
+        )
+        for recording in recordings
+    ]
     drawn = 0
     data_x_min: float | None = None
     data_x_max: float | None = None
@@ -3318,7 +3427,11 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
     draw_app = _appearance(request)
     stim_xs: list[float] = []
     stim_end_xs: list[float] = []
-    if mode == "continuous" and request.settings.continuous_mark_stims:
+    if (
+        mode == "continuous"
+        and request.settings.continuous_mark_stims
+        and not anchor_to_stim
+    ):
         from panel_prepare import _continuous_stim_marks
 
         for stim_x, role in _continuous_stim_marks(recordings, sync_mode, stream_x):
@@ -3408,7 +3521,15 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
                 )
                 channel_drawn += 1
                 drawn += 1
-            if mode == "continuous" and (stim_xs or stim_end_xs):
+            if mode == "continuous" and anchor_to_stim and request.legend.show_reference_markers:
+                _draw_onset_offset_lines(
+                    ax,
+                    end_markers=request.end_markers(),
+                    label_in_legend=False,
+                    appearance=draw_app,
+                    **_stim_edge_label_kwargs(request),
+                )
+            elif mode == "continuous" and (stim_xs or stim_end_xs):
                 mark_stim_times(ax, stim_xs, appearance=draw_app, alpha=0.40)
                 mark_stim_times(
                     ax,
@@ -3511,9 +3632,12 @@ def _render_montage_continuous(figure: Any, request: RenderRequest) -> str:
         elif kind == "trial_rate":
             ax.set_xlabel("Trial")
         elif kind in _MONTAGE_STREAM_KINDS and mode == "continuous":
-            ax.set_xlabel(
-                "Time relative to trigger (s)" if sync_mode == "trigger" else "Time (s)"
-            )
+            if sync_mode == "trigger":
+                ax.set_xlabel("Time relative to trigger (s)")
+            elif anchor_to_stim:
+                ax.set_xlabel("Time relative to stimulation (s)")
+            else:
+                ax.set_xlabel("Time (s)")
         else:
             ax.set_xlabel("Time relative to stimulation (s)")
 
@@ -3882,14 +4006,31 @@ def _render_panel_from_prepare(
     figure: Any, request: RenderRequest, fingerprint: tuple[Any, ...]
 ) -> str:
     """PDF/CLI path shared with the screen: prepare_panel → matplotlib draw."""
+    import logging
+
     from panel_draw_mpl import draw_panel_spec
     from panel_prepare import prepare_panel
 
-    spec = prepare_panel(request)
-    status = draw_panel_spec(figure, spec, request)
+    log = logging.getLogger("plot_erg.render")
+    try:
+        spec = prepare_panel(request)
+        status = draw_panel_spec(figure, spec, request)
+    except Exception as exc:
+        log.exception("Panel %s prepare/draw failed: %s", request.panel, exc)
+        figure.clear()
+        ax = figure.add_subplot(111)
+        message = f"Erreur de rendu ({request.panel}): {exc}"
+        _unavailable(ax, message)
+        figure._erg_structure_key = fingerprint
+        figure._erg_from_prepare = True
+        figure._erg_status = "error"
+        figure._erg_error = str(exc)
+        return "error"
     # draw_panel_spec ne gère pas l’échelle flottante : appliquer ici.
     panel = request.panel
-    if panel not in {"mea_layout", "summary_rms_table"}:
+    if panel not in {"mea_layout", "summary_rms_table"} and str(
+        getattr(spec, "layout_kind", "")
+    ) != "table":
         is_montage = (
             panel in _MONTAGE_SPECS
             or panel in {"montage_continuous_raw", "full_recording"}
@@ -3924,11 +4065,7 @@ def render_panel(figure: Any, request: RenderRequest) -> str:
     has_axes = bool(list(getattr(figure, "axes", []) or []))
     prepare_path = uses_prepare_mpl(panel)
 
-    if (
-        previous == fingerprint
-        and has_axes
-        and panel not in {"mea_layout", "summary_rms_table", "summary_rms", "summary_impedance"}
-    ):
+    if previous == fingerprint and has_axes:
         # Prepare-backed panels: re-draw so Y-limits / style stay in sync with PanelSpec.
         if prepare_path or getattr(figure, "_erg_from_prepare", False):
             return _render_panel_from_prepare(figure, request, fingerprint)

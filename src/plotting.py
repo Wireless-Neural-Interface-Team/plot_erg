@@ -44,7 +44,7 @@ from pdf_layout import (
     place_legend_below,
     save_figure_to_pdf,
 )
-from plot_utils import decimate_envelope, downsample_points, shorten_filename_for_windows
+from plot_utils import decimate_envelope, downsample_curve, downsample_points, shorten_filename_for_windows
 
 from draw_primitives import (  # noqa: F401 — re-export for PDF + legacy callers
     SPIKE_OVERLAY_DEFAULT_POST_MS,
@@ -1854,9 +1854,10 @@ class _PlotRenderCache:
             t_range_s=t_range_s,
             trigger_index=trigger_index,
         )
-        extracted = _extract_spike_waveforms(
+        t_ms, waves, t_rel_spk, _total, _mean = _extract_spike_waveforms(
             source, ch, times, pre_ms=pre_ms, post_ms=post_ms
         )
+        extracted = (t_ms, waves, t_rel_spk)
         self._waveforms[key] = extracted
         return extracted
 
@@ -2330,7 +2331,7 @@ def _append_single_curve_stream_montage_pages(
                 )
             else:
                 any_curve = True
-                tx, yy = downsample_points(
+                tx, yy = downsample_curve(
                     t_plot, np.asarray(curve, dtype=np.float64), sampling_percent
                 )
                 ax.plot(tx, yy, color=line_color, linewidth=1.15, zorder=2)
@@ -2674,7 +2675,7 @@ def _append_second_to_third_stim_span_lp_montage_pages(
                 )
             else:
                 any_curve = True
-                tx, yy = downsample_points(
+                tx, yy = downsample_curve(
                     t_plot, np.asarray(curve, dtype=np.float64), sampling_percent
                 )
                 ax.plot(tx, yy, color=_MONTAGE_LP_COLOR, linewidth=1.15, zorder=2)

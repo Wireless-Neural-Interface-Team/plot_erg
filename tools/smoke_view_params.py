@@ -105,11 +105,15 @@ def _check_prepare(recording) -> None:
     dock = replace(
         base,
         style=replace(base.style, stim_linewidth=4.5, stim_onset_color="#abcdef"),
+        legend=replace(base.legend, visible=False),
+        graph_height_px=520,
     )
     frozen = replace(
         base,
         style=replace(base.style, stim_linewidth=1.0, line_width=3.3),
         texts=TextOverrides(title="Titre figé"),
+        legend=replace(base.legend, visible=True),
+        graph_height_px=300,
     )
     merged = apply_local_display_settings(dock, frozen, inherit_scale_bars=True)
     if abs(float(merged.style.stim_linewidth) - 4.5) > 1e-6:
@@ -120,6 +124,10 @@ def _check_prepare(recording) -> None:
         _fail("l’épaisseur de courbe locale a été écrasée par le dock")
     if merged.texts.title != "Titre figé":
         _fail("le titre local a été perdu")
+    if merged.legend.visible is not False:
+        _fail("override local bloque Afficher les légendes du dock")
+    if int(merged.graph_height_px) != 520:
+        _fail(f"override local bloque la hauteur de graph du dock: {merged.graph_height_px}")
 
     no_marks = replace(base, continuous_mark_stims=False)
     if _roles(prepare_panel(_request(recording, "full_recording", no_marks))) & {
@@ -549,13 +557,34 @@ def _check_montage_shared_ylim() -> None:
     recording.source = SimpleNamespace(
         amplifier=amp, highpass=amp * 0.25, lowpass=amp * 0.5
     )
+    # Axe X manuel = toute la durée fichier, pour tester l’échelle Y sur les
+    # amplitudes pleine plage (le défaut continuous est la fenêtre d’essai).
+    duration_s = float(n_samp) / float(recording.meta.fs)
     shared = ViewerSettings(
         continuous_streams=("raw", "hp"),
         continuous_stream="raw",
         montage_review_channels=2,
         montage_shared_ylim=True,
         preview_content="continuous",
+        x_limits=AxisLimits(enabled=True, minimum=0.0, maximum=duration_s),
     )
+    # Défaut continuous : toute la courbe (pas la fenêtre t_rel de stim).
+    default_cont = prepare_panel(
+        _request(
+            recording,
+            "montage_continuous_raw",
+            replace(shared, x_limits=AxisLimits(enabled=False)),
+        )
+    )
+    if default_cont.status != "ok" or default_cont.xlim is None:
+        _fail(f"fenêtre continuous par défaut absente: {default_cont.xlim}")
+    if abs(float(default_cont.xlim[0]) - 0.0) > 1e-3:
+        _fail(f"continuous ne démarre pas à 0: {default_cont.xlim}")
+    if abs(float(default_cont.xlim[1]) - duration_s) > 0.05:
+        _fail(
+            f"continuous ne couvre pas le fichier: {default_cont.xlim} vs {duration_s}"
+        )
+
     spec = prepare_panel(_request(recording, "montage_continuous_raw", shared))
     if spec.status != "ok" or len(spec.row_ylims) < 4:
         _fail(f"échelle commune : spec {spec.status} ylims={spec.row_ylims}")

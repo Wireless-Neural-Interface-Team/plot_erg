@@ -57,6 +57,7 @@ class MontageController:
             or getattr(analysis, "show_psth", False)
             or getattr(analysis, "show_trial_rate", False)
             or getattr(analysis, "show_raster", False)
+            or getattr(analysis, "show_raster_trials", False)
         )
         need_overlay = bool(getattr(analysis, "show_overlay", False))
         return need_rms, need_spikes, need_overlay
@@ -140,13 +141,11 @@ class MontageController:
         return max(1, int(getattr(settings, "montage_review_channels", 10) or 10))
 
     def needs_means(self, settings: Any) -> bool:
-        """True si la revue montage lit des moyennes / fenêtres de stim."""
+        """True si la revue montage lit des moyennes d’essais (pas une stim seule)."""
         if not self._in_montage:
             return False
-        return str(getattr(settings, "preview_content", None) or "continuous") in {
-            "average",
-            "stimulation",
-        }
+        # Mode stimulation → trigger_window (memmap), pas de moyennes précalculées.
+        return str(getattr(settings, "preview_content", None) or "continuous") == "average"
 
     def extra_flags(self, settings: Any) -> tuple[bool, bool, bool]:
         return self.analysis_extra_flags(getattr(settings, "analysis", None))

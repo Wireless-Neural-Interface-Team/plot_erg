@@ -8,6 +8,7 @@ from gui.services.redraw_scheduler import RedrawScheduler
 from gui.services.render_request_factory import RenderRequestFactory
 from gui.services.view_scopes import settings_for_zoom_window
 from gui.services.view_settings import merge_central_viewer_settings
+from gui.services.viewer_host import ViewerServiceBridge
 
 __all__ = [
     "ChannelPreviewController",
@@ -16,6 +17,7 @@ __all__ = [
     "PipelineController",
     "RedrawScheduler",
     "RenderRequestFactory",
+    "ViewerServiceBridge",
     "merge_central_viewer_settings",
     "settings_for_zoom_window",
 ]

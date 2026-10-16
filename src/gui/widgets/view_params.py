@@ -123,6 +123,7 @@ class LocalViewParams(QWidget):
         self._cb_psth: QCheckBox | None = None
         self._cb_trial_rate: QCheckBox | None = None
         self._cb_raster: QCheckBox | None = None
+        self._cb_raster_trials: QCheckBox | None = None
         self._cb_isi: QCheckBox | None = None
         self._cb_overlay: QCheckBox | None = None
         self._cb_mark_stims: QCheckBox | None = None
@@ -264,6 +265,7 @@ class LocalViewParams(QWidget):
                 analysis.show_psth
                 or analysis.show_trial_rate
                 or analysis.show_raster
+                or analysis.show_raster_trials
                 or analysis.show_isi
                 or analysis.show_overlay
             ),
@@ -274,17 +276,20 @@ class LocalViewParams(QWidget):
         self._cb_psth = QCheckBox("PSTH")
         self._cb_trial_rate = QCheckBox("Firing rate / essai")
         self._cb_raster = QCheckBox("Raster")
+        self._cb_raster_trials = QCheckBox("Raster / essai")
         self._cb_isi = QCheckBox("ISI")
         self._cb_overlay = QCheckBox("Spike scope")
         self._cb_psth.setChecked(bool(analysis.show_psth))
         self._cb_trial_rate.setChecked(bool(analysis.show_trial_rate))
         self._cb_raster.setChecked(bool(analysis.show_raster))
+        self._cb_raster_trials.setChecked(bool(analysis.show_raster_trials))
         self._cb_isi.setChecked(bool(analysis.show_isi))
         self._cb_overlay.setChecked(bool(analysis.show_overlay))
         for box in (
             self._cb_psth,
             self._cb_trial_rate,
             self._cb_raster,
+            self._cb_raster_trials,
             self._cb_isi,
             self._cb_overlay,
         ):
@@ -386,7 +391,9 @@ class LocalViewParams(QWidget):
             160, 1200, int(settings.graph_height_px), step=20, suffix=" px"
         )
         self._graph_height.setToolTip(
-            "Hauteur fixe de chaque graphique de cette fenêtre."
+            "Hauteur fixe de chaque graphique de cette fenêtre. "
+            "Grisée si « Taille amp. » est en manuel "
+            "(le bâton fixe alors le gain Y)."
         )
         self._show_scale_bars = QCheckBox("Échelle flottante (barres temps / amplitude)")
         self._show_scale_bars.setChecked(bool(getattr(settings.style, "show_scale_bars", False)))
@@ -408,8 +415,26 @@ class LocalViewParams(QWidget):
             suffix=" µV",
         )
         self._scale_bar_amp.setToolTip(
-            "Amplitude représentée par le bâton vertical. La longueur pixel "
-            "s’adapte automatiquement au zoom / à l’échelle Y."
+            "Amplitude du bâton vertical (ex. 50 µV). "
+            "Seule : le bâton suit le zoom. "
+            "Avec « Taille amp. » : fixe la hauteur du graph "
+            "(pas de recalcul du libellé)."
+        )
+        self._scale_bar_amp_len_manual = QCheckBox("Manuel")
+        self._scale_bar_amp_len_manual.setChecked(
+            bool(getattr(style, "scale_bar_amplitude_length_manual", False))
+        )
+        _amp_len0 = int(
+            round(float(getattr(style, "scale_bar_amplitude_length_px", 40.0) or 40.0))
+        )
+        self._scale_bar_amp_len_px = _int_spin(
+            4, 800, max(4, min(800, _amp_len0)), step=5, suffix=" px"
+        )
+        self._scale_bar_amp_len_px.setToolTip(
+            "Hauteur du bâton en pixels. "
+            "Seule : le libellé est calculé depuis le zoom. "
+            "Avec Amplitude : fixe la hauteur du graph "
+            "(ex. 50 µV = 40 px)."
         )
         self._scale_bar_time_manual = QCheckBox("Manuel")
         self._scale_bar_time_manual.setChecked(
@@ -426,8 +451,26 @@ class LocalViewParams(QWidget):
             suffix=" ms",
         )
         self._scale_bar_time_ms.setToolTip(
-            "Durée représentée par le bâton horizontal. La longueur pixel "
-            "s’adapte automatiquement au zoom / à l’échelle X."
+            "Durée du bâton horizontal (ex. 200 ms). "
+            "Seule : le bâton suit le zoom X, libellé = cette durée. "
+            "Avec « Taille temps » : fixe la largeur du graph "
+            "(pas de recalcul du libellé)."
+        )
+        self._scale_bar_time_len_manual = QCheckBox("Manuel")
+        self._scale_bar_time_len_manual.setChecked(
+            bool(getattr(style, "scale_bar_time_length_manual", False))
+        )
+        self._scale_bar_time_len_px = _int_spin(
+            4,
+            800,
+            int(round(float(getattr(style, "scale_bar_time_length_px", 40.0) or 40.0))),
+            suffix=" px",
+        )
+        self._scale_bar_time_len_px.setToolTip(
+            "Longueur du bâton de temps en pixels. "
+            "Seule : le libellé est calculé depuis le zoom X. "
+            "Avec Durée : fixe la largeur du graph "
+            "(ex. 200 ms = 40 px)."
         )
         amp_row = QWidget(page)
         amp_lay = QHBoxLayout(amp_row)
@@ -435,12 +478,24 @@ class LocalViewParams(QWidget):
         amp_lay.setSpacing(6)
         amp_lay.addWidget(self._scale_bar_amp_manual)
         amp_lay.addWidget(self._scale_bar_amp, 1)
+        amp_len_row = QWidget(page)
+        amp_len_lay = QHBoxLayout(amp_len_row)
+        amp_len_lay.setContentsMargins(0, 0, 0, 0)
+        amp_len_lay.setSpacing(6)
+        amp_len_lay.addWidget(self._scale_bar_amp_len_manual)
+        amp_len_lay.addWidget(self._scale_bar_amp_len_px, 1)
         time_row = QWidget(page)
         time_lay = QHBoxLayout(time_row)
         time_lay.setContentsMargins(0, 0, 0, 0)
         time_lay.setSpacing(6)
         time_lay.addWidget(self._scale_bar_time_manual)
         time_lay.addWidget(self._scale_bar_time_ms, 1)
+        time_len_row = QWidget(page)
+        time_len_lay = QHBoxLayout(time_len_row)
+        time_len_lay.setContentsMargins(0, 0, 0, 0)
+        time_len_lay.setSpacing(6)
+        time_len_lay.addWidget(self._scale_bar_time_len_manual)
+        time_len_lay.addWidget(self._scale_bar_time_len_px, 1)
         bar_lw = float(getattr(style, "scale_bar_linewidth", 1.4) or 1.4)
         self._scale_bar_linewidth = _spin(
             0.2, 20.0, bar_lw, decimals=2, step=0.1, suffix=" pt"
@@ -490,6 +545,8 @@ class LocalViewParams(QWidget):
         )
         self._scale_bar_amp_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._scale_bar_time_manual.toggled.connect(self._sync_scale_bar_inputs)
+        self._scale_bar_amp_len_manual.toggled.connect(self._sync_scale_bar_inputs)
+        self._scale_bar_time_len_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._show_scale_bars.toggled.connect(self._sync_scale_bar_inputs)
         self._sync_scale_bar_inputs()
         _max_pts_lo, _max_pts_hi = 500, 200_000
@@ -526,7 +583,9 @@ class LocalViewParams(QWidget):
             self._graph_height.hide()
         layout_form.addRow(self._show_scale_bars)
         layout_form.addRow("Amplitude barre :", amp_row)
+        layout_form.addRow("Taille amp. :", amp_len_row)
         layout_form.addRow("Temps barre :", time_row)
+        layout_form.addRow("Taille temps :", time_len_row)
         layout_form.addRow("Épaisseur du trait :", self._scale_bar_linewidth)
         layout_form.addRow("Temps — horizontal :", self._scale_bar_time_dx)
         layout_form.addRow("Temps — vertical :", self._scale_bar_time_dy)
@@ -851,8 +910,48 @@ class LocalViewParams(QWidget):
         style_form.addRow("Police fin (off) :", self._stim_off_font)
         style_form.addRow("Fin — horizontal :", self._stim_off_dx)
         style_form.addRow("Fin — vertical :", self._stim_off_dy)
+        self._show_zone_labels = QCheckBox("Libellés sous les zones de zoom")
+        self._show_zone_labels.setChecked(
+            bool(getattr(style, "show_zone_labels", True))
+        )
+        self._show_zone_labels.setToolTip(
+            "Afficher « Zone N » (ou le nom édité dans Plages / zooms) "
+            "sous chaque bande de zoom, en bas du graphique."
+        )
+        self._zone_font = FontSizeFaceRow(
+            4.0,
+            50.0,
+            float(getattr(style, "zone_font_size", 8.0) or 8.0),
+            getattr(style, "zone_face", None),
+            decimals=1,
+            step=0.5,
+        )
+        self._zone_dx = _int_spin(
+            -400,
+            400,
+            int(round(float(getattr(style, "zone_dx_px", 0.0) or 0.0))),
+            suffix=" px",
+        )
+        self._zone_dx.setToolTip(
+            "Décalage horizontal du libellé de zone. Positif = droite."
+        )
+        self._zone_dy = _int_spin(
+            -400,
+            400,
+            int(round(float(getattr(style, "zone_dy_px", 0.0) or 0.0))),
+            suffix=" px",
+        )
+        self._zone_dy.setToolTip(
+            "Décalage vertical du libellé de zone. Positif = haut."
+        )
+        style_form.addRow(self._show_zone_labels)
+        style_form.addRow("Police des zones :", self._zone_font)
+        style_form.addRow("Zone — horizontal :", self._zone_dx)
+        style_form.addRow("Zone — vertical :", self._zone_dy)
         self._show_stim_labels.toggled.connect(self._sync_stim_label_inputs)
         self._sync_stim_label_inputs()
+        self._show_zone_labels.toggled.connect(self._sync_zone_label_inputs)
+        self._sync_zone_label_inputs()
         form_layout.addWidget(style_group)
 
     def _sync_scale_bar_inputs(self, *_args: Any) -> None:
@@ -865,11 +964,29 @@ class LocalViewParams(QWidget):
         self._scale_bar_time_ms.setEnabled(
             enabled and bool(self._scale_bar_time_manual.isChecked())
         )
+        self._scale_bar_amp_len_manual.setEnabled(enabled)
+        self._scale_bar_time_len_manual.setEnabled(enabled)
+        self._scale_bar_amp_len_px.setEnabled(
+            enabled and bool(self._scale_bar_amp_len_manual.isChecked())
+        )
+        self._scale_bar_time_len_px.setEnabled(
+            enabled and bool(self._scale_bar_time_len_manual.isChecked())
+        )
         self._scale_bar_linewidth.setEnabled(enabled)
         self._scale_bar_dx.setEnabled(enabled)
         self._scale_bar_dy.setEnabled(enabled)
         self._scale_bar_time_dx.setEnabled(enabled)
         self._scale_bar_time_dy.setEnabled(enabled)
+        # Taille amp. manuelle → griser « Hauteur des graphs » (même formulaire).
+        amp_len_on = enabled and bool(self._scale_bar_amp_len_manual.isChecked())
+        if hasattr(self, "_graph_height") and bool(
+            getattr(self, "_show_graph_height", True)
+        ):
+            self._graph_height.setEnabled(not amp_len_on)
+            if hasattr(self, "_layout_form"):
+                label = self._layout_form.labelForField(self._graph_height)
+                if label is not None:
+                    label.setEnabled(not amp_len_on)
 
     def _sync_stim_label_inputs(self, *_args: Any) -> None:
         enabled = bool(self._show_stim_labels.isChecked())
@@ -883,6 +1000,11 @@ class LocalViewParams(QWidget):
             self._stim_off_dx,
             self._stim_off_dy,
         ):
+            widget.setEnabled(enabled)
+
+    def _sync_zone_label_inputs(self, *_args: Any) -> None:
+        enabled = bool(self._show_zone_labels.isChecked())
+        for widget in (self._zone_font, self._zone_dx, self._zone_dy):
             widget.setEnabled(enabled)
 
     def _watch_widgets(self) -> list[Any]:
@@ -918,6 +1040,10 @@ class LocalViewParams(QWidget):
             self._stim_on_dy,
             self._stim_off_dx,
             self._stim_off_dy,
+            self._show_zone_labels,
+            self._zone_font,
+            self._zone_dx,
+            self._zone_dy,
             self._line_width,
             self._stim_linewidth,
             self._stim_onset_color,
@@ -932,6 +1058,10 @@ class LocalViewParams(QWidget):
             self._scale_bar_amp,
             self._scale_bar_time_manual,
             self._scale_bar_time_ms,
+            self._scale_bar_amp_len_manual,
+            self._scale_bar_amp_len_px,
+            self._scale_bar_time_len_manual,
+            self._scale_bar_time_len_px,
             self._scale_bar_linewidth,
             self._scale_bar_dx,
             self._scale_bar_dy,
@@ -957,6 +1087,7 @@ class LocalViewParams(QWidget):
             self._cb_psth,
             self._cb_trial_rate,
             self._cb_raster,
+            self._cb_raster_trials,
             self._cb_isi,
             self._cb_overlay,
         ):
@@ -996,6 +1127,7 @@ class LocalViewParams(QWidget):
             self._cb_psth,
             self._cb_trial_rate,
             self._cb_raster,
+            self._cb_raster_trials,
             self._cb_isi,
             self._cb_overlay,
         )
@@ -1038,6 +1170,11 @@ class LocalViewParams(QWidget):
                 show_spikes
                 and self._cb_raster is not None
                 and self._cb_raster.isChecked()
+            ),
+            show_raster_trials=bool(
+                show_spikes
+                and self._cb_raster_trials is not None
+                and self._cb_raster_trials.isChecked()
             ),
             show_isi=bool(
                 show_spikes and self._cb_isi is not None and self._cb_isi.isChecked()
@@ -1102,6 +1239,11 @@ class LocalViewParams(QWidget):
             stim_on_dy_px=float(self._stim_on_dy.value()),
             stim_off_dx_px=float(self._stim_off_dx.value()),
             stim_off_dy_px=float(self._stim_off_dy.value()),
+            show_zone_labels=bool(self._show_zone_labels.isChecked()),
+            zone_font_size=self._zone_font.size_value(),
+            zone_face=self._zone_font.face_value(),
+            zone_dx_px=float(self._zone_dx.value()),
+            zone_dy_px=float(self._zone_dy.value()),
             grid=bool(self._grid.isChecked()),
             grid_alpha=float(self._grid_alpha.value()),
             show_borders=bool(self._show_borders.isChecked()),
@@ -1110,6 +1252,14 @@ class LocalViewParams(QWidget):
             scale_bar_time_s=float(self._scale_bar_time_ms.value()) / 1000.0,
             scale_bar_amplitude_manual=bool(self._scale_bar_amp_manual.isChecked()),
             scale_bar_amplitude=float(self._scale_bar_amp.value()),
+            scale_bar_amplitude_length_manual=bool(
+                self._scale_bar_amp_len_manual.isChecked()
+            ),
+            scale_bar_amplitude_length_px=float(self._scale_bar_amp_len_px.value()),
+            scale_bar_time_length_manual=bool(
+                self._scale_bar_time_len_manual.isChecked()
+            ),
+            scale_bar_time_length_px=float(self._scale_bar_time_len_px.value()),
             scale_bar_linewidth=float(self._scale_bar_linewidth.value()),
             scale_bar_dx_px=float(self._scale_bar_dx.value()),
             scale_bar_dy_px=float(self._scale_bar_dy.value()),

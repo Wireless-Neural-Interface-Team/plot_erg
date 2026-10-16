@@ -32,7 +32,13 @@ from gui.form_widgets import FitWidthScrollArea, configure_narrow_form
 from gui.jobs import Debouncer
 from gui.services.view_scopes import settings_for_zoom_window
 from gui.widgets.custom_zoom_dialog import ask_custom_zoom
-from gui.widgets.panel_canvas import DetachedPanelWindow, DetachedZoomWindow
+from gui.widgets.panel_canvas import (
+    DetachedPanelWindow,
+    DetachedZoomWindow,
+    _Y_SCALE_NONNEG_FAMILIES,
+    _axis_ylim_setting,
+    y_scale_family,
+)
 from gui.widgets.panel_grid import PanelGrid
 from gui.widgets.range_bars import RangeBarControllerPg, RangeBarToolbar
 from gui.widgets.view_params import LocalViewParams
@@ -47,8 +53,10 @@ from view_config import (
     ViewerSettings,
     apply_local_display_settings,
     continuous_sync_offset_s,
+    default_zone_label,
     default_zoom_range_color,
     resolved_range_bar_color,
+    resolved_zone_label,
 )
 
 _WINDOW_COUNTER = itertools.count(1)
@@ -205,13 +213,19 @@ class ChannelAnalysisWindow(QWidget):
         self._cb_psth = QCheckBox("PSTH")
         self._cb_trial_rate = QCheckBox("Firing rate / essai")
         self._cb_raster = QCheckBox("Raster")
-        self._cb_raster.setToolTip(
-            "Raster compact (style montage) + raster tous essais."
-        )
+        self._cb_raster.setToolTip("Raster compact (tous essais sur une ligne).")
+        self._cb_raster_trials = QCheckBox("Raster / essai")
+        self._cb_raster_trials.setToolTip("Raster avec une ligne par essai.")
         self._cb_psth.setChecked(analysis.show_psth)
         self._cb_trial_rate.setChecked(analysis.show_trial_rate)
         self._cb_raster.setChecked(analysis.show_raster)
-        for box in (self._cb_psth, self._cb_trial_rate, self._cb_raster):
+        self._cb_raster_trials.setChecked(analysis.show_raster_trials)
+        for box in (
+            self._cb_psth,
+            self._cb_trial_rate,
+            self._cb_raster,
+            self._cb_raster_trials,
+        ):
             spikes_layout.addWidget(box)
             box.toggled.connect(self._on_curves_toggled)
 
@@ -242,9 +256,13 @@ class ChannelAnalysisWindow(QWidget):
         # Controller continuous (barres abs. sur full_recording) — pyqtgraph.
         self._range_ctrl = RangeBarControllerPg(self)
         self._range_ctrl.barsChanged.connect(self._on_bars_changed)
+        self._range_ctrl.activeChanged.connect(self._on_range_ctrl_active_changed)
         # Controller analyse : mêmes plages, attaché aux graphs temporels.
         self._analysis_range_ctrl = RangeBarControllerPg(self)
         self._analysis_range_ctrl.barsChanged.connect(self._on_analysis_bars_changed)
+        self._analysis_range_ctrl.activeChanged.connect(
+            self._on_analysis_ctrl_active_changed
+        )
 
         self._btn_redraw = QPushButton("Redessiner", self)
         self._btn_redraw.clicked.connect(lambda: self.refreshRequested.emit(self))
@@ -487,7 +505,7 @@ class ChannelAnalysisWindow(QWidget):
         )
         # Overrides locaux (édition texte / Style) : ne pas bloquer le toggle global.
         try:
-            self.grid.sync_scale_bars_from(self.settings.style)
+            self.grid.sync_scale_bars_from(self.settings)
         except Exception:
             pass
         self._sync_params_base()
@@ -564,7 +582,7 @@ class ChannelAnalysisWindow(QWidget):
                 TimeRangeBar(
                     t0_s=t0,
                     t1_s=t1,
-                    label=bar.label.strip() or f"Plage {index + 1}",
+                    label=resolved_zone_label(bar, index),
                     bar_id=str(bar.bar_id or f"bar{index}"),
                     relative_to_stim=False,
                     color=str(bar.color or default_zoom_range_color(index)),
@@ -658,6 +676,7 @@ class ChannelAnalysisWindow(QWidget):
             show_psth=self._cb_psth.isChecked(),
             show_trial_rate=self._cb_trial_rate.isChecked(),
             show_raster=self._cb_raster.isChecked(),
+            show_raster_trials=self._cb_raster_trials.isChecked(),
             show_summary_rms=show_summary_rms,
             show_summary_rms_table=show_summary_rms_table,
         )
@@ -771,6 +790,7 @@ class ChannelAnalysisWindow(QWidget):
                 "show_psth": flags.show_psth,
                 "show_trial_rate": flags.show_trial_rate,
                 "show_raster": flags.show_raster,
+                "show_raster_trials": flags.show_raster_trials,
             }
         else:
             raw = dict(flags)
@@ -784,6 +804,7 @@ class ChannelAnalysisWindow(QWidget):
             (self._cb_psth, "show_psth"),
             (self._cb_trial_rate, "show_trial_rate"),
             (self._cb_raster, "show_raster"),
+            (self._cb_raster_trials, "show_raster_trials"),
         )
         self._pipeline_applying = True
         try:
@@ -853,6 +874,38 @@ class ChannelAnalysisWindow(QWidget):
         if index >= len(self._stim_times_s):
             index = 0
         return float(self._stim_times_s[index])
+
+    def _local_stim_for_absolute_range(self, t0: float, t1: float) -> float | None:
+        """Stim dans / la plus proche d’une plage absolue (pour afficher en t_rel)."""
+        if not self._stim_times_s:
+            return None
+        import numpy as np
+
+        stims = np.asarray(self._stim_times_s, dtype=np.float64).ravel()
+        if stims.size == 0:
+            return None
+        lo, hi = (float(t0), float(t1)) if t0 <= t1 else (float(t1), float(t0))
+        inside = stims[(stims >= lo) & (stims <= hi)]
+        if inside.size:
+            return float(inside[0])
+        mid = 0.5 * (lo + hi)
+        return float(stims[int(np.argmin(np.abs(stims - mid)))])
+
+    def _bars_for_analysis_display(self) -> list[TimeRangeBar]:
+        """Plages en coords t_rel pour le graph moyenne / stimulation."""
+        shown: list[TimeRangeBar] = []
+        for bar in self._all_range_bars():
+            if bar.relative_to_stim:
+                shown.append(replace(bar))
+                continue
+            t0, t1 = bar.ordered()
+            ref = self._local_stim_for_absolute_range(t0, t1)
+            if ref is None:
+                continue
+            shown.append(
+                replace(bar, t0_s=float(t0) - ref, t1_s=float(t1) - ref)
+            )
+        return shown
 
     def _any_zooms_applied(self) -> bool:
         return bool(self._zooms_applied)
@@ -931,6 +984,7 @@ class ChannelAnalysisWindow(QWidget):
                     show_psth=True,
                     show_trial_rate=True,
                     show_raster=True,
+                    show_raster_trials=True,
                 )
                 panel_keys = extras.selected_continuous_extra_panels()
             else:
@@ -945,6 +999,7 @@ class ChannelAnalysisWindow(QWidget):
                     show_psth=True,
                     show_trial_rate=True,
                     show_raster=True,
+                    show_raster_trials=True,
                 )
                 panel_keys = full_analysis.selected_analysis_panels()
             for key in panel_keys:
@@ -979,7 +1034,7 @@ class ChannelAnalysisWindow(QWidget):
             if self._zooms_applied:
                 for index, bar in enumerate(shared_bars):
                     t0, t1 = bar.ordered()
-                    label = bar.label.strip() or f"Plage {index + 1}"
+                    label = resolved_zone_label(bar, index)
                     bar_id = str(bar.bar_id or f"an{index}")
                     self._append_zoom_panels(
                         analysis_panels,
@@ -1031,17 +1086,19 @@ class ChannelAnalysisWindow(QWidget):
 
     @staticmethod
     def _bar_id_from_placement(placement: PanelPlacement) -> str:
-        iid = str(placement.instance_id or "")
-        if ":" in iid:
-            return iid.split(":", 1)[1]
-        return iid or placement.key
+        iid = str(placement.instance_id or "").strip()
+        if not iid:
+            return placement.key
+        # ``raw:barId`` / ``analysis_rms:barId`` → barId (dernier segment).
+        bar_id = iid.rsplit(":", 1)[-1].strip()
+        return bar_id or placement.key
 
     @staticmethod
     def _zoom_group_label(placements: Sequence[PanelPlacement]) -> str:
         if not placements:
             return "Zoom"
         zl = str(placements[0].zoom_label or "").strip()
-        # Continuous : « Zoom WIDE Plage 1 » → « Plage 1 »
+        # Continuous : « Zoom WIDE Zone 1 » → « Zone 1 »
         if zl.startswith("Zoom "):
             parts = zl.split(" ", 2)
             if len(parts) >= 3:
@@ -1103,6 +1160,8 @@ class ChannelAnalysisWindow(QWidget):
                 continue
 
             # Scope zoom : pas d’échelle X aperçu (sinon toute la courbe revient).
+            # Parent = fenêtre top-level (aperçu embarqué) ; coords écran via mapToGlobal.
+            parent_win = self.window() if self.window() is not None else self
             win = DetachedZoomWindow(
                 self.channel_name,
                 group,
@@ -1110,15 +1169,85 @@ class ChannelAnalysisWindow(QWidget):
                 panel_height=self._panel_height(),
                 zoom_key=key,
                 zoom_label=label,
-                parent=self,
+                parent=parent_win,
             )
-            win.move(self.x() + 48 + index * 36, self.y() + 48 + index * 36)
+            try:
+                origin = self.mapToGlobal(self.rect().topLeft())
+                win.move(origin.x() + 48 + index * 36, origin.y() + 48 + index * 36)
+            except Exception:
+                win.move(80 + index * 36, 80 + index * 36)
             win.closed.connect(self._on_zoom_window_closed)
             win.refreshRequested.connect(self._on_zoom_window_refresh)
             self._zoom_windows[key] = win
             win.show()
             win.raise_()
             self._render_zoom_window(win)
+
+        # Même échelle Y entre fenêtres zoom (même flux) — X reste propre à chaque plage.
+        self._sync_zoom_shared_ylims()
+
+    def _sync_zoom_shared_ylims(self) -> None:
+        """Une échelle Y commune aux zooms affichés d’une même famille de courbes.
+
+        WIDE avec WIDE, HIGH avec HIGH, etc. L’axe X n’est pas synchronisé
+        (chaque fenêtre garde sa fenêtre temporelle). Une échelle Y manuelle
+        (onglet Canal de la fenêtre) reste prioritaire pour ce panneau.
+        """
+        windows = [
+            win
+            for win in self._zoom_windows.values()
+            if isinstance(win, DetachedZoomWindow)
+        ]
+        if len(windows) < 2:
+            return
+
+        peers: dict[str, list[Any]] = {}
+        for win in windows:
+            panels = getattr(getattr(win, "grid", None), "_panels", None) or {}
+            for widget in panels.values():
+                placement = getattr(widget, "placement", None)
+                if placement is None or not getattr(placement, "has_custom_zoom", False):
+                    continue
+                family = y_scale_family(
+                    str(placement.panel),
+                    placement_stream=str(getattr(placement, "stream", "") or ""),
+                )
+                if not family:
+                    continue
+                # Y manuel local → ne pas écraser ni forcer les autres sur cette valeur.
+                request = getattr(widget, "_last_request", None)
+                host = getattr(widget, "plot_host", None) or getattr(widget, "_plot", None)
+                if request is not None and host is not None:
+                    figure = getattr(host, "figure", None)
+                    if figure is not None and _axis_ylim_setting(figure, request, 0) is not None:
+                        continue
+                peers.setdefault(family, []).append(widget)
+
+        for family, widgets in peers.items():
+            if len(widgets) < 2:
+                continue
+            y0: float | None = None
+            y1: float | None = None
+            for widget in widgets:
+                host = getattr(widget, "plot_host", None) or getattr(widget, "_plot", None)
+                if host is None:
+                    continue
+                span = host.data_ylim() if hasattr(host, "data_ylim") else None
+                if span is None:
+                    continue
+                a, b = float(span[0]), float(span[1])
+                y0 = a if y0 is None else min(y0, a)
+                y1 = b if y1 is None else max(y1, b)
+            if y0 is None or y1 is None or not (y1 > y0):
+                continue
+            shared = (y0, y1)
+            nonneg = family in _Y_SCALE_NONNEG_FAMILIES or any(
+                token in family for token in ("psth", "trial_rate", "isi", ":rms")
+            )
+            for widget in widgets:
+                apply = getattr(widget, "apply_shared_y_scale", None)
+                if callable(apply):
+                    apply(shared, non_negative=nonneg)
 
     def _on_zoom_window_closed(self) -> None:
         sender = self.sender()
@@ -1129,6 +1258,7 @@ class ChannelAnalysisWindow(QWidget):
             self._zoom_windows.pop(key, None)
         if key:
             self._user_closed_zoom_keys.add(key)
+        self._sync_zoom_shared_ylims()
 
     def _refresh_zoom_placement_catalog(self) -> tuple[PanelPlacement, ...]:
         """Recataloguer tous les zooms possibles (filtrage Canal = fenêtre zoom)."""
@@ -1140,7 +1270,7 @@ class ChannelAnalysisWindow(QWidget):
             zoom_panels: list[PanelPlacement] = []
             for index, bar in enumerate(self._all_range_bars()):
                 t0, t1 = bar.ordered()
-                label = bar.label.strip() or f"Plage {index + 1}"
+                label = resolved_zone_label(bar, index)
                 bar_id = str(bar.bar_id or f"an{index}")
                 self._append_zoom_panels(
                     [],
@@ -1202,14 +1332,17 @@ class ChannelAnalysisWindow(QWidget):
                         impedance_sessions=[],
                         preserve_view=preserve,
                     )
-                # Scope zoom : ignorer x_limits aperçu même si le panneau local
-                # a été seedé avant le correctif.
+                # Scope zoom : ignorer x_limits / plages aperçu (sinon courbe complète).
                 zoom_local = settings_for_zoom_window(local)
                 settings = apply_local_display_settings(
                     request.settings, zoom_local, include_analysis=True
                 )
+                settings = settings_for_zoom_window(settings)
                 return replace(
-                    request, settings=settings, preserve_view=preserve
+                    request,
+                    settings=settings,
+                    preserve_view=preserve,
+                    highlight_zooms=(),
                 )
 
             window.schedule_render(factory, force=True)
@@ -1307,7 +1440,13 @@ class ChannelAnalysisWindow(QWidget):
         """Liste éditable + compteurs — mêmes plages pour tous les modes."""
         bars = self._all_range_bars()
         n = len(bars)
-        active = max(0, min(n - 1, self._active_range_index)) if n else 0
+        active = int(self._active_range_index)
+        if n <= 0:
+            active = -1
+        elif active >= 0:
+            active = max(0, min(n - 1, active))
+        else:
+            active = -1
         self._active_range_index = active
         self._range_toolbar.set_bars(bars, active)
 
@@ -1360,7 +1499,47 @@ class ChannelAnalysisWindow(QWidget):
         return None
 
     def _add_bar(self) -> None:
-        """+ Absolue : barre centrée (10 % du graph) — n’ouvre pas les zooms."""
+        """+ Absolue : barre centrée (10 % du graph) — n’ouvre pas les zooms.
+
+        En moyenne / stimulation le graph est en t_rel : on crée une plage
+        *relative* (sinon les bornes t_rel seraient traitées comme temps fichier).
+        """
+        if self.is_analysis_view():
+            span = self._visible_graph_time_span()
+            if span is None:
+                settings = self.local_settings()
+                t0 = float(settings.zoom_onset_t0_s)
+                t1 = float(settings.zoom_onset_t1_s)
+            else:
+                width = max(1e-3, 0.1 * (span[1] - span[0]))
+                mid = 0.5 * (span[0] + span[1])
+                t0, t1 = mid - 0.5 * width, mid + 0.5 * width
+            n = len(self._relative_ranges) + 1
+            color_index = len(self._all_range_bars())
+            self._relative_ranges.append(
+                TimeRangeBar(
+                    t0_s=float(t0),
+                    t1_s=float(t1),
+                    label=default_zone_label(len(self._all_range_bars())),
+                    bar_id=uuid.uuid4().hex[:8],
+                    relative_to_stim=True,
+                    color=default_zoom_range_color(color_index),
+                )
+            )
+            self._active_range_index = len(self._all_range_bars()) - 1
+            self._update_range_counts()
+            self._sync_settings_from_bars()
+            self._sync_analysis_range_ctrl_from_list()
+            self._attach_range_bars_to_analysis()
+            if self._zooms_applied:
+                self._rebuild_placements(reopen_zooms=True)
+                self.refreshRequested.emit(self)
+            self._status.setText(
+                f"Plage relative [{t0:g} … {t1:g}] s (graph analyse) — "
+                "« Appliquer les zooms » pour ouvrir."
+            )
+            return
+
         span = self._visible_graph_time_span()
         if span is not None:
             self._range_ctrl.set_time_span(span[0], span[1])
@@ -1376,10 +1555,7 @@ class ChannelAnalysisWindow(QWidget):
         self._sync_settings_from_bars()
         self._sync_analysis_range_ctrl_from_list()
         # Réattacher sur un host vivant (évite un redraw sur ViewBox détruite).
-        if self.is_analysis_view():
-            self._attach_range_bars_to_analysis()
-        else:
-            self._attach_range_bars_to_full_recording()
+        self._attach_range_bars_to_full_recording()
         if self._zooms_applied:
             self._rebuild_placements(reopen_zooms=True)
             self.refreshRequested.emit(self)
@@ -1432,6 +1608,13 @@ class ChannelAnalysisWindow(QWidget):
         if not bars:
             QMessageBox.information(self, "Plages", "Aucune plage à supprimer.")
             return
+        if self._active_range_index < 0:
+            QMessageBox.information(
+                self,
+                "Plages",
+                "Aucune plage sélectionnée — cliquez une plage (liste ou bande).",
+            )
+            return
         idx = max(0, min(len(bars) - 1, self._active_range_index))
         target = bars[idx]
         if target.relative_to_stim:
@@ -1447,9 +1630,11 @@ class ChannelAnalysisWindow(QWidget):
                 self._range_ctrl.detach()
                 self._range_ctrl.set_bars(abs_bars, active_index=max(0, abs_idx - 1))
         remaining = self._all_range_bars()
-        self._active_range_index = max(0, min(len(remaining) - 1, idx))
         if not remaining:
+            self._active_range_index = -1
             self._zooms_applied = False
+        else:
+            self._active_range_index = max(0, min(len(remaining) - 1, idx))
         self._update_range_counts()
         self._sync_settings_from_bars()
         self._sync_analysis_range_ctrl_from_list()
@@ -1459,26 +1644,59 @@ class ChannelAnalysisWindow(QWidget):
     def _on_active_changed(self, index: int) -> None:
         bars = self._all_range_bars()
         if not bars:
-            self._active_range_index = 0
+            self._active_range_index = -1
+            self._range_ctrl.set_active_index(-1)
+            self._analysis_range_ctrl.set_active_index(-1)
+            self._sync_settings_from_bars()
+            self._update_range_counts()
             return
-        self._active_range_index = max(0, min(len(bars) - 1, int(index)))
-        n_abs = len(self._range_ctrl.bars or ())
-        if self.is_analysis_view():
-            # Le contrôleur d’analyse porte absolues puis relatives, dans cet ordre.
-            self._analysis_range_ctrl.set_active_index(self._active_range_index)
-        elif self._active_range_index < n_abs:
-            self._range_ctrl.set_active_index(self._active_range_index)
+        raw = int(index)
+        if raw < 0:
+            self._active_range_index = -1
+            self._range_ctrl.set_active_index(-1)
             self._analysis_range_ctrl.set_active_index(-1)
         else:
-            self._range_ctrl.set_active_index(-1)
-            self._analysis_range_ctrl.set_active_index(self._active_range_index - n_abs)
+            self._active_range_index = max(0, min(len(bars) - 1, raw))
+            n_abs = len(self._range_ctrl.bars or ())
+            if self.is_analysis_view():
+                # Le contrôleur d’analyse porte absolues puis relatives, dans cet ordre.
+                self._analysis_range_ctrl.set_active_index(self._active_range_index)
+            elif self._active_range_index < n_abs:
+                self._range_ctrl.set_active_index(self._active_range_index)
+                self._analysis_range_ctrl.set_active_index(-1)
+            else:
+                self._range_ctrl.set_active_index(-1)
+                self._analysis_range_ctrl.set_active_index(
+                    self._active_range_index - n_abs
+                )
         self._sync_settings_from_bars()
         self._update_range_counts()
+
+    def _on_range_ctrl_active_changed(self, local_index: int) -> None:
+        """Sélection / désélection depuis une bande continuous (abs)."""
+        if int(local_index) >= 0:
+            self._on_active_changed(int(local_index))
+            return
+        # Clic à côté : ne vider le global que si l’autre contrôleur n’est pas actif.
+        if int(self._analysis_range_ctrl.active_index) < 0:
+            self._on_active_changed(-1)
+
+    def _on_analysis_ctrl_active_changed(self, local_index: int) -> None:
+        """Sélection / désélection depuis une bande analyse / relative."""
+        if int(local_index) >= 0:
+            if self.is_analysis_view():
+                self._on_active_changed(int(local_index))
+            else:
+                n_abs = len(self._range_ctrl.bars or ())
+                self._on_active_changed(n_abs + int(local_index))
+            return
+        if int(self._range_ctrl.active_index) < 0:
+            self._on_active_changed(-1)
 
     def _on_range_color_changed(self, color: str) -> None:
         """Compat nuancier legacy → délègue à l’édition de la plage active."""
         bars = list(self._all_range_bars())
-        if not bars:
+        if not bars or self._active_range_index < 0:
             return
         idx = max(0, min(len(bars) - 1, self._active_range_index))
         self._on_bar_edited(idx, bars[idx].with_color(str(color)))
@@ -1545,12 +1763,38 @@ class ChannelAnalysisWindow(QWidget):
                 if bar.relative_to_stim
             ]
             n_abs = len(self._range_ctrl.bars or ())
-            self._active_range_index = n_abs + int(self._analysis_range_ctrl.active_index)
+            local = int(self._analysis_range_ctrl.active_index)
+            self._active_range_index = -1 if local < 0 else n_abs + local
             self._update_range_counts()
             self._analysis_bars_debouncer.request()
             return
-        abs_bars = [b for b in shared if not b.relative_to_stim]
-        rel_bars = [b for b in shared if b.relative_to_stim]
+        # Graph analyse = t_rel. Les plages « absolues » y sont affichées converties :
+        # au drop, reconvertir vers temps fichier via la stim locale d’origine.
+        prev_abs = {
+            str(b.bar_id): b for b in (self._range_ctrl.bars or ()) if b.bar_id
+        }
+        abs_bars: list[TimeRangeBar] = []
+        rel_bars: list[TimeRangeBar] = []
+        for bar in shared:
+            if bar.relative_to_stim:
+                rel_bars.append(replace(bar))
+                continue
+            prev = prev_abs.get(str(bar.bar_id or ""))
+            ref = None
+            if prev is not None:
+                ref = self._local_stim_for_absolute_range(*prev.ordered())
+            if ref is None:
+                ref = self._stim_reference_s()
+            if ref is None:
+                continue
+            abs_bars.append(
+                replace(
+                    bar,
+                    t0_s=float(bar.t0_s) + float(ref),
+                    t1_s=float(bar.t1_s) + float(ref),
+                    relative_to_stim=False,
+                )
+            )
         try:
             self._range_ctrl.barsChanged.disconnect(self._on_bars_changed)
         except (TypeError, RuntimeError):
@@ -1591,6 +1835,7 @@ class ChannelAnalysisWindow(QWidget):
         self._sync_zoom_windows(reopen=False)
         for zoom in list(self._zoom_windows.values()):
             self._render_zoom_window(zoom)
+        self._sync_zoom_shared_ylims()
         self._status.setText("Barres déplacées — zooms actualisés.")
         self._refresh_spike_scope_for_active_range()
 
@@ -1607,7 +1852,7 @@ class ChannelAnalysisWindow(QWidget):
         abs_bars = self._range_ctrl.bars or ()
         for index, bar in enumerate(abs_bars):
             t0, t1 = bar.ordered()
-            label = bar.label.strip() or f"Plage {index + 1}"
+            label = resolved_zone_label(bar, index)
             bar_id = str(bar.bar_id or f"bar{index}")
             self._append_zoom_panels(
                 analysis_panels,
@@ -1650,7 +1895,7 @@ class ChannelAnalysisWindow(QWidget):
         zoom_panels: list[PanelPlacement] = []
         for index, bar in enumerate(self._all_range_bars()):
             t0, t1 = bar.ordered()
-            label = bar.label.strip() or f"Plage {index + 1}"
+            label = resolved_zone_label(bar, index)
             bar_id = str(bar.bar_id or f"an{index}")
             self._append_zoom_panels(
                 analysis_panels,
@@ -1668,18 +1913,27 @@ class ChannelAnalysisWindow(QWidget):
         self._sync_zoom_windows(reopen=False)
         for zoom in list(self._zoom_windows.values()):
             self._render_zoom_window(zoom)
+        self._sync_zoom_shared_ylims()
         self._status.setText("Barres déplacées — zooms actualisés.")
         self._refresh_spike_scope_for_active_range()
 
     def _sync_analysis_range_ctrl_from_list(self) -> None:
-        """Pousser les plages partagées vers le controller analyse."""
+        """Pousser les plages partagées vers le controller analyse (coords t_rel)."""
         ctrl = self._analysis_range_ctrl
         try:
             ctrl.barsChanged.disconnect(self._on_analysis_bars_changed)
         except (TypeError, RuntimeError):
             pass
-        bars = list(self._all_range_bars())
-        ctrl.set_bars(bars, active_index=self._active_range_index)
+        # Toujours en t_rel sur le graph analyse (abs converties via stim locale).
+        bars = self._bars_for_analysis_display()
+        active = int(self._active_range_index)
+        if not bars:
+            active = -1
+        elif active >= 0:
+            active = max(0, min(len(bars) - 1, active))
+        else:
+            active = -1
+        ctrl.set_bars(bars, active_index=active)
         ctrl.barsChanged.connect(self._on_analysis_bars_changed)
 
 
@@ -1719,11 +1973,19 @@ class ChannelAnalysisWindow(QWidget):
         except Exception:
             pass
         self._sync_analysis_range_ctrl_from_list()
+        self._analysis_range_ctrl.set_zone_label_style(self.settings.style)
         self._analysis_range_ctrl.attach(host)
 
     def _sync_settings_from_bars(self) -> None:
         self.settings = self.local_settings()
         self._sync_params_base()
+        self._sync_zone_label_style()
+
+    def _sync_zone_label_style(self) -> None:
+        """Police / placement des libellés Zone N (Affichage, toutes les vues)."""
+        style = getattr(self.settings, "style", None)
+        self._range_ctrl.set_zone_label_style(style)
+        self._analysis_range_ctrl.set_zone_label_style(style)
 
     def _configure_preview_grid(self) -> None:
         """Hauteur fixe pour continuous / moyenne / stimulation (pas de fill viewport)."""
@@ -1753,7 +2015,7 @@ class ChannelAnalysisWindow(QWidget):
             "analysis_psth": self._cb_psth,
             "analysis_trial_rate": self._cb_trial_rate,
             "analysis_raster_channel": self._cb_raster,
-            "analysis_raster": self._cb_raster,
+            "analysis_raster": self._cb_raster_trials,
         }
         return mapping.get(str(panel))
 
@@ -1810,7 +2072,7 @@ class ChannelAnalysisWindow(QWidget):
             "analysis_psth": self._cb_psth,
             "analysis_trial_rate": self._cb_trial_rate,
             "analysis_raster_channel": self._cb_raster,
-            "analysis_raster": self._cb_raster,
+            "analysis_raster": self._cb_raster_trials,
         }
         return mapping.get(str(panel))
 
@@ -1868,15 +2130,16 @@ class ChannelAnalysisWindow(QWidget):
     def redraw(self, *, preserve_view: bool = False) -> None:
         """Redessiner. ``preserve_view=True`` conserve zoom / pan (ex. après Traiter)."""
         self.settings = self.local_settings()
+        self._sync_zone_label_style()
         try:
-            self.grid.sync_scale_bars_from(self.settings.style)
+            self.grid.sync_scale_bars_from(self.settings)
         except Exception:
             pass
         if self._placements:
             # Appliquer la hauteur fixe sans reconstruire la grille.
-            self.grid.set_panel_height(
-                self._panel_height(), uniform=True, fill=False
-            )
+            height = self._panel_height()
+            self.grid.set_panel_height(height, uniform=True, fill=False)
+            self.grid.set_graph_height(height)
         if self._request_factory is None:
             return
         keep = bool(preserve_view) or bool(self._preserve_view)
@@ -1908,6 +2171,7 @@ class ChannelAnalysisWindow(QWidget):
         self.grid.schedule_render(factory, force=True)
         for zoom in list(self._zoom_windows.values()):
             self._render_zoom_window(zoom)
+        self._sync_zoom_shared_ylims()
         for detached in list(self._detached.values()):
             self._render_zoom_window(detached)
 
@@ -1962,6 +2226,7 @@ class ChannelAnalysisWindow(QWidget):
                     )
             except Exception:
                 pass
+            self._range_ctrl.set_zone_label_style(self.settings.style)
             self._range_ctrl.attach(host)
             break
 
@@ -2000,10 +2265,12 @@ class ChannelAnalysisWindow(QWidget):
         except (TypeError, RuntimeError):
             pass
         self._analysis_range_ctrl.set_display_offset(offset)
-        self._analysis_range_ctrl.set_bars(shown, active_index=max(0, active))
+        rel_active = -1 if active < 0 else max(0, active)
+        self._analysis_range_ctrl.set_bars(shown, active_index=rel_active)
         if active < 0:
             self._analysis_range_ctrl.set_active_index(-1)
         self._analysis_range_ctrl.barsChanged.connect(self._on_analysis_bars_changed)
+        self._analysis_range_ctrl.set_zone_label_style(self.settings.style)
         self._analysis_range_ctrl.attach(host)
 
     def closeEvent(self, event: Any) -> None:  # noqa: D102

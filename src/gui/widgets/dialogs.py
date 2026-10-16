@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from erg_cache import (
+    DEFAULT_CACHE_MAX_BYTES,
     cache_size_bytes,
     clear_cache,
     describe_cache,
@@ -40,7 +42,7 @@ class ExportOptions:
     directory: Path
     include_trigger_windows: bool = True
     include_overlay: bool = True
-    include_streams: bool = False
+    include_streams: bool = True
     make_archive: bool = False
 
 
@@ -71,9 +73,13 @@ class ExportDatasetDialog(QDialog):
         )
         self._overlay.setChecked(True)
         self._streams = QCheckBox(
-            "Flux complets brut / passe-haut / passe-bas (très volumineux, rarement utile)"
+            "Flux complets brut / HP / LP (requis pour export PDF sans le .rhs ; volumineux)"
         )
-        self._streams.setChecked(False)
+        self._streams.setChecked(True)
+        self._streams.setToolTip(
+            "Inclure les memmaps ampli / passe-haut / passe-bas. "
+            "Nécessaire pour générer un rapport PDF depuis le dataset traité seul."
+        )
         self._archive = QCheckBox("Créer aussi une archive .zip pour le transport")
         self._archive.setChecked(False)
 
@@ -82,7 +88,8 @@ class ExportDatasetDialog(QDialog):
 
         hint = QLabel(
             "Le dataset exporté se rouvre sans le fichier .rhs d’origine : moyennes "
-            "d’essais, profils RMS, trains de spikes, seuils et métadonnées sont inclus."
+            "d’essais, profils RMS, trains de spikes, seuils et métadonnées sont inclus. "
+            "Cochez les flux complets si vous voulez aussi exporter un PDF hors machine source."
         )
         hint.setObjectName("hintLabel")
         hint.setWordWrap(True)
@@ -146,9 +153,21 @@ class CacheDialog(QDialog):
         for column in range(1, 5):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
 
-        prune = QPushButton("Garder seulement 20 Go")
+        self._limit_gb = QDoubleSpinBox(self)
+        self._limit_gb.setRange(0.5, 500.0)
+        self._limit_gb.setDecimals(1)
+        self._limit_gb.setSingleStep(1.0)
+        self._limit_gb.setSuffix(" Go")
+        self._limit_gb.setValue(DEFAULT_CACHE_MAX_BYTES / (1024**3))
+        self._limit_gb.setToolTip(
+            "Budget disque cible. L’élagage retire d’abord les bundles / filtres / "
+            "flux bruts les plus anciens (datasets ouverts protégés)."
+        )
+
+        prune = QPushButton("Élaguer au budget")
         prune.setToolTip(
-            "Supprimer les datasets en cache les plus anciens jusqu’à tenir en 20 Go."
+            "Supprimer les entrées les plus anciennes (bundles, filtres HP/LP, flux bruts) "
+            "jusqu’à tenir dans le budget choisi."
         )
         prune.clicked.connect(self._prune)
         clear = QPushButton("Vider le cache")
@@ -160,6 +179,11 @@ class CacheDialog(QDialog):
         close = QPushButton("Fermer")
         close.clicked.connect(self.accept)
 
+        budget_row = QHBoxLayout()
+        budget_row.addWidget(QLabel("Budget :"))
+        budget_row.addWidget(self._limit_gb)
+        budget_row.addStretch(1)
+
         buttons = QHBoxLayout()
         buttons.addWidget(prune)
         buttons.addWidget(clear)
@@ -170,9 +194,13 @@ class CacheDialog(QDialog):
         layout.addWidget(QLabel(f"Dossier de cache : {self._root}"))
         layout.addWidget(self.table, 1)
         layout.addWidget(self._summary)
+        layout.addLayout(budget_row)
         layout.addLayout(buttons)
 
         self.refresh()
+
+    def _budget_bytes(self) -> int:
+        return int(float(self._limit_gb.value()) * (1024**3))
 
     def refresh(self) -> None:
         entries = describe_cache(self._root)
@@ -191,32 +219,36 @@ class CacheDialog(QDialog):
                     item.setToolTip(str(entry.root))
                 self.table.setItem(row, column, item)
         total = cache_size_bytes(self._root)
+        limit = self._budget_bytes()
         self._summary.setText(
             f"{len(entries)} dataset(s) en cache · {human_bytes(total)} sur disque "
-            "(y compris les caches de flux bruts partagés)."
+            f"(budget {human_bytes(limit)} ; bundles + filtres + flux bruts)."
         )
 
     def _prune(self) -> None:
         total = cache_size_bytes(self._root)
-        limit = 20 * 1024**3
+        limit = self._budget_bytes()
         if total <= limit:
             QMessageBox.information(
                 self,
                 "Cache",
-                f"Le cache fait déjà {human_bytes(total)} (≤ 20 Go). Rien à supprimer.",
+                f"Le cache fait déjà {human_bytes(total)} "
+                f"(≤ {human_bytes(limit)}). Rien à supprimer.",
             )
             return
         reply = QMessageBox.question(
             self,
             "Élaguer le cache",
             f"Cache actuel : {human_bytes(total)}.\n"
-            f"Supprimer les entrées les plus anciennes jusqu’à ≈ 20 Go ?\n"
-            f"(Les datasets ouverts restent protégés.)",
+            f"Supprimer les entrées les plus anciennes jusqu’à ≈ {human_bytes(limit)} ?\n"
+            f"(Les datasets ouverts restent protégés ; les flux bruts orphelins sont inclus.)",
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        removed = prune_cache(self._root, max_bytes=limit, keep=self._protected)
-        self._summary.setText(f"{removed} dataset(s) supprimé(s).")
+        removed = prune_cache(
+            self._root, max_bytes=limit, keep=self._protected, include_raw=True
+        )
+        self._summary.setText(f"{removed} entrée(s) de cache supprimée(s).")
         self.refresh()
 
     def _clear(self) -> None:

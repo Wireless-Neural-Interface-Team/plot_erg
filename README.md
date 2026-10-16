@@ -34,11 +34,11 @@ without the original `.rhs` file.
 - `src/view_config.py` — live display settings: legends, panel style, views and tabs
 - `src/panel_prepare.py` — backend-neutral panel data specs (screen + PDF for supported panels)
 - `src/panel_draw_mpl.py` — matplotlib drawer for `PanelSpec` (PDF / CLI; includes triggered montages + full_recording)
-- `src/panel_registry.py` — PDF orchestration + legacy renderers (`montage_continuous_raw`, MEA, summaries)
+- `src/panel_registry.py` — PDF orchestration (panels via `prepare_panel` → `panel_draw_mpl`)
 - `src/display_config.py` — PDF section visibility and recording styles
 - `src/gui/` — Qt viewer (PySide6 + **pyqtgraph** screen plots)
   - `services/` — redraw, pipeline, montage, preview, export, render-request factory
-  - `widgets/plot_host.py` — pyqtgraph plot surface
+  - `widgets/plot_host/` — pyqtgraph plot surface (host + mixins montage / scale bars / stim-zone / view)
   - `jobs.py` — background build / ensure / filter warm (never on the UI thread)
 - `src/cli.py` — command-line entry point (PDF via the same `build_recording` path)
 - `run_gui.py` — GUI launcher
@@ -52,16 +52,34 @@ without the original `.rhs` file.
 
 ## Install
 
+Editable install (recommended — exposes the `plot-erg` and `intan-trigger-plotter` entry points):
+
+```bash
+pip install -e ".[dev]"
+```
+
+Or requirements only:
+
 ```bash
 pip install -r requirements.txt
 ```
 
-Dependencies: `numpy`, `scipy`, `matplotlib`, `PySide6`, `pyqtgraph`.
+Dependencies: `numpy`, `scipy`, `matplotlib`, `PySide6`, `pyqtgraph`. Dev extras add `pytest`.
+
+### Packaging for end users
+
+- Day-to-day: `pipx install -e .` then `plot-erg`, or `python run_gui.py` from a venv.
+- Windows one-folder build (optional):
+  `pyinstaller --noconfirm --windowed --name plot_erg run_gui.py`
+  after `pip install pyinstaller` in the same environment. Bundle the probe JSON /
+  sample data next to the executable if needed.
 
 ## The viewer
 
 ```bash
 python run_gui.py
+# or, after editable install:
+plot-erg
 ```
 
 ### Window layout
@@ -146,6 +164,8 @@ python src/cli.py a.rhs b.rhs --save-dir "plots"   # multi-recording PDF
 
 ### Main CLI options
 
+- `--channels`: comma-separated 0-based indices / ranges (`0,3,5-8`) — only those
+  channels are filtered and materialized for the PDF (default: all)
 - `--edge`: `falling`, `rising`, or `none`
 - `--threshold`, `--pre`, `--post`
 - `--zoom-mode`: `none`, `onset`, `trigger_end`, `both`
@@ -161,10 +181,12 @@ Amplifier traces are in **microvolts (µV)**.
 
 ## Checks
 
-The scripts in `tools/` run without any recording, on synthetic data.
-GitHub Actions runs the same suite on every push / pull request.
+Unit tests (`pytest`) plus the scripts in `tools/` (synthetic data; real-RHS
+smokes skip when `exemple.rhs` is absent). GitHub Actions runs the same suite
+on every push / pull request.
 
 ```bash
+pytest -q
 python tools/smoke_dataset.py         # write, reopen and compare a processed dataset
 python tools/smoke_render.py          # draw every panel (matplotlib / PDF path)
 python tools/smoke_gui.py             # build the window offscreen and redraw every panel
@@ -172,4 +194,13 @@ python tools/smoke_perf.py            # timings: means, redraw, filter cache, Pl
 python tools/smoke_montage_ylim.py    # montage Y autoscale / preserve_view
 python tools/smoke_montage_kind.py    # montage kind visibility regression
 python tools/smoke_ylim_autoscale.py  # manual → auto Y scale regression
+python tools/smoke_montage_filters.py # HIGH/LOW until filters ready
+python tools/smoke_view_params.py     # display params → redraw
+python tools/smoke_spike_scope.py     # spike overlay window
 ```
+
+### Cache budget
+
+*Process → Cache manager* shows total disk use (bundles + filter stores + raw
+memmaps). Set a Go budget and **Élaguer au budget** to prune oldest entries
+(including raw / filter trees). Open datasets stay protected.

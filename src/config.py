@@ -62,6 +62,8 @@ class AnalysisConfig:
     channel_workers: int | None = None
     sampling_percent: int = 100
     probe_layout_json: Path | None = None
+    # Optional 0-based channel indices for CLI/PDF materialization (None = all).
+    pdf_channels: tuple[int, ...] | None = None
     # Custom legend label (falls back to .rhs stem when empty).
     recording_label: str | None = None
     recording_style: RecordingStyle = field(default_factory=RecordingStyle.visible)

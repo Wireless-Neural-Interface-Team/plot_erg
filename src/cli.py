@@ -11,12 +11,54 @@ from config import AnalysisConfig
 from display_config import resolve_display_label
 
 
+def _resolve_pdf_channels(n_channels: int, selected: tuple[int, ...] | None) -> list[int]:
+    """Clamp / dedupe 0-based channel indices; ``None`` → all channels."""
+    if not selected:
+        return list(range(int(n_channels)))
+    out: list[int] = []
+    seen: set[int] = set()
+    for raw in selected:
+        ch = int(raw)
+        if ch < 0 or ch >= int(n_channels) or ch in seen:
+            continue
+        seen.add(ch)
+        out.append(ch)
+    if not out:
+        raise ValueError(
+            f"No valid --channels in {selected!r} for n_channels={n_channels}."
+        )
+    return out
+
+
+def _parse_channels_arg(raw: str | None) -> tuple[int, ...] | None:
+    """Parse ``0,3,5-8`` style channel lists into a tuple of indices."""
+    if raw is None or not str(raw).strip():
+        return None
+    values: list[int] = []
+    for part in str(raw).split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            left, right = token.split("-", 1)
+            start, end = int(left), int(right)
+            if end < start:
+                start, end = end, start
+            values.extend(range(start, end + 1))
+        else:
+            values.append(int(token))
+    return tuple(values)
+
+
 def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple:
     """Build via ``build_recording`` (same as GUI), warm filters, materialize stacks.
 
     Returns the picklable 10-tuple expected by ``_run_streaming_comparison``:
     t_rel, names, n_valid, n_total, fs, end_rising_s, triggers, pre_n, post_n, amp_path.
     HP/LP are written next to ``amp_path`` as ``high_intan.npy`` / ``low_intan.npy``.
+
+    When ``config.pdf_channels`` is set, only those channels are materialized
+    (dense stacks shaped ``(n_selected, n_samples)``).
     """
     import numpy as np
 
@@ -40,7 +82,7 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple:
 
     n_channels = int(recording.n_channels)
     n_samples = int(recording.meta.n_samples)
-    channels = list(range(n_channels))
+    channels = _resolve_pdf_channels(n_channels, config.pdf_channels)
     for bank_name in ("highpass", "lowpass"):
         bank = getattr(source, bank_name, None)
         prefetch = getattr(bank, "prefetch", None)
@@ -56,13 +98,13 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple:
     if dsp is not None:
         dsp.save_json(work_dir / "intan_dsp.json")
 
+    n_out = len(channels)
     amp_out = work_dir / "amplifier.npy"
-    amp_mm = open_writable_memmap(amp_out, (n_channels, n_samples), np.dtype(np.float32))
+    amp_mm = open_writable_memmap(amp_out, (n_out, n_samples), np.dtype(np.float32))
     try:
         src_amp = np.asarray(source.amplifier)
-        for start in range(0, n_channels, 8):
-            end = min(n_channels, start + 8)
-            amp_mm[start:end] = np.asarray(src_amp[start:end], dtype=np.float32)
+        for out_i, ch in enumerate(channels):
+            amp_mm[out_i] = np.asarray(src_amp[ch], dtype=np.float32)
         amp_mm.flush()
     finally:
         del amp_mm
@@ -71,10 +113,10 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple:
     low = source.lowpass
     for name, bank in (("high_intan.npy", high), ("low_intan.npy", low)):
         out = work_dir / name
-        mm = open_writable_memmap(out, (n_channels, n_samples), np.dtype(np.float32))
+        mm = open_writable_memmap(out, (n_out, n_samples), np.dtype(np.float32))
         try:
-            for ch in channels:
-                mm[ch] = np.asarray(bank[ch], dtype=np.float32)
+            for out_i, ch in enumerate(channels):
+                mm[out_i] = np.asarray(bank[ch], dtype=np.float32)
             mm.flush()
         finally:
             del mm
@@ -84,7 +126,8 @@ def _compute_payload_for_streaming(config: AnalysisConfig) -> tuple:
     triggers = np.asarray(recording.derived.triggers, dtype=np.int64)
     t_rel = np.asarray(recording.derived.t_rel, dtype=np.float64)
     seg = recording.meta.segmentation
-    names = list(recording.channel_names)
+    all_names = list(recording.channel_names)
+    names = [all_names[ch] if ch < len(all_names) else f"ch{ch}" for ch in channels]
     fs = float(recording.meta.fs)
     end_rising = seg.end_rising_s
     n_valid = int(seg.n_trials)
@@ -372,6 +415,15 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="probeinterface JSON (MEA): electrode map inset when channel maps.",
     )
+    parser.add_argument(
+        "--channels",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated 0-based channel indices (ranges ok: 0,3,5-8). "
+            "Only those channels are filtered/materialized for the PDF (default: all)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -399,10 +451,14 @@ def run(config: AnalysisConfig) -> None:
         else:
             print(f"Target section count: {config.section_count}")
         print(f"Sections used for average: {n_valid}")
+        if n_total > n_valid:
+            print(f"  ({n_total - n_valid} section(s) excluded: [-pre,+post] window outside signal)")
+        print(f"Time window: [-{config.pre_s:.3f}s, +{config.post_s:.3f}s]")
         print(
             f"Imaginary stimulation markers per segment: "
             f"{config.section_trigger_start_s:g}–{config.section_trigger_end_s:g} s "
-            f"(PDF shows the full section; t=0 at segment start + {config.section_trigger_start_s:g} s)"
+            f"(same [-pre,+post] display as real stimulations; "
+            f"t=0 at segment start + {config.section_trigger_start_s:g} s)"
         )
     else:
         print("--- Stimulations (ANALOG_IN 0) ---")
@@ -418,7 +474,7 @@ def run(config: AnalysisConfig) -> None:
             print("Next rising edge at threshold: not computed (no rising edge after stimulations).")
     print(f"Channels compared (overlay): {stats['n_ch']}")
     if config.edge == "none":
-        print("Segmentation: equal sections with imaginary stimulation window")
+        print("Segmentation: equal sections with imaginary stimulations ([-pre,+post] windows)")
     print(
         "Mean traces in PDF: raw + separate Intan HP and LP "
         f"(HP {config.intan_hp_filter_type} @ {config.intan_hp_filter_cutoff_hz:g} Hz "
@@ -448,7 +504,10 @@ def run_multi_comparison(configs: list[AnalysisConfig]) -> None:
     print(f"Multi compute time (multiprocessing): {stats['t_compute_s']:.2f} s")
     print(f"Multi PDF render time: {stats['t_render_s']:.2f} s")
     if configs[0].edge == "none":
-        print("Segmentation: no stimulation — equal contiguous sections")
+        print(
+            "Segmentation: no stimulation — equal sections with "
+            f"[-{configs[0].pre_s:g}, +{configs[0].post_s:g}] s windows"
+        )
     else:
         print(f"ANALOG_IN 0 edge: {configs[0].edge}")
     print(f"Comparison PDF written: {pdf_path}")
@@ -457,17 +516,15 @@ def run_multi_comparison(configs: list[AnalysisConfig]) -> None:
 
 def _autotune_config(cfg: AnalysisConfig, n_files: int) -> AnalysisConfig:
     """Auto-tuning policy biased toward stable throughput."""
-    from core import uses_analog_trigger
-
     if n_files <= 1:
         return replace(cfg, comparison_workers=1)
     workers = max(1, min(int(cfg.comparison_workers), max(1, min(6, n_files))))
     channel_workers = cfg.channel_workers
     if channel_workers is None:
         channel_workers = 8 if n_files <= 3 else 4
-    if uses_analog_trigger(cfg) and cfg.pre_s + cfg.post_s > 20:
+    if cfg.pre_s + cfg.post_s > 20:
         workers = min(workers, 3)
-        channel_workers = min(channel_workers, 4)
+        channel_workers = min(int(channel_workers), 4)
     sampling_percent = cfg.sampling_percent
     if n_files >= 2 and sampling_percent > 50:
         sampling_percent = 50
@@ -490,7 +547,7 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
 
     import numpy as np
 
-    from core import AmplifierSpikeSource, uses_analog_trigger
+    from core import AmplifierSpikeSource
     from impedance_tracking import collect_impedance_sessions
     from memmap_io import load_readonly_memmap
     from plotting import plot_channel_multi_comparison
@@ -507,7 +564,7 @@ def _run_streaming_comparison(configs: list[AnalysisConfig], label: str) -> tupl
     plot_display = tuned[0].plot_display
     print(f"{label.capitalize()}: {len(tuned)} file(s).")
     print("Files: " + " | ".join(cfg.rhs_file.name for cfg in tuned))
-    if uses_analog_trigger(tuned[0]) and tuned[0].pre_s + tuned[0].post_s > 20:
+    if tuned[0].pre_s + tuned[0].post_s > 20:
         print("Guardrail mode: large window detected, parallelism limited for memory stability.")
     if tuned[0].sampling_percent != configs[0].sampling_percent:
         print(f"Auto-tuning sampling: {configs[0].sampling_percent}% -> {tuned[0].sampling_percent}%")
@@ -742,6 +799,7 @@ def main() -> None:
         first_trigger_hp_ylim_enabled=args.first_trigger_hp_ylim,
         first_trigger_hp_ylim_min_uv=args.first_trigger_hp_ylim_min_uv,
         first_trigger_hp_ylim_max_uv=args.first_trigger_hp_ylim_max_uv,
+        pdf_channels=_parse_channels_arg(args.channels),
     )
     if config.zoom_mode in ("onset", "both") and config.zoom_onset_t1_s <= config.zoom_onset_t0_s:
         print(

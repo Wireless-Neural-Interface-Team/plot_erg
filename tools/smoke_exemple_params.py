@@ -157,8 +157,8 @@ def _set_combo(box, value: str) -> None:
 
 def main() -> int:
     if not EXAMPLE.is_file():
-        print(f"exemple.rhs absent: {EXAMPLE}")
-        return 1
+        print(f"skip: exemple.rhs absent ({EXAMPLE})")
+        return 0
     report = _Report()
     print("chargement cache…", flush=True)
     t0 = time.perf_counter()

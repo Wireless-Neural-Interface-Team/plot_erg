@@ -147,8 +147,8 @@ ANALYSIS_PANEL_LABELS: dict[str, str] = {
     "analysis_psth": "Analyse — PSTH / FR",
     "analysis_trial_rate": "Analyse — taux de décharge / essai",
     "analysis_isi": "Analyse — ISI",
-    "analysis_raster_channel": "Analyse — raster par canal (compact)",
-    "analysis_raster": "Analyse — raster (tous essais)",
+    "analysis_raster_channel": "Analyse — raster (compact)",
+    "analysis_raster": "Analyse — raster / essai",
     "analysis_overlay": "Analyse — spike scope",
 }
 

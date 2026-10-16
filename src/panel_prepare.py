@@ -17,6 +17,7 @@ from display_config import STREAM_PLOT_COLORS, recording_trace_color
 from panel_catalog import panel_label
 from view_config import (
     STREAM_SHORT_LABELS,
+    continuous_anchor_offset_s,
     continuous_sync_offset_s,
     included_channel_indices,
     montage_row_axis_label,
@@ -74,7 +75,7 @@ class HistSeries:
 class AnnotationSpec:
     """Lightweight annotation (vline / text / hline / stim_label)."""
 
-    kind: str  # "vline" | "hline" | "text" | "span" | "stim_label"
+    kind: str  # "vline" | "hline" | "text" | "span" | "stim_label" | "zone_label"
     x: float = 0.0
     y: float = 0.0
     x2: float = 0.0
@@ -320,6 +321,13 @@ class ScaleBarSpec:
     time_s: float = 0.1
     amp_manual: bool = False
     amplitude: float = 100.0
+    # Longueur pixel manuelle des bâtons (None / non manuel → suit le zoom).
+    # Avec amp_manual + amp_length_manual : fixe le gain Y
+    # (span = amplitude × hauteur_plot / amp_length_px).
+    amp_length_manual: bool = False
+    amp_length_px: float = 40.0
+    time_length_manual: bool = False
+    time_length_px: float = 40.0
     linewidth: float = 1.4
     fontsize: float = 8.0
     color: str = "#111827"
@@ -579,13 +587,18 @@ def restyle_panel_spec(spec: PanelSpec, request: Any) -> PanelSpec:
         out.row_highlight = [int(ch) == selected for ch in out.row_channels]
     if out.row_kinds:
         settings = getattr(request, "settings", None)
+        is_montage = str(panel).startswith("montage_")
         new_ylims: list[tuple[float, float] | None] = []
         for kind in out.row_kinds:
             kind_s = str(kind)
             if kind_s in {"raw", "hp", "lp"}:
-                new_ylims.append(_ylim_tuple(settings, kind_s))
+                new_ylims.append(
+                    _ylim_tuple(settings, kind_s, montage=is_montage)
+                )
             elif kind_s == "rms":
-                new_ylims.append(_ylim_tuple(settings, "rms"))
+                new_ylims.append(
+                    _ylim_tuple(settings, "rms", montage=is_montage)
+                )
             else:
                 new_ylims.append(None)
         if panel == "montage_continuous_raw":
@@ -833,6 +846,12 @@ def _scale_bar_spec(request: Any, *, panel: str) -> ScaleBarSpec:
         return ScaleBarSpec(enabled=False)
     dx_px, dy_px = resolved_scale_bar_offset_px(style)
     time_dx_px, time_dy_px = resolved_scale_bar_time_offset_px(style)
+    amp_len = float(getattr(style, "scale_bar_amplitude_length_px", 40.0) or 40.0)
+    if amp_len <= 0:
+        amp_len = 40.0
+    time_len = float(getattr(style, "scale_bar_time_length_px", 40.0) or 40.0)
+    if time_len <= 0:
+        time_len = 40.0
     return ScaleBarSpec(
         enabled=True,
         x_unit=x_unit,
@@ -841,6 +860,14 @@ def _scale_bar_spec(request: Any, *, panel: str) -> ScaleBarSpec:
         time_s=float(getattr(style, "scale_bar_time_s", 0.1) or 0.1),
         amp_manual=bool(getattr(style, "scale_bar_amplitude_manual", False)),
         amplitude=float(getattr(style, "scale_bar_amplitude", 100.0) or 100.0),
+        amp_length_manual=bool(
+            getattr(style, "scale_bar_amplitude_length_manual", False)
+        ),
+        amp_length_px=float(amp_len),
+        time_length_manual=bool(
+            getattr(style, "scale_bar_time_length_manual", False)
+        ),
+        time_length_px=float(time_len),
         linewidth=resolved_scale_bar_linewidth(style),
         fontsize=float(getattr(style, "tick_font_size", 8.0) or 8.0),
         dx_px=dx_px,
@@ -1115,7 +1142,19 @@ def _apply_montage_shared_ylims(
     return out
 
 
-def _ylim_tuple(settings: Any, stream: str) -> tuple[float, float] | None:
+def _ylim_tuple(
+    settings: Any,
+    stream: str,
+    *,
+    montage: bool = False,
+    height_px: float | None = None,
+) -> tuple[float, float] | None:
+    """Échelle Y Canal manuelle uniquement.
+
+    Avec taille amp. manuelle, le gain vient de la hauteur du widget
+    (``scale_bar_view_height_for_span``) et le ylim reste en autoscale données.
+    """
+    del montage, height_px  # conservés pour compatibilité d’appel
     if settings is None:
         return None
     if stream == "rms":
@@ -1169,6 +1208,8 @@ def _prepare_full_recording(request: Any) -> PanelSpec:
     else:
         streams = list(request.settings.resolved_continuous_streams()) or ["raw"]
     # Custom zoom → jamais retomber sur x_limits de l’aperçu.
+    # Axe X auto → toute la courbe (downsample via max_points).
+    anchor_to_stim = False
     if request.placement.has_custom_zoom:
         window = request.section_window()
         if window is None:
@@ -1180,13 +1221,17 @@ def _prepare_full_recording(request: Any) -> PanelSpec:
     max_pts = _max_points(request)
     lw = _line_width(request)
     sync_mode = request.settings.time_sync
+    stim_index = int(request.settings.analysis.stim_index)
     window_is_absolute = bool(
         request.placement.has_custom_zoom and request.placement.zoom_absolute
     )
     ref_offset = 0.0
     if request.recordings:
-        ref_offset = continuous_sync_offset_s(
-            request.recordings[0].stimulation_times_s(), sync_mode
+        ref_offset = continuous_anchor_offset_s(
+            request.recordings[0].stimulation_times_s(),
+            sync_mode,
+            stim_index=stim_index,
+            anchor_to_stim=anchor_to_stim,
         )
 
     series: list[SeriesItem] = []
@@ -1211,7 +1256,12 @@ def _prepare_full_recording(request: Any) -> PanelSpec:
                 pending_any = True
                 continue
             stims = recording.stimulation_times_s()
-            offset = continuous_sync_offset_s(stims, sync_mode)
+            offset = continuous_anchor_offset_s(
+                stims,
+                sync_mode,
+                stim_index=stim_index,
+                anchor_to_stim=anchor_to_stim,
+            )
             t_range = None
             if window is not None:
                 if window_is_absolute:
@@ -1253,7 +1303,7 @@ def _prepare_full_recording(request: Any) -> PanelSpec:
             )
             stream_drawn += 1
             drawn += 1
-            if _show_continuous_stim_marks(request):
+            if _show_continuous_stim_marks(request) and not anchor_to_stim:
                 mark_window = None
                 if window is not None and not window_is_absolute:
                     mark_window = (float(window[0]), float(window[1]))
@@ -1290,6 +1340,11 @@ def _prepare_full_recording(request: Any) -> PanelSpec:
                 AnnotationSpec(kind="text", text=msg, color="#64748b", row=row)
             )
 
+    if anchor_to_stim and _show_continuous_stim_marks(request) and drawn:
+        annotations.extend(
+            _stim_markers_rel(request, rows=list(range(len(streams))))
+        )
+
     xlim = None
     if window is not None:
         if window_is_absolute:
@@ -1297,11 +1352,12 @@ def _prepare_full_recording(request: Any) -> PanelSpec:
         else:
             xlim = (float(window[0]), float(window[1]))
 
-    time_label = (
-        "Temps relatif au trigger (s)"
-        if sync_mode == "trigger"
-        else "Temps (s)"
-    )
+    if sync_mode == "trigger":
+        time_label = "Temps relatif au trigger (s)"
+    elif anchor_to_stim:
+        time_label = "Temps relatif à la stimulation (s)"
+    else:
+        time_label = "Temps (s)"
     if drawn == 0:
         status = "pending" if pending_any else "unavailable"
         return _placeholder(
@@ -1369,7 +1425,14 @@ def _prepare_triggered_trace(request: Any) -> PanelSpec:
     max_pts = _max_points(request)
     series: list[SeriesItem] = []
     drawn = 0
+    pending = False
     for index, recording in enumerate(request.recordings):
+        # HP/LP : ne jamais lancer sosfilt sur le thread UI.
+        if str(stream) in {"hp", "lp"} and not recording.stream_ready(
+            stream, request.channel_index
+        ):
+            pending = True
+            continue
         if trigger_index is None:
             curve = recording.mean(stream, request.channel_index)
             suffix = "moyenne d’essais"
@@ -1381,6 +1444,8 @@ def _prepare_triggered_trace(request: Any) -> PanelSpec:
             )
             suffix = f"stimulation #{trigger_index + 1}"
         if curve is None:
+            if trigger_index is None:
+                pending = True
             continue
         t = np.asarray(recording.t_rel, dtype=np.float64)
         y = np.asarray(curve, dtype=np.float64)
@@ -1400,6 +1465,13 @@ def _prepare_triggered_trace(request: Any) -> PanelSpec:
         drawn += 1
 
     if drawn == 0:
+        if pending:
+            short = STREAM_SHORT_LABELS.get(str(stream), str(stream).upper())
+            return _placeholder(
+                title=f"{request.channel_name} — {panel_label(panel)}",
+                message=f"{short} — calcul…",
+                status="pending",
+            )
         return _placeholder(
             title=f"{request.channel_name} — {panel_label(panel)}",
             message="Trace d’analyse indisponible.\nCalculer le canal (F6).",
@@ -1606,10 +1678,22 @@ def _spike_trigger_index(request: Any) -> int | None:
 
 
 def _spike_window(request: Any) -> tuple[float, float] | None:
-    # Prefer relative stim window helpers from panel_registry when available.
+    """Fenêtre t_rel affichée pour les graphs spikes (zoom / plage / section)."""
     try:
-        from panel_registry import _relative_stim_window
+        from panel_registry import _relative_stim_window, spike_scope_time_range
 
+        reference = getattr(request, "reference", None)
+        recordings = list(getattr(request, "recordings", []) or [])
+        if reference is not None and recordings:
+            try:
+                index = next(
+                    i for i, rec in enumerate(recordings) if rec is reference
+                )
+            except StopIteration:
+                index = 0
+            window = spike_scope_time_range(request, reference, index)
+            if window is not None:
+                return window
         window = _relative_stim_window(request)
         if window is not None:
             return window
@@ -1626,8 +1710,10 @@ def _prepare_spike_like(request: Any) -> PanelSpec:
         return _prepare_psth(request)
     if panel.endswith("isi") or panel == "analysis_isi":
         return _prepare_isi(request)
+    if panel in {"analysis_raster_channel"} or panel.endswith("raster_channel"):
+        return _prepare_raster(request, compact=True)
     if "raster" in panel:
-        return _prepare_raster(request)
+        return _prepare_raster(request, compact=False)
     if "trial_rate" in panel:
         return _prepare_trial_rate(request)
     if panel in _ANALYSIS_TRACE:
@@ -1638,10 +1724,12 @@ def _prepare_spike_like(request: Any) -> PanelSpec:
 
 
 def _spike_trains(request: Any, trigger_index: int | None) -> list[list[np.ndarray]]:
-    windows = request.per_recording_windows()
+    """Spikes filtrés sur la fenêtre affichée (même logique que le spike scope)."""
+    from panel_registry import spike_scope_time_range
+
     trains: list[list[np.ndarray]] = []
     for index, recording in enumerate(request.recordings):
-        window = windows[index] if index < len(windows) else None
+        window = spike_scope_time_range(request, recording, index)
         trains.append(
             recording.spike_times(
                 request.channel_index,
@@ -1733,8 +1821,11 @@ def _prepare_isi(request: Any) -> PanelSpec:
         intervals: list[float] = []
         for trial in st_per_trial:
             arr = np.asarray(trial, dtype=np.float64).ravel()
+            if window is not None and arr.size:
+                arr = arr[(arr >= window[0]) & (arr <= window[1])]
             if arr.size >= 2:
-                intervals.extend(np.diff(np.sort(arr)).tolist())
+                # ms : même unité que le montage ISI / convention spikes.
+                intervals.extend((np.diff(np.sort(arr)) * 1000.0).tolist())
         if not intervals:
             continue
         counts, edges = np.histogram(np.asarray(intervals, dtype=np.float64), bins=40)
@@ -1754,7 +1845,7 @@ def _prepare_isi(request: Any) -> PanelSpec:
         )
     return PanelSpec(
         title=f"{request.channel_name} — {panel_label(request.panel)}",
-        xlabel="ISI (s)",
+        xlabel="ISI (ms)",
         ylabel="Nombre",
         series=series,
         status="ok",
@@ -1762,11 +1853,13 @@ def _prepare_isi(request: Any) -> PanelSpec:
     )
 
 
-def _prepare_raster(request: Any) -> PanelSpec:
+def _prepare_raster(request: Any, *, compact: bool = False) -> PanelSpec:
+    """Raster compact (tous essais sur une ligne) ou raster / essai (une ligne par essai)."""
+    title_kind = "Raster" if compact else "Raster / essai"
     window = _spike_window(request)
     if window is None:
         return _placeholder(
-            title=f"{request.channel_name} — Raster",
+            title=f"{request.channel_name} — {title_kind}",
             message="Section indisponible.",
             status="unavailable",
         )
@@ -1791,7 +1884,7 @@ def _prepare_raster(request: Any) -> PanelSpec:
                 arr = arr[(arr >= window[0]) & (arr <= window[1])]
             if arr.size == 0:
                 continue
-            y = y_cursor + float(trial_i)
+            y = 0.0 if compact else (y_cursor + float(trial_i))
             xs.extend(arr.tolist())
             ys.extend([y] * int(arr.size))
         if xs:
@@ -1801,23 +1894,26 @@ def _prepare_raster(request: Any) -> PanelSpec:
                     y=np.asarray(ys, dtype=np.float64),
                     color=str(request.colors[index % len(request.colors)]),
                     label=_series_label(request, index),
-                    size=3.0,
+                    size=3.0 if not compact else 2.5,
                     symbol="|",
                 )
             )
-        y_cursor += max(1.0, float(len(st_per_trial)))
+        if not compact:
+            y_cursor += max(1.0, float(len(st_per_trial)))
     if not series:
         return _placeholder(
-            title=f"{request.channel_name} — Raster",
+            title=f"{request.channel_name} — {title_kind}",
             message="Aucun spike dans cette fenêtre.",
             status="empty",
         )
+    ylim = (-0.7, 0.7) if compact else None
     return PanelSpec(
         title=f"{request.channel_name} — {panel_label(request.panel)}",
         xlabel="Temps relatif à la stimulation (s)",
-        ylabel="Essai",
+        ylabel="" if compact else "Essai",
         series=series,
         xlim=(float(window[0]), float(window[1])),
+        ylim=ylim,
         annotations=_stim_markers_rel(request),
         status="ok",
         row_kinds=["raster"],
@@ -2047,7 +2143,13 @@ def _montage_continuous_axis_labels(
     return labels
 
 
-def _montage_xlabel(mode: str, sync_mode: str, last_kind: str) -> str:
+def _montage_xlabel(
+    mode: str,
+    sync_mode: str,
+    last_kind: str,
+    *,
+    stim_anchored: bool = False,
+) -> str:
     """Libellé X selon la dernière ligne (unités incompatibles entre kinds)."""
     if last_kind == "overlay":
         return "Temps relatif au spike (ms)"
@@ -2056,11 +2158,11 @@ def _montage_xlabel(mode: str, sync_mode: str, last_kind: str) -> str:
     if last_kind == "trial_rate":
         return "Essai"
     if last_kind in _MONTAGE_STREAM_KINDS and mode == "continuous":
-        return (
-            "Temps relatif au trigger (s)"
-            if sync_mode == "trigger"
-            else "Temps (s)"
-        )
+        if sync_mode == "trigger":
+            return "Temps relatif au trigger (s)"
+        if stim_anchored:
+            return "Temps relatif à la stimulation (s)"
+        return "Temps (s)"
     return "Temps relatif à la stimulation (s)"
 
 
@@ -2117,14 +2219,10 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
     row = 0
     data_x_min: float | None = None
     data_x_max: float | None = None
-    # Spikes / RMS : toujours t_rel (comme panel_registry._render_montage_continuous).
+    # Spikes / RMS : toujours t_rel. Continuous : axe X manuel ou toute la courbe.
     extra_section_x = _relative_stim_window(request)
-    stream_section_x = extra_section_x if mode != "continuous" else None
-    stream_x = (
-        x_limits
-        if (mode == "continuous" and x_limits is not None)
-        else stream_section_x
-    )
+    stream_x = x_limits if mode == "continuous" else extra_section_x
+    anchor_to_stim = False
     trigger_index = _analysis_trigger_index(request)
     rms_kind = _montage_rms_kind(request)
 
@@ -2147,9 +2245,13 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
             row_keys.append((int(ch), str(kind)))
             row_highlight.append(int(ch) == int(request.channel_index))
             if kind in _MONTAGE_STREAM_KINDS:
-                row_ylims.append(_ylim_tuple(request.settings, kind))
+                row_ylims.append(
+                    _ylim_tuple(request.settings, kind, montage=True)
+                )
             elif kind == "rms":
-                row_ylims.append(_ylim_tuple(request.settings, "rms"))
+                row_ylims.append(
+                    _ylim_tuple(request.settings, "rms", montage=True)
+                )
             elif kind == "raster":
                 row_ylims.append((-0.7, 0.7))
             else:
@@ -2168,8 +2270,11 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                     offset = 0.0
                     abs_range = None
                     if mode == "continuous":
-                        offset = continuous_sync_offset_s(
-                            recording.stimulation_times_s(), sync_mode
+                        offset = continuous_anchor_offset_s(
+                            recording.stimulation_times_s(),
+                            sync_mode,
+                            stim_index=stim_index,
+                            anchor_to_stim=anchor_to_stim,
                         )
                         if stream_x is not None:
                             abs_range = (
@@ -2186,7 +2291,11 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                         t_range=abs_range,
                     )
                     if y.size == 0:
-                        if kind in {"hp", "lp"} and mode == "continuous":
+                        # Continuous / moyenne / stim : HP/LP en attente de filtre.
+                        if kind in {"hp", "lp"}:
+                            pending_any = True
+                            row_pending = True
+                        elif mode == "average":
                             pending_any = True
                             row_pending = True
                         continue
@@ -2332,13 +2441,17 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                     _psth_mean_hz,
                     _trial_mean_firing_rate_hz,
                 )
+                from panel_registry import spike_scope_time_range
 
                 color_default = _MONTAGE_EXTRA_COLORS.get(kind, "#334155")
                 for index, recording in enumerate(recordings):
                     if ch >= int(recording.n_channels):
                         continue
+                    spike_win = spike_scope_time_range(request, recording, index)
+                    if spike_win is None:
+                        spike_win = extra_section_x
                     trains = recording.spike_times(
-                        ch, trigger_index=trigger_index, t_range_s=extra_section_x
+                        ch, trigger_index=trigger_index, t_range_s=spike_win
                     )
                     color = recording_trace_color(
                         request.colors, index, fallback=color_default
@@ -2368,7 +2481,7 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                         drawn += 1
                     elif kind == "psth":
                         t_rel = np.asarray(recording.t_rel, dtype=np.float64)
-                        if t_rel.size < 2 or extra_section_x is None:
+                        if t_rel.size < 2 or spike_win is None:
                             continue
                         n_trials = max(
                             1,
@@ -2381,7 +2494,7 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                             t_rel,
                             n_trials,
                             float(request.settings.psth_bin_window_s),
-                            t_range_s=extra_section_x,
+                            t_range_s=spike_win,
                         )
                         if centers.size < 2:
                             continue
@@ -2398,9 +2511,9 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                         row_drawn += 1
                         drawn += 1
                     elif kind == "trial_rate":
-                        if extra_section_x is None or not trains:
+                        if spike_win is None or not trains:
                             continue
-                        rates = _trial_mean_firing_rate_hz(trains, extra_section_x)
+                        rates = _trial_mean_firing_rate_hz(trains, spike_win)
                         if rates.size == 0:
                             continue
                         x = np.arange(1, rates.size + 1, dtype=np.float64)
@@ -2418,7 +2531,7 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                         drawn += 1
                     elif kind == "isi":
                         _t_isi, d_isi = _isi_time_and_values_s(
-                            trains, isi_window_s=extra_section_x
+                            trains, isi_window_s=spike_win
                         )
                         if d_isi.size == 0:
                             continue
@@ -2477,7 +2590,9 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
         )
 
     last_kind = row_kinds[-1] if row_kinds else "raw"
-    xlabel = _montage_xlabel(mode, str(sync_mode), last_kind)
+    xlabel = _montage_xlabel(
+        mode, str(sync_mode), last_kind, stim_anchored=anchor_to_stim
+    )
 
     # X partagé seulement si toutes les lignes ont la même famille temporelle.
     if has_extras:
@@ -2508,26 +2623,30 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
 
     # Pointillés de stim : début et fin sur les flux continus.
     if mode == "continuous" and _show_continuous_stim_marks(request):
-        stim_marks = _continuous_stim_marks(recordings, str(sync_mode), stream_x)
-        if stim_marks:
-            onset_color, offset_color = _stim_line_colors(request)
-            stream_rows = [
-                row_i
-                for row_i, kind in enumerate(row_kinds)
-                if kind in _MONTAGE_STREAM_KINDS
-            ]
-            label_row = stream_rows[0] if stream_rows else None
-            for row_i in stream_rows:
-                for stim_x, role in stim_marks:
-                    _append_stim_vline_with_label(
-                        annotations,
-                        request,
-                        x=float(stim_x),
-                        row=row_i,
-                        which="off" if role == "offset" else "on",
-                        color=offset_color if role == "offset" else onset_color,
-                        with_label=(row_i == label_row),
-                    )
+        stream_rows = [
+            row_i
+            for row_i, kind in enumerate(row_kinds)
+            if kind in _MONTAGE_STREAM_KINDS
+        ]
+        if anchor_to_stim:
+            # Même on/off relatifs que stimulation / moyenne.
+            annotations.extend(_stim_markers_rel(request, rows=stream_rows))
+        else:
+            stim_marks = _continuous_stim_marks(recordings, str(sync_mode), stream_x)
+            if stim_marks:
+                onset_color, offset_color = _stim_line_colors(request)
+                label_row = stream_rows[0] if stream_rows else None
+                for row_i in stream_rows:
+                    for stim_x, role in stim_marks:
+                        _append_stim_vline_with_label(
+                            annotations,
+                            request,
+                            x=float(stim_x),
+                            row=row_i,
+                            which="off" if role == "offset" else "on",
+                            color=offset_color if role == "offset" else onset_color,
+                            with_label=(row_i == label_row),
+                        )
     elif mode != "continuous":
         marker_rows = [
             row_i
@@ -2610,7 +2729,9 @@ def _prepare_montage_triggered(request: Any) -> PanelSpec:
             else f"CH{ch}"
         )
         row_labels.append(name)
-        row_ylims.append(_ylim_tuple(request.settings, stream))
+        row_ylims.append(
+            _ylim_tuple(request.settings, stream, montage=True)
+        )
         row_kinds.append(stream)
         row_channels.append(int(ch))
         row_keys.append((int(ch), stream))
@@ -2717,7 +2838,9 @@ def _prepare_montage_second_to_third(request: Any) -> PanelSpec:
             else f"CH{ch}"
         )
         row_labels.append(name)
-        row_ylims.append(_ylim_tuple(request.settings, "lp"))
+        row_ylims.append(
+            _ylim_tuple(request.settings, "lp", montage=True)
+        )
         row_kinds.append("lp")
         row_channels.append(int(ch))
         row_keys.append((int(ch), "lp-span"))

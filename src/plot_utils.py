@@ -196,12 +196,32 @@ def shorten_filename_for_windows(output_dir: Path, filename: str, max_total_len:
 
 
 def downsample_points(x: np.ndarray, y: np.ndarray, sampling_percent: int) -> tuple[np.ndarray, np.ndarray]:
-    """Deterministically downsample points based on a percentage in [1, 100]."""
+    """Sous-échantillon stride (scatter / points indépendants).
+
+    Pour une courbe tension continue, préférer ``downsample_curve``
+    (enveloppe min/max) afin de ne pas perdre les pics.
+    """
     if sampling_percent >= 100:
         return x, y
     pct = max(1, min(100, int(sampling_percent)))
     step = max(1, int(np.ceil(100.0 / float(pct))))
     return x[::step], y[::step]
+
+
+def downsample_curve(
+    x: np.ndarray, y: np.ndarray, sampling_percent: int
+) -> tuple[np.ndarray, np.ndarray]:
+    """Sous-échantillon d’une courbe continue en préservant min/max par bin."""
+    if sampling_percent >= 100:
+        return x, y
+    x_arr = np.asarray(x)
+    y_arr = np.asarray(y)
+    n = int(x_arr.size)
+    if n <= 0:
+        return x_arr, y_arr
+    pct = max(1, min(100, int(sampling_percent)))
+    max_points = max(16, int(np.ceil(n * pct / 100.0)))
+    return decimate_envelope(x_arr, y_arr, max_points)
 
 
 def decimate_envelope(
@@ -227,6 +247,83 @@ def decimate_envelope(
     out_y[0::2] = lows
     out_y[1::2] = highs
     return out_x, out_y
+
+
+def envelope_minmax_row(
+    row: Any,
+    n_samples: int,
+    max_points: int,
+    *,
+    t_origin: float = 0.0,
+    fs: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Min/max envelope of ``row[0:n_samples]`` without a full-row RAM copy.
+
+    Bin-sized reads keep memmap / disk-backed channels responsive on the UI
+    thread even for multi-million-sample recordings (WIDE / HIGH / LOW).
+    Contiguous in-RAM float buffers still use a single ``reduceat`` pass.
+    """
+    empty = np.empty(0, dtype=np.float64)
+    n_samples = int(n_samples)
+    limit = max(16, int(max_points))
+    fs = float(fs)
+    if n_samples <= 0 or fs <= 0:
+        return empty, empty
+    if n_samples <= limit:
+        data = np.asarray(row[:n_samples], dtype=np.float64)
+        t = float(t_origin) + np.arange(data.size, dtype=np.float64) / fs
+        return t, data
+
+    n_bins = max(1, limit // 2)
+    edges = np.linspace(0, n_samples, n_bins + 1)
+    edges = np.rint(edges).astype(np.int64)
+    edges[0] = 0
+    edges[-1] = n_samples
+    edges = np.unique(edges)
+    starts = edges[:-1]
+    widths = np.diff(edges)
+    n_out = int(starts.size)
+
+    def _is_in_ram_float_row(buffer: Any) -> bool:
+        if not isinstance(buffer, np.ndarray) or int(getattr(buffer, "ndim", 1)) != 1:
+            return False
+        if isinstance(buffer, np.memmap):
+            return False
+        base = getattr(buffer, "base", None)
+        while base is not None:
+            if isinstance(base, np.memmap):
+                return False
+            base = getattr(base, "base", None)
+        return bool(buffer.flags.c_contiguous) and str(buffer.dtype.kind) == "f"
+
+    if _is_in_ram_float_row(row):
+        values = row[:n_samples]
+        if values.dtype not in (np.float32, np.float64):
+            values = np.asarray(values, dtype=np.float32)
+        lows = np.minimum.reduceat(values, starts)
+        highs = np.maximum.reduceat(values, starts)
+    else:
+        # Memmap / disk view: batched reduceat — avoids a full-row RAM copy
+        # and the cost of one Python min/max per bin (~50k bins by default).
+        lows = np.empty(n_out, dtype=np.float64)
+        highs = np.empty(n_out, dtype=np.float64)
+        bin_batch = 256
+        for batch_start in range(0, n_out, bin_batch):
+            batch_end = min(n_out, batch_start + bin_batch)
+            s0 = int(starts[batch_start])
+            s1 = int(edges[batch_end])
+            block = np.asarray(row[s0:s1], dtype=np.float32)
+            local = starts[batch_start:batch_end] - s0
+            lows[batch_start:batch_end] = np.minimum.reduceat(block, local)
+            highs[batch_start:batch_end] = np.maximum.reduceat(block, local)
+
+    centers = starts.astype(np.float64) + (widths.astype(np.float64) - 1.0) / 2.0
+    mids = float(t_origin) + centers / fs
+    out_t = np.repeat(mids, 2)
+    out_y = np.empty(mids.size * 2, dtype=np.float64)
+    out_y[0::2] = lows
+    out_y[1::2] = highs
+    return out_t, out_y
 
 
 def nice_scale_length(span: float, *, target_frac: float = 0.18) -> float:
@@ -328,23 +425,123 @@ def resolve_scale_bar_length(
     *,
     manual: bool,
     value: float,
+    clamp_to_span: bool = False,
 ) -> float:
-    """Longueur de barre : valeur manuelle si demandée, sinon auto.
+    """Longueur de barre cible (unités de données) : manuelle ou auto.
 
-    Si la valeur manuelle dépasse ~90 % du span visible (ex. 100 ms sur un
-    spike scope de 6 ms), on repasse en auto pour que bâton et libellé
-    restent cohérents avec la vue.
+    En manuel, renvoie ``value`` (ex. 100 µV) — c’est aussi le libellé.
+    Avec taille px manuelle, le widget est recalé pour que
+    ``value`` ↔ ``length_px`` (voir ``scale_bar_needed_view_height_px``).
+
+    ``clamp_to_span=True`` (legacy) : si ``value`` dépasse ~90 % du span,
+    repasse en auto.
     """
     span = abs(float(span))
-    if (
-        manual
-        and math.isfinite(float(value))
-        and float(value) > 0
-        and span > 0
-        and float(value) <= span * 0.9
-    ):
-        return float(value)
+    if manual and math.isfinite(float(value)) and float(value) > 0:
+        if not clamp_to_span:
+            return float(value)
+        if span > 0 and float(value) <= span * 0.9:
+            return float(value)
     return _nice_bar_length(span)
+
+
+def scale_bar_pixel_length(
+    *,
+    data_value: float,
+    span: float,
+    axis_px: float,
+    length_px: float | None = None,
+    value_manual: bool = False,
+) -> float:
+    """Longueur du bâton en pixels.
+
+    - **Valeur + taille** manuelles : bâton *proportionnel* à ``data_value``
+      (échelle vraie sur la courbe). ``length_px`` sert uniquement à caler
+      la hauteur du widget, pas à forcer un bâton décorrélé du zoom.
+    - **Taille seule** : bâton = ``length_px`` (libellé calculé à part).
+    - **Valeur seule** / auto : bâton proportionnel à ``data_value``.
+    """
+    try:
+        axis = float(axis_px)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (axis > 0.0) or axis != axis:
+        return 0.0
+    length_manual = False
+    fixed = 0.0
+    if length_px is not None:
+        try:
+            fixed = float(length_px)
+        except (TypeError, ValueError):
+            fixed = 0.0
+        length_manual = bool(fixed > 0.0 and fixed == fixed)
+    # Les deux manuels → proportionnel (la taille px pilote le widget ailleurs).
+    if length_manual and not bool(value_manual):
+        return max(1.0, min(fixed, axis))
+    try:
+        value = float(data_value)
+        data_span = abs(float(span))
+    except (TypeError, ValueError):
+        return 0.0
+    if not (value > 0.0 and data_span > 0.0):
+        return 0.0
+    if value != value or data_span != data_span:
+        return 0.0
+    return max(1.0, min((value / data_span) * axis, axis))
+
+
+def scale_bar_true_value(
+    bar_px: float,
+    *,
+    span: float,
+    axis_px: float,
+) -> float:
+    """Valeur réelle (unités de données) représentée par ``bar_px`` pixels.
+
+    Invariant d’une échelle honnête :
+    ``true = bar_px / axis_px × span``.
+    """
+    try:
+        bar = float(bar_px)
+        data_span = abs(float(span))
+        axis = float(axis_px)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (bar > 0.0 and data_span > 0.0 and axis > 0.0):
+        return 0.0
+    if bar != bar or data_span != data_span or axis != axis:
+        return 0.0
+    return (bar / axis) * data_span
+
+
+def scale_bar_label_value(
+    *,
+    data_value: float,
+    span: float,
+    axis_px: float,
+    bar_px: float,
+    value_manual: bool,
+    length_manual: bool,
+) -> float:
+    """Valeur affichée à côté du bâton selon le mode de saisie.
+
+    - **Valeur manuelle** (seule ou avec taille px) : toujours ``data_value``
+      (c’est la valeur affichée ; avec taille px elle calibre aussi le graph).
+    - **Taille px seule** : valeur déduite de la géométrie
+      (``bar_px / axis_px × span``).
+    - **Auto** : ``data_value`` (longueur « nice »).
+    """
+    try:
+        target = float(data_value)
+    except (TypeError, ValueError):
+        target = 0.0
+    # Valeur saisie = libellé affiché (jamais recalculé).
+    if bool(value_manual) and target > 0.0 and target == target:
+        return target
+    if bool(length_manual) and not bool(value_manual):
+        true = scale_bar_true_value(bar_px, span=span, axis_px=axis_px)
+        return true if true > 0.0 else (target if target > 0.0 and target == target else 0.0)
+    return target if target > 0.0 and target == target else 0.0
 
 
 def _mark_scale_artist(artist: Any) -> Any:
@@ -391,11 +588,17 @@ def draw_floating_scale_bars(
     dy_px: float = 0.0,
     x_dx_px: float | None = None,
     x_dy_px: float | None = None,
+    y_length_px: float | None = None,
+    x_length_px: float | None = None,
+    y_value_manual: bool = False,
+    x_value_manual: bool = False,
 ) -> None:
     """Barres d’échelle flottantes (temps + amplitude).
 
-    Longueurs en unités de données : une valeur fixe (manuelle ou auto) donne un
-    bâton dont la taille pixel suit automatiquement le zoom.
+    Modes de libellé (voir ``scale_bar_label_value``) :
+    - valeur + taille px manuelles → libellé = valeur (fixe la taille du graph) ;
+    - taille px seule → libellé calculé depuis la géométrie ;
+    - valeur seule → bâton proportionnel, libellé = valeur.
 
     Position : ancrée sur le bord des axes (fraction d’axes), pas en coordonnées
     de données — ainsi les barres restent hors des courbes.
@@ -420,7 +623,11 @@ def draw_floating_scale_bars(
         return
     x_span = abs(float(xlim[1]) - float(xlim[0]))
     y_span = abs(float(ylim[1]) - float(ylim[0]))
-    if (show_x and x_span <= 0) or (show_y and y_span <= 0):
+    if show_x and x_span <= 0:
+        show_x = False
+    if show_y and y_span <= 0:
+        show_y = False
+    if not show_x and not show_y:
         return
 
     from matplotlib.lines import Line2D
@@ -471,6 +678,83 @@ def draw_floating_scale_bars(
         else (_nice_bar_length(y_span) if show_y else 0.0)
     )
 
+    def _axes_size_px() -> tuple[float, float]:
+        try:
+            bbox = ax.get_window_extent()
+            return max(1.0, float(bbox.width)), max(1.0, float(bbox.height))
+        except Exception:
+            return 400.0, 300.0
+
+    def _data_len_for_px(length_px: float | None, *, span: float, axis_px: float) -> float | None:
+        if length_px is None:
+            return None
+        px = _px(length_px)
+        if px <= 0.0 or span <= 0.0 or axis_px <= 0.0:
+            return None
+        return (px / axis_px) * span
+
+    ax_w_px, ax_h_px = _axes_size_px()
+    y_len_manual = y_length_px is not None and _px(y_length_px) > 0.0
+    x_len_manual = x_length_px is not None and _px(x_length_px) > 0.0
+    # Longueur tracée en données : taille px → conversion ; sinon = cible.
+    y_draw = _data_len_for_px(y_length_px, span=y_span, axis_px=ax_h_px)
+    if y_draw is None:
+        y_draw = y_len
+    x_draw = _data_len_for_px(x_length_px, span=x_span, axis_px=ax_w_px)
+    if x_draw is None:
+        x_draw = x_len
+    y_bar_px = (
+        scale_bar_pixel_length(
+            data_value=y_len,
+            span=y_span,
+            axis_px=ax_h_px,
+            length_px=y_length_px if y_len_manual else None,
+            value_manual=bool(y_value_manual),
+        )
+        if show_y
+        else 0.0
+    )
+    x_bar_px = (
+        scale_bar_pixel_length(
+            data_value=x_len,
+            span=x_span,
+            axis_px=ax_w_px,
+            length_px=x_length_px if x_len_manual else None,
+            value_manual=bool(x_value_manual),
+        )
+        if show_x
+        else 0.0
+    )
+    y_label_value = (
+        scale_bar_label_value(
+            data_value=y_len,
+            span=y_span,
+            axis_px=ax_h_px,
+            bar_px=y_bar_px,
+            value_manual=bool(y_value_manual),
+            length_manual=y_len_manual,
+        )
+        if show_y
+        else 0.0
+    )
+    x_label_value = (
+        scale_bar_label_value(
+            data_value=x_len,
+            span=x_span,
+            axis_px=ax_w_px,
+            bar_px=x_bar_px,
+            value_manual=bool(x_value_manual),
+            length_manual=x_len_manual,
+        )
+        if show_x
+        else 0.0
+    )
+    # Valeur+taille : bâton en données = valeur (la figure doit avoir la bonne taille).
+    if show_y and bool(y_value_manual) and y_len_manual and y_len > 0:
+        y_draw = float(y_len)
+    if show_x and bool(x_value_manual) and x_len_manual and x_len > 0:
+        x_draw = float(x_len)
+
     # Fraction d’axes : à droite des courbes (dans la marge si gutter).
     x_axes = 1.02 if gutter else 0.985
     line_kw = {
@@ -483,19 +767,20 @@ def draw_floating_scale_bars(
     }
 
     if show_y:
-        # X fixe (axes) · Y en données → bâton vertical, longueur = y_len.
+        # X fixe (axes) · Y en données → bâton vertical.
+        # y_draw = longueur visuelle ; libellé = y_len (valeur d’échelle).
         trans_y = _with_px_shift(
             blended_transform_factory(ax.transAxes, ax.transData),
             shift_dx=amp_dx,
             shift_dy=amp_dy,
         )
         y_mid = 0.5 * (float(ylim[0]) + float(ylim[1]))
-        y0 = y_mid - 0.5 * y_len
-        y1 = y0 + y_len
+        y0 = y_mid - 0.5 * y_draw
+        y1 = y0 + y_draw
         vline = Line2D([x_axes, x_axes], [y0, y1], transform=trans_y, **line_kw)
         _mark_scale_artist(vline)
         ax.add_line(vline)
-        label = format_scale_label(y_len, str(y_unit))
+        label = format_scale_label(y_label_value, str(y_unit))
         text = ax.text(
             x_axes + (0.012 if gutter else 0.008),
             y_mid,
@@ -531,17 +816,18 @@ def draw_floating_scale_bars(
                 trans_base, shift_dx=time_dx, shift_dy=time_dy
             )
             y_ref = 0.08
+        # x_draw = longueur en données (= libellé) ; taille px fixe via conversion.
         x_right = float(xlim[1]) - 0.02 * x_span
-        x_left = x_right - x_len
+        x_left = x_right - x_draw
         if x_left < float(xlim[0]):
             x_left = float(xlim[0]) + 0.02 * x_span
-            x_right = x_left + x_len
+            x_right = x_left + x_draw
         hline = Line2D(
             [x_left, x_right], [y_ref, y_ref], transform=trans_line, **line_kw
         )
         _mark_scale_artist(hline)
         ax.add_line(hline)
-        label = format_scale_label(x_len, str(x_unit))
+        label = format_scale_label(x_label_value, str(x_unit))
         text = ax.text(
             0.5 * (x_left + x_right),
             y_ref if below else (y_ref - 0.04),

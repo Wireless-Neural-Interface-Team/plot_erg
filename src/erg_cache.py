@@ -67,6 +67,9 @@ def segmentation_params(config: AnalysisConfig) -> dict[str, Any]:
             "section_spec": str(config.section_spec),
             "trigger_start_s": float(config.section_trigger_start_s),
             "trigger_end_s": float(config.section_trigger_end_s),
+            # Same analysis window as real stimulations.
+            "pre_s": float(config.pre_s),
+            "post_s": float(config.post_s),
         }
     return {
         "edge": str(config.edge),
@@ -440,8 +443,18 @@ def clear_cache(
     return removed
 
 
-def prune_cache(cache_root: Path, *, max_bytes: int, keep: set[Path] | None = None) -> int:
-    """Remove oldest bundles / filter caches until the cache fits in ``max_bytes``."""
+# Default on-disk cache budget used by the Cache manager UI.
+DEFAULT_CACHE_MAX_BYTES = 20 * 1024**3
+
+
+def prune_cache(
+    cache_root: Path,
+    *,
+    max_bytes: int,
+    keep: set[Path] | None = None,
+    include_raw: bool = True,
+) -> int:
+    """Remove oldest bundles / filter / raw caches until the cache fits in ``max_bytes``."""
     if max_bytes <= 0:
         return 0
     protected = {Path(p).resolve() for p in (keep or set())}
@@ -458,9 +471,18 @@ def prune_cache(cache_root: Path, *, max_bytes: int, keep: set[Path] | None = No
         except OSError:
             mtime = 0.0
         candidates.append((layout.root, _tree_size(layout.root), mtime))
+    if include_raw:
+        for layout in iter_raw_layouts(cache_root):
+            if layout.root.resolve() in protected:
+                continue
+            try:
+                mtime = layout.root.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            candidates.append((layout.root, _tree_size(layout.root), mtime))
     total = sum(size for _p, size, _m in candidates)
-    # Also count raw caches in the budget, but prune bundles/filters first.
-    total += sum(_tree_size(layout.root) for layout in iter_raw_layouts(cache_root))
+    if not include_raw:
+        total += sum(_tree_size(layout.root) for layout in iter_raw_layouts(cache_root))
     candidates.sort(key=lambda item: item[2])
     removed = 0
     for path, size, _mtime in candidates:

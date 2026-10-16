@@ -93,19 +93,25 @@ class SegmentationInfo:
     section_duration_s: float | None = None
 
     def describe(self) -> str:
+        window = f"window [-{self.pre_s:g}, +{self.post_s:g}] s"
         if self.mode == "none":
-            return (
+            text = (
                 f"{self.n_trials} fixed section(s)"
                 + (
                     f" of {self.section_duration_s:.3f} s"
                     if self.section_duration_s
                     else ""
                 )
+                + f" ({window})"
             )
+            excluded = max(0, int(self.n_triggers_detected) - int(self.n_trials))
+            if excluded:
+                text += f", {excluded} excluded (window outside signal)"
+            return text
         excluded = max(0, int(self.n_triggers_detected) - int(self.n_trials))
         text = (
             f"{self.n_trials} stimulation(s) on {self.mode} edge "
-            f"(window [-{self.pre_s:g}, +{self.post_s:g}] s)"
+            f"({window})"
         )
         if excluded:
             text += f", {excluded} excluded (window outside signal)"
@@ -666,8 +672,18 @@ class ProcessedRecording:
         }.get(stream)
         if array is None or ch < 0 or ch >= int(array.shape[0]):
             return empty, empty
-        # Vue memmap (pas de copie tant qu’on reste en enveloppe float32).
-        row = array[ch]
+        # HIGH/LOW : ``peek`` évite la copie disque→RAM forcée par ``bank[ch]``
+        # (cause typique du freeze UI à l’affichage d’une courbe filtrée).
+        peek = getattr(array, "peek", None)
+        if callable(peek) and str(stream) in {"hp", "lp"}:
+            row = peek(int(ch))
+            if row is None:
+                if require_ready:
+                    return empty, empty
+                row = array[ch]
+        else:
+            # WIDE memmap : vue 1D, sans materialiser toute la ligne ici.
+            row = array[ch]
         n_total = int(getattr(row, "shape", (0,))[0]) if row is not None else 0
         if n_total <= 0:
             return empty, empty
@@ -685,27 +701,17 @@ class ProcessedRecording:
         n_samples = int(i1 - i0)
         t_origin = float(i0) / fs
         if limit > 16 and n_samples > limit:
-            # Enveloppe min/max sur tout l’intervalle. Un pas ``n // n_bins``
-            # laissait jusqu’à ``n_bins - 1`` échantillons hors du tracé
-            # (souvent plus d’une seconde en fin de fenêtre).
-            n_bins = max(1, limit // 2)
-            edges = np.linspace(0, n_samples, n_bins + 1)
-            edges = np.rint(edges).astype(np.int64)
-            edges[0] = 0
-            edges[-1] = n_samples
-            edges = np.unique(edges)
-            starts = edges[:-1]
-            widths = np.diff(edges)
-            values = np.asarray(row, dtype=np.float32)
-            lows = np.minimum.reduceat(values, starts)
-            highs = np.maximum.reduceat(values, starts)
-            centers = starts.astype(np.float64) + (widths.astype(np.float64) - 1.0) / 2.0
-            mids = t_origin + centers / fs
-            out_t = np.repeat(mids, 2)
-            out_y = np.empty(mids.size * 2, dtype=np.float64)
-            out_y[0::2] = lows
-            out_y[1::2] = highs
-            result = (out_t, out_y)
+            # Enveloppe par bins (pas de ``asarray`` full-row) — UI-safe pour
+            # WIDE memmap et HIGH/LOW disque.
+            from plot_utils import envelope_minmax_row
+
+            result = envelope_minmax_row(
+                row,
+                n_samples,
+                limit,
+                t_origin=t_origin,
+                fs=fs,
+            )
         else:
             data = np.asarray(row, dtype=np.float64)
             t = t_origin + np.arange(data.size, dtype=np.float64) / fs
@@ -950,23 +956,12 @@ class ProcessedRecording:
         from draw_primitives import _extract_spike_waveforms
 
         trains = self.spike_times(int(ch))
-        new_t, new_w, new_times = _extract_spike_waveforms(
+        new_t, new_w, new_times, total, mean = _extract_spike_waveforms(
             source, int(ch), trains, pre_ms=pre, post_ms=post
         )
         new_w = np.asarray(new_w, dtype=np.float32)
-        total = int(new_w.shape[0]) if new_w.ndim == 2 else 0
-        mean = (
-            np.mean(np.asarray(new_w, dtype=np.float64), axis=0)
-            if total
-            else None
-        )
         times = np.asarray(new_times, dtype=np.float64)
-        if total > MAX_OVERLAY_SNIPPETS_PER_CHANNEL:
-            picks = np.linspace(
-                0, total - 1, MAX_OVERLAY_SNIPPETS_PER_CHANNEL
-            ).astype(np.int64)
-            new_w = new_w[picks]
-            times = times[picks]
+        total = int(total)
         self._overlay_override[int(ch)] = (
             np.asarray(new_t, dtype=np.float64),
             new_w,
