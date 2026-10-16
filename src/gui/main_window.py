@@ -709,7 +709,7 @@ class ViewerWindow(QMainWindow):
             self._schedule_redraw(force=True, preserve_view=True)
             return
         self._apply_graph_height_to_tabs()
-        if self._channel_inspect is not None:
+        if self._showing_channel_preview() and self._channel_inspect is not None:
             self._channel_inspect.apply_viewer_settings(self._settings)
             height = max(160, int(self._settings.graph_height_px))
             try:
@@ -720,7 +720,7 @@ class ViewerWindow(QMainWindow):
             except Exception:
                 pass
             self._channel_inspect.redraw(preserve_view=True)
-            self._redraw_detached_windows()
+        self._redraw_detached_windows()
 
     def _apply_graph_height_to_tabs(self) -> None:
         """Propager la hauteur fixe Affichage aux onglets (hors revue montage)."""

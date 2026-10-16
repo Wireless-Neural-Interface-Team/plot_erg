@@ -1,15 +1,15 @@
-"""Modes d’échelle : valeur seule / taille seule / les deux."""
+"""Contrat unique des barres d’échelle — ``resolve_axis_bar``."""
 
 from __future__ import annotations
 
 import math
 
-from plot_utils import (
+from scale_bar_model import (
     format_scale_label,
-    resolve_scale_bar_length,
-    scale_bar_label_value,
-    scale_bar_pixel_length,
-    scale_bar_true_value,
+    resolve_axis_bar,
+    time_value_in_axis_units,
+    units_for_kind,
+    units_for_panel,
 )
 
 
@@ -18,173 +18,160 @@ def _assert_close(a: float, b: float, *, tol: float = 1e-9) -> None:
     assert abs(a - b) <= tol * max(1.0, abs(b)), (a, b)
 
 
-def test_value_and_length_bar_follows_amplitude() -> None:
-    """Taille + amplitude : bâton proportionnel (échelle vraie), libellé = amp.
-
-    ``length_px`` ne force plus un bâton décorrélé — il cale le widget.
-    """
-    span, axis, amp, length_px = 200.0, 400.0, 50.0, 40.0
-    bar = scale_bar_pixel_length(
-        data_value=amp,
-        span=span,
-        axis_px=axis,
-        length_px=length_px,
-        value_manual=True,
-    )
-    # Proportionnel : 50/200 * 400 = 100 px (pas 40).
-    _assert_close(bar, 100.0)
-    label = scale_bar_label_value(
-        data_value=amp,
-        span=span,
-        axis_px=axis,
-        bar_px=bar,
-        value_manual=True,
-        length_manual=True,
-    )
-    _assert_close(label, amp)
-    _assert_close(scale_bar_true_value(bar, span=span, axis_px=axis), amp)
+def test_auto_mode_nice_proportional() -> None:
+    span, axis = 100.0, 400.0
+    bar = resolve_axis_bar(span=span, axis_px=axis)
+    assert bar.value > 0
+    _assert_close(bar.bar_px, (bar.value / span) * axis)
+    _assert_close(bar.label, bar.value)
+    _assert_close(bar.data_length, bar.bar_px / axis * span)
+    assert bar.needed_axis_px is None
 
 
-def test_length_only_calculates_label() -> None:
-    """Taille px seule → bâton fixe, libellé calculé."""
-    span, axis, nice, length_px = 100.0, 400.0, 50.0, 40.0
-    bar = scale_bar_pixel_length(
-        data_value=nice,
-        span=span,
-        axis_px=axis,
-        length_px=length_px,
-        value_manual=False,
-    )
-    _assert_close(bar, 40.0)
-    label = scale_bar_label_value(
-        data_value=nice,
-        span=span,
-        axis_px=axis,
-        bar_px=bar,
-        value_manual=False,
-        length_manual=True,
-    )
-    _assert_close(label, 10.0)
-    assert format_scale_label(label, "µV") == "10µV"
-
-
-def test_amplitude_only_proportional() -> None:
-    """Amplitude seule → bâton proportionnel, libellé = amplitude."""
+def test_value_only_label_and_proportional_bar() -> None:
     span, axis, amp = 100.0, 400.0, 50.0
-    bar = scale_bar_pixel_length(
-        data_value=amp, span=span, axis_px=axis, length_px=None, value_manual=True
+    bar = resolve_axis_bar(span=span, axis_px=axis, value=amp)
+    _assert_close(bar.bar_px, 200.0)
+    _assert_close(bar.label, amp)
+    _assert_close(bar.data_length, amp)
+    assert bar.needed_axis_px is None
+
+
+def test_length_only_fixed_bar_geometric_label() -> None:
+    span, axis, length_px = 100.0, 400.0, 40.0
+    bar = resolve_axis_bar(span=span, axis_px=axis, length_px=length_px)
+    _assert_close(bar.bar_px, 40.0)
+    _assert_close(bar.label, 10.0)
+    _assert_close(bar.data_length, 10.0)
+    assert format_scale_label(bar.label, "µV") == "10µV"
+    assert bar.needed_axis_px is None
+
+
+def test_both_manual_fit_and_label() -> None:
+    """Valeur + taille : bâton = L tout de suite ; needed pour caler le widget."""
+    span, amp, length_px = 200.0, 50.0, 40.0
+    # Avant fit : la taille px est respectée (pas un bâton proportionnel).
+    bar = resolve_axis_bar(
+        span=span, axis_px=400.0, value=amp, length_px=length_px
     )
-    label = scale_bar_label_value(
-        data_value=amp,
+    _assert_close(bar.bar_px, length_px)
+    _assert_close(bar.label, amp)
+    assert bar.needed_axis_px is not None
+    _assert_close(bar.needed_axis_px, span * (length_px / amp))  # 160
+
+    # Après fit théorique : bâton == length_px et true == amp.
+    fitted = resolve_axis_bar(
         span=span,
-        axis_px=axis,
-        bar_px=bar,
-        value_manual=True,
-        length_manual=False,
-    )
-    _assert_close(label, amp)
-    _assert_close(scale_bar_true_value(bar, span=span, axis_px=axis), amp)
-
-
-def test_both_with_matched_widget_height() -> None:
-    """Après fit hauteur, bâton ≈ length_px et libellé = amp."""
-    amp, length_px, data_span = 50.0, 40.0, 100.0
-    axis = data_span * (length_px / amp)
-    bar = scale_bar_pixel_length(
-        data_value=amp,
-        span=data_span,
-        axis_px=axis,
+        axis_px=float(bar.needed_axis_px),
+        value=amp,
         length_px=length_px,
-        value_manual=True,
     )
-    _assert_close(bar, length_px)
-    label = scale_bar_label_value(
-        data_value=amp,
-        span=data_span,
-        axis_px=axis,
-        bar_px=bar,
-        value_manual=True,
-        length_manual=True,
-    )
-    _assert_close(label, amp)
+    _assert_close(fitted.bar_px, length_px)
+    _assert_close(fitted.label, amp)
+    _assert_close(fitted.data_length, amp)
 
 
-def test_same_curve_same_visual_scale() -> None:
-    """Même courbe + même amp : même échelle visuelle, quelle que soit la hauteur."""
-    amp, span = 100.0, 250.0
-    length_px = 40.0
+def test_both_manual_time() -> None:
+    span, time_s, length_px = 1.0, 0.2, 40.0
+    bar = resolve_axis_bar(
+        span=span, axis_px=100.0, value=time_s, length_px=length_px
+    )
+    assert bar.needed_axis_px is not None
+    fitted = resolve_axis_bar(
+        span=span,
+        axis_px=float(bar.needed_axis_px),
+        value=time_s,
+        length_px=length_px,
+    )
+    _assert_close(fitted.bar_px, length_px)
+    _assert_close(fitted.label, time_s)
+
+
+def test_value_manual_label_stable_after_zoom_span() -> None:
+    """Zoom : span change → bâton change, libellé reste la valeur."""
+    amp = 50.0
+    for span in (200.0, 100.0, 50.0):
+        bar = resolve_axis_bar(span=span, axis_px=400.0, value=amp, length_px=40.0)
+        _assert_close(bar.label, amp)
+
+
+def test_both_manual_bar_px_unchanged_when_value_changes() -> None:
+    """Valeur ×10 : le bâton reste L px (seul le widget / le gain données bouge)."""
+    amp, length_px, span = 50.0, 40.0, 200.0
     for axis in (200.0, 400.0, 800.0):
-        bar = scale_bar_pixel_length(
-            data_value=amp,
-            span=span,
-            axis_px=axis,
-            length_px=length_px,
-            value_manual=True,
+        b10 = resolve_axis_bar(
+            span=span, axis_px=axis, value=10.0, length_px=length_px
         )
-        true = scale_bar_true_value(bar, span=span, axis_px=axis)
-        _assert_close(true, amp)
+        b100 = resolve_axis_bar(
+            span=span, axis_px=axis, value=100.0, length_px=length_px
+        )
+        _assert_close(b10.bar_px, length_px)
+        _assert_close(b100.bar_px, length_px)
+        _assert_close(b10.label, 10.0)
+        _assert_close(b100.label, 100.0)
+        assert b100.needed_axis_px is not None and b10.needed_axis_px is not None
+        _assert_close(b100.needed_axis_px, b10.needed_axis_px / 10.0)
 
 
-def test_resolve_manual_still_returns_target() -> None:
+def test_both_manual_bar_px_stable_across_axis() -> None:
+    """Valeur + taille : bâton reste L px quelle que soit la taille d’axe."""
+    amp, span, length_px = 100.0, 250.0, 40.0
+    for axis in (200.0, 400.0, 800.0):
+        bar = resolve_axis_bar(
+            span=span, axis_px=axis, value=amp, length_px=length_px
+        )
+        _assert_close(bar.bar_px, length_px)
+        _assert_close(bar.label, amp)
+        _assert_close(bar.needed_axis_px or 0.0, span * (length_px / amp))
+
+
+def test_time_fit_needed_grows_with_span() -> None:
+    """Durée + taille : needed_axis croît avec la plage X (zoom inclus)."""
+    time_s, length_px = 0.1, 40.0
+    short = resolve_axis_bar(span=0.25, axis_px=100.0, value=time_s, length_px=length_px)
+    long = resolve_axis_bar(span=12.0, axis_px=100.0, value=time_s, length_px=length_px)
+    assert short.needed_axis_px is not None
+    assert long.needed_axis_px is not None
+    assert long.needed_axis_px > short.needed_axis_px
+
+
+def test_units_isi_and_overlay() -> None:
+    assert units_for_panel("analysis_isi") == ("ms", None)
+    assert units_for_panel("isi") == ("ms", None)
+    assert units_for_kind("isi") == ("ms", None)
+    assert units_for_kind("overlay") == ("ms", "µV")
+    assert units_for_kind("raw") == ("s", "µV")
+    assert time_value_in_axis_units(0.1, "ms") == 100.0
+    assert time_value_in_axis_units(0.1, "s") == 0.1
+
+
+def test_compat_shims() -> None:
+    from plot_utils import (
+        resolve_scale_bar_length,
+        scale_bar_label_value,
+        scale_bar_pixel_length,
+        scale_bar_true_value,
+    )
+
     assert resolve_scale_bar_length(22.0, manual=True, value=100.0) == 100.0
-
-
-def test_value_manual_label_always_shows_entered_amp() -> None:
-    """Valeur manuelle → libellé = valeur saisie (même si bâton clampé)."""
-    span, axis, amp = 50.0, 400.0, 100.0
-    bar = scale_bar_pixel_length(
+    span, axis, amp = 100.0, 400.0, 50.0
+    px = scale_bar_pixel_length(
         data_value=amp, span=span, axis_px=axis, length_px=None, value_manual=True
     )
-    _assert_close(bar, axis)  # clampé à la hauteur d’axe
-    label = scale_bar_label_value(
+    _assert_close(px, 200.0)
+    lab = scale_bar_label_value(
         data_value=amp,
         span=span,
         axis_px=axis,
-        bar_px=bar,
+        bar_px=px,
         value_manual=True,
         length_manual=False,
     )
-    _assert_close(label, amp)
-
-
-def test_both_manual_time_label_is_entered_duration() -> None:
-    """Temps + taille temps : libellé = durée saisie."""
-    span, axis, time_s, length_px = 1.0, 500.0, 0.2, 40.0
-    # Après fit largeur : axis = span * length / time.
-    axis_fit = span * (length_px / time_s)
-    bar = scale_bar_pixel_length(
-        data_value=time_s,
-        span=span,
-        axis_px=axis_fit,
-        length_px=length_px,
-        value_manual=True,
-    )
-    _assert_close(bar, length_px)
-    label = scale_bar_label_value(
-        data_value=time_s,
-        span=span,
-        axis_px=axis_fit,
-        bar_px=bar,
-        value_manual=True,
-        length_manual=True,
-    )
-    _assert_close(label, time_s)
-
-
-def test_isi_scale_bar_units_are_ms_not_counts() -> None:
-    """Histogramme ISI : X en ms, pas d’échelle Y (comptages)."""
-    from panel_registry import _scale_bar_units
-
-    x_unit, y_unit = _scale_bar_units("analysis_isi")
-    assert x_unit == "ms"
-    assert y_unit is None
-    x_unit, y_unit = _scale_bar_units("isi")
-    assert x_unit == "ms"
-    assert y_unit is None
+    _assert_close(lab, amp)
+    _assert_close(scale_bar_true_value(px, span=span, axis_px=axis), amp)
 
 
 def test_montage_mean_decimate_preserves_peak() -> None:
-    """Montage moyenne/stim : enveloppe, pas stride (pic conservé)."""
     import numpy as np
     from types import SimpleNamespace
 

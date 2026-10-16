@@ -312,9 +312,10 @@ def _restyle_stim_annotations(
 
 @dataclass
 class ScaleBarSpec:
-    """Floating time / amplitude scale bars (screen path)."""
+    """Échelle temps / amplitude (écran) : paramètres communs barres ou graduations."""
 
     enabled: bool = False
+    floating: bool = False
     x_unit: str | None = None
     y_unit: str | None = None
     time_manual: bool = False
@@ -337,6 +338,22 @@ class ScaleBarSpec:
     # Décalage échelle temps / axe horizontal (+dx droite, +dy haut).
     time_dx_px: float = 0.0
     time_dy_px: float = 0.0
+
+
+def scale_bar_spec_settings_key(bars: ScaleBarSpec) -> tuple[Any, ...]:
+    """Empreinte des réglages d’échelle (invalidation affichage / fit)."""
+    return (
+        bool(bars.enabled),
+        bool(bars.floating),
+        bool(bars.amp_manual),
+        round(float(bars.amplitude), 12),
+        bool(bars.amp_length_manual),
+        round(float(bars.amp_length_px), 3),
+        bool(bars.time_manual),
+        round(float(bars.time_s), 12),
+        bool(bars.time_length_manual),
+        round(float(bars.time_length_px), 3),
+    )
 
 
 SeriesItem = CurveSeries | ScatterSeries | HistSeries
@@ -829,9 +846,9 @@ def _apply_legend_label_overrides(spec: PanelSpec, request: Any) -> None:
 
 
 def _scale_bar_spec(request: Any, *, panel: str) -> ScaleBarSpec:
-    """Build scale-bar recipe from ``request.style`` (disabled if unsupported)."""
+    """Paramètres d’échelle depuis ``request.style`` (barres flottantes optionnelles)."""
     style = getattr(request, "style", None)
-    if style is None or not bool(getattr(style, "show_scale_bars", False)):
+    if style is None:
         return ScaleBarSpec(enabled=False)
     try:
         from panel_registry import _scale_bar_units
@@ -852,8 +869,10 @@ def _scale_bar_spec(request: Any, *, panel: str) -> ScaleBarSpec:
     time_len = float(getattr(style, "scale_bar_time_length_px", 40.0) or 40.0)
     if time_len <= 0:
         time_len = 40.0
+    floating = bool(getattr(style, "show_scale_bars", False))
     return ScaleBarSpec(
         enabled=True,
+        floating=floating,
         x_unit=x_unit,
         y_unit=y_unit,
         time_manual=bool(getattr(style, "scale_bar_time_manual", False)),

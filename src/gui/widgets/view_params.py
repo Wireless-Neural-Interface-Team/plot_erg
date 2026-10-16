@@ -226,8 +226,8 @@ class LocalViewParams(QWidget):
         wide_form = configure_narrow_form(QFormLayout(wide_inner))
         wide_form.setContentsMargins(0, 0, 0, 0)
         self._raw_ylim = AxisLimitRow(settings.raw_ylim, unit=" µV")
-        self._raw_ylim.setToolTip("Échelle Y des panneaux WIDE de cette fenêtre.")
-        wide_form.addRow("Échelle Y :", self._raw_ylim)
+        self._raw_ylim.setToolTip("Plage Y affichée (µV) — panneaux WIDE.")
+        wide_form.addRow("Plage Y :", self._raw_ylim)
         self._curve_wide_box.setToolTip(
             "Afficher WIDE dans cette fenêtre (continuous / moyenne / stim)."
         )
@@ -238,8 +238,8 @@ class LocalViewParams(QWidget):
         high_form = configure_narrow_form(QFormLayout(high_inner))
         high_form.setContentsMargins(0, 0, 0, 0)
         self._hp_ylim = AxisLimitRow(settings.hp_ylim, unit=" µV")
-        self._hp_ylim.setToolTip("Échelle Y des panneaux HIGH de cette fenêtre.")
-        high_form.addRow("Échelle Y :", self._hp_ylim)
+        self._hp_ylim.setToolTip("Plage Y affichée (µV) — panneaux HIGH.")
+        high_form.addRow("Plage Y :", self._hp_ylim)
 
         self._curve_low_box, low_inner = _collapsible_group(
             "LOW (passe-bas)", expanded=bool(analysis.show_lp)
@@ -247,8 +247,8 @@ class LocalViewParams(QWidget):
         low_form = configure_narrow_form(QFormLayout(low_inner))
         low_form.setContentsMargins(0, 0, 0, 0)
         self._lp_ylim = AxisLimitRow(settings.lp_ylim, unit=" µV")
-        self._lp_ylim.setToolTip("Échelle Y des panneaux LOW de cette fenêtre.")
-        low_form.addRow("Échelle Y :", self._lp_ylim)
+        self._lp_ylim.setToolTip("Plage Y affichée (µV) — panneaux LOW.")
+        low_form.addRow("Plage Y :", self._lp_ylim)
 
         self._curve_rms_box, rms_inner = _collapsible_group(
             "RMS", expanded=bool(analysis.show_rms)
@@ -256,8 +256,8 @@ class LocalViewParams(QWidget):
         rms_form = configure_narrow_form(QFormLayout(rms_inner))
         rms_form.setContentsMargins(0, 0, 0, 0)
         self._rms_ylim = AxisLimitRow(settings.rms_ylim, unit=" µV", step=1.0)
-        self._rms_ylim.setToolTip("Échelle Y des panneaux RMS de cette fenêtre.")
-        rms_form.addRow("Échelle Y :", self._rms_ylim)
+        self._rms_ylim.setToolTip("Plage Y affichée (µV) — panneaux RMS.")
+        rms_form.addRow("Plage Y :", self._rms_ylim)
 
         self._curve_spikes_box, spikes_inner = _collapsible_group(
             "Spikes",
@@ -346,7 +346,7 @@ class LocalViewParams(QWidget):
         form_layout.setContentsMargins(8, 8, 8, 8)
         form_layout.setSpacing(8)
 
-        axis_group = QGroupBox("Échelles des axes", page)
+        axis_group = QGroupBox("Plages d’affichage", page)
         axis_form = configure_narrow_form(QFormLayout(axis_group))
         self._x_limits = AxisLimitRow(
             settings.x_limits,
@@ -355,33 +355,33 @@ class LocalViewParams(QWidget):
             step=0.01,
         )
         self._x_limits.setToolTip(
-            "Limites X manuelles (temps en secondes), appliquées à tous les "
-            "graphs temporels de cette fenêtre."
+            "Plage de temps visible (fenêtre X, en secondes). Le gain temporel "
+            "(s/px) se règle avec Temps barre + Taille temps."
         )
-        axis_form.addRow("Axe X (temps) :", self._x_limits)
+        axis_form.addRow("Plage X (temps) :", self._x_limits)
 
         if self._show_canal_tab:
             # Y déjà dans Canal — comme le dock Paramètres principal.
             axis_hint = QLabel(
-                "Échelles verticales (WIDE / HIGH / LOW / RMS) → Canal, "
-                "dans la section de la courbe cochée."
+                "Plages Y (WIDE / HIGH / LOW / RMS) → Canal. Recadrent l’affichage ; "
+                "le gain µV/px vient d’Amplitude + Taille amp."
             )
             axis_hint.setObjectName("hintLabel")
             axis_hint.setWordWrap(True)
             axis_form.addRow(axis_hint)
         else:
             self._raw_ylim = AxisLimitRow(settings.raw_ylim, unit=" µV")
-            self._raw_ylim.setToolTip("Échelle Y des panneaux WIDE.")
+            self._raw_ylim.setToolTip("Plage Y affichée (µV) — panneaux WIDE.")
             self._hp_ylim = AxisLimitRow(settings.hp_ylim, unit=" µV")
-            self._hp_ylim.setToolTip("Échelle Y des panneaux HIGH.")
+            self._hp_ylim.setToolTip("Plage Y affichée (µV) — panneaux HIGH.")
             self._lp_ylim = AxisLimitRow(settings.lp_ylim, unit=" µV")
-            self._lp_ylim.setToolTip("Échelle Y des panneaux LOW.")
+            self._lp_ylim.setToolTip("Plage Y affichée (µV) — panneaux LOW.")
             self._rms_ylim = AxisLimitRow(settings.rms_ylim, unit=" µV", step=1.0)
-            self._rms_ylim.setToolTip("Échelle Y des panneaux et résumés RMS.")
-            axis_form.addRow("WIDE (µV) :", self._raw_ylim)
-            axis_form.addRow("HIGH (µV) :", self._hp_ylim)
-            axis_form.addRow("LOW (µV) :", self._lp_ylim)
-            axis_form.addRow("RMS (µV) :", self._rms_ylim)
+            self._rms_ylim.setToolTip("Plage Y affichée (µV) — panneaux RMS.")
+            axis_form.addRow("Plage Y WIDE :", self._raw_ylim)
+            axis_form.addRow("Plage Y HIGH :", self._hp_ylim)
+            axis_form.addRow("Plage Y LOW :", self._lp_ylim)
+            axis_form.addRow("Plage Y RMS :", self._rms_ylim)
         form_layout.addWidget(axis_group)
 
         layout_group = QGroupBox("Disposition", page)
@@ -391,15 +391,16 @@ class LocalViewParams(QWidget):
             160, 1200, int(settings.graph_height_px), step=20, suffix=" px"
         )
         self._graph_height.setToolTip(
-            "Hauteur fixe de chaque graphique de cette fenêtre. "
-            "Grisée si « Taille amp. » est en manuel "
-            "(le bâton fixe alors le gain Y)."
+            "Hauteur du panneau si « Taille amp. » n’est pas en manuel. "
+            "Sinon la hauteur suit Taille amp. + Amplitude."
         )
-        self._show_scale_bars = QCheckBox("Échelle flottante (barres temps / amplitude)")
+        self._show_scale_bars = QCheckBox(
+            "Barres flottantes (sinon graduations sur les axes)"
+        )
         self._show_scale_bars.setChecked(bool(getattr(settings.style, "show_scale_bars", False)))
         self._show_scale_bars.setToolTip(
-            "Masque les graduations numériques sur les bords (les titres d’axes "
-            "restent) et affiche une barre d’échelle flottante (ex. 100 ms · 200 µV)."
+            "Temps / Amplitude définissent toujours l’échelle. Coché : barres "
+            "flottantes ; décoché : graduations sur les axes."
         )
         style = settings.style
         self._scale_bar_amp_manual = QCheckBox("Manuel")
@@ -955,38 +956,35 @@ class LocalViewParams(QWidget):
         form_layout.addWidget(style_group)
 
     def _sync_scale_bar_inputs(self, *_args: Any) -> None:
-        enabled = bool(self._show_scale_bars.isChecked())
-        self._scale_bar_amp_manual.setEnabled(enabled)
-        self._scale_bar_time_manual.setEnabled(enabled)
-        self._scale_bar_amp.setEnabled(
-            enabled and bool(self._scale_bar_amp_manual.isChecked())
-        )
-        self._scale_bar_time_ms.setEnabled(
-            enabled and bool(self._scale_bar_time_manual.isChecked())
-        )
-        self._scale_bar_amp_len_manual.setEnabled(enabled)
-        self._scale_bar_time_len_manual.setEnabled(enabled)
+        floating = bool(self._show_scale_bars.isChecked())
+        # Valeur / taille px : barres flottantes ou graduations sur les axes.
+        self._scale_bar_amp_manual.setEnabled(True)
+        self._scale_bar_time_manual.setEnabled(True)
+        self._scale_bar_amp.setEnabled(bool(self._scale_bar_amp_manual.isChecked()))
+        self._scale_bar_time_ms.setEnabled(bool(self._scale_bar_time_manual.isChecked()))
+        self._scale_bar_amp_len_manual.setEnabled(True)
+        self._scale_bar_time_len_manual.setEnabled(True)
         self._scale_bar_amp_len_px.setEnabled(
-            enabled and bool(self._scale_bar_amp_len_manual.isChecked())
+            bool(self._scale_bar_amp_len_manual.isChecked())
         )
         self._scale_bar_time_len_px.setEnabled(
-            enabled and bool(self._scale_bar_time_len_manual.isChecked())
+            bool(self._scale_bar_time_len_manual.isChecked())
         )
-        self._scale_bar_linewidth.setEnabled(enabled)
-        self._scale_bar_dx.setEnabled(enabled)
-        self._scale_bar_dy.setEnabled(enabled)
-        self._scale_bar_time_dx.setEnabled(enabled)
-        self._scale_bar_time_dy.setEnabled(enabled)
-        # Taille amp. manuelle → griser « Hauteur des graphs » (même formulaire).
-        amp_len_on = enabled and bool(self._scale_bar_amp_len_manual.isChecked())
+        self._scale_bar_linewidth.setEnabled(floating)
+        self._scale_bar_dx.setEnabled(floating)
+        self._scale_bar_dy.setEnabled(floating)
+        self._scale_bar_time_dx.setEnabled(floating)
+        self._scale_bar_time_dy.setEnabled(floating)
+        amp_len_on = bool(self._scale_bar_amp_len_manual.isChecked())
         if hasattr(self, "_graph_height") and bool(
             getattr(self, "_show_graph_height", True)
         ):
-            self._graph_height.setEnabled(not amp_len_on)
+            show_h = not amp_len_on
+            self._graph_height.setVisible(show_h)
             if hasattr(self, "_layout_form"):
                 label = self._layout_form.labelForField(self._graph_height)
                 if label is not None:
-                    label.setEnabled(not amp_len_on)
+                    label.setVisible(show_h)
 
     def _sync_stim_label_inputs(self, *_args: Any) -> None:
         enabled = bool(self._show_stim_labels.isChecked())

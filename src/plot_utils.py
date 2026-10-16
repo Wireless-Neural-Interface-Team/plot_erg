@@ -328,41 +328,16 @@ def envelope_minmax_row(
 
 def nice_scale_length(span: float, *, target_frac: float = 0.18) -> float:
     """Longueur « ronde » (~1 / 2 / 5 × 10ⁿ) proche de ``target_frac`` du span visible."""
-    span = abs(float(span))
-    if not math.isfinite(span) or span <= 0:
-        return 1.0
-    target = span * float(target_frac)
-    if target <= 0:
-        return span * target_frac
-    exponent = math.floor(math.log10(target))
-    fraction = target / (10.0**exponent)
-    for candidate in (1.0, 2.0, 5.0, 10.0):
-        if fraction <= candidate * 1.05:
-            return candidate * (10.0**exponent)
-    return 10.0 * (10.0**exponent)
+    from scale_bar_model import nice_scale_length as _nice
+
+    return _nice(span, target_frac=target_frac)
 
 
 def format_scale_label(value: float, unit: str) -> str:
     """Libellé compact pour une barre d’échelle (ex. ``100ms``, ``200µV``)."""
-    unit = (unit or "").strip()
-    magnitude = abs(float(value))
-    if unit in {"s", "sec", "seconds"}:
-        if magnitude >= 1.0:
-            text = f"{magnitude:g}"
-            return f"{text}s"
-        ms = magnitude * 1000.0
-        if ms >= 1.0:
-            return f"{ms:g}ms"
-        us = ms * 1000.0
-        return f"{us:g}µs"
-    if unit in {"ms"}:
-        return f"{magnitude:g}ms"
-    if not unit:
-        return f"{magnitude:g}"
-    # µV, Hz, Ω, …
-    if magnitude >= 100 or abs(magnitude - round(magnitude)) < 1e-9:
-        return f"{magnitude:g}{unit}"
-    return f"{magnitude:g}{unit}"
+    from scale_bar_model import format_scale_label as _fmt
+
+    return _fmt(value, unit)
 
 
 def clear_floating_scale_bars(ax: Any) -> None:
@@ -412,14 +387,6 @@ def hide_edge_scale(
             pass
 
 
-def _nice_bar_length(span: float) -> float:
-    """Longueur ronde bornée à ~45 % du span visible."""
-    size = nice_scale_length(span)
-    while size > span * 0.45 and size > 0:
-        size *= 0.5
-    return size
-
-
 def resolve_scale_bar_length(
     span: float,
     *,
@@ -429,20 +396,18 @@ def resolve_scale_bar_length(
 ) -> float:
     """Longueur de barre cible (unités de données) : manuelle ou auto.
 
-    En manuel, renvoie ``value`` (ex. 100 µV) — c’est aussi le libellé.
-    Avec taille px manuelle, le widget est recalé pour que
-    ``value`` ↔ ``length_px`` (voir ``scale_bar_needed_view_height_px``).
-
-    ``clamp_to_span=True`` (legacy) : si ``value`` dépasse ~90 % du span,
-    repasse en auto.
+    Shim vers :func:`scale_bar_model.resolve_axis_bar`.
     """
-    span = abs(float(span))
+    from scale_bar_model import resolve_axis_bar
+
+    span_abs = abs(float(span))
     if manual and math.isfinite(float(value)) and float(value) > 0:
         if not clamp_to_span:
             return float(value)
-        if span > 0 and float(value) <= span * 0.9:
+        if span_abs > 0 and float(value) <= span_abs * 0.9:
             return float(value)
-    return _nice_bar_length(span)
+    bar = resolve_axis_bar(span=span_abs, axis_px=100.0, value=None, length_px=None)
+    return float(bar.value)
 
 
 def scale_bar_pixel_length(
@@ -453,41 +418,26 @@ def scale_bar_pixel_length(
     length_px: float | None = None,
     value_manual: bool = False,
 ) -> float:
-    """Longueur du bâton en pixels.
+    """Longueur du bâton en pixels (shim → ``resolve_axis_bar``)."""
+    from scale_bar_model import resolve_axis_bar
 
-    - **Valeur + taille** manuelles : bâton *proportionnel* à ``data_value``
-      (échelle vraie sur la courbe). ``length_px`` sert uniquement à caler
-      la hauteur du widget, pas à forcer un bâton décorrélé du zoom.
-    - **Taille seule** : bâton = ``length_px`` (libellé calculé à part).
-    - **Valeur seule** / auto : bâton proportionnel à ``data_value``.
-    """
-    try:
-        axis = float(axis_px)
-    except (TypeError, ValueError):
-        return 0.0
-    if not (axis > 0.0) or axis != axis:
-        return 0.0
-    length_manual = False
-    fixed = 0.0
-    if length_px is not None:
-        try:
-            fixed = float(length_px)
-        except (TypeError, ValueError):
-            fixed = 0.0
-        length_manual = bool(fixed > 0.0 and fixed == fixed)
-    # Les deux manuels → proportionnel (la taille px pilote le widget ailleurs).
-    if length_manual and not bool(value_manual):
-        return max(1.0, min(fixed, axis))
-    try:
-        value = float(data_value)
-        data_span = abs(float(span))
-    except (TypeError, ValueError):
-        return 0.0
-    if not (value > 0.0 and data_span > 0.0):
-        return 0.0
-    if value != value or data_span != data_span:
-        return 0.0
-    return max(1.0, min((value / data_span) * axis, axis))
+    length_ok = length_px is not None and float(length_px) > 0
+    if length_ok and not bool(value_manual):
+        return float(
+            resolve_axis_bar(
+                span=span, axis_px=axis_px, value=None, length_px=float(length_px)
+            ).bar_px
+        )
+    # Valeur manuelle, les deux, ou cible auto déjà résolue dans data_value.
+    val = float(data_value) if float(data_value) > 0 else None
+    return float(
+        resolve_axis_bar(
+            span=span,
+            axis_px=axis_px,
+            value=val,
+            length_px=float(length_px) if (length_ok and bool(value_manual)) else None,
+        ).bar_px
+    )
 
 
 def scale_bar_true_value(
@@ -496,11 +446,7 @@ def scale_bar_true_value(
     span: float,
     axis_px: float,
 ) -> float:
-    """Valeur réelle (unités de données) représentée par ``bar_px`` pixels.
-
-    Invariant d’une échelle honnête :
-    ``true = bar_px / axis_px × span``.
-    """
+    """Valeur réelle (unités de données) : ``bar_px / axis_px × span``."""
     try:
         bar = float(bar_px)
         data_span = abs(float(span))
@@ -523,24 +469,29 @@ def scale_bar_label_value(
     value_manual: bool,
     length_manual: bool,
 ) -> float:
-    """Valeur affichée à côté du bâton selon le mode de saisie.
+    """Valeur affichée (shim → ``resolve_axis_bar``)."""
+    from scale_bar_model import resolve_axis_bar
 
-    - **Valeur manuelle** (seule ou avec taille px) : toujours ``data_value``
-      (c’est la valeur affichée ; avec taille px elle calibre aussi le graph).
-    - **Taille px seule** : valeur déduite de la géométrie
-      (``bar_px / axis_px × span``).
-    - **Auto** : ``data_value`` (longueur « nice »).
-    """
+    if bool(length_manual) and not bool(value_manual):
+        # Géométrie du bâton réellement dessiné.
+        return float(
+            resolve_axis_bar(
+                span=span, axis_px=axis_px, value=None, length_px=float(bar_px)
+            ).label
+        )
+    if bool(value_manual) and float(data_value) > 0:
+        return float(
+            resolve_axis_bar(
+                span=span,
+                axis_px=axis_px,
+                value=float(data_value),
+                length_px=float(bar_px) if bool(length_manual) else None,
+            ).label
+        )
     try:
         target = float(data_value)
     except (TypeError, ValueError):
         target = 0.0
-    # Valeur saisie = libellé affiché (jamais recalculé).
-    if bool(value_manual) and target > 0.0 and target == target:
-        return target
-    if bool(length_manual) and not bool(value_manual):
-        true = scale_bar_true_value(bar_px, span=span, axis_px=axis_px)
-        return true if true > 0.0 else (target if target > 0.0 and target == target else 0.0)
     return target if target > 0.0 and target == target else 0.0
 
 
@@ -593,21 +544,13 @@ def draw_floating_scale_bars(
     y_value_manual: bool = False,
     x_value_manual: bool = False,
 ) -> None:
-    """Barres d’échelle flottantes (temps + amplitude).
+    """Barres d’échelle flottantes via :func:`scale_bar_model.resolve_axis_bar`.
 
-    Modes de libellé (voir ``scale_bar_label_value``) :
-    - valeur + taille px manuelles → libellé = valeur (fixe la taille du graph) ;
-    - taille px seule → libellé calculé depuis la géométrie ;
-    - valeur seule → bâton proportionnel, libellé = valeur.
-
-    Position : ancrée sur le bord des axes (fraction d’axes), pas en coordonnées
-    de données — ainsi les barres restent hors des courbes.
-    ``gutter=True`` place l’échelle Y à droite de la zone de tracé.
-    ``below=True`` (défaut) place l’échelle X sous le graphique.
-    ``dx_px`` / ``dy_px`` décalent l’échelle amplitude (axe vertical).
-    ``x_dx_px`` / ``x_dy_px`` décalent l’échelle temps (axe horizontal) ;
-    s’ils sont ``None``, on réutilise ``dx_px`` / ``dy_px``.
+    Longueur en données = ``bar_px / axis_px × span`` (alignée pixel ↔ données).
     """
+    from scale_bar_model import format_scale_label as _fmt
+    from scale_bar_model import resolve_axis_bar
+
     if clear:
         clear_floating_scale_bars(ax)
 
@@ -667,17 +610,6 @@ def draw_floating_scale_bars(
             fig.dpi_scale_trans,
         )
 
-    x_len = (
-        float(x_size)
-        if (show_x and x_size is not None and float(x_size) > 0)
-        else (_nice_bar_length(x_span) if show_x else 0.0)
-    )
-    y_len = (
-        float(y_size)
-        if (show_y and y_size is not None and float(y_size) > 0)
-        else (_nice_bar_length(y_span) if show_y else 0.0)
-    )
-
     def _axes_size_px() -> tuple[float, float]:
         try:
             bbox = ax.get_window_extent()
@@ -685,77 +617,60 @@ def draw_floating_scale_bars(
         except Exception:
             return 400.0, 300.0
 
-    def _data_len_for_px(length_px: float | None, *, span: float, axis_px: float) -> float | None:
-        if length_px is None:
-            return None
-        px = _px(length_px)
-        if px <= 0.0 or span <= 0.0 or axis_px <= 0.0:
-            return None
-        return (px / axis_px) * span
-
     ax_w_px, ax_h_px = _axes_size_px()
-    y_len_manual = y_length_px is not None and _px(y_length_px) > 0.0
-    x_len_manual = x_length_px is not None and _px(x_length_px) > 0.0
-    # Longueur tracée en données : taille px → conversion ; sinon = cible.
-    y_draw = _data_len_for_px(y_length_px, span=y_span, axis_px=ax_h_px)
-    if y_draw is None:
-        y_draw = y_len
-    x_draw = _data_len_for_px(x_length_px, span=x_span, axis_px=ax_w_px)
-    if x_draw is None:
-        x_draw = x_len
-    y_bar_px = (
-        scale_bar_pixel_length(
-            data_value=y_len,
-            span=y_span,
-            axis_px=ax_h_px,
-            length_px=y_length_px if y_len_manual else None,
-            value_manual=bool(y_value_manual),
-        )
-        if show_y
-        else 0.0
-    )
-    x_bar_px = (
-        scale_bar_pixel_length(
-            data_value=x_len,
-            span=x_span,
-            axis_px=ax_w_px,
-            length_px=x_length_px if x_len_manual else None,
-            value_manual=bool(x_value_manual),
-        )
-        if show_x
-        else 0.0
-    )
-    y_label_value = (
-        scale_bar_label_value(
-            data_value=y_len,
-            span=y_span,
-            axis_px=ax_h_px,
-            bar_px=y_bar_px,
-            value_manual=bool(y_value_manual),
-            length_manual=y_len_manual,
-        )
-        if show_y
-        else 0.0
-    )
-    x_label_value = (
-        scale_bar_label_value(
-            data_value=x_len,
-            span=x_span,
-            axis_px=ax_w_px,
-            bar_px=x_bar_px,
-            value_manual=bool(x_value_manual),
-            length_manual=x_len_manual,
-        )
-        if show_x
-        else 0.0
-    )
-    # Valeur+taille : bâton en données = valeur (la figure doit avoir la bonne taille).
-    if show_y and bool(y_value_manual) and y_len_manual and y_len > 0:
-        y_draw = float(y_len)
-    if show_x and bool(x_value_manual) and x_len_manual and x_len > 0:
-        x_draw = float(x_len)
 
-    # Fraction d’axes : à droite des courbes (dans la marge si gutter).
+    def _axis_from_caller(
+        *,
+        span: float,
+        axis_px: float,
+        size: float | None,
+        length_px: float | None,
+        value_manual: bool,
+    ):
+        """Mapper les flags appelant → ``resolve_axis_bar``.
+
+        - taille seule : value=None, length_px=L
+        - valeur (+ taille) : value=size, length_px=L|None
+        - auto : value=size (nice déjà résolu) ou None
+        """
+        length = _px(length_px) if length_px is not None and _px(length_px) > 0 else None
+        size_ok = size is not None and float(size) > 0
+        if length is not None and not bool(value_manual):
+            return resolve_axis_bar(
+                span=span, axis_px=axis_px, value=None, length_px=length
+            )
+        if size_ok:
+            return resolve_axis_bar(
+                span=span,
+                axis_px=axis_px,
+                value=float(size),
+                length_px=length if bool(value_manual) else None,
+            )
+        return resolve_axis_bar(span=span, axis_px=axis_px)
+
+    y_bar = (
+        _axis_from_caller(
+            span=y_span,
+            axis_px=ax_h_px,
+            size=y_size,
+            length_px=y_length_px,
+            value_manual=bool(y_value_manual),
+        )
+        if show_y
+        else None
+    )
+    x_bar = (
+        _axis_from_caller(
+            span=x_span,
+            axis_px=ax_w_px,
+            size=x_size,
+            length_px=x_length_px,
+            value_manual=bool(x_value_manual),
+        )
+        if show_x
+        else None
+    )
+
     x_axes = 1.02 if gutter else 0.985
     line_kw = {
         "color": color,
@@ -766,25 +681,26 @@ def draw_floating_scale_bars(
         "zorder": 20,
     }
 
-    if show_y:
-        # X fixe (axes) · Y en données → bâton vertical.
-        # y_draw = longueur visuelle ; libellé = y_len (valeur d’échelle).
+    if show_y and y_bar is not None and y_bar.data_length > 0:
         trans_y = _with_px_shift(
             blended_transform_factory(ax.transAxes, ax.transData),
             shift_dx=amp_dx,
             shift_dy=amp_dy,
         )
         y_mid = 0.5 * (float(ylim[0]) + float(ylim[1]))
-        y0 = y_mid - 0.5 * y_draw
-        y1 = y0 + y_draw
-        vline = Line2D([x_axes, x_axes], [y0, y1], transform=trans_y, **line_kw)
+        half = 0.5 * float(y_bar.data_length)
+        vline = Line2D(
+            [x_axes, x_axes],
+            [y_mid - half, y_mid + half],
+            transform=trans_y,
+            **line_kw,
+        )
         _mark_scale_artist(vline)
         ax.add_line(vline)
-        label = format_scale_label(y_label_value, str(y_unit))
         text = ax.text(
             x_axes + (0.012 if gutter else 0.008),
             y_mid,
-            label,
+            _fmt(y_bar.label, str(y_unit)),
             transform=trans_y,
             color=color,
             fontsize=fontsize,
@@ -796,11 +712,9 @@ def draw_floating_scale_bars(
         _mark_scale_artist(text)
         _apply_scale_label_face(text, face)
 
-    if show_x:
-        # X en données · Y = bord bas des axes + décalage fixe (points).
+    if show_x and x_bar is not None and x_bar.data_length > 0:
         trans_base = blended_transform_factory(ax.transData, ax.transAxes)
         if below:
-            # Sous le graph, hors zone de tracé (décalage fixe en points).
             trans_line = _with_px_shift(
                 trans_base, shift_dx=time_dx, shift_dy=time_dy, extra_dy_in=-14 / 72
             )
@@ -816,7 +730,7 @@ def draw_floating_scale_bars(
                 trans_base, shift_dx=time_dx, shift_dy=time_dy
             )
             y_ref = 0.08
-        # x_draw = longueur en données (= libellé) ; taille px fixe via conversion.
+        x_draw = float(x_bar.data_length)
         x_right = float(xlim[1]) - 0.02 * x_span
         x_left = x_right - x_draw
         if x_left < float(xlim[0]):
@@ -827,11 +741,10 @@ def draw_floating_scale_bars(
         )
         _mark_scale_artist(hline)
         ax.add_line(hline)
-        label = format_scale_label(x_label_value, str(x_unit))
         text = ax.text(
             0.5 * (x_left + x_right),
             y_ref if below else (y_ref - 0.04),
-            label,
+            _fmt(x_bar.label, str(x_unit)),
             transform=trans_label,
             color=color,
             fontsize=fontsize,
@@ -843,5 +756,4 @@ def draw_floating_scale_bars(
         _mark_scale_artist(text)
         _apply_scale_label_face(text, face)
 
-    # ``loc`` conservé pour compatibilité d’appel ; placement géré ci-dessus.
     _ = loc

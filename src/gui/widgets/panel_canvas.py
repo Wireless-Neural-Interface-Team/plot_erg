@@ -45,6 +45,20 @@ from view_config import (
 )
 
 
+def _scale_fit_signature(style: PanelStyle) -> tuple[Any, ...]:
+    """Empreinte des réglages valeur + taille px (recalcul layout si changement)."""
+    return (
+        bool(style.scale_bar_amplitude_manual),
+        round(float(style.scale_bar_amplitude or 0.0), 12),
+        bool(style.scale_bar_amplitude_length_manual),
+        int(round(float(style.scale_bar_amplitude_length_px or 0.0))),
+        bool(style.scale_bar_time_manual),
+        round(float(style.scale_bar_time_s or 0.0), 12),
+        bool(style.scale_bar_time_length_manual),
+        int(round(float(style.scale_bar_time_length_px or 0.0))),
+    )
+
+
 def x_scale_family(panel: str) -> str:
     """Famille d’échelle X partageable au double-clic ('' = ne pas synchroniser)."""
     key = str(panel or "")
@@ -461,10 +475,15 @@ class PanelCanvas(QFrame):
         self.plot_host = self._plot
         self._plot.textEdited.connect(self._on_canvas_text_edited)
         self._plot.xAutoscaleRequested.connect(self._on_host_x_autoscale)
-        self._plot.scaleBarHeightFitRequested.connect(self._fit_scale_bar_widget_height)
-        self._plot.scaleBarWidthFitRequested.connect(self._fit_scale_bar_widget_width)
+        self._plot.scaleBarHeightFitRequested.connect(self._schedule_scale_bar_widget_fit)
+        self._plot.scaleBarWidthFitRequested.connect(self._schedule_scale_bar_widget_fit)
         self.fitted_height_px: int | None = None
         self.fitted_width_px: int | None = None
+        self._last_scale_fit_signature: tuple[Any, ...] | None = None
+        self._scale_fit_coalesce = QTimer(self)
+        self._scale_fit_coalesce.setSingleShot(True)
+        self._scale_fit_coalesce.setInterval(150)
+        self._scale_fit_coalesce.timeout.connect(self._run_scale_bar_widget_fit)
 
         interact_hint = (
             _TITLE_INTERACT_HINT if self._allow_zoom else _TITLE_INTERACT_HINT_NO_ZOOM
@@ -705,20 +724,11 @@ class PanelCanvas(QFrame):
         self._last_request = request
         if self._style_overrides is None:
             return request
-        # Légende / hauteur / échelle = réglages Affichage globaux (pas un freeze).
+        # Overrides = affichage de *ce* graphique (dialogue Style), pas le dock parent.
         settings = apply_local_display_settings(
             request.settings,
             self._style_overrides,
-            inherit_scale_bars=True,
-        )
-        # Garder l’override aligné pour les prochains rendus / le dialogue Style.
-        self._style_overrides = replace(
-            self._style_overrides,
-            style=copy_global_display_style(
-                self._style_overrides.style, request.settings.style
-            ),
-            legend=request.settings.legend,
-            graph_height_px=int(request.settings.graph_height_px),
+            inherit_scale_bars=False,
         )
         return replace(request, settings=settings)
 
@@ -761,6 +771,11 @@ class PanelCanvas(QFrame):
             delta = _request_sync_offset(request) - old_offset
             if delta:
                 saved_limits = _shift_limits_for_sync_delta(saved_limits, delta)
+        sig = _scale_fit_signature(request.settings.style)
+        if sig != self._last_scale_fit_signature:
+            self._last_scale_fit_signature = sig
+            self.fitted_height_px = None
+            self.fitted_width_px = None
         started = time.perf_counter()
         status = _finish_panel_render(
             self._plot,
@@ -776,7 +791,21 @@ class PanelCanvas(QFrame):
         if str(self.placement.panel).startswith("montage_"):
             # Le layout pyqtgraph n’a sa géométrie finale qu’au tick suivant.
             QTimer.singleShot(0, self._fit_montage_height)
+        # Après limits_after_paint + éventuel restore_view (preserve_view).
+        QTimer.singleShot(0, self._schedule_scale_bar_widget_fit)
         return status
+
+    def _schedule_scale_bar_widget_fit(self) -> None:
+        """Un seul passage H/W après stabilisation layout (évite sauts continus)."""
+        self._scale_fit_coalesce.start()
+
+    def _run_scale_bar_widget_fit(self) -> None:
+        self._fit_scale_bar_widget_height()
+        self._fit_scale_bar_widget_width()
+        try:
+            self._plot._refresh_scale_bars()
+        except Exception:
+            pass
 
     def _grid_host(self) -> Any | None:
         parent = self.parentWidget()
@@ -842,35 +871,39 @@ class PanelCanvas(QFrame):
         widget_h = max(1, int(self.height()))
         required = max(160, int(round(widget_h - current_vb + float(needed_vb))))
         required = min(required, 4000)
-        if (
-            self.fitted_height_px is not None
-            and abs(int(self.fitted_height_px) - required) <= 2
-        ):
-            return
         grid = self._grid_host()
         if grid is not None:
-            grid.apply_fitted_height(self.placement, required)
+            grid.apply_fitted_height(self.placement, required, scale_fit=True)
         else:
             self.fitted_height_px = required
-            self.setMinimumHeight(required)
-            self.setMaximumHeight(required)
+            self.setMinimumHeight(int(self.fitted_height_px))
+            self.setMaximumHeight(int(self.fitted_height_px))
+
+    def _clear_fitted_width(self) -> None:
+        """Retirer le verrouillage de largeur (layout Expanding)."""
+        if self.fitted_width_px is None:
+            return
+        self.fitted_width_px = None
+        grid = self._grid_host()
+        if grid is not None:
+            grid._apply_panel_width(self, self.placement)
+        else:
+            self.setMinimumWidth(0)
+            self.setMaximumWidth(16777215)
 
     def _fit_scale_bar_widget_width(self) -> None:
-        """Adapter la largeur du widget pour que durée = taille temps (px)."""
+        """Adapter la largeur pour durée = taille temps — seulement si raisonnable.
+
+        Si la fenêtre X est trop longue (fit désactivé côté host), on libère
+        toute largeur figée pour éviter panneaux monstrueux / barres fausses.
+        """
         needed_vb = None
         try:
             needed_vb = self._plot.scale_bar_needed_view_width_px()
         except Exception:
             needed_vb = None
         if needed_vb is None:
-            if self.fitted_width_px is not None:
-                self.fitted_width_px = None
-                grid = self._grid_host()
-                if grid is not None:
-                    grid._apply_panel_width(self, self.placement)
-                else:
-                    self.setMinimumWidth(0)
-                    self.setMaximumWidth(16777215)
+            self._clear_fitted_width()
             return
         current_vb = self._current_viewbox_width_px()
         if current_vb < 8.0:
@@ -878,19 +911,13 @@ class PanelCanvas(QFrame):
             return
         widget_w = max(1, int(self.width()))
         required = max(200, int(round(widget_w - current_vb + float(needed_vb))))
-        required = min(required, 8000)
-        if (
-            self.fitted_width_px is not None
-            and abs(int(self.fitted_width_px) - required) <= 2
-        ):
-            return
         grid = self._grid_host()
         if grid is not None:
-            grid.apply_fitted_width(self.placement, required)
+            grid.apply_fitted_width(self.placement, required, scale_fit=True)
         else:
             self.fitted_width_px = required
-            self.setMinimumWidth(required)
-            self.setMaximumWidth(required)
+            self.setMinimumWidth(int(self.fitted_width_px))
+            self.setMaximumWidth(16777215)
 
     def _set_status(self, status: str, text: str) -> None:
         self._status = status
@@ -945,12 +972,12 @@ class DetachedPanelWindow(QDialog):
         self.canvas = self._plot
         self.plot_host = self._plot
         self._plot.textEdited.connect(self._on_detached_text_edited)
-        self._plot.scaleBarHeightFitRequested.connect(
-            self._fit_scale_bar_widget_height
-        )
-        self._plot.scaleBarWidthFitRequested.connect(
-            self._fit_scale_bar_widget_width
-        )
+        self._scale_fit_coalesce = QTimer(self)
+        self._scale_fit_coalesce.setSingleShot(True)
+        self._scale_fit_coalesce.setInterval(150)
+        self._scale_fit_coalesce.timeout.connect(self._run_detached_scale_fit)
+        self._plot.scaleBarHeightFitRequested.connect(self._schedule_detached_scale_fit)
+        self._plot.scaleBarWidthFitRequested.connect(self._schedule_detached_scale_fit)
         self._scale_fit_plot_min_h = 280
         self._scale_fit_plot_min_w = 320
 
@@ -958,6 +985,7 @@ class DetachedPanelWindow(QDialog):
         self._status.setObjectName("panelStatus")
         self._last_render_s = 0.0
         self._last_request: RenderRequest | None = None
+        self._last_scale_fit_signature: tuple[Any, ...] | None = None
 
         self.params = LocalViewParams(
             settings,
@@ -1049,6 +1077,9 @@ class DetachedPanelWindow(QDialog):
             delta = _request_sync_offset(request) - old_offset
             if delta:
                 saved_limits = _shift_limits_for_sync_delta(saved_limits, delta)
+        sig = _scale_fit_signature(request.settings.style)
+        if sig != self._last_scale_fit_signature:
+            self._last_scale_fit_signature = sig
         started = time.perf_counter()
         status = _finish_panel_render(
             self._plot,
@@ -1059,6 +1090,7 @@ class DetachedPanelWindow(QDialog):
             previous_request=prev_request,
         )
         self._last_render_s = time.perf_counter() - started
+        QTimer.singleShot(0, self._schedule_detached_scale_fit)
         self._status.setText(f"{self._last_render_s * 1000:.0f} ms")
         self._status.setStyleSheet(f"color: {_STATUS_COLORS.get(status, '#64748b')};")
         self._status.setToolTip(
@@ -1085,8 +1117,19 @@ class DetachedPanelWindow(QDialog):
         except Exception:
             return 0.0
 
+    def _schedule_detached_scale_fit(self) -> None:
+        self._scale_fit_coalesce.start()
+
+    def _run_detached_scale_fit(self) -> None:
+        self._fit_scale_bar_widget_height()
+        self._fit_scale_bar_widget_width()
+        try:
+            self._plot._refresh_scale_bars()
+        except Exception:
+            pass
+
     def _fit_scale_bar_widget_height(self) -> None:
-        """Agrandir la fenêtre détachée pour que le signal tienne à l’échelle µV/px."""
+        """Redimensionner la fenêtre pour amplitude = taille amp. (px)."""
         try:
             needed_vb = self._plot.scale_bar_needed_view_height_px()
         except Exception:
@@ -1105,19 +1148,24 @@ class DetachedPanelWindow(QDialog):
             int(round(plot_h - current_vb + float(needed_vb))),
         )
         required_plot = min(required_plot, 4000)
-        if abs(plot_h - required_plot) <= 2:
+        if abs(required_plot - plot_h) <= 2:
             return
         delta = required_plot - plot_h
         self._plot.setMinimumHeight(required_plot)
         self.resize(self.width(), max(480, int(self.height()) + int(delta)))
 
     def _fit_scale_bar_widget_width(self) -> None:
-        """Agrandir la fenêtre détachée pour que durée = taille temps (px)."""
+        """Redimensionner la fenêtre pour durée = taille temps (px)."""
         try:
             needed_vb = self._plot.scale_bar_needed_view_width_px()
         except Exception:
             needed_vb = None
         if needed_vb is None:
+            # Libérer un ancien verrouillage de largeur.
+            try:
+                self._plot.setMinimumWidth(self._scale_fit_plot_min_w)
+            except Exception:
+                pass
             return
         current_vb = self._current_viewbox_width_px()
         if current_vb < 8.0:
@@ -1128,8 +1176,7 @@ class DetachedPanelWindow(QDialog):
             self._scale_fit_plot_min_w,
             int(round(plot_w - current_vb + float(needed_vb))),
         )
-        required_plot = min(required_plot, 8000)
-        if abs(plot_w - required_plot) <= 2:
+        if abs(required_plot - plot_w) <= 2:
             return
         delta = required_plot - plot_w
         self._plot.setMinimumWidth(required_plot)
@@ -1176,6 +1223,16 @@ def _zoom_placement_visible(
         return bool(curve_flags[panel])
     # Impédance / résumés éventuels : toujours visibles s’ils sont dans la liste.
     return True
+
+
+def zoom_grid_panel_height(settings: ViewerSettings) -> int | None:
+    """Hauteur fixe des panneaux zoom, ou ``None`` si le fit échelle amp. pilote H."""
+    style = settings.style
+    if bool(style.scale_bar_amplitude_manual) and bool(
+        style.scale_bar_amplitude_length_manual
+    ):
+        return None
+    return max(160, int(settings.graph_height_px))
 
 
 class DetachedZoomWindow(QDialog):
@@ -1343,7 +1400,10 @@ class DetachedZoomWindow(QDialog):
         # Le parent (ChannelAnalysisWindow) recatalogue les placements, assure
         # les produits HIGH/RMS/spikes, puis redraw → schedule_render ici.
         self.settings = self.local_settings()
-        self._panel_height = max(160, int(self.settings.graph_height_px))
+        ph = zoom_grid_panel_height(self.settings)
+        if ph is not None:
+            self._panel_height = ph
+        self._configure_grid()
         self.refreshRequested.emit(self)
 
     def schedule_render(self, factory: Any, *, force: bool = True) -> None:
@@ -1353,7 +1413,7 @@ class DetachedZoomWindow(QDialog):
         if force:
             self.grid.invalidate_all()
             drawn = int(self.grid.render_dirty_now(factory) or 0)
-            # Garantir xlim zoom appliqué (évite vue [0,1] sur Plage 2…).
+            # Limites puis fit échelle (même ordre que l’aperçu après paint).
             for widget in getattr(self.grid, "_panels", {}).values():
                 host = getattr(widget, "plot_host", None) or getattr(
                     widget, "_plot", None
@@ -1364,6 +1424,16 @@ class DetachedZoomWindow(QDialog):
                         flush()
                     except Exception:
                         pass
+                run_fit = getattr(widget, "_run_scale_bar_widget_fit", None)
+                if callable(run_fit):
+                    try:
+                        run_fit()
+                    except Exception:
+                        pass
+                else:
+                    schedule = getattr(widget, "_schedule_scale_bar_widget_fit", None)
+                    if callable(schedule):
+                        schedule()
             self._status.setText(f"{drawn} panneau(x) · sync")
         else:
             self.grid.schedule_render(factory, force=False)

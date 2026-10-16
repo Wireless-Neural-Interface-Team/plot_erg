@@ -317,7 +317,7 @@ class ParamsPanel(QWidget):
         sync_form.addRow(self._cb_mark_stims)
         self._cb_mark_stims.toggled.connect(self._emit_view)
 
-        axis_group = QGroupBox("Échelles des axes")
+        axis_group = QGroupBox("Plages d’affichage")
         self._axis_form = configure_narrow_form(QFormLayout(axis_group))
         self._x_limits = AxisLimitRow(
             AxisLimits(enabled=False, minimum=-0.1, maximum=0.4),
@@ -326,14 +326,13 @@ class ParamsPanel(QWidget):
             step=0.01,
         )
         self._x_limits.setToolTip(
-            "Limites X manuelles (temps, s) pour tous les graphs temporels. "
-            "Prioritaire sur la section / le zoom par défaut. "
-            "Les échelles Y se règlent dans Canal → section de chaque courbe."
+            "Plage de temps visible (fenêtre X, en secondes). Ne fixe pas le gain "
+            "temporel (s/px) : utilisez Temps barre + Taille temps plus bas."
         )
-        self._axis_form.addRow("Axe X (temps) :", self._x_limits)
+        self._axis_form.addRow("Plage X (temps) :", self._x_limits)
         axis_hint = QLabel(
-            "Échelles verticales (WIDE / HIGH / LOW / RMS) → Canal, "
-            "dans la section de la courbe cochée."
+            "Plages Y (WIDE / HIGH / LOW / RMS) → Canal, section de chaque courbe. "
+            "Recadrent l’affichage ; le gain µV/px vient d’Amplitude + Taille amp."
         )
         axis_hint.setObjectName("hintLabel")
         axis_hint.setWordWrap(True)
@@ -429,11 +428,11 @@ class ParamsPanel(QWidget):
             "Positif agrandit l’espace, négatif le réduit jusqu’à coller le titre à la courbe."
         )
         self._preview_title_gap.setToolTip(self._preview_title_gap_tooltip)
-        self._show_scale_bars = QCheckBox("Échelle flottante (barres temps / amplitude)")
+        self._show_scale_bars = QCheckBox("Barres flottantes (sinon graduations sur les axes)")
         self._show_scale_bars.setChecked(False)
         self._show_scale_bars.setToolTip(
-            "Masque les graduations numériques sur les bords (les titres d’axes "
-            "restent) et affiche une barre d’échelle flottante (ex. 100 ms · 200 µV)."
+            "Les réglages Temps / Amplitude ci-dessous définissent toujours l’échelle. "
+            "Coché : barres flottantes. Décoché : mêmes valeurs en graduations sur les axes."
         )
         self._scale_bar_amp_manual = QCheckBox("Manuel")
         self._scale_bar_amp_manual.setChecked(False)
@@ -730,36 +729,28 @@ class ParamsPanel(QWidget):
         return page
 
     def _sync_scale_bar_inputs(self, *_args: Any) -> None:
-        enabled = bool(self._show_scale_bars.isChecked())
-        self._scale_bar_amp_manual.setEnabled(enabled)
-        self._scale_bar_time_manual.setEnabled(enabled)
-        self._scale_bar_amp.setEnabled(
-            enabled and bool(self._scale_bar_amp_manual.isChecked())
-        )
-        self._scale_bar_time_ms.setEnabled(
-            enabled and bool(self._scale_bar_time_manual.isChecked())
-        )
-        self._scale_bar_amp_len_manual.setEnabled(enabled)
-        self._scale_bar_time_len_manual.setEnabled(enabled)
+        floating = bool(self._show_scale_bars.isChecked())
+        self._scale_bar_amp_manual.setEnabled(True)
+        self._scale_bar_time_manual.setEnabled(True)
+        self._scale_bar_amp.setEnabled(bool(self._scale_bar_amp_manual.isChecked()))
+        self._scale_bar_time_ms.setEnabled(bool(self._scale_bar_time_manual.isChecked()))
+        self._scale_bar_amp_len_manual.setEnabled(True)
+        self._scale_bar_time_len_manual.setEnabled(True)
         self._scale_bar_amp_len_px.setEnabled(
-            enabled and bool(self._scale_bar_amp_len_manual.isChecked())
+            bool(self._scale_bar_amp_len_manual.isChecked())
         )
         self._scale_bar_time_len_px.setEnabled(
-            enabled and bool(self._scale_bar_time_len_manual.isChecked())
+            bool(self._scale_bar_time_len_manual.isChecked())
         )
-        self._scale_bar_linewidth.setEnabled(enabled)
-        self._scale_bar_dx.setEnabled(enabled)
-        self._scale_bar_dy.setEnabled(enabled)
-        self._scale_bar_time_dx.setEnabled(enabled)
-        self._scale_bar_time_dy.setEnabled(enabled)
-        # Taille amp. manuelle → griser « Hauteur des graphs » (même formulaire).
-        amp_len_on = enabled and bool(self._scale_bar_amp_len_manual.isChecked())
-        if hasattr(self, "_graph_height"):
-            self._graph_height.setEnabled(not amp_len_on)
-            if hasattr(self, "_layout_form"):
-                label = self._layout_form.labelForField(self._graph_height)
-                if label is not None:
-                    label.setEnabled(not amp_len_on)
+        self._scale_bar_linewidth.setEnabled(floating)
+        self._scale_bar_dx.setEnabled(floating)
+        self._scale_bar_dy.setEnabled(floating)
+        self._scale_bar_time_dx.setEnabled(floating)
+        self._scale_bar_time_dy.setEnabled(floating)
+        # Taille amp. manuelle → hauteur pilotée par l’échelle, pas graph_height_px.
+        amp_len_on = bool(self._scale_bar_amp_len_manual.isChecked())
+        if hasattr(self, "_graph_height") and hasattr(self, "_layout_form"):
+            _set_form_row_visible(self._layout_form, self._graph_height, not amp_len_on)
 
     def _sync_stim_label_inputs(self, *_args: Any) -> None:
         enabled = bool(self._show_stim_labels.isChecked())

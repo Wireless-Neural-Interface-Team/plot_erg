@@ -35,6 +35,7 @@ from gui.widgets.custom_zoom_dialog import ask_custom_zoom
 from gui.widgets.panel_canvas import (
     DetachedPanelWindow,
     DetachedZoomWindow,
+    zoom_grid_panel_height,
     _Y_SCALE_NONNEG_FAMILIES,
     _axis_ylim_setting,
     y_scale_family,
@@ -1144,7 +1145,7 @@ class ChannelAnalysisWindow(QWidget):
             if existing is not None:
                 existing.update_placements(
                     group,
-                    panel_height=self._panel_height(),
+                    panel_height=zoom_grid_panel_height(existing.local_settings()),
                     zoom_label=label,
                 )
                 self._render_zoom_window(existing)
@@ -1162,11 +1163,13 @@ class ChannelAnalysisWindow(QWidget):
             # Scope zoom : pas d’échelle X aperçu (sinon toute la courbe revient).
             # Parent = fenêtre top-level (aperçu embarqué) ; coords écran via mapToGlobal.
             parent_win = self.window() if self.window() is not None else self
+            zoom_seed = settings_for_zoom_window(self.local_settings())
             win = DetachedZoomWindow(
                 self.channel_name,
                 group,
-                settings_for_zoom_window(self.local_settings()),
-                panel_height=self._panel_height(),
+                zoom_seed,
+                panel_height=zoom_grid_panel_height(zoom_seed)
+                or self._panel_height(),
                 zoom_key=key,
                 zoom_label=label,
                 parent=parent_win,
@@ -1303,7 +1306,7 @@ class ChannelAnalysisWindow(QWidget):
         if group:
             window.update_placements(
                 group,
-                panel_height=self._panel_height(),
+                panel_height=zoom_grid_panel_height(window.local_settings()),
                 zoom_label=self._zoom_group_label(group),
             )
         self.refreshRequested.emit(self)
@@ -1312,11 +1315,10 @@ class ChannelAnalysisWindow(QWidget):
         if self._request_factory is None:
             return
         if isinstance(window, DetachedZoomWindow):
-            local = window.local_settings()
-            keep = bool(self._preserve_view)
-
             def factory(placement: PanelPlacement) -> RenderRequest:
-                preserve = keep and not placement.has_custom_zoom
+                # Affichage / échelle : uniquement le panneau local de *cette* fenêtre zoom
+                # (ne pas fusionner avec l’aperçu canal — sinon échelle incohérente).
+                zoom_settings = settings_for_zoom_window(window.local_settings())
                 request = self._request_factory(self, placement)  # type: ignore[misc]
                 if request is None:
                     return RenderRequest(
@@ -1327,21 +1329,15 @@ class ChannelAnalysisWindow(QWidget):
                         legend_flags=[],
                         channel_index=self.channel_index,
                         channel_name=self.channel_name,
-                        settings=local,
+                        settings=zoom_settings,
                         probe_layout=None,
                         impedance_sessions=[],
-                        preserve_view=preserve,
+                        preserve_view=False,
                     )
-                # Scope zoom : ignorer x_limits / plages aperçu (sinon courbe complète).
-                zoom_local = settings_for_zoom_window(local)
-                settings = apply_local_display_settings(
-                    request.settings, zoom_local, include_analysis=True
-                )
-                settings = settings_for_zoom_window(settings)
                 return replace(
                     request,
-                    settings=settings,
-                    preserve_view=preserve,
+                    settings=zoom_settings,
+                    preserve_view=False,
                     highlight_zooms=(),
                 )
 

@@ -2,8 +2,8 @@
 
 Contrats :
   - valeur manuelle → libellé = valeur saisie
-  - valeur + taille px → fit hauteur/largeur pour que bâton ≈ taille px
-  - zoom interactif → libellé reste la valeur saisie
+  - valeur + taille px → fit widget + bâton = taille px
+  - zoom interactif → libellé reste la valeur saisie (pas de refit au zoom)
   - montage → fit hauteur seulement sur lignes µV
 
     .venv\\Scripts\\python.exe tools\\smoke_scale_bar_contexts.py
@@ -27,11 +27,7 @@ from PySide6.QtWidgets import QApplication
 
 from gui.widgets.plot_host import PlotHost
 from panel_prepare import CurveSeries, PanelSpec, ScaleBarSpec
-from plot_utils import (
-    scale_bar_label_value,
-    scale_bar_pixel_length,
-    scale_bar_true_value,
-)
+from scale_bar_model import resolve_axis_bar
 
 
 def _close(a: float, b: float, *, tol: float = 0.02) -> bool:
@@ -55,6 +51,7 @@ def _bars(
 ) -> ScaleBarSpec:
     return ScaleBarSpec(
         enabled=True,
+        floating=True,
         x_unit="s",
         y_unit="µV",
         time_manual=time_manual,
@@ -114,28 +111,17 @@ def _check_labels_after_zoom(host: PlotHost, *, amp: float, time_s: float, label
     (zx0, zx1), (zy0, zy1) = plot.viewRange()
     x_span = abs(zx1 - zx0)
     y_span = abs(zy1 - zy0)
-    # Libellés = valeurs saisies (pas recalcul géométrique).
-    y_label = scale_bar_label_value(
-        data_value=float(bars.amplitude),
-        span=y_span,
-        axis_px=200.0,
-        bar_px=80.0,
-        value_manual=True,
-        length_manual=True,
-    )
-    x_label = scale_bar_label_value(
-        data_value=float(bars.time_s),
-        span=x_span,
-        axis_px=200.0,
-        bar_px=80.0,
-        value_manual=True,
-        length_manual=True,
-    )
+    y_label = resolve_axis_bar(
+        span=y_span, axis_px=200.0, value=float(bars.amplitude), length_px=40.0
+    ).label
+    x_label = resolve_axis_bar(
+        span=x_span, axis_px=200.0, value=float(bars.time_s), length_px=40.0
+    ).label
     if not _close(y_label, amp, tol=1e-9):
-        _fail(f"{label}: libellé amp après zoom {y_label} ≠ {amp}")
+        _fail(f"{label}: libelle amp apres zoom {y_label} != {amp}")
     if not _close(x_label, time_s, tol=1e-9):
-        _fail(f"{label}: libellé temps après zoom {x_label} ≠ {time_s}")
-    print(f"  OK  {label}: libellés stables après zoom")
+        _fail(f"{label}: libelle temps apres zoom {x_label} != {time_s}")
+    print(f"  OK  {label}: libelles stables apres zoom")
 
 
 def test_preview() -> None:
@@ -159,25 +145,21 @@ def test_preview() -> None:
     )
     _show(host, spec)
     needed_h = host.scale_bar_needed_view_height_px()
-    expect_h = (y1 - y0) * (amp_px / amp)  # 200 * 40/50 = 160
+    expect_h = (y1 - y0) * (amp_px / amp)
     if needed_h is None or not _close(needed_h, expect_h, tol=0.05):
         _fail(f"aperçu hauteur {needed_h} ≠ {expect_h}")
     needed_w = host.scale_bar_needed_view_width_px()
-    expect_w = (t1 - t0) * (time_px / time_s)  # 1.0 * 40/0.1 = 400
-    if needed_w is None or not _close(needed_w, expect_w, tol=0.05):
-        _fail(f"aperçu largeur {needed_w} ≠ {expect_w}")
-    # Après fit théorique : bâton = taille px, libellé = valeur.
-    bar = scale_bar_pixel_length(
-        data_value=amp, span=y1 - y0, axis_px=expect_h, length_px=amp_px, value_manual=True
+    expect_w = (t1 - t0) * (time_px / time_s)
+    if expect_w <= 1200:
+        if needed_w is None or not _close(needed_w, expect_w, tol=0.05):
+            _fail(f"apercu largeur {needed_w} != {expect_w}")
+    fitted = resolve_axis_bar(
+        span=y1 - y0, axis_px=expect_h, value=amp, length_px=amp_px
     )
-    if not _close(bar, amp_px):
-        _fail(f"aperçu bâton amp {bar} ≠ {amp_px}")
-    if not _close(
-        scale_bar_true_value(bar, span=y1 - y0, axis_px=expect_h), amp
-    ):
-        _fail("aperçu échelle amp fausse après fit")
-    print(f"  OK  fit H={needed_h}px W={needed_w}px")
-    _check_labels_after_zoom(host, amp=amp, time_s=time_s, label="aperçu")
+    if not _close(fitted.bar_px, amp_px):
+        _fail(f"aperçu baton amp {fitted.bar_px} != {amp_px}")
+    print(f"  OK  fit H={needed_h}px W={needed_w}px", flush=True)
+    _check_labels_after_zoom(host, amp=amp, time_s=time_s, label="apercu")
     host.close()
 
 
@@ -217,17 +199,51 @@ def test_montage() -> None:
     assert host._scale_bar_units_for_row(bars, 0) == ("s", "µV")
     assert host._scale_bar_units_for_row(bars, 2) == ("ms", None)
     needed_h = host.scale_bar_needed_view_height_px()
-    # Seulement 2 lignes × 100 µV × (40/50) = 160
     expect_h = 2.0 * 100.0 * (amp_px / amp)
     if needed_h is None or not _close(needed_h, expect_h, tol=0.08):
-        _fail(f"montage hauteur (sans ISI) {needed_h} ≠ {expect_h}")
+        _fail(f"montage hauteur {needed_h} ≠ {expect_h}")
     needed_w = host.scale_bar_needed_view_width_px()
-    # Dernière ligne = ISI → x en ms ; time_s=0.05 → 50 ms ; span X données ISI ~20
-    # Mais le mixin lit le plot de la dernière ligne (ISI, xlim peut différer).
-    if needed_w is None:
-        _fail("montage largeur None (ISI last row devrait quand même scaler X en ms)")
-    print(f"  OK  fit H={needed_h}px (ISI exclu) W={needed_w}px")
+    if needed_w is None or not (needed_w > 0):
+        _fail(f"montage: fit largeur attendu, got {needed_w}")
+    print(f"  OK  fit H={needed_h}px W={needed_w}px (montage)")
     _check_labels_after_zoom(host, amp=amp, time_s=time_s, label="montage")
+    host.close()
+
+
+def test_time_width_fit_follows_wheel_zoom() -> None:
+    """Fit largeur suit la plage X visible (recalcul needed, pas resize auto au zoom)."""
+    print("fit largeur vs plage X visible:")
+    amp, amp_px = 50.0, 40.0
+    time_s, time_px = 0.1, 40.0
+    t0, t1 = 0.0, 1.0
+    host = PlotHost(show_toolbar=False, show_cursor=False, min_height=120)
+    spec = PanelSpec(
+        title="Zoom",
+        xlabel="Temps (s)",
+        ylabel="µV",
+        series=[_curve(t0, t1, -50.0, 50.0)],
+        xlim=(t0, t1),
+        ylim=None,
+        status="ok",
+        layout_kind="single",
+        row_kinds=["raw"],
+        scale_bars=_bars(amp=amp, amp_px=amp_px, time_s=time_s, time_px=time_px),
+    )
+    _show(host, spec)
+    w0 = host.scale_bar_needed_view_width_px()
+    plot = host._plots[-1]
+    (x0, x1), _y = plot.viewRange()
+    mx = 0.5 * (x0 + x1)
+    plot.setXRange(mx - 0.1, mx + 0.1, padding=0)
+    app = QApplication.instance()
+    assert app is not None
+    for _ in range(6):
+        app.processEvents()
+    w1 = host.scale_bar_needed_view_width_px()
+    expect_ratio = 0.2
+    if w0 is None or w1 is None or not _close(w1, w0 * expect_ratio, tol=0.12):
+        _fail(f"needed W doit suivre zoom {w0} -> {w1}")
+    print(f"  OK  needed W {w0}px -> {w1}px apres zoom X")
     host.close()
 
 
@@ -253,11 +269,11 @@ def test_zoom_window() -> None:
     )
     _show(host, spec)
     needed_h = host.scale_bar_needed_view_height_px()
-    expect_h = (y1 - y0) * (amp_px / amp)  # 160 * 50/25 = 320
+    expect_h = (y1 - y0) * (amp_px / amp)
     if needed_h is None or not _close(needed_h, expect_h, tol=0.05):
         _fail(f"zoom hauteur {needed_h} ≠ {expect_h}")
     needed_w = host.scale_bar_needed_view_width_px()
-    expect_w = (t1 - t0) * (time_px / time_s)  # 0.2 * 60/0.02 = 600
+    expect_w = (t1 - t0) * (time_px / time_s)
     if needed_w is None or not _close(needed_w, expect_w, tol=0.05):
         _fail(f"zoom largeur {needed_w} ≠ {expect_w}")
     # ylim Canal manuel → pas de fit hauteur.
@@ -283,29 +299,23 @@ def test_zoom_window() -> None:
 
 def test_length_only_vs_value_both() -> None:
     print("modes taille seule / valeur+taille:")
-    # Taille seule → libellé géométrique.
-    label = scale_bar_label_value(
-        data_value=50.0,
-        span=100.0,
-        axis_px=400.0,
-        bar_px=40.0,
-        value_manual=False,
-        length_manual=True,
+    alone = resolve_axis_bar(span=100.0, axis_px=400.0, length_px=40.0)
+    if not _close(alone.label, 10.0):
+        _fail(f"taille seule label {alone.label} != 10")
+    both = resolve_axis_bar(
+        span=100.0, axis_px=400.0, value=50.0, length_px=40.0
     )
-    if not _close(label, 10.0):
-        _fail(f"taille seule label {label} ≠ 10")
-    # Les deux → libellé = valeur (calibre le graph).
-    label = scale_bar_label_value(
-        data_value=50.0,
-        span=100.0,
-        axis_px=80.0,  # fit: 100 * 40/50 = 80
-        bar_px=40.0,
-        value_manual=True,
-        length_manual=True,
+    if not _close(both.label, 50.0):
+        _fail(f"valeur+taille label {both.label} != 50")
+    # Bâton = L même si l’axe n’est pas encore fitté (sinon taille px « morte »).
+    if not _close(both.bar_px, 40.0):
+        _fail(f"valeur+taille baton {both.bar_px} != 40")
+    both2 = resolve_axis_bar(
+        span=100.0, axis_px=400.0, value=50.0, length_px=120.0
     )
-    if not _close(label, 50.0):
-        _fail(f"valeur+taille label {label} ≠ 50")
-    print("  OK  contrats libellé")
+    if not _close(both2.bar_px, 120.0):
+        _fail(f"valeur+taille baton suit L : {both2.bar_px} != 120")
+    print("  OK  contrats libelle + taille px")
 
 
 def main() -> int:
@@ -313,6 +323,7 @@ def main() -> int:
     test_length_only_vs_value_both()
     test_preview()
     test_montage()
+    test_time_width_fit_follows_wheel_zoom()
     test_zoom_window()
     print("smoke_scale_bar_contexts: all passed")
     return 0

@@ -214,27 +214,51 @@ class PanelGrid(QScrollArea):
                     widget.fitted_height_px = None  # type: ignore[attr-defined]
             self._apply_panel_height(widget, placement)
 
-    def apply_fitted_height(self, placement: PanelPlacement, height: int) -> None:
-        """Hauteur réelle mesurée après dessin (montage trop court → rognage)."""
+    def apply_fitted_height(
+        self, placement: PanelPlacement, height: int, *, scale_fit: bool = False
+    ) -> None:
+        """Hauteur panneau : ``scale_fit`` = valeur exacte (échelle amp.), sinon grow-only."""
         widget = self._panels.get(placement.key)
         if widget is None:
             return
+        try:
+            current_h = max(1, int(widget.height()))
+        except Exception:
+            current_h = 160
         fitted = max(140, int(height))
+        if not scale_fit:
+            fitted = max(fitted, current_h)
         previous = getattr(widget, "fitted_height_px", None)
         widget.fitted_height_px = fitted  # type: ignore[attr-defined]
-        if previous is not None and abs(int(previous) - fitted) <= 2:
+        if (
+            not scale_fit
+            and previous is not None
+            and abs(int(previous) - fitted) <= 2
+        ):
             return
         self._apply_panel_height(widget, placement)
 
-    def apply_fitted_width(self, placement: PanelPlacement, width: int) -> None:
-        """Largeur calée sur temps + taille temps (échelle s/px ou ms/px)."""
+    def apply_fitted_width(
+        self, placement: PanelPlacement, width: int, *, scale_fit: bool = False
+    ) -> None:
+        """Largeur panneau : ``scale_fit`` = exacte (échelle temps), sinon grow-only."""
         widget = self._panels.get(placement.key)
         if widget is None:
             return
+        try:
+            current_w = max(1, int(widget.width()))
+        except Exception:
+            current_w = 200
         fitted = max(200, int(width))
+        if not scale_fit:
+            fitted = max(fitted, current_w)
         previous = getattr(widget, "fitted_width_px", None)
         widget.fitted_width_px = fitted  # type: ignore[attr-defined]
-        if previous is not None and abs(int(previous) - fitted) <= 2:
+        if (
+            not scale_fit
+            and previous is not None
+            and abs(int(previous) - fitted) <= 2
+        ):
             return
         self._apply_panel_width(widget, placement)
 
@@ -246,7 +270,8 @@ class PanelGrid(QScrollArea):
             return
         width = max(200, int(fitted))
         widget.setMinimumWidth(width)  # type: ignore[attr-defined]
-        widget.setMaximumWidth(width)  # type: ignore[attr-defined]
+        # Largeur max libre : le graph peut dépasser → scroll, pas de bande étroite figée.
+        widget.setMaximumWidth(16777215)  # type: ignore[attr-defined]
 
     def set_graph_height(self, graph_height: int) -> None:
         """Hauteur des panneaux hors montage (RMS, spikes, résumés…)."""

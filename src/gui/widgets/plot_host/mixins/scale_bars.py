@@ -1,15 +1,24 @@
-"""Barres d’échelle."""
+"""Barres d’échelle flottantes (écran pyqtgraph) — via ``scale_bar_model``."""
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import pyqtgraph as pg
-from PySide6.QtCore import QPointF, Qt, QTimer
+from PySide6.QtCore import QPointF, QTimer
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPen
-from PySide6.QtWidgets import QGraphicsItem, QGraphicsLineItem, QGraphicsSimpleTextItem
+from PySide6.QtWidgets import QGraphicsLineItem
 
-from panel_prepare import PanelSpec, ScaleBarSpec
+from panel_prepare import PanelSpec, ScaleBarSpec, scale_bar_spec_settings_key
+from scale_bar_model import (
+    amp_manual_applies,
+    format_scale_label,
+    major_ticks_for_axis,
+    resolve_axis_bar,
+    time_value_in_axis_units,
+    units_for_kind,
+)
 
 from ..constants import (
     _MONTAGE_DATA_BOTTOM_AXIS_PX,
@@ -19,39 +28,91 @@ from ..constants import (
 )
 from ..helpers import (
     scale_bar_offset_px as _scale_bar_offset_px,
-    scale_bar_pair_px as _scale_bar_pair_px,
     scale_bar_time_offset_px as _scale_bar_time_offset_px,
     uncrop_scale_axis as _uncrop_scale_axis,
 )
-from ..text_style import _face_qfont, _scale_label_item, _tick_qfont
+from ..text_style import _scale_label_item, _tick_qfont
+
+# Au-delà de cette largeur ViewBox cible, on garde le bâton à L px sans élargir l’UI.
+_MAX_SCALE_FIT_VIEW_WIDTH_PX = 4800
+
+
+def _manual_y_params(
+    bars: ScaleBarSpec, y_unit: str
+) -> tuple[float | None, float | None]:
+    if not amp_manual_applies(y_unit):
+        return None, None
+    val = float(bars.amplitude) if bool(bars.amp_manual) else None
+    length = (
+        float(bars.amp_length_px) if bool(bars.amp_length_manual) else None
+    )
+    return val, length
+
+
+def _manual_x_params(
+    bars: ScaleBarSpec, x_unit: str
+) -> tuple[float | None, float | None]:
+    val = None
+    if bool(bars.time_manual):
+        val = time_value_in_axis_units(float(bars.time_s), x_unit)
+        if not (val and val > 0):
+            val = None
+    length = (
+        float(bars.time_length_px) if bool(bars.time_length_manual) else None
+    )
+    return val, length
+
+
+def _resolve_y_bar(
+    bars: ScaleBarSpec, *, span: float, axis_px: float, y_unit: str
+):
+    if not (span > 0) or not (axis_px > 0) or not y_unit:
+        return None
+    val, length = _manual_y_params(bars, y_unit)
+    if val is None and length is None:
+        return resolve_axis_bar(span=span, axis_px=axis_px)
+    return resolve_axis_bar(span=span, axis_px=axis_px, value=val, length_px=length)
+
+
+def _resolve_x_bar(
+    bars: ScaleBarSpec, *, span: float, axis_px: float, x_unit: str
+):
+    if not (span > 0) or not (axis_px > 0) or not x_unit:
+        return None
+    val, length = _manual_x_params(bars, x_unit)
+    if val is None and length is None:
+        return resolve_axis_bar(span=span, axis_px=axis_px)
+    return resolve_axis_bar(span=span, axis_px=axis_px, value=val, length_px=length)
 
 
 class ScaleBarsMixin:
-    def scale_bar_needed_view_height_px(self) -> int | None:
-        """Hauteur ViewBox (px) pour que amplitude = taille amp., données visibles.
+    def scale_bar_widget_fit_enabled(self) -> bool:
+        """True si l’utilisateur a défini valeur + taille px (temps ou amplitude)."""
+        bars = self._active_scale_bars()
+        if bars is None:
+            return False
+        amp_fit = bool(bars.amp_manual) and bool(bars.amp_length_manual)
+        time_fit = bool(bars.time_manual) and bool(bars.time_length_manual)
+        return amp_fit or time_fit
 
-        Somme sur les lignes : chaque span Y données × ``amp_length_px / amplitude``.
-        ``None`` si l’échelle ne pilote pas la hauteur, ou si un ylim Canal est fixé.
-        """
-        spec = getattr(self, "_spec", None)
-        if spec is None:
+    def scale_bar_needed_view_height_px(self) -> int | None:
+        """Hauteur ViewBox totale pour que amplitude (µV) = taille amp. (px)."""
+        if not self.scale_bar_widget_fit_enabled():
             return None
-        bars = getattr(spec, "scale_bars", None)
-        if bars is None or not bool(getattr(bars, "enabled", False)):
+        bars = self._active_scale_bars()
+        if bars is None or not (
+            bool(bars.amp_manual) and bool(bars.amp_length_manual)
+        ):
             return None
-        if not bool(getattr(bars, "amp_manual", False)):
-            return None
-        if not bool(getattr(bars, "amp_length_manual", False)):
-            return None
-        # ylim Canal / manuel : ne pas écraser par un fit hauteur.
+        spec = self._spec
         if getattr(spec, "ylim", None) is not None:
             return None
         row_ylims = list(getattr(spec, "row_ylims", None) or [])
         if any(y is not None for y in row_ylims):
             return None
         try:
-            amp = float(getattr(bars, "amplitude", 0.0) or 0.0)
-            length = float(getattr(bars, "amp_length_px", 0.0) or 0.0)
+            amp = float(bars.amplitude)
+            length = float(bars.amp_length_px)
         except (TypeError, ValueError):
             return None
         if not (amp > 0.0 and length > 0.0):
@@ -61,54 +122,38 @@ class ScaleBarsMixin:
             return None
         total = 0.0
         any_span = False
-        data_range = getattr(self, "_data_range_from_plot", None)
         for row, plot in enumerate(plots):
-            # Seulement les lignes tension (µV) — pas ISI / PSTH / raster.
             _x_unit, y_unit = self._scale_bar_units_for_row(bars, row)
-            if y_unit != "µV":
+            if not amp_manual_applies(y_unit):
                 continue
-            span = None
-            if callable(data_range):
-                try:
-                    span = data_range(plot, axis="y")
-                except Exception:
-                    span = None
-            if span is None:
-                try:
-                    (_x0, _x1), (y0, y1) = plot.viewRange()
-                    if float(y1) > float(y0):
-                        span = (float(y0), float(y1))
-                except Exception:
-                    span = None
+            span = self._axis_span(plot, axis="y")
             if span is None:
                 continue
             dy = float(span[1]) - float(span[0])
             if not (dy > 0.0) or dy != dy:
                 continue
+            bar = resolve_axis_bar(
+                span=dy, axis_px=100.0, value=amp, length_px=length
+            )
+            if bar.needed_axis_px is None:
+                continue
             any_span = True
-            total += dy * (length / amp)
+            total += float(bar.needed_axis_px)
         if not any_span or not (total > 0.0) or total != total:
             return None
         return max(40, int(round(total)))
 
     def scale_bar_needed_view_width_px(self) -> int | None:
-        """Largeur ViewBox (px) pour que durée = taille temps, données visibles.
-
-        ``x_span × time_length_px / time_value`` (unités de l’axe : s ou ms).
-        ``None`` si l’échelle ne pilote pas la largeur.
-        """
-        spec = getattr(self, "_spec", None)
-        if spec is None:
+        """Largeur ViewBox pour temps (s) = taille temps (px), plage X visible."""
+        if not self.scale_bar_widget_fit_enabled():
             return None
-        bars = getattr(spec, "scale_bars", None)
-        if bars is None or not bool(getattr(bars, "enabled", False)):
-            return None
-        if not bool(getattr(bars, "time_manual", False)):
-            return None
-        if not bool(getattr(bars, "time_length_manual", False)):
+        bars = self._active_scale_bars()
+        if bars is None or not (
+            bool(bars.time_manual) and bool(bars.time_length_manual)
+        ):
             return None
         try:
-            length = float(getattr(bars, "time_length_px", 0.0) or 0.0)
+            length = float(bars.time_length_px)
         except (TypeError, ValueError):
             return None
         if not (length > 0.0):
@@ -116,42 +161,60 @@ class ScaleBarsMixin:
         plots = list(getattr(self, "_plots", None) or [])
         if not plots:
             return None
-        # Échelle X = dernière ligne (barre temps unique sous le montage).
         row = len(plots) - 1
         plot = plots[row]
         x_unit, _y_unit = self._scale_bar_units_for_row(bars, row)
         if x_unit is None:
             return None
+        time_val = time_value_in_axis_units(float(bars.time_s), x_unit)
+        if not (time_val > 0.0):
+            return None
         try:
-            time_s = float(getattr(bars, "time_s", 0.0) or 0.0)
-        except (TypeError, ValueError):
+            (x0, x1), _y = plot.viewRange()
+            if not (float(x1) > float(x0)):
+                return None
+            dx = abs(float(x1) - float(x0))
+        except Exception:
             return None
-        time_val = time_s * 1000.0 if x_unit == "ms" else time_s
-        if not (time_val > 0.0) or time_val != time_val:
+        bar = resolve_axis_bar(
+            span=dx, axis_px=100.0, value=time_val, length_px=length
+        )
+        if bar.needed_axis_px is None or not (bar.needed_axis_px > 0):
             return None
-        span = None
+        needed = float(bar.needed_axis_px)
+        if needed > float(_MAX_SCALE_FIT_VIEW_WIDTH_PX):
+            return None
+        return max(80, int(round(needed)))
+
+    def _active_scale_bars(self) -> ScaleBarSpec | None:
+        spec = getattr(self, "_spec", None)
+        if spec is None:
+            return None
+        bars = getattr(spec, "scale_bars", None)
+        if bars is None or not bool(getattr(bars, "enabled", False)):
+            return None
+        return bars
+
+    def _axis_span(
+        self, plot: pg.PlotItem, *, axis: str
+    ) -> tuple[float, float] | None:
         data_range = getattr(self, "_data_range_from_plot", None)
         if callable(data_range):
             try:
-                span = data_range(plot, axis="x")
+                span = data_range(plot, axis=axis)
+                if span is not None and float(span[1]) > float(span[0]):
+                    return (float(span[0]), float(span[1]))
             except Exception:
-                span = None
-        if span is None:
-            try:
-                (x0, x1), _y = plot.viewRange()
-                if float(x1) > float(x0):
-                    span = (float(x0), float(x1))
-            except Exception:
-                span = None
-        if span is None:
-            return None
-        dx = float(span[1]) - float(span[0])
-        if not (dx > 0.0) or dx != dx:
-            return None
-        needed = dx * (length / time_val)
-        if not (needed > 0.0) or needed != needed:
-            return None
-        return max(80, int(round(needed)))
+                pass
+        try:
+            (x0, x1), (y0, y1) = plot.viewRange()
+            if axis == "x" and float(x1) > float(x0):
+                return (float(x0), float(x1))
+            if axis == "y" and float(y1) > float(y0):
+                return (float(y0), float(y1))
+        except Exception:
+            pass
+        return None
 
     def _scale_bar_item_ids(self) -> set[int]:
         return {id(item) for _plot, item in self._scale_bar_items}
@@ -183,10 +246,49 @@ class ScaleBarsMixin:
                     pass
         self._scale_bar_items.clear()
 
-    def _reserve_scale_bar_gutters(self, bars: ScaleBarSpec) -> None:
-        """Réserver axe droit (Y) et hauteur bas (X) hors zone de tracé."""
-        from plot_utils import format_scale_label
+    def _scale_bar_units_for_row(
+        self, bars: ScaleBarSpec, row: int
+    ) -> tuple[str | None, str | None]:
+        spec = self._spec
+        kinds = list(getattr(spec, "row_kinds", None) or []) if spec else []
+        kind = str(kinds[row]) if row < len(kinds) else ""
+        return units_for_kind(kind, default_x=bars.x_unit, default_y=bars.y_unit)
 
+    def _resolve_scale_bar_lengths(
+        self, bars: ScaleBarSpec
+    ) -> list[tuple[float | None, float | None]]:
+        """Cibles X/Y en unités de données (une par ligne)."""
+        out: list[tuple[float | None, float | None]] = []
+        n = len(self._plots)
+        multi = n > 1
+        for row, plot in enumerate(self._plots):
+            try:
+                (x0, x1), (y0, y1) = plot.viewRange()
+            except Exception:
+                out.append((None, None))
+                continue
+            x_span = abs(float(x1) - float(x0))
+            y_span = abs(float(y1) - float(y0))
+            x_unit, y_unit = self._scale_bar_units_for_row(bars, row)
+            x_size: float | None = None
+            y_size: float | None = None
+            y_bar = (
+                _resolve_y_bar(bars, span=y_span, axis_px=100.0, y_unit=str(y_unit))
+                if y_unit is not None and y_span > 0
+                else None
+            )
+            y_size = float(y_bar.label) if y_bar is not None else None
+            show_x = x_unit is not None and (row == n - 1 or not multi)
+            x_bar = (
+                _resolve_x_bar(bars, span=x_span, axis_px=100.0, x_unit=str(x_unit))
+                if show_x and x_span > 0
+                else None
+            )
+            x_size = float(x_bar.label) if x_bar is not None else None
+            out.append((x_size, y_size))
+        return out
+
+    def _reserve_scale_bar_gutters(self, bars: ScaleBarSpec) -> None:
         spec = self._spec
         font = _tick_qfont(
             max(7, int(round(float(bars.fontsize)))),
@@ -205,11 +307,8 @@ class ScaleBarsMixin:
             if y_size is not None and y_unit is not None:
                 lab = format_scale_label(float(y_size), str(y_unit))
                 label_w = max(label_w, int(metrics.horizontalAdvance(lab)) + 14)
-        # Élargir la gouttière pour que bâton + libellé restent dans le panneau.
-        # +dx amplitude → plus de place à droite ; dx négatif : le bâton entre dans la courbe.
         right_needed = int(round(pad + max(0.0, amp_dx) + pad + max(0, label_w - 14) + 8))
         right_w = max(_SCALE_BAR_RIGHT_GUTTER_PX, label_w, right_needed)
-        # +dy temps (haut) : le bâton monte vers la courbe ; -dy : descendre → plus bas.
         bottom_needed = int(
             round(pad + max(0.0, -time_dy) + pad + float(label_h) + 4.0)
         )
@@ -275,16 +374,37 @@ class ScaleBarsMixin:
             except Exception:
                 pass
 
+    def _request_scale_widget_fit(self) -> None:
+        """Demander au parent un recalage H/W (échelle amp. / temps)."""
+        try:
+            self.scaleBarHeightFitRequested.emit()
+        except Exception:
+            pass
+        try:
+            self.scaleBarWidthFitRequested.emit()
+        except Exception:
+            pass
+
     def _apply_scale_bars(self, spec: PanelSpec, *, is_montage: bool = False) -> None:
         bars = getattr(spec, "scale_bars", None)
         enabled = bars is not None and bool(getattr(bars, "enabled", False))
         if not enabled:
-            # Décoche / refresh : retirer les barres et restaurer ticks + cadres.
             self._teardown_scale_bars(spec, is_montage=is_montage)
             return
         if not self._plots:
             return
-        # Masquer les graduations numériques seulement — garder les titres d’axes.
+        floating = bool(getattr(bars, "floating", True))
+        if not floating:
+            key = scale_bar_spec_settings_key(bars)
+            if key != getattr(self, "_scale_bar_settings_key", None):
+                self._scale_bar_settings_key = key
+                self._clear_scale_bar_items()
+            self._scale_bar_lengths = self._resolve_scale_bar_lengths(bars)
+            self._connect_scale_bar_range()
+            self._apply_scale_axis_ticks(bars)
+            self._request_scale_widget_fit()
+            QTimer.singleShot(0, lambda: self._apply_scale_axis_ticks(bars))
+            return
         for plot in self._plots:
             plot.getAxis("left").setStyle(showValues=False)
             plot.getAxis("bottom").setStyle(showValues=False)
@@ -293,7 +413,6 @@ class ScaleBarsMixin:
                     plot.getAxis(axis_name).setPen(pg.mkPen(None))
                 except Exception:
                     pass
-        # Axe X partagé (montage) : même règle — barres flottantes sans ticks.
         if is_montage and self._montage_x_axis_plot is not None:
             x_plot = self._montage_x_axis_plot
             try:
@@ -308,15 +427,18 @@ class ScaleBarsMixin:
                     x_plot.getAxis(axis_name).setPen(pg.mkPen(None))
                 except Exception:
                     pass
+        key = scale_bar_spec_settings_key(bars)
+        if key != getattr(self, "_scale_bar_settings_key", None):
+            self._scale_bar_settings_key = key
+            self._clear_scale_bar_items()
         self._scale_bar_lengths = self._resolve_scale_bar_lengths(bars)
         self._reserve_scale_bar_gutters(bars)
         self._connect_scale_bar_range()
         self._refresh_scale_bars()
-        # Après layout : les axes ont une taille pixel réelle → redessiner.
+        self._request_scale_widget_fit()
         QTimer.singleShot(0, self._refresh_scale_bars)
 
     def _teardown_scale_bars(self, spec: PanelSpec, *, is_montage: bool) -> None:
-        """Retirer les barres flottantes et remettre graduations / cadres d’axes."""
         try:
             self._scale_bar_timer.stop()
         except Exception:
@@ -324,6 +446,7 @@ class ScaleBarsMixin:
         self._disconnect_scale_bar_range()
         self._clear_scale_bar_items()
         self._scale_bar_lengths = []
+        self._scale_bar_settings_key = None
         if not self._plots:
             return
         c = self._colors
@@ -343,7 +466,6 @@ class ScaleBarsMixin:
                     axis.setTextPen(text_pen)
                 except Exception:
                     pass
-            # Ticks Y numériques ; ticks X sur l’axe partagé (montage) ou dernière ligne.
             plot.getAxis("left").setStyle(showValues=True)
             if is_montage:
                 plot.getAxis("bottom").setStyle(showValues=False)
@@ -372,7 +494,6 @@ class ScaleBarsMixin:
                 pass
 
     def _resync_scale_bar_lengths(self) -> None:
-        """Recalculer les longueurs après que le viewRange soit final (limites/⌂)."""
         spec = self._spec
         if spec is None or not self._plots:
             return
@@ -381,70 +502,6 @@ class ScaleBarsMixin:
             return
         self._scale_bar_lengths = self._resolve_scale_bar_lengths(bars)
         self._reserve_scale_bar_gutters(bars)
-
-    def _scale_bar_units_for_row(
-        self, bars: ScaleBarSpec, row: int
-    ) -> tuple[str | None, str | None]:
-        """Unités X/Y pour une ligne (overlay montage = ms, pas secondes)."""
-        x_unit = bars.x_unit
-        y_unit = bars.y_unit
-        spec = self._spec
-        kinds = list(getattr(spec, "row_kinds", None) or []) if spec else []
-        if row < len(kinds):
-            kind = str(kinds[row])
-            if kind == "overlay":
-                return ("ms", "µV")
-            if kind == "psth":
-                return ("s", "Hz")
-            if kind == "trial_rate":
-                return (None, "Hz")
-            if kind == "isi":
-                # Histogramme : X = ISI (ms), Y = comptages.
-                return ("ms", None)
-            if kind == "raster":
-                return ("s", None)
-            if kind == "rms":
-                return ("s", "µV")
-        return (x_unit, y_unit)
-
-    def _resolve_scale_bar_lengths(
-        self, bars: ScaleBarSpec
-    ) -> list[tuple[float | None, float | None]]:
-        """Longueurs X/Y en unités de données, une fois par rendu."""
-        from plot_utils import resolve_scale_bar_length
-
-        out: list[tuple[float | None, float | None]] = []
-        n = len(self._plots)
-        multi = n > 1
-        for row, plot in enumerate(self._plots):
-            try:
-                (x0, x1), (y0, y1) = plot.viewRange()
-            except Exception:
-                out.append((None, None))
-                continue
-            x_span = abs(float(x1) - float(x0))
-            y_span = abs(float(y1) - float(y0))
-            x_unit, y_unit = self._scale_bar_units_for_row(bars, row)
-            x_size: float | None = None
-            y_size: float | None = None
-            if y_unit is not None and y_span > 0:
-                y_size = resolve_scale_bar_length(
-                    y_span,
-                    manual=bool(bars.amp_manual) and y_unit == "µV",
-                    value=float(bars.amplitude),
-                )
-            show_x = x_unit is not None and (row == n - 1 or not multi)
-            if show_x and x_span > 0:
-                manual_x = float(bars.time_s)
-                if x_unit == "ms":
-                    manual_x *= 1000.0
-                x_size = resolve_scale_bar_length(
-                    x_span,
-                    manual=bool(bars.time_manual),
-                    value=manual_x,
-                )
-            out.append((x_size, y_size))
-        return out
 
     def _connect_scale_bar_range(self) -> None:
         self._disconnect_scale_bar_range()
@@ -464,9 +521,9 @@ class ScaleBarsMixin:
         if self._scale_bars_refreshing:
             return
         self._schedule_scale_bar_refresh()
+        # Pas de fit widget ici (sigRange/sigResized) : boucle resize ↔ layout.
 
     def _schedule_scale_bar_refresh(self) -> None:
-        """Coalescer les rebuilds de barres d’échelle pendant pan/zoom/XLink."""
         if self._scale_bars_refreshing:
             return
         if not self._scale_bar_timer.isActive():
@@ -479,27 +536,103 @@ class ScaleBarsMixin:
             return
         bars = getattr(spec, "scale_bars", None)
         if bars is None or not bool(getattr(bars, "enabled", False)):
-            # Style désactivé après un pan/zoom programmé : ne pas redessiner.
             self._disconnect_scale_bar_range()
             self._clear_scale_bar_items()
             return
-        if not self._plots:
+        if not self._plots or self._scale_bars_refreshing:
             return
-        if self._scale_bars_refreshing:
-            return
+        self._scale_bar_lengths = self._resolve_scale_bar_lengths(bars)
         self._scale_bars_refreshing = True
         try:
-            self._clear_scale_bar_items()
-            self._draw_scale_bar_artists(bars)
+            if not bool(getattr(bars, "floating", True)):
+                self._clear_scale_bar_items()
+                self._apply_scale_axis_ticks(bars)
+            else:
+                self._clear_scale_bar_items()
+                self._draw_scale_bar_artists(bars)
         finally:
             self._scale_bars_refreshing = False
 
-    def _draw_scale_bar_artists(self, bars: ScaleBarSpec) -> None:
-        """Barres dans les gouttières d’axes (droite / bas), hors ViewBox.
+    def _scale_ticks_for_axis(
+        self,
+        *,
+        lo: float,
+        hi: float,
+        span: float,
+        axis_px: float,
+        bars: ScaleBarSpec,
+        axis: str,
+        unit: str,
+    ) -> list[tuple[float, str]] | None:
+        if axis == "y":
+            val, length = _manual_y_params(bars, unit)
+        else:
+            val, length = _manual_x_params(bars, unit)
+        val_manual = val is not None
+        length_manual = length is not None
+        ticks = major_ticks_for_axis(
+            lo=lo,
+            hi=hi,
+            span=span,
+            axis_px=axis_px,
+            unit=unit,
+            manual_value=val,
+            value_manual=val_manual,
+            length_px=length,
+            length_manual=length_manual,
+        )
+        return ticks or None
 
-        Valeur+taille manuelles → libellé = valeur (taille widget pilotée).
-        Taille seule → libellé calculé. Valeur seule → bâton proportionnel.
-        """
+    def _apply_scale_axis_ticks(self, bars: ScaleBarSpec) -> None:
+        """Graduations classiques calées sur le même modèle que les barres flottantes."""
+        n = len(self._plots)
+        for row, plot in enumerate(self._plots):
+            try:
+                (x0, x1), (y0, y1) = plot.viewRange()
+            except Exception:
+                continue
+            x_unit, y_unit = self._scale_bar_units_for_row(bars, row)
+            left = plot.getAxis("left")
+            try:
+                h = float(left.height())
+            except Exception:
+                h = 0.0
+            y_span = abs(float(y1) - float(y0))
+            if y_unit is not None and y_span > 0 and h > 4:
+                y_ticks = self._scale_ticks_for_axis(
+                    lo=float(y0),
+                    hi=float(y1),
+                    span=y_span,
+                    axis_px=h,
+                    bars=bars,
+                    axis="y",
+                    unit=str(y_unit),
+                )
+                if y_ticks:
+                    left.setTicks([y_ticks])
+                left.setStyle(showValues=True)
+            if row == n - 1 and x_unit is not None:
+                bottom = plot.getAxis("bottom")
+                try:
+                    w = float(bottom.width())
+                except Exception:
+                    w = 0.0
+                x_span = abs(float(x1) - float(x0))
+                if x_span > 0 and w > 4:
+                    x_ticks = self._scale_ticks_for_axis(
+                        lo=float(x0),
+                        hi=float(x1),
+                        span=x_span,
+                        axis_px=w,
+                        bars=bars,
+                        axis="x",
+                        unit=str(x_unit),
+                    )
+                    if x_ticks:
+                        bottom.setTicks([x_ticks])
+                    bottom.setStyle(showValues=True)
+
+    def _draw_scale_bar_artists(self, bars: ScaleBarSpec) -> None:
         color = str(bars.color or "#111827")
         qcolor = QColor(color)
         pen = QPen(qcolor, float(bars.linewidth))
@@ -512,12 +645,6 @@ class ScaleBarsMixin:
             underline=bool(getattr(spec, "tick_underline", False)),
         )
         metrics = QFontMetrics(font)
-        lengths = self._scale_bar_lengths
-        if len(lengths) != len(self._plots):
-            lengths = self._resolve_scale_bar_lengths(bars)
-            self._scale_bar_lengths = lengths
-            self._reserve_scale_bar_gutters(bars)
-
         pad = float(_SCALE_BAR_PAD_PX)
         amp_dx, amp_dy = _scale_bar_offset_px(bars)
         time_dx, time_dy = _scale_bar_time_offset_px(bars)
@@ -529,33 +656,12 @@ class ScaleBarsMixin:
                 continue
             x_span = abs(float(x1) - float(x0))
             y_span = abs(float(y1) - float(y0))
-            x_size, y_size = lengths[row] if row < len(lengths) else (None, None)
             x_unit, y_unit = self._scale_bar_units_for_row(bars, row)
 
-            amp_len_px = (
-                float(bars.amp_length_px)
-                if bool(getattr(bars, "amp_length_manual", False))
-                and float(getattr(bars, "amp_length_px", 0.0) or 0.0) > 0
-                else None
-            )
-            time_len_px = (
-                float(bars.time_length_px)
-                if bool(getattr(bars, "time_length_manual", False))
-                and float(getattr(bars, "time_length_px", 0.0) or 0.0) > 0
-                else None
-            )
-            amp_value_manual = bool(bars.amp_manual) and y_unit == "µV"
-            time_value_manual = bool(bars.time_manual)
-
-            if (
-                y_size is not None
-                and y_size > 0
-                and y_unit is not None
-                and y_span > 0
-            ):
+            if y_unit is not None and y_span > 0:
                 self._draw_y_scale_in_gutter(
                     plot,
-                    y_size=float(y_size),
+                    bars=bars,
                     y_span=y_span,
                     y_unit=str(y_unit),
                     pen=pen,
@@ -565,21 +671,13 @@ class ScaleBarsMixin:
                     pad=pad,
                     dx=amp_dx,
                     dy=amp_dy,
-                    length_px=amp_len_px,
-                    value_manual=amp_value_manual,
                 )
 
-            if (
-                x_size is not None
-                and x_size > 0
-                and x_unit is not None
-                and x_span > 0
-                and row == n - 1
-            ):
+            if x_unit is not None and x_span > 0 and row == n - 1:
                 x_host = self._montage_x_axis_plot or plot
                 self._draw_x_scale_in_gutter(
                     x_host,
-                    x_size=float(x_size),
+                    bars=bars,
                     x_span=x_span,
                     x_unit=str(x_unit),
                     pen=pen,
@@ -589,15 +687,13 @@ class ScaleBarsMixin:
                     pad=pad,
                     dx=time_dx,
                     dy=time_dy,
-                    length_px=time_len_px,
-                    value_manual=time_value_manual,
                 )
 
     def _draw_y_scale_in_gutter(
         self,
         plot: pg.PlotItem,
         *,
-        y_size: float,
+        bars: ScaleBarSpec,
         y_span: float,
         y_unit: str,
         pen: QPen,
@@ -607,16 +703,7 @@ class ScaleBarsMixin:
         pad: float,
         dx: float = 0.0,
         dy: float = 0.0,
-        length_px: float | None = None,
-        value_manual: bool = False,
     ) -> None:
-        """Bâton + libellé Y dans l’axe droit (à côté du graph)."""
-        from plot_utils import (
-            format_scale_label,
-            scale_bar_label_value,
-            scale_bar_pixel_length,
-        )
-
         axis = plot.getAxis("right")
         try:
             h = float(axis.height())
@@ -625,54 +712,37 @@ class ScaleBarsMixin:
             return
         if h < 4.0 or w < 4.0:
             return
-        length_manual = length_px is not None and float(length_px) > 0
-        bar_h = scale_bar_pixel_length(
-            data_value=float(y_size),
-            span=float(y_span),
-            axis_px=h,
-            length_px=length_px if length_manual else None,
-            value_manual=bool(value_manual),
-        )
+        bar = _resolve_y_bar(bars, span=y_span, axis_px=h, y_unit=y_unit)
+        if bar is None:
+            return
+        val, length = _manual_y_params(bars, y_unit)
+        both_manual = val is not None and length is not None
+        length_only = length is not None and val is None
+        bar_h = float(bar.bar_px)
         if bar_h < 1.0:
             return
-        label_value = scale_bar_label_value(
-            data_value=float(y_size),
-            span=float(y_span),
-            axis_px=h,
-            bar_px=bar_h,
-            value_manual=bool(value_manual),
-            length_manual=length_manual,
-        )
-        label = format_scale_label(label_value, str(y_unit))
-        # Qt : y vers le bas. dy positif (haut) diminue y.
+        label = format_scale_label(float(bar.label), str(y_unit))
         y_a = 0.5 * (h - bar_h) - float(dy)
         y_b = y_a + bar_h
-        if y_a < 0.0:
-            y_b -= y_a
-            y_a = 0.0
-        if y_b > h:
-            y_a -= y_b - h
-            y_b = h
-            y_a = max(0.0, y_a)
-        # Taille seule : si le clamp raccourcit le bâton, recalculer le libellé.
+        if not both_manual:
+            if y_a < 0.0:
+                y_b -= y_a
+                y_a = 0.0
+            if y_b > h:
+                y_a -= y_b - h
+                y_b = h
+                y_a = max(0.0, y_a)
         drawn_h = max(0.0, y_b - y_a)
-        if (
-            length_manual
-            and not value_manual
-            and drawn_h + 0.5 < bar_h
-        ):
-            label_value = scale_bar_label_value(
-                data_value=float(y_size),
-                span=float(y_span),
-                axis_px=h,
-                bar_px=drawn_h,
-                value_manual=False,
-                length_manual=True,
+        # Taille seule : si clamp, libellé = géométrie réelle du bâton dessiné.
+        if length_only and drawn_h + 0.5 < bar_h:
+            label = format_scale_label(
+                resolve_axis_bar(
+                    span=y_span, axis_px=h, value=None, length_px=drawn_h
+                ).label,
+                str(y_unit),
             )
-            label = format_scale_label(label_value, str(y_unit))
         text_w = float(metrics.horizontalAdvance(label))
         text_h = float(metrics.height())
-        # Garder bâton + libellé dans la gouttière droite (élargie si besoin).
         x_line = pad + float(dx)
         x_line = max(0.0, min(x_line, max(0.0, w - pad - text_w)))
         line = QGraphicsLineItem(x_line, y_a, x_line, y_b)
@@ -680,7 +750,6 @@ class ScaleBarsMixin:
         line.setParentItem(axis)
         line.setZValue(50)
         self._scale_bar_items.append((plot, line))
-
         text = _scale_label_item(label, font, brush)
         text.setParentItem(axis)
         text.setZValue(50)
@@ -693,7 +762,7 @@ class ScaleBarsMixin:
         self,
         plot: pg.PlotItem,
         *,
-        x_size: float,
+        bars: ScaleBarSpec,
         x_span: float,
         x_unit: str,
         pen: QPen,
@@ -703,16 +772,7 @@ class ScaleBarsMixin:
         pad: float,
         dx: float = 0.0,
         dy: float = 0.0,
-        length_px: float | None = None,
-        value_manual: bool = False,
     ) -> None:
-        """Bâton + libellé X dans l’axe bas (sous le graph)."""
-        from plot_utils import (
-            format_scale_label,
-            scale_bar_label_value,
-            scale_bar_pixel_length,
-        )
-
         axis = plot.getAxis("bottom")
         try:
             h = float(axis.height())
@@ -721,60 +781,45 @@ class ScaleBarsMixin:
             return
         if h < 4.0 or w < 8.0:
             return
-        length_manual = length_px is not None and float(length_px) > 0
-        bar_w = scale_bar_pixel_length(
-            data_value=float(x_size),
-            span=float(x_span),
-            axis_px=w,
-            length_px=length_px if length_manual else None,
-            value_manual=bool(value_manual),
-        )
+        bar = _resolve_x_bar(bars, span=x_span, axis_px=w, x_unit=x_unit)
+        if bar is None:
+            return
+        val, length = _manual_x_params(bars, x_unit)
+        both_manual = val is not None and length is not None
+        length_only = length is not None and val is None
+        bar_w = float(bar.bar_px)
         if bar_w < 1.0:
             return
-        label_value = scale_bar_label_value(
-            data_value=float(x_size),
-            span=float(x_span),
-            axis_px=w,
-            bar_px=bar_w,
-            value_manual=bool(value_manual),
-            length_manual=length_manual,
-        )
-        label = format_scale_label(label_value, str(x_unit))
+        label = format_scale_label(float(bar.label), str(x_unit))
         text_w = float(metrics.horizontalAdvance(label))
         text_h = float(metrics.height())
         x_right = w - pad
         x_left = x_right - bar_w
-        if x_left < pad:
-            # Ancrage à gauche si la barre dépasse : garder bar_w exact.
-            x_left = pad
-            x_right = x_left + bar_w
-        x_left += float(dx)
-        x_right += float(dx)
-        # Recentrer dans [0, w] si le décalage dépasse encore la gouttière.
-        if x_left < 0.0:
-            x_right -= x_left
-            x_left = 0.0
-        if x_right > w:
-            x_left -= x_right - w
-            x_right = w
-            x_left = max(0.0, x_left)
+        if not both_manual:
+            if x_left < pad:
+                x_left = pad
+                x_right = x_left + bar_w
+            x_left += float(dx)
+            x_right += float(dx)
+            if x_left < 0.0:
+                x_right -= x_left
+                x_left = 0.0
+            if x_right > w:
+                x_left -= x_right - w
+                x_right = w
+                x_left = max(0.0, x_left)
+        else:
+            x_left += float(dx)
+            x_right += float(dx)
         drawn_w = max(0.0, x_right - x_left)
-        if (
-            length_manual
-            and not value_manual
-            and drawn_w + 0.5 < bar_w
-        ):
-            label_value = scale_bar_label_value(
-                data_value=float(x_size),
-                span=float(x_span),
-                axis_px=w,
-                bar_px=drawn_w,
-                value_manual=False,
-                length_manual=True,
+        if length_only and drawn_w + 0.5 < bar_w:
+            label = format_scale_label(
+                resolve_axis_bar(
+                    span=x_span, axis_px=w, value=None, length_px=drawn_w
+                ).label,
+                str(x_unit),
             )
-            label = format_scale_label(label_value, str(x_unit))
             text_w = float(metrics.horizontalAdvance(label))
-        # Qt : y vers le bas. dy positif (haut) rapproche la barre du graph.
         y_line = pad - float(dy)
         y_max = max(pad, h - pad - text_h)
         y_line = max(0.0, min(y_line, y_max))
@@ -783,7 +828,6 @@ class ScaleBarsMixin:
         line.setParentItem(axis)
         line.setZValue(50)
         self._scale_bar_items.append((plot, line))
-
         text = _scale_label_item(label, font, brush)
         text.setParentItem(axis)
         text.setZValue(50)
@@ -791,4 +835,3 @@ class ScaleBarsMixin:
         text_y = max(0.0, min(y_line + pad, h - text_h))
         text.setPos(QPointF(text_x, text_y))
         self._scale_bar_items.append((plot, text))
-

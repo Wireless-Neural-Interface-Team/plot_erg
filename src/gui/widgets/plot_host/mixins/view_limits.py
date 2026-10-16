@@ -388,25 +388,12 @@ class ViewLimitsMixin:
         self._resync_scale_bar_lengths()
         self._refresh_scale_bars()
         self.draw_idle()
-        # Amp. + taille amp. → hauteur ; temps + taille temps → largeur.
+        # Pas d’agrandissement auto (fit échelle off) ; libère fitted H/W si besoin.
         try:
-            needed_h = self.scale_bar_needed_view_height_px()
+            self.scaleBarHeightFitRequested.emit()
+            self.scaleBarWidthFitRequested.emit()
         except Exception:
-            needed_h = None
-        if needed_h is not None:
-            try:
-                self.scaleBarHeightFitRequested.emit()
-            except Exception:
-                pass
-        try:
-            needed_w = self.scale_bar_needed_view_width_px()
-        except Exception:
-            needed_w = None
-        if needed_w is not None:
-            try:
-                self.scaleBarWidthFitRequested.emit()
-            except Exception:
-                pass
+            pass
 
     def _apply_pending_limits(self) -> None:
         spec = self._spec

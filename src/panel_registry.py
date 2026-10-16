@@ -819,36 +819,9 @@ def apply_text_face(text: Any, face: TextFace | None) -> None:
 
 def _scale_bar_units(panel: str) -> tuple[str | None, str | None]:
     """Unités (x, y) pour les barres d’échelle ; ``None`` = barre omise."""
-    if panel in {"mea_layout", "summary_rms_table"}:
-        return (None, None)
-    if panel in {"impedance", "summary_impedance"}:
-        return (None, "Ω")
-    if panel in {"analysis_overlay", "spike_overlay"}:
-        return ("ms", "µV")
-    if panel in {
-        "analysis_psth",
-        "psth",
-        "first_psth",
-        "second_psth",
-    }:
-        return ("s", "Hz")
-    if panel in {"analysis_trial_rate", "trial_rate"}:
-        return (None, "Hz")
-    if panel in {"analysis_isi", "isi", "first_isi", "second_isi"}:
-        # Histogramme ISI : X = intervalle (ms), Y = comptages (pas d’échelle Y).
-        return ("ms", None)
-    if panel in {"analysis_raster", "analysis_raster_channel", "raster"}:
-        return ("s", None)
-    if panel in {
-        "analysis_rms",
-        "rms",
-        "first_rms",
-        "second_rms",
-        "summary_rms",
-    }:
-        return ("s", "µV")
-    # Traces tension (aperçu, analyse, montages, continuous…).
-    return ("s", "µV")
+    from scale_bar_model import units_for_panel
+
+    return units_for_panel(panel)
 
 
 def _scale_bar_lengths(
@@ -859,7 +832,11 @@ def _scale_bar_lengths(
     ax: Any,
 ) -> tuple[float | None, float | None]:
     """Longueurs X/Y (unités de données) selon réglages manuels ou auto."""
-    from plot_utils import resolve_scale_bar_length
+    from scale_bar_model import (
+        amp_manual_applies,
+        resolve_axis_bar,
+        time_value_in_axis_units,
+    )
 
     try:
         xlim = ax.get_xlim()
@@ -872,25 +849,25 @@ def _scale_bar_lengths(
     x_size: float | None = None
     if x_unit is not None and x_span > 0:
         time_s = float(getattr(style, "scale_bar_time_s", 0.1) or 0.1)
-        # Stocké en secondes ; convertir si le panneau est en ms.
-        manual_x = time_s * 1000.0 if x_unit == "ms" else time_s
-        x_size = resolve_scale_bar_length(
-            x_span,
-            manual=bool(getattr(style, "scale_bar_time_manual", False)),
-            value=manual_x,
-        )
+        manual = bool(getattr(style, "scale_bar_time_manual", False))
+        val = time_value_in_axis_units(time_s, x_unit) if manual else None
+        x_size = resolve_axis_bar(
+            span=x_span, axis_px=100.0, value=val if val and val > 0 else None
+        ).value
 
     y_size: float | None = None
     if y_unit is not None and y_span > 0:
-        # Manuel = µV seulement (spin « amplitude ») ; Hz / ms → auto.
-        y_size = resolve_scale_bar_length(
-            y_span,
-            manual=(
-                bool(getattr(style, "scale_bar_amplitude_manual", False))
-                and y_unit == "µV"
-            ),
-            value=float(getattr(style, "scale_bar_amplitude", 100.0) or 100.0),
+        manual = bool(getattr(style, "scale_bar_amplitude_manual", False)) and (
+            amp_manual_applies(y_unit)
         )
+        val = (
+            float(getattr(style, "scale_bar_amplitude", 100.0) or 100.0)
+            if manual
+            else None
+        )
+        y_size = resolve_axis_bar(
+            span=y_span, axis_px=100.0, value=val
+        ).value
     return (x_size, y_size)
 
 
@@ -903,72 +880,16 @@ def _apply_scale_bars(
     keep_xlabel: bool = True,
     draw_bars: bool = True,
 ) -> None:
-    """Masquer les graduations et, si demandé, tracer les barres flottantes.
+    """Échelle temps / amplitude (barres flottantes ou graduations, même modèle)."""
+    from plot_scale_display import apply_panel_scale_display
 
-    Les titres d’axes (xlabel / ylabel) sont conservés par défaut.
-    """
-    from plot_utils import clear_floating_scale_bars, draw_floating_scale_bars, hide_edge_scale
-
-    if not bool(getattr(style, "show_scale_bars", False)):
-        clear_floating_scale_bars(ax)
-        # Restaurer graduations / cadres après décochage (style refresh).
-        ax.tick_params(
-            axis="both",
-            which="both",
-            bottom=True,
-            left=True,
-            labelbottom=True,
-            labelleft=True,
-        )
-        for spine in ax.spines.values():
-            spine.set_visible(bool(style.show_borders))
-        return
-    hide_edge_scale(ax, keep_ylabel=keep_ylabel, keep_xlabel=keep_xlabel)
-    # Avec barres flottantes : pas de cadre (style montage EEG).
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    if not draw_bars:
-        clear_floating_scale_bars(ax)
-        return
-    x_unit, y_unit = _scale_bar_units(panel)
-    if x_unit is None and y_unit is None:
-        clear_floating_scale_bars(ax)
-        return
-    x_size, y_size = _scale_bar_lengths(style, x_unit=x_unit, y_unit=y_unit, ax=ax)
-    dx_px, dy_px = resolved_scale_bar_offset_px(style)
-    time_dx_px, time_dy_px = resolved_scale_bar_time_offset_px(style)
-    y_length_px = None
-    if bool(getattr(style, "scale_bar_amplitude_length_manual", False)):
-        y_px = float(getattr(style, "scale_bar_amplitude_length_px", 0.0) or 0.0)
-        if y_px > 0:
-            y_length_px = y_px
-    x_length_px = None
-    if bool(getattr(style, "scale_bar_time_length_manual", False)):
-        x_px = float(getattr(style, "scale_bar_time_length_px", 0.0) or 0.0)
-        if x_px > 0:
-            x_length_px = x_px
-    draw_floating_scale_bars(
+    apply_panel_scale_display(
         ax,
-        x_unit=x_unit,
-        y_unit=y_unit,
-        x_size=x_size,
-        y_size=y_size,
-        fontsize=float(style.tick_font_size),
-        linewidth=resolved_scale_bar_linewidth(style),
-        # Même gouttière que le montage : la marge droite _AXES_RIGHT_SCALEBARS
-        # est réservée pour ça (sinon le libellé Y reste dans la zone de tracé).
-        gutter=True,
-        face=style.tick_face,
-        dx_px=dx_px,
-        dy_px=dy_px,
-        x_dx_px=time_dx_px,
-        x_dy_px=time_dy_px,
-        y_length_px=y_length_px,
-        x_length_px=x_length_px,
-        y_value_manual=bool(
-            getattr(style, "scale_bar_amplitude_manual", False) and y_unit == "µV"
-        ),
-        x_value_manual=bool(getattr(style, "scale_bar_time_manual", False)),
+        style,
+        panel=panel,
+        keep_ylabel=keep_ylabel,
+        keep_xlabel=keep_xlabel,
+        draw_bars=draw_bars,
     )
 
 
@@ -1020,8 +941,6 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
         return
     style = request.style
     show_bars = bool(getattr(style, "show_scale_bars", False))
-    # Une seule ligne (ex. full_recording WIDE) : marges « single », pas montage.
-    # Sinon ticks / xlabel / légende below sont coupés (bottom montage ≈ 3.5 %).
     _apply_uniform_axes_box(
         figure,
         show_scale_bars=show_bars,
@@ -1029,37 +948,43 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
         legend=request.legend,
         style=style,
     )
-    if not show_bars:
-        for ax in axes:
-            clear_floating_scale_bars(ax)
-            # Sans barres : garder les titres de ligne alignés (pas de ticks Y).
-            ax.tick_params(axis="y", which="both", labelleft=False)
-        return
+    from plot_scale_display import apply_mpl_scale_ticks
 
     panel_x, panel_y = _scale_bar_units(request.panel)
     row_kinds = list(getattr(figure, "_erg_montage_row_kinds", None) or [])
     last = len(axes) - 1
+
+    def _units_for_row(row: int) -> tuple[str | None, str | None]:
+        from scale_bar_model import units_for_kind
+
+        if row < len(row_kinds):
+            return units_for_kind(
+                str(row_kinds[row]), default_x=panel_x, default_y=panel_y
+            )
+        return (panel_x, panel_y)
+
+    if not show_bars:
+        for row, ax in enumerate(axes):
+            clear_floating_scale_bars(ax)
+            x_unit, y_unit = _units_for_row(row)
+            if x_unit is None and y_unit is None:
+                ax.tick_params(axis="y", which="both", labelleft=False)
+                continue
+            x_size, y_size = _scale_bar_lengths(
+                style, x_unit=x_unit, y_unit=y_unit, ax=ax
+            )
+            apply_mpl_scale_ticks(
+                ax, style, x_unit=x_unit, y_unit=y_unit, x_size=x_size, y_size=y_size
+            )
+            if row < last:
+                ax.tick_params(axis="x", which="both", labelbottom=False)
+            ax.tick_params(axis="y", which="both", labelleft=(y_unit is not None))
+        return
+
     fontsize = float(style.tick_font_size)
     linewidth = resolved_scale_bar_linewidth(style)
     dx_px, dy_px = resolved_scale_bar_offset_px(style)
     time_dx_px, time_dy_px = resolved_scale_bar_time_offset_px(style)
-
-    def _units_for_row(row: int) -> tuple[str | None, str | None]:
-        if row < len(row_kinds):
-            kind = str(row_kinds[row])
-            if kind == "overlay":
-                return ("ms", "µV")
-            if kind == "psth":
-                return ("s", "Hz")
-            if kind == "trial_rate":
-                return (None, "Hz")
-            if kind == "isi":
-                return ("ms", None)
-            if kind == "raster":
-                return ("s", None)
-            if kind == "rms":
-                return ("s", "µV")
-        return (panel_x, panel_y)
 
     y_length_px = None
     if bool(getattr(style, "scale_bar_amplitude_length_manual", False)):
