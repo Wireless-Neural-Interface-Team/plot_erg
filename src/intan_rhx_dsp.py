@@ -14,11 +14,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
-from scipy.signal import sosfilt
 
-# systemstate.h
+# systemstate.h / spikeplot.cpp
 INTAN_SNIPPET_SIZE = 50
-INTAN_FRAMES_PER_BLOCK = 128
 INTAN_NOTCH_BANDWIDTH_HZ = 10.0
 INTAN_RMS_WINDOW_S = 1.0
 
@@ -72,15 +70,23 @@ _BUTTERWORTH_SPECS: dict[int, list[tuple[float, float]]] = {
 
 @dataclass(frozen=True)
 class IntanDspSettings:
-    """Defaults match Intan RHX SystemState (v3.5.1) HIGH filter."""
+    """Defaults match Intan RHX SystemState (v3.5.1) software filters.
+
+    High-pass (HIGH) and low-pass (LOW) are computed as separate cascades
+    (never band-pass). Each path has its own order / prototype / cutoff.
+    """
 
     fs: float
     rhs_version_major: int = 3
     notch_filter_frequency_hz: float = 0.0
-    spike_filter_kind: SpikeFilterKind = "highpass"
-    filter_order: int = 2
-    filter_type: FilterType = "bessel"
-    filter_cutoff_hz: float = 250.0
+    # User-selected software notch (0 / 50 / 60). Applied even on RHX v3+ files.
+    software_notch_hz: float = 0.0
+    hp_filter_order: int = 2
+    hp_filter_type: FilterType = "bessel"
+    hp_filter_cutoff_hz: float = 250.0
+    lp_filter_order: int = 2
+    lp_filter_type: FilterType = "bessel"
+    lp_filter_cutoff_hz: float = 250.0
     spike_threshold_uv: float = -70.0
     artifact_threshold_uv: float = 2500.0
     artifact_suppression_enabled: bool = True
@@ -91,40 +97,64 @@ class IntanDspSettings:
     def rms_window_samples(self) -> int:
         return max(1, int(math.ceil(float(self.fs) * float(self.rms_window_s))))
 
-    def apply_notch_to_wideband(self) -> bool:
-        """True when wideband must be notch-filtered before software filter (pre-RHX v3)."""
-        return self.notch_filter_frequency_hz > 0 and self.rhs_version_major < 3
+    def effective_notch_hz(self) -> float:
+        """Software notch applied in the HP/LP chain (0 = none).
 
-    def validate_filter(self) -> None:
-        fc = float(self.filter_cutoff_hz)
+        Header notch for pre-RHX v3 files is applied once at RHS load time
+        (vectorized). Only an explicit ``software_notch_hz`` (50/60) is
+        re-applied here, so line noise can be cleaned on RHX v3+ recordings
+        without double-filtering legacy files.
+        """
+        soft = float(self.software_notch_hz or 0.0)
+        return soft if soft > 0 else 0.0
+
+    def filter_params(self, kind: SpikeFilterKind) -> tuple[int, FilterType, float]:
+        """Return (order, type, cutoff_hz) for HIGH or LOW."""
+        if kind == "highpass":
+            return (
+                int(self.hp_filter_order),
+                self.hp_filter_type,
+                float(self.hp_filter_cutoff_hz),
+            )
+        return (
+            int(self.lp_filter_order),
+            self.lp_filter_type,
+            float(self.lp_filter_cutoff_hz),
+        )
+
+    def _validate_one_filter(self, kind: SpikeFilterKind) -> None:
+        order, ftype, fc = self.filter_params(kind)
+        label = self.filter_pass_label(kind)
         if fc <= 0:
-            raise ValueError("Spike filter cutoff frequency must be > 0 Hz.")
-        order = int(self.filter_order)
+            raise ValueError(f"{label} cutoff frequency must be > 0 Hz.")
         if order < 1 or order > 8:
-            raise ValueError("Spike filter order must be between 1 and 8.")
-        kind = self.spike_filter_kind
-        if kind not in ("highpass", "lowpass"):
-            raise ValueError("Spike filter kind must be highpass or lowpass.")
+            raise ValueError(f"{label} order must be between 1 and 8.")
+        if ftype not in ("bessel", "butterworth"):
+            raise ValueError(f"{label} type must be bessel or butterworth.")
         nyq = float(self.fs) / 2.0
         if fc >= nyq:
             raise ValueError(
-                f"Spike filter cutoff ({fc:g} Hz) must be below Nyquist ({nyq:g} Hz)."
+                f"{label} cutoff ({fc:g} Hz) must be below Nyquist ({nyq:g} Hz)."
             )
 
-    def filter_pass_label(self) -> str:
-        return "high-pass" if self.spike_filter_kind == "highpass" else "low-pass"
+    def validate_filter(self) -> None:
+        self._validate_one_filter("highpass")
+        self._validate_one_filter("lowpass")
 
-    def filter_title_label(self) -> str:
+    @staticmethod
+    def filter_pass_label(kind: SpikeFilterKind) -> str:
+        return "high-pass" if kind == "highpass" else "low-pass"
+
+    def filter_title_label(self, kind: SpikeFilterKind = "highpass") -> str:
         """Compact filter description for plot titles (type, pass band, cutoff)."""
-        return (
-            f"{self.filter_type} {self.filter_pass_label()} "
-            f"@ {self.filter_cutoff_hz:g} Hz"
-        )
+        order, ftype, fc = self.filter_params(kind)
+        del order
+        return f"{ftype} {self.filter_pass_label(kind)} @ {fc:g} Hz"
 
-    def filter_short_label(self) -> str:
+    def filter_short_label(self, kind: SpikeFilterKind = "highpass") -> str:
+        order, ftype, fc = self.filter_params(kind)
         return (
-            f"{self.filter_type} {self.filter_pass_label()} ord.{self.filter_order} "
-            f"@ {self.filter_cutoff_hz:g} Hz"
+            f"{ftype} {self.filter_pass_label(kind)} order {order} @ {fc:g} Hz"
         )
 
     @classmethod
@@ -133,12 +163,20 @@ class IntanDspSettings:
         data: dict[str, Any],
         *,
         spike_threshold_uv: float = -70.0,
-        spike_filter_kind: SpikeFilterKind = "highpass",
-        filter_order: int = 2,
-        filter_type: FilterType = "bessel",
-        filter_cutoff_hz: float = 250.0,
+        hp_filter_order: int = 2,
+        hp_filter_type: FilterType = "bessel",
+        hp_filter_cutoff_hz: float = 250.0,
+        lp_filter_order: int = 2,
+        lp_filter_type: FilterType = "bessel",
+        lp_filter_cutoff_hz: float = 250.0,
         artifact_threshold_uv: float = 2500.0,
         artifact_suppression_enabled: bool = True,
+        rms_window_s: float = INTAN_RMS_WINDOW_S,
+        software_notch_hz: float = 0.0,
+        # Legacy shared kwargs (apply to both HP and LP when provided alone).
+        filter_order: int | None = None,
+        filter_type: FilterType | None = None,
+        filter_cutoff_hz: float | None = None,
     ) -> IntanDspSettings:
         freq = data.get("frequency_parameters") or {}
         fs = float(freq.get("amplifier_sample_rate") or data.get("sample_rate") or 0.0)
@@ -147,17 +185,30 @@ class IntanDspSettings:
         version = data.get("version") or {}
         major = int(version.get("major", 3))
         notch = float(freq.get("notch_filter_frequency") or 0.0)
+        soft = float(software_notch_hz or 0.0)
+        if soft not in (0.0, 50.0, 60.0):
+            soft = 0.0
+        if filter_order is not None:
+            hp_filter_order = lp_filter_order = int(filter_order)
+        if filter_type is not None:
+            hp_filter_type = lp_filter_type = filter_type
+        if filter_cutoff_hz is not None:
+            hp_filter_cutoff_hz = lp_filter_cutoff_hz = float(filter_cutoff_hz)
         settings = cls(
             fs=fs,
             rhs_version_major=major,
             notch_filter_frequency_hz=notch,
-            spike_filter_kind=spike_filter_kind,
-            filter_order=int(filter_order),
-            filter_type=filter_type,
-            filter_cutoff_hz=float(filter_cutoff_hz),
+            software_notch_hz=soft,
+            hp_filter_order=int(hp_filter_order),
+            hp_filter_type=hp_filter_type,
+            hp_filter_cutoff_hz=float(hp_filter_cutoff_hz),
+            lp_filter_order=int(lp_filter_order),
+            lp_filter_type=lp_filter_type,
+            lp_filter_cutoff_hz=float(lp_filter_cutoff_hz),
             spike_threshold_uv=float(spike_threshold_uv),
             artifact_threshold_uv=float(artifact_threshold_uv),
             artifact_suppression_enabled=bool(artifact_suppression_enabled),
+            rms_window_s=float(rms_window_s),
         )
         settings.validate_filter()
         return settings
@@ -167,21 +218,29 @@ class IntanDspSettings:
         path.write_text(json.dumps(asdict(self), indent=2), encoding="utf-8")
 
     @classmethod
-    def load_json(cls, path: Path) -> IntanDspSettings:
-        raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
-        if "filter_cutoff_hz" not in raw:
-            raw.setdefault("spike_filter_kind", "highpass")
-            if "high_order" in raw:
-                raw["filter_order"] = raw.pop("high_order")
-            if "high_type" in raw:
-                raw["filter_type"] = raw.pop("high_type")
-            if "high_cutoff_hz" in raw:
-                raw["filter_cutoff_hz"] = raw.pop("high_cutoff_hz")
+    def from_dict(cls, raw: dict[str, Any]) -> IntanDspSettings:
+        """Build settings from a dict, migrating legacy shared ``filter_*`` keys."""
+        data = dict(raw)
+        if "hp_filter_order" not in data and "filter_order" in data:
+            data["hp_filter_order"] = data["filter_order"]
+            data["lp_filter_order"] = data["filter_order"]
+        if "hp_filter_type" not in data and "filter_type" in data:
+            data["hp_filter_type"] = data["filter_type"]
+            data["lp_filter_type"] = data["filter_type"]
+        if "hp_filter_cutoff_hz" not in data and "filter_cutoff_hz" in data:
+            data["hp_filter_cutoff_hz"] = data["filter_cutoff_hz"]
+            data["lp_filter_cutoff_hz"] = data["filter_cutoff_hz"]
         field_names = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        filtered = {k: v for k, v in raw.items() if k in field_names}
+        # Ignore legacy spike_filter_kind / shared filter_* keys.
+        filtered = {k: v for k, v in data.items() if k in field_names}
         settings = cls(**filtered)
         settings.validate_filter()
         return settings
+
+    @classmethod
+    def load_json(cls, path: Path) -> IntanDspSettings:
+        raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+        return cls.from_dict(raw)
 
 
 @dataclass
@@ -192,50 +251,6 @@ class _BiquadCoeffs:
     a1: float
     a2: float
     is_dc_gain_zero: bool = False
-
-
-class _BiquadStream:
-    """Direct Form I biquad (filter.cpp / BiquadFilter::filterOne)."""
-
-    def __init__(self, coeffs: _BiquadCoeffs) -> None:
-        self.c = coeffs
-        self.first = True
-        self.prev_in = 0.0
-        self.prev_prev_in = 0.0
-        self.prev_out = 0.0
-        self.prev_prev_out = 0.0
-
-    def filter_one(self, x: float) -> float:
-        c = self.c
-        if self.first:
-            self.prev_in = x
-            self.prev_prev_in = x
-            if c.is_dc_gain_zero:
-                self.prev_out = 0.0
-                self.prev_prev_out = 0.0
-            else:
-                self.prev_out = x
-                self.prev_prev_out = x
-            self.first = False
-        out = (
-            c.b0 * x
-            + c.b1 * self.prev_in
-            + c.b2 * self.prev_prev_in
-            - c.a1 * self.prev_out
-            - c.a2 * self.prev_prev_out
-        )
-        self.prev_prev_in = self.prev_in
-        self.prev_in = x
-        self.prev_prev_out = self.prev_out
-        self.prev_out = out
-        return out
-
-    def process(self, signal: np.ndarray) -> np.ndarray:
-        x = np.asarray(signal, dtype=np.float64).ravel()
-        y = np.empty(x.size, dtype=np.float64)
-        for i in range(x.size):
-            y[i] = self.filter_one(float(x[i]))
-        return y
 
 
 def _first_order_lowpass(fc: float, fs: float) -> _BiquadCoeffs:
@@ -265,10 +280,12 @@ def _second_order_highpass(fc: float, q: float, fs: float) -> _BiquadCoeffs:
 
 
 def _second_order_notch(f_notch: float, bandwidth: float, fs: float) -> _BiquadCoeffs:
+    # Same IIR as intanutil.filter.notch_filter:
+    # a1 must be -b so that Direct Form I (y -= a1*y[n-1]) matches the reference.
     d = math.exp(-math.pi * bandwidth / fs)
     b = (1.0 + d * d) * math.cos(2.0 * math.pi * f_notch / fs)
     a = (1.0 + d * d) / 2.0
-    return _BiquadCoeffs(a, -b, a, b, d * d, False)
+    return _BiquadCoeffs(a, -b, a, -b, d * d, False)
 
 
 def _filter_biquad_chain(
@@ -298,10 +315,6 @@ def _filter_biquad_chain(
     return chain
 
 
-def _highpass_biquad_chain(order: int, fc: float, fs: float, ftype: FilterType) -> list[_BiquadCoeffs]:
-    return _filter_biquad_chain("highpass", order, fc, fs, ftype)
-
-
 def _coeffs_to_sos(coeffs: list[_BiquadCoeffs]) -> np.ndarray:
     sos = np.empty((len(coeffs), 6), dtype=np.float64)
     for i, c in enumerate(coeffs):
@@ -309,162 +322,31 @@ def _coeffs_to_sos(coeffs: list[_BiquadCoeffs]) -> np.ndarray:
     return sos
 
 
-def _cascade(signal: np.ndarray, coeffs: list[_BiquadCoeffs]) -> np.ndarray:
-    """Vectorized IIR cascade (scipy SOS, ~100× faster than sample-wise Python)."""
-    if not coeffs:
-        return np.asarray(signal, dtype=np.float64).ravel()
-    x = np.asarray(signal, dtype=np.float64).ravel()
-    return sosfilt(_coeffs_to_sos(coeffs), x)
-
-
 def build_intan_filter_sos(
     settings: IntanDspSettings,
-) -> tuple[np.ndarray | None, np.ndarray]:
-    """Precompute SOS sections for notch (optional) + software HP/LP (reuse per channel)."""
+) -> tuple[np.ndarray | None, np.ndarray, np.ndarray]:
+    """Precompute SOS: optional notch + independent high-pass and low-pass."""
     notch_sos: np.ndarray | None = None
-    if settings.apply_notch_to_wideband():
+    notch_hz = settings.effective_notch_hz()
+    if notch_hz > 0:
         notch_sos = _coeffs_to_sos(
             [
                 _second_order_notch(
-                    settings.notch_filter_frequency_hz,
+                    notch_hz,
                     INTAN_NOTCH_BANDWIDTH_HZ,
                     settings.fs,
                 )
             ]
         )
-    filt_chain = _filter_biquad_chain(
-        settings.spike_filter_kind,
-        settings.filter_order,
-        settings.filter_cutoff_hz,
-        settings.fs,
-        settings.filter_type,
+    hp_order, hp_type, hp_fc = settings.filter_params("highpass")
+    lp_order, lp_type, lp_fc = settings.filter_params("lowpass")
+    hp_sos = _coeffs_to_sos(
+        _filter_biquad_chain("highpass", hp_order, hp_fc, settings.fs, hp_type)
     )
-    return notch_sos, _coeffs_to_sos(filt_chain)
-
-
-def filter_wideband_with_sos(
-    wideband_uv: np.ndarray,
-    notch_sos: np.ndarray | None,
-    filter_sos: np.ndarray,
-) -> np.ndarray:
-    x = np.asarray(wideband_uv, dtype=np.float64).ravel()
-    if notch_sos is not None:
-        x = sosfilt(notch_sos, x)
-    return sosfilt(filter_sos, x)
-
-
-def wideband_to_filtered(
-    wideband_uv: np.ndarray,
-    settings: IntanDspSettings,
-) -> np.ndarray:
-    """Convert wideband amplifier (µV) to Intan software-filtered waveform (HIGH or LOW)."""
-    notch_sos, filter_sos = build_intan_filter_sos(settings)
-    return filter_wideband_with_sos(wideband_uv, notch_sos, filter_sos)
-
-
-def wideband_to_high(
-    wideband_uv: np.ndarray,
-    settings: IntanDspSettings,
-) -> np.ndarray:
-    """Alias: HIGH path when spike_filter_kind is highpass."""
-    return wideband_to_filtered(wideband_uv, settings)
-
-
-def write_filtered_stack_channelwise(
-    amplifier: np.ndarray,
-    path: Path,
-    settings: IntanDspSettings,
-    *,
-    channel_workers: int = 1,
-    cancel_check: Any | None = None,
-    progress_every: int = 0,
-) -> Path:
-    """Filter wideband to disk per channel (parallel workers, no full output stack in RAM)."""
-    from concurrent.futures import ThreadPoolExecutor
-
-    from memmap_io import open_writable_memmap
-
-    arr = np.asarray(amplifier)
-    if arr.ndim != 2:
-        raise ValueError("write_filtered_stack_channelwise expects [n_channels, n_samples].")
-    n_ch, n_samp = int(arr.shape[0]), int(arr.shape[1])
-    workers = max(1, min(int(channel_workers), 16, n_ch))
-    out = open_writable_memmap(path, (n_ch, n_samp), np.dtype(np.float32))
-    notch_sos, filter_sos = build_intan_filter_sos(settings)
-
-    def _one(ch: int) -> tuple[int, np.ndarray]:
-        if cancel_check is not None:
-            cancel_check()
-        filtered = filter_wideband_with_sos(np.asarray(arr[ch], dtype=np.float64), notch_sos, filter_sos)
-        return ch, np.asarray(filtered, dtype=np.float32)
-
-    try:
-        if workers <= 1 or n_ch == 1:
-            for ch in range(n_ch):
-                _, row = _one(ch)
-                out[ch] = row
-                if progress_every > 0 and (ch + 1) % progress_every == 0:
-                    print(f"  filter → {path.name}: channel {ch + 1}/{n_ch}")
-        else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                for ch, row in pool.map(_one, range(n_ch)):
-                    out[ch] = row
-            if progress_every > 0:
-                print(f"  filter → {path.name}: {n_ch} channels ({workers} workers)")
-        out.flush()
-    finally:
-        del out
-    return path
-
-
-def compute_filtered_channel_stack(
-    amplifier_2d: np.ndarray,
-    settings: IntanDspSettings,
-    channel_workers: int | None = None,
-    cancel_check: Any | None = None,
-) -> np.ndarray:
-    """In-RAM filtered stack (legacy); prefer write_filtered_stack_channelwise for large files."""
-    import os
-    from concurrent.futures import ThreadPoolExecutor
-
-    n_ch, n_samp = np.asarray(amplifier_2d).shape
-    if channel_workers is not None:
-        workers = max(1, min(int(channel_workers), 16, n_ch))
-    else:
-        workers = max(1, min(n_ch, 16, int(os.cpu_count() or 2)))
-    out = np.empty((n_ch, n_samp), dtype=np.float32)
-    notch_sos, filter_sos = build_intan_filter_sos(settings)
-
-    def _one(ch: int) -> tuple[int, np.ndarray]:
-        if cancel_check is not None:
-            cancel_check()
-        row = np.asarray(
-            filter_wideband_with_sos(np.asarray(amplifier_2d[ch], dtype=np.float64), notch_sos, filter_sos),
-            dtype=np.float32,
-        )
-        return ch, row
-
-    if workers <= 1 or n_ch == 1:
-        for ch in range(n_ch):
-            _, row = _one(ch)
-            out[ch] = row
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for ch, row in pool.map(_one, range(n_ch)):
-                out[ch] = row
-    return out
-
-
-def compute_high_channel_stack(
-    amplifier_2d: np.ndarray,
-    settings: IntanDspSettings,
-    channel_workers: int | None = None,
-    cancel_check: Any | None = None,
-) -> np.ndarray:
-    """Backward-compatible alias for compute_filtered_channel_stack."""
-    return compute_filtered_channel_stack(
-        amplifier_2d, settings, channel_workers=channel_workers, cancel_check=cancel_check
+    lp_sos = _coeffs_to_sos(
+        _filter_biquad_chain("lowpass", lp_order, lp_fc, settings.fs, lp_type)
     )
+    return notch_sos, hp_sos, lp_sos
 
 
 def rms_intan_at_index(high: np.ndarray, end_index: int, settings: IntanDspSettings) -> float:
@@ -488,11 +370,6 @@ def mean_rms_intan_channel(high: np.ndarray, settings: IntanDspSettings) -> floa
     if n == 0:
         return 0.0
     return rms_intan_at_index(high, n - 1, settings)
-
-
-def sliding_rms_intan_profile(high: np.ndarray, settings: IntanDspSettings) -> np.ndarray:
-    """RMS (µV) at each sample: sqrt(mean(x²)) over the preceding rms_window."""
-    return sliding_rms_intan_profile_range(high, settings, 0, None)
 
 
 def sliding_rms_intan_profile_range(
@@ -532,43 +409,68 @@ def detect_spikes_intan(
     start_sample: int = 0,
     end_sample: int | None = None,
 ) -> np.ndarray:
-    """Spike sample indices on HIGH (simplified Intan cpuinterface, no hoops)."""
+    """Spike sample indices on HIGH (cpuinterface.cpp, no hoops).
+
+    Threshold crossing on the first sample that exceeds the signed threshold.
+    After a hit, search skips ``snippet_size`` samples (Intan refractory).
+    Artifact snippets (any sample past spikeMax) are not counted as spikes
+    but still consume the same refractory window.
+
+    Candidates are found with a vectorized scan; refractory / artifact checks
+    keep Intan ordering without a sample-by-sample Python loop over the whole
+    window.
+    """
     n = int(np.asarray(high).shape[-1]) if np.ndim(high) >= 1 else int(np.asarray(high).size)
     if n < 2:
         return np.array([], dtype=np.int64)
     t0 = max(0, int(start_sample))
     t1 = n if end_sample is None else min(n, int(end_sample))
-    if t1 - t0 < settings.snippet_size + 2:
+    snippet = int(settings.snippet_size)
+    if t1 - t0 < snippet + 2:
         return np.array([], dtype=np.int64)
 
     x = np.asarray(high[t0:t1], dtype=np.float32).ravel()
-    win_len = x.size
+    win_len = int(x.size)
     thr = float(settings.spike_threshold_uv)
     artifact = float(settings.artifact_threshold_uv)
-    use_artifact = settings.artifact_suppression_enabled
-    snippet = int(settings.snippet_size)
+    use_artifact = bool(settings.artifact_suppression_enabled)
+
+    # Search only where a full snippet still fits (Intan behaviour).
+    search_end = win_len - snippet
+    if search_end <= 0:
+        return np.array([], dtype=np.int64)
+    region = x[:search_end]
+    # Rising / falling edge through threshold (not every sample already beyond it).
+    if thr >= 0:
+        above = region > thr
+        prev = np.empty_like(above)
+        prev[0] = False
+        prev[1:] = above[:-1]
+        candidates = np.flatnonzero(above & ~prev)
+    else:
+        below = region < thr
+        prev = np.empty_like(below)
+        prev[0] = False
+        prev[1:] = below[:-1]
+        candidates = np.flatnonzero(below & ~prev)
+    if candidates.size == 0:
+        return np.array([], dtype=np.int64)
 
     spikes: list[int] = []
-    s = 0
-    while s < win_len - snippet:
-        surpassed = False
-        if thr >= 0:
-            if x[s] > thr:
-                surpassed = True
-        elif x[s] < thr:
-            surpassed = True
-        if not surpassed:
-            s += 1
+    next_allowed = 0
+    for s in candidates.tolist():
+        if s < next_allowed:
             continue
-        snippet_end = min(win_len, s + snippet)
-        seg = x[s:snippet_end]
+        snippet_end = s + snippet
         if use_artifact:
-            if thr >= 0 and np.any(seg >= artifact):
-                s += 1
-                continue
-            if thr < 0 and np.any(seg <= -artifact):
-                s += 1
+            seg = x[s:snippet_end]
+            if thr >= 0:
+                is_artifact = bool(np.any(seg >= artifact))
+            else:
+                is_artifact = bool(np.any(seg <= -artifact))
+            if is_artifact:
+                next_allowed = snippet_end
                 continue
         spikes.append(s + t0)
-        s += snippet
+        next_allowed = snippet_end
     return np.asarray(spikes, dtype=np.int64)

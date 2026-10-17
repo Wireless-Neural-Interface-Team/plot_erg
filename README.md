@@ -1,66 +1,206 @@
-# Intan Trigger Plotter
+# Intan Stimulation Plotter
 
-Programme Python pour lire des fichiers Intan `.rhs`, détecter un **front montant ou descendant** sur `ANALOG_IN 0`, extraire des fenêtres temporelles autour de chaque trigger, puis enregistrer la moyenne par canal dans **un seul PDF multi-pages** (aucune fenêtre matplotlib).
+Python tool to read Intan `.rhs` recordings, detect stimulations on `ANALOG_IN 0`,
+extract time windows around each one, and explore every resulting curve
+**interactively in the GUI** — with the multi-page PDF report still available.
 
-## Structure du projet
+A recording is processed **once**. Everything the panels need (trial averages,
+per-stimulation windows, sliding RMS profiles, spike trains, spike waveforms,
+thresholds) is computed, cached on disk, and from then on drawn from the cache.
+Display settings therefore apply in real time, and a recording can be exported as
+a **reusable processed dataset** that reopens in a few hundred milliseconds,
+without the original `.rhs` file.
 
-- `src/core.py` : lecture RHS, filtrage Intan RHX, triggers, piles mmap
-- `src/plotting.py` : export PDF multi-panneaux (moyennes, RMS, raster, PSTH, ISI)
-- `src/gui.py` : interface graphique Qt (sélection fichier + paramètres)
-- `src/cli.py` : point d'entrée ligne de commande
-- `src/load_intan_rhs_format.py` : lecteur Intan RHS
-- `run_gui.py` : lanceur Python simple pour la GUI
+## Project layout
 
-## Prérequis
+### Analysis core
 
-1. Installer Python 3.9+
-2. Installer les dépendances :
+- `src/core.py` — RHS I/O helpers, Intan RHX filtering, stimulation detection, memmap stacks
+- `src/intan_rhx_dsp.py` — Intan-compatible filters, spike detection, sliding RMS
+- `src/probe_layout.py` — MEA probe geometry (probeinterface and mea_editor JSON)
+- `src/impedance_tracking.py` — companion impedance CSV exports
+- `src/plotting.py` — matplotlib PDF composition (Agg); can seed from `ProcessedRecording`
+- `src/load_intan_rhs_format.py` / `src/intanutil/` — RHS reader with **stream-to-memmap** path
+
+### Processed data and cache
+
+- `src/erg_cache.py` — staged, content-addressed cache keys and bundle layout
+- `src/processed_dataset.py` — the processed-recording model and its on-disk format
+- `src/dataset_builder.py` — pipeline (`build_recording` + lazy `LazyFilterBank` + `ensure_channels`)
+
+### Display
+
+- `src/panel_catalog.py` — single catalogue of panel keys, labels and metadata
+- `src/view_config.py` — live display settings: legends, panel style, views and tabs
+- `src/panel_prepare.py` — backend-neutral panel data specs (screen + PDF for supported panels)
+- `src/panel_draw_mpl.py` — matplotlib drawer for `PanelSpec` (PDF / CLI; includes triggered montages + full_recording)
+- `src/panel_registry.py` — PDF orchestration (panels via `prepare_panel` → `panel_draw_mpl`)
+- `src/display_config.py` — PDF section visibility and recording styles
+- `src/gui/` — Qt viewer (PySide6 + **pyqtgraph** screen plots)
+  - `services/` — redraw, pipeline, montage, preview, export, render-request factory
+  - `widgets/plot_host/` — pyqtgraph plot surface (host + mixins montage / scale bars / stim-zone / view)
+  - `jobs.py` — background build / ensure / filter warm (never on the UI thread)
+- `src/cli.py` — command-line entry point (PDF via the same `build_recording` path)
+- `run_gui.py` — GUI launcher
+
+### Performance model
+
+- **UI thread**: read ready buffers + draw only (no `sosfilt`, no RHS I/O, no `savefig`)
+- **Workers**: F5 build, channel ensure, filter prefetch, PDF/dataset/image export
+- **RHS load**: decode blocks straight into a float32 memmap (no full-file double copy)
+- **Filters**: lazy HP/LP with RAM LRU + disk store (batch flush)
+
+## Install
+
+Editable install (recommended — exposes the `plot-erg` and `intan-trigger-plotter` entry points):
+
+```bash
+pip install -e ".[dev]"
+```
+
+Or requirements only:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Le lecteur Intan `load_intan_rhs_format.py` doit être dans `src/`.
+Dependencies: `numpy`, `scipy`, `matplotlib`, `PySide6`, `pyqtgraph`. Dev extras add `pytest`.
 
-## Utilisation
+### Packaging for end users
 
-### Mode GUI (sélection du fichier RHS)
+- Day-to-day: `pipx install -e .` then `plot-erg`, or `python run_gui.py` from a venv.
+- Windows one-folder build (optional):
+  `pyinstaller --noconfirm --windowed --name plot_erg run_gui.py`
+  after `pip install pyinstaller` in the same environment. Bundle the probe JSON /
+  sample data next to the executable if needed.
 
-```bash
-python src/cli.py --gui --save-dir "plots"
-```
-
-L'interface comporte deux **onglets** :
-- **Analyse** : un ou plusieurs fichiers `.rhs`, PDF par canal avec moyennes superposées.
-- **Comparaison** : plusieurs enregistrements, mêmes paramètres, courbes **superposées** par canal.
-
-Paramètres communs (seuil, front, pre/post, filtre Intan RHX, dossier PDF) :
-- type de front sur ANALOG_IN 0 (descendant, montant, ou aucun pour sections fixes)
-- fenêtre pre/post trigger
-- filtre Intan pour moyennes filtrées, RMS et panneaux spike (passe-haut ou passe-bas, Bessel/Butterworth, ordre, coupure)
-- dossier de sortie du PDF (optionnel : si vide, **même dossier que le premier .rhs**)
-
-### Mode ligne de commande
-
-```bash
-python src/cli.py "session01.rhs" --save-dir "plots"
-```
-
-### Lanceur Python GUI
+## The viewer
 
 ```bash
 python run_gui.py
+# or, after editable install:
+plot-erg
 ```
 
-## Options principales
+### Window layout
 
-- `--edge` : `falling`, `rising` ou `none` sur ANALOG_IN 0 (défaut : `falling`)
-- `--threshold` : seuil de détection du front (défaut : `1.0`)
-- `--pre` / `--post` : secondes avant/après trigger
-- `--save-dir` : dossier de sortie du PDF
-- `--intan-spike-filter` : `highpass` ou `lowpass` (défaut : `highpass`)
-- `--intan-filter-type` : `bessel` ou `butterworth`
-- `--intan-filter-order` : ordre du filtre Intan (1–8)
-- `--intan-filter-cutoff-hz` : fréquence de coupure (Hz)
+Channel-first workflow: the centre shows a **light preview of the selected
+channel**. Range bars live in the per-channel inspector, not on a global
+montage. The all-channel montage is optional (*Vue → Revue montage*, `Ctrl+M`).
 
-Les courbes amplificateur sont en **microvolts (µV)**. Le PDF contient, par canal : moyenne brute, moyenne filtrée Intan, premier trigger (HP et brut), RMS, raster, PSTH, taux par trial et ISI.
+The window is a set of docks around the views; every dock can be moved, stacked,
+or hidden from the **Vue** menu (`Ctrl+P` toggles Paramètres, `Ctrl+J` the log).
+
+- **Recordings** — the files being compared. Each row has its own legend label,
+  curve colour, and two independent toggles (draw it, show it in legends).
+- **Channels** — the clickable MEA map plus a filterable channel list; they stay in
+  sync, and the map contacts can be shaded by mean RMS or spike count so the
+  channels worth looking at stand out. **Double-click** a contact or list row to
+  inspect that channel (continuous traces + adjustable range bars).
+- **Parameters** — two tabs: *Affichage* applies immediately;
+  *Canal → Pipeline* requires reprocessing (and says so).
+- **Progress & log** — per-stage progress, a table of loading times, and the full
+  pipeline log.
+
+Menus: **Fichier**, **Traitement** (F5 / F6 / F7, cache), **Vue** (montage,
+configure panels with `Ctrl+Shift+P`), **Aide**.
+
+### Views and panels
+
+The centre holds the channel preview by default. Use *Vue → Revue montage*
+(`Ctrl+M`) for the optional multi-channel montage, then *Vue → Configurer les
+panneaux* (`Ctrl+Shift+P`) to customise its grid. In the channel inspector, use
+**+ Absolue** / **+ Rel. stim**, then *Appliquer les zooms* for analysis graphs.
+
+Each panel has its own header showing how long its last redraw took, pyqtgraph
+zoom/pan/interaction controls, and buttons to open it in its own window or remove
+it from the view. Panels scrolled far from the viewport are drawn when they come
+into reach, which is what keeps a view with dozens of panels responsive.
+Matplotlib (Agg) remains the PDF / CLI export path.
+
+### Available panels
+
+Every panel of the PDF report is available on screen:
+
+- Trial-averaged raw, high-pass, and low-pass traces
+- First and second stimulation, raw / high-pass / low-pass
+- Sliding RMS, trial-averaged and per stimulation
+- PSTH and firing rate, ISI, rate per trial, raster
+- Spike waveform overlay
+- MEA layout for the selected channel, impedance evolution
+- Summary pages: mean RMS across channels, mean RMS per channel, mean impedance
+- All-channel montages (trial-averaged and second stimulation)
+
+Channel-aware panels can be instantiated once per temporal section, so the same
+graph can be compared side by side at different zoom levels.
+
+## Processed datasets and cache
+
+Processing is staged, and each stage is keyed by the parameters it actually
+depends on. Changing the spike threshold reuses the cached filtered streams;
+changing the filter reuses the cached wideband read. The cache lives in
+`.erg_cache/` next to the recording (or in the folder set in *Processing → Cache /
+work folder*) and can be inspected and trimmed from *Process → Cache manager*.
+
+Filtered HP/LP (and notch) channels are also persisted under
+`.erg_cache/_filter_<hash>/` as float32 memmaps, filled channel-by-channel on
+first access. That directory can grow to roughly
+`8 bytes × n_samples × n_channels` (HP + LP); it is invalidated automatically when
+filter settings change. An in-RAM LRU (32 channels) sits in front of the disk
+cache so switching between recently viewed MEA contacts stays responsive.
+
+*Fichier → Exporter un dataset traité* writes a self-contained `.ergproc` folder
+(optionally zipped for transport). Compute the channels you care about first
+(F6 / F7); the export packs their trial averages, RMS, spikes and overlays even
+when they were filled on demand. Reopen with *Fichier → Ouvrir traité*: every
+panel works, on any machine, without the `.rhs` file.
+
+## Command line
+
+```bash
+python src/cli.py "session01.rhs" --save-dir "plots"
+python src/cli.py a.rhs b.rhs --save-dir "plots"   # multi-recording PDF
+```
+
+### Main CLI options
+
+- `--channels`: comma-separated 0-based indices / ranges (`0,3,5-8`) — only those
+  channels are filtered and materialized for the PDF (default: all)
+- `--edge`: `falling`, `rising`, or `none`
+- `--threshold`, `--pre`, `--post`
+- `--zoom-mode`: `none`, `onset`, `trigger_end`, `both`
+- `--zoom-onset-t0-s` / `--zoom-onset-t1-s`, `--zoom-end-t0-s` / `--zoom-end-t1-s`
+- `--intan-hp-filter-type`, `--intan-hp-filter-order`, `--intan-hp-filter-cutoff-hz`
+  (HIGH / passe-haut)
+- `--intan-lp-filter-type`, `--intan-lp-filter-order`, `--intan-lp-filter-cutoff-hz`
+  (LOW / passe-bas ; paramètres indépendants du HIGH)
+- `--spike-threshold-mode`, `--psth-bin-window-s`, `--rms-window-s`
+- `--spike-overlay-pre-ms`, `--spike-overlay-post-ms`
+
+Amplifier traces are in **microvolts (µV)**.
+
+## Checks
+
+Unit tests (`pytest`) plus the scripts in `tools/` (synthetic data; real-RHS
+smokes skip when `exemple.rhs` is absent). GitHub Actions runs the same suite
+on every push / pull request.
+
+```bash
+pytest -q
+python tools/smoke_dataset.py         # write, reopen and compare a processed dataset
+python tools/smoke_render.py          # draw every panel (matplotlib / PDF path)
+python tools/smoke_gui.py             # build the window offscreen and redraw every panel
+python tools/smoke_perf.py            # timings: means, redraw, filter cache, PlotHost
+python tools/smoke_montage_ylim.py    # montage Y autoscale / preserve_view
+python tools/smoke_montage_kind.py    # montage kind visibility regression
+python tools/smoke_ylim_autoscale.py  # manual → auto Y scale regression
+python tools/smoke_montage_filters.py # HIGH/LOW until filters ready
+python tools/smoke_view_params.py     # display params → redraw
+python tools/smoke_spike_scope.py     # spike overlay window
+```
+
+### Cache budget
+
+*Process → Cache manager* shows total disk use (bundles + filter stores + raw
+memmaps). Set a Go budget and **Élaguer au budget** to prune oldest entries
+(including raw / filter trees). Open datasets stay protected.

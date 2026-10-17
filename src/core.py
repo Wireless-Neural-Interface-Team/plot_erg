@@ -4,18 +4,12 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-import functools
-import gc
-import importlib.util
-import io
 import os
-import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import sys
 import threading
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 
@@ -23,14 +17,9 @@ from config import AnalysisConfig, SectionSpecKind
 from intan_rhx_dsp import (
     effective_spike_threshold_uv,
     IntanDspSettings,
-    build_intan_filter_sos,
     detect_spikes_intan,
-    filter_wideband_with_sos,
     mean_rms_intan_channel,
-    write_filtered_stack_channelwise,
 )
-from memmap_io import load_readonly_memmap, write_2d_channelwise
-
 _analysis_cancel_event: contextvars.ContextVar[threading.Event | None] = contextvars.ContextVar(
     "analysis_cancel_event",
     default=None,
@@ -53,51 +42,6 @@ def check_analysis_cancelled() -> None:
     ev = _analysis_cancel_event.get()
     if ev is not None and ev.is_set():
         raise InterruptedError("Analysis interrupted.")
-
-
-def _import_intan_loader():
-    src_dir = Path(__file__).resolve().parent
-    loader_path = src_dir / "load_intan_rhs_format.py"
-    if not loader_path.exists():
-        raise RuntimeError(f"File not found: {loader_path}")
-
-    spec = importlib.util.spec_from_file_location("load_intan_rhs_format", loader_path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError("Cannot build Python loader for load_intan_rhs_format.py.")
-
-    # Resolve reader internal imports (e.g. intanutil.*) from src/.
-    inserted_path = False
-    if str(src_dir) not in sys.path:
-        sys.path.insert(0, str(src_dir))
-        inserted_path = True
-
-    try:
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        read_data = getattr(module, "read_data", None)
-        if not callable(read_data):
-            raise RuntimeError("read_data is missing from load_intan_rhs_format.py.")
-        return read_data
-    except Exception as exc:
-        raise RuntimeError(
-            "Cannot import 'load_intan_rhs_format.py'. "
-            "Ensure the 'intanutil' package is present under src/ (full Intan zip). "
-            f"Detail: {exc}"
-        ) from exc
-    finally:
-        if inserted_path:
-            try:
-                sys.path.remove(str(src_dir))
-            except ValueError:
-                pass
-
-
-def load_rhs_file(rhs_path: Path) -> dict[str, Any]:
-    read_data = _import_intan_loader()
-    data = read_data(str(rhs_path))
-    if not isinstance(data, dict):
-        raise RuntimeError("Intan reader did not return a dictionary.")
-    return data
 
 
 def get_sampling_rate(data: dict[str, Any]) -> float:
@@ -124,30 +68,6 @@ def uses_analog_trigger(config: AnalysisConfig) -> bool:
     return config.edge != "none"
 
 
-def peek_rhs_recording_info(rhs_path: Path) -> tuple[int, float]:
-    """Read RHS header only: return (num_samples, sample_rate_hz)."""
-    if not rhs_path.exists():
-        raise FileNotFoundError(f"File not found: {rhs_path}")
-    from intanutil.data import calculate_num_samples, get_bytes_per_data_block
-    from intanutil.header import read_header
-
-    with open(rhs_path, "rb") as fid:
-        with contextlib.redirect_stdout(io.StringIO()):
-            header = read_header(fid)
-        fs = float(header["sample_rate"])
-        bytes_per_block = get_bytes_per_data_block(header)
-        bytes_remaining = os.path.getsize(rhs_path) - fid.tell()
-        if bytes_remaining <= 0:
-            raise RuntimeError(f"RHS file contains no data: {rhs_path}")
-        if bytes_remaining % bytes_per_block != 0:
-            raise RuntimeError(f"Invalid RHS file size: {rhs_path}")
-        num_blocks = int(bytes_remaining / bytes_per_block)
-        num_samples = int(calculate_num_samples(header, num_blocks))
-    if num_samples < 2:
-        raise RuntimeError(f"Recording too short: {rhs_path}")
-    return num_samples, fs
-
-
 def validate_section_trigger_window(
     section_duration_s: float,
     trigger_start_s: float,
@@ -156,16 +76,16 @@ def validate_section_trigger_window(
     """Raise if the imaginary trigger window falls outside a segment."""
     if trigger_start_s < 0:
         raise ValueError(
-            f"Imaginary trigger start ({trigger_start_s:g} s) must be >= 0 within each segment."
+            f"Imaginary stimulation start ({trigger_start_s:g} s) must be >= 0 within each segment."
         )
     if trigger_end_s > section_duration_s:
         raise ValueError(
-            f"Imaginary trigger end ({trigger_end_s:g} s) exceeds segment duration "
+            f"Imaginary stimulation end ({trigger_end_s:g} s) exceeds segment duration "
             f"({section_duration_s:g} s)."
         )
     if trigger_start_s >= trigger_end_s:
         raise ValueError(
-            f"Imaginary trigger start ({trigger_start_s:g} s) must be strictly before "
+            f"Imaginary stimulation start ({trigger_start_s:g} s) must be strictly before "
             f"end ({trigger_end_s:g} s)."
         )
 
@@ -178,8 +98,15 @@ def no_trigger_sections_and_timebase(
     section_spec: SectionSpecKind,
     section_trigger_start_s: float,
     section_trigger_end_s: float,
-) -> tuple[np.ndarray, np.ndarray, int, int, int, float]:
-    """Split recording into sections; average an imaginary trigger window in each."""
+    pre_s: float,
+    post_s: float,
+) -> tuple[np.ndarray, np.ndarray, int, int, int, int, float]:
+    """Split recording into equal sections; t=0 is the imaginary stimulation onset.
+
+    Same display / analysis window as real stimulations: ``[-pre_s, +post_s]``
+    around each imaginary onset. ``section_trigger_start_s`` / ``_end_s`` only
+    place t=0 and the stimulation-end marker inside each section.
+    """
     if n_samples < 2:
         raise RuntimeError("Recording too short for section averaging.")
     total_s = float(n_samples) / float(fs)
@@ -196,7 +123,9 @@ def no_trigger_sections_and_timebase(
         raise RuntimeError(
             f"Too many sections ({n_sections}) for recording length ({total_s:.3f} s)."
         )
-    n_sections = int(n_samples // section_len)
+    # Garder le nombre demandé. Le reste (n_samples % section_len) ne forme pas
+    # une section complète : le recalculer ici ajoutait une section en trop
+    # dès que n_samples // section_len > section_count.
     section_duration_resolved = section_len / float(fs)
     validate_section_trigger_window(
         section_duration_resolved,
@@ -204,22 +133,25 @@ def no_trigger_sections_and_timebase(
         float(section_trigger_end_s),
     )
     start_n = int(round(float(section_trigger_start_s) * fs))
-    end_n = int(round(float(section_trigger_end_s) * fs))
     start_n = max(0, min(start_n, section_len - 1))
-    end_n = max(start_n + 1, min(end_n, section_len))
-    window_n = end_n - start_n
-    if window_n < 2:
-        raise RuntimeError("Imaginary trigger window too short (< 2 samples).")
     starts = np.arange(n_sections, dtype=np.int64) * section_len
-    triggers = starts + start_n
-    if np.any(triggers + window_n > n_samples):
-        raise RuntimeError(
-            "Imaginary trigger window extends beyond the recording for at least one section."
-        )
-    pre_n = 0
-    post_n = window_n
-    t_rel = np.arange(0, window_n, dtype=np.float64) / float(fs)
-    return triggers, t_rel, pre_n, post_n, n_sections, section_duration_resolved
+    trigger_indices = starts + start_n
+    valid_triggers, t_rel, pre_n, post_n = valid_triggers_and_timebase(
+        n_samples=n_samples,
+        trigger_indices=trigger_indices,
+        fs=fs,
+        pre_s=pre_s,
+        post_s=post_s,
+    )
+    return (
+        valid_triggers,
+        t_rel,
+        pre_n,
+        post_n,
+        int(valid_triggers.size),
+        int(n_sections),
+        section_duration_resolved,
+    )
 
 
 def resolve_recording_windows(
@@ -227,10 +159,23 @@ def resolve_recording_windows(
     n_samples: int,
     fs: float,
     analog_in0: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, int, int, int, int, float | None]:
-    """Return segmentation windows: triggers or fixed sections."""
+) -> tuple[np.ndarray, np.ndarray, int, int, int, int, float | None, float | None]:
+    """Return segmentation windows: triggers or fixed sections.
+
+    Returns
+    -------
+    triggers, t_rel, pre_n, post_n, n_valid, n_total, end_rising_s, section_duration_s
+    """
     if config.edge == "none":
-        starts, t_rel, pre_n, post_n, n_sections, _section_duration_s = no_trigger_sections_and_timebase(
+        (
+            triggers,
+            t_rel,
+            pre_n,
+            post_n,
+            n_valid,
+            n_total,
+            section_duration_s,
+        ) = no_trigger_sections_and_timebase(
             n_samples=n_samples,
             fs=fs,
             section_count=config.section_count,
@@ -238,8 +183,22 @@ def resolve_recording_windows(
             section_spec=config.section_spec,
             section_trigger_start_s=config.section_trigger_start_s,
             section_trigger_end_s=config.section_trigger_end_s,
+            pre_s=config.pre_s,
+            post_s=config.post_s,
         )
-        return starts, t_rel, pre_n, post_n, n_sections, n_sections, None
+        end_rel_s = float(config.section_trigger_end_s) - float(config.section_trigger_start_s)
+        if end_rel_s <= 0:
+            end_rel_s = None
+        return (
+            triggers,
+            t_rel,
+            pre_n,
+            post_n,
+            n_valid,
+            n_total,
+            end_rel_s,
+            float(section_duration_s),
+        )
 
     trigger_indices = detect_edges(analog_in0, threshold=config.threshold, edge=config.edge)
     if trigger_indices.size == 0:
@@ -252,8 +211,8 @@ def resolve_recording_windows(
         pre_s=config.pre_s,
         post_s=config.post_s,
     )
-    end_rising_rel_s = mean_time_to_next_rising_edge_s(
-        analog_in0, trigger_indices, config.threshold, fs
+    end_rising_rel_s = mean_time_to_pulse_end_s(
+        analog_in0, valid_triggers, config.threshold, fs, trigger_edge=config.edge
     )
     return (
         valid_triggers,
@@ -263,6 +222,7 @@ def resolve_recording_windows(
         int(valid_triggers.size),
         int(trigger_indices.size),
         end_rising_rel_s,
+        None,
     )
 
 
@@ -276,26 +236,30 @@ def detect_edges(signal: np.ndarray, threshold: float, edge: str) -> np.ndarray:
     raise ValueError("edge must be 'falling' or 'rising'.")
 
 
-def mean_time_to_next_rising_edge_s(
+def mean_time_to_pulse_end_s(
     signal: np.ndarray,
     trigger_indices: np.ndarray,
     threshold: float,
     fs: float,
+    *,
+    trigger_edge: str = "falling",
 ) -> float | None:
-    """Mean time (s) from each trigger to the next rising-edge crossing (typical pulse end)."""
+    """Mean time (s) from each trigger to the opposite edge (typical pulse end).
+
+    Falling trigger → next rising (active-high pulse end).
+    Rising trigger → next falling (active-low / rising-onset pulse end).
+    """
     trigger_indices = np.asarray(trigger_indices, dtype=np.int64)
-    rising_idx = detect_edges(signal, threshold, "rising")
-    if rising_idx.size == 0:
+    end_edge = "rising" if trigger_edge == "falling" else "falling"
+    end_idx = detect_edges(signal, threshold, end_edge)
+    if end_idx.size == 0 or trigger_indices.size == 0:
         return None
-    deltas_s: list[float] = []
-    for tr in trigger_indices:
-        after = rising_idx[rising_idx > tr]
-        if after.size == 0:
-            continue
-        deltas_s.append(float(after[0] - tr) / fs)
-    if not deltas_s:
+    positions = np.searchsorted(end_idx, trigger_indices + 1, side="left")
+    valid = positions < end_idx.size
+    if not np.any(valid):
         return None
-    return float(np.mean(deltas_s))
+    deltas = (end_idx[positions[valid]] - trigger_indices[valid]).astype(np.float64) / float(fs)
+    return float(np.mean(deltas))
 
 
 def detect_spikes_at_threshold(
@@ -328,16 +292,6 @@ def detect_spikes_at_threshold(
     return np.asarray(kept, dtype=np.int64)
 
 
-def detect_spikes_threshold_rising(
-    trace: np.ndarray,
-    fs: float,
-    threshold: float,
-    refractory_s: float = 0.001,
-) -> np.ndarray:
-    """Backward compatibility: delegates to detect_spikes_at_threshold (negative threshold supported)."""
-    return detect_spikes_at_threshold(trace, fs, threshold, refractory_s=refractory_s)
-
-
 def resolve_work_dir(config: AnalysisConfig) -> Path:
     """Directory for amplifier_raw.npy and intermediate files."""
     if config.work_dir is not None:
@@ -346,30 +300,14 @@ def resolve_work_dir(config: AnalysisConfig) -> Path:
     return root / ".plot_erg" / f"{config.rhs_file.stem}_work"
 
 
-def cleanup_plot_erg_root_if_empty(work_dir: Path | None) -> None:
-    """Remove the root .plot_erg folder only if empty."""
-    if work_dir is None:
-        return
-    root = work_dir.parent
-    if root.name != ".plot_erg":
-        return
-    if not root.exists():
-        return
-    try:
-        if not any(root.iterdir()):
-            root.rmdir()
-    except OSError:
-        # Non-empty, locked, or permission error: ignore.
-        pass
-
-
 class AmplifierSpikeSource:
-    """Per-trigger windows on Intan RHX HIGH waveforms (spikeplot / cpuinterface)."""
+    """Per-trigger windows on Intan RHX waveforms (spikes on HIGH / high-pass)."""
 
     def __init__(
         self,
         amplifier: np.ndarray,
         highpass: np.ndarray,
+        lowpass: np.ndarray,
         valid_triggers: np.ndarray,
         pre_n: int,
         post_n: int,
@@ -378,6 +316,7 @@ class AmplifierSpikeSource:
     ) -> None:
         self.amplifier = amplifier
         self.highpass = highpass
+        self.lowpass = lowpass
         self.valid_triggers = np.asarray(valid_triggers, dtype=np.int64)
         self.pre_n = pre_n
         self.post_n = post_n
@@ -388,8 +327,12 @@ class AmplifierSpikeSource:
         self._closed = False
 
     def _high_row(self, ch: int) -> np.ndarray:
-        """1D mmap/view for one channel (no full-row copy)."""
+        """1D mmap/view for one high-pass channel (no full-row copy)."""
         return self.highpass[ch]
+
+    def _low_row(self, ch: int) -> np.ndarray:
+        """1D mmap/view for one low-pass channel (no full-row copy)."""
+        return self.lowpass[ch]
 
     def _amp_row(self, ch: int) -> np.ndarray:
         """1D mmap/view for one amplifier channel (no full-row copy)."""
@@ -398,23 +341,6 @@ class AmplifierSpikeSource:
     def high_trace_for_channel(self, ch: int) -> np.ndarray:
         return self._high_row(ch)
 
-    def windows_2d_for_channel(self, ch: int) -> np.ndarray:
-        row = self._high_row(ch)
-        trial_count = int(self.valid_triggers.size)
-        window_length = int(self._offsets.size)
-        if trial_count * window_length > 25_000_000:
-            raise RuntimeError(
-                "Spike window too large for 2D RAM extraction. "
-                "Reduce pre/post window or spike display sampling (%)."
-            )
-        trial_windows = np.empty((trial_count, window_length), dtype=np.float64)
-        for trial_index, trigger_index in enumerate(self.valid_triggers):
-            sample_start = int(trigger_index - self.pre_n)
-            sample_end = int(trigger_index + self.post_n)
-            trial_windows[trial_index] = np.asarray(
-                row[sample_start:sample_end], dtype=np.float64
-            )
-        return trial_windows
 
     def spike_times_per_trial_for_channel(
         self,
@@ -422,47 +348,88 @@ class AmplifierSpikeSource:
         t_rel: np.ndarray,
         threshold: float,
         refractory_s: float = 0.001,
+        t_range_s: tuple[float, float] | None = None,
+        trigger_index: int | None = None,
     ) -> list[np.ndarray]:
-        """Detect spikes per trial on filtered trace (mmap slices per trial)."""
+        """Detect spikes per trial on high-pass trace, optionally limited to ``t_range_s``.
+
+        ``t_range_s`` is (t0, t1) in seconds relative to stimulation. When omitted,
+        detection uses the full pre/post trial window.
+        ``trigger_index`` restricts detection to one stimulation (0 = first, 1 = second).
+        """
         del refractory_s  # Intan uses snippet_size refractory instead.
         from dataclasses import replace
 
         row = self._high_row(ch)
         dsp = replace(self.intan_dsp, spike_threshold_uv=float(threshold))
-        spike_times_by_trial: list[np.ndarray] = []
-        for trigger_index in self.valid_triggers:
-            sample_start = int(trigger_index - self.pre_n)
-            sample_end = int(trigger_index + self.post_n)
+        fs = float(self.fs)
+        if t_range_s is not None:
+            win_t0, win_t1 = float(t_range_s[0]), float(t_range_s[1])
+        else:
+            win_t0, win_t1 = None, None
+        all_triggers = np.asarray(self.valid_triggers, dtype=np.int64)
+        n_trig = int(all_triggers.size)
+        empty = np.empty(0, dtype=np.float64)
+        if n_trig == 0:
+            return []
+        if trigger_index is not None:
+            sel = int(trigger_index)
+            if sel < 0 or sel >= n_trig:
+                return [empty.copy() for _ in range(n_trig)]
+            trial_indices = [sel]
+        else:
+            trial_indices = list(range(n_trig))
+        spike_times_by_trial: list[np.ndarray] = [empty.copy() for _ in range(n_trig)]
+        for trial_i in trial_indices:
+            trigger_index_abs = int(all_triggers[trial_i])
+            if win_t0 is None or win_t1 is None or win_t1 <= win_t0:
+                sample_start = int(trigger_index_abs - self.pre_n)
+                sample_end = int(trigger_index_abs + self.post_n)
+            else:
+                sample_start = int(trigger_index_abs + int(round(win_t0 * fs)))
+                sample_end = int(trigger_index_abs + int(round(win_t1 * fs)))
+                sample_start = max(sample_start, int(trigger_index_abs - self.pre_n))
+                sample_end = min(sample_end, int(trigger_index_abs + self.post_n))
+            if sample_end - sample_start < 2:
+                continue
             spike_sample_indices = detect_spikes_intan(
                 row,
                 dsp,
                 start_sample=sample_start,
                 end_sample=sample_end,
             )
-            rel = spike_sample_indices - int(trigger_index) + int(self.pre_n)
+            rel = spike_sample_indices - int(trigger_index_abs) + int(self.pre_n)
             rel = rel[(rel >= 0) & (rel < int(t_rel.size))]
-            spike_times_by_trial.append(np.asarray(t_rel[rel], dtype=np.float64))
+            times = np.asarray(t_rel[rel], dtype=np.float64)
+            if win_t0 is not None and win_t1 is not None:
+                times = times[(times >= win_t0) & (times <= win_t1)]
+            spike_times_by_trial[trial_i] = times
         return spike_times_by_trial
 
     def mean_rms_for_channel(self, ch: int) -> float:
-        """RMS over the last 1 s of filtered trace (Spike Scope, spikeplot.cpp)."""
+        """RMS over the last 1 s of high-pass trace (Spike Scope, spikeplot.cpp)."""
         return mean_rms_intan_channel(self._high_row(ch), self.intan_dsp)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        for arr in (self.amplifier, self.highpass):
-            try:
-                if isinstance(arr, np.memmap):
+        for name in ("amplifier", "highpass", "lowpass"):
+            arr = getattr(self, name)
+            setattr(self, name, np.empty((0,)))
+            if isinstance(arr, np.memmap):
+                try:
                     arr._mmap.close()
-            except Exception:
-                pass
-        self.amplifier = np.empty((0,))
-        self.highpass = np.empty((0,))
-        if self.work_dir is not None and self.work_dir.exists():
-            shutil.rmtree(self.work_dir, ignore_errors=True)
-            cleanup_plot_erg_root_if_empty(self.work_dir)
+                except Exception:
+                    pass
+            elif hasattr(arr, "close"):
+                # LazyFilterBank (and similar) hold their own disk memmaps.
+                try:
+                    arr.close()
+                except Exception:
+                    pass
+        # Keep ``work_dir`` on disk so the next CLI run can reuse HP/LP memmaps.
+        # Callers that want a throwaway temp dir should delete it themselves.
 
 
 def valid_triggers_and_timebase(
@@ -484,7 +451,7 @@ def valid_triggers_and_timebase(
     valid_mask = (start_idx >= 0) & (end_idx <= n_samples)
     valid_triggers = trigger_indices[valid_mask]
     if valid_triggers.size == 0:
-        raise RuntimeError("No valid window around triggers.")
+        raise RuntimeError("No valid window around stimulations.")
     t_rel = np.arange(-pre_n, post_n, dtype=np.float64) / fs
     return valid_triggers, t_rel, pre_n, post_n
 
@@ -499,104 +466,16 @@ def resolve_channel_workers(channel_workers: int | None, n_channels: int) -> int
     return max(1, min(int(n_channels), int(MAX_PARALLEL_CHANNELS), n_cpu))
 
 
-def persist_amplifier_float32(amplifier_2d: np.ndarray, path: Path) -> Path:
-    """Write amplifier stack channel-by-channel (float32 memmap)."""
-    return write_2d_channelwise(amplifier_2d, path, dtype=np.dtype(np.float32))
+def gui_channel_workers(channel_workers: int | None, n_channels: int = MAX_PARALLEL_CHANNELS) -> int:
+    """Cap parallelism so the Qt event loop keeps a free core.
 
-
-def intan_memmap_cache_valid(
-    work_dir: Path,
-    intan_dsp: IntanDspSettings,
-    shape: tuple[int, int],
-) -> bool:
-    """True when on-disk amplifier + filtered stacks match current DSP settings."""
-    amp_path = work_dir / "amplifier_raw.npy"
-    high_path = work_dir / "high_intan.npy"
-    json_path = work_dir / "intan_dsp.json"
-    if not (amp_path.exists() and high_path.exists() and json_path.exists()):
-        return False
-    try:
-        if tuple(np.load(amp_path, mmap_mode="r").shape) != shape:
-            return False
-        if tuple(np.load(high_path, mmap_mode="r").shape) != shape:
-            return False
-        return IntanDspSettings.load_json(json_path) == intan_dsp
-    except Exception:
-        return False
-
-
-def persist_amp_and_filtered_stacks(
-    work_dir: Path,
-    intan_dsp: IntanDspSettings,
-    shape: tuple[int, int],
-    *,
-    amplifier_2d: np.ndarray | None = None,
-    amplifier_memmap: np.memmap | None = None,
-    channel_workers: int | None = None,
-) -> tuple[Path, Path]:
-    """One pass per channel: write amplifier_raw + high_intan (fast SOS filter)."""
-    from memmap_io import open_writable_memmap
-
-    amp_path = work_dir / "amplifier_raw.npy"
-    high_path = work_dir / "high_intan.npy"
-
-    if intan_memmap_cache_valid(work_dir, intan_dsp, shape):
-        print("Reusing cached amplifier / filtered memmaps (.plot_erg).")
-        return amp_path, high_path
-
-    intan_dsp.save_json(work_dir / "intan_dsp.json")
-
-    n_ch, n_samp = int(shape[0]), int(shape[1])
-    workers = resolve_channel_workers(channel_workers, n_ch)
-    notch_sos, filter_sos = build_intan_filter_sos(intan_dsp)
-    progress_every = max(1, n_ch // 10) if n_ch >= 20 else 0
-
-    if amplifier_2d is not None:
-        src = np.asarray(amplifier_2d)
-        amp_mm = open_writable_memmap(amp_path, (n_ch, n_samp), np.dtype(np.float32))
-        high_mm = open_writable_memmap(high_path, (n_ch, n_samp), np.dtype(np.float32))
-        print(f"Writing amplifier + Intan filter ({workers} worker(s), fused pass)...")
-
-        def _fused(ch: int) -> tuple[int, np.ndarray, np.ndarray]:
-            check_analysis_cancelled()
-            row = np.asarray(src[ch], dtype=np.float32)
-            filtered = filter_wideband_with_sos(row, notch_sos, filter_sos)
-            return ch, row, np.asarray(filtered, dtype=np.float32)
-
-        try:
-            if workers <= 1 or n_ch == 1:
-                for ch in range(n_ch):
-                    _, amp_row, hi_row = _fused(ch)
-                    amp_mm[ch] = amp_row
-                    high_mm[ch] = hi_row
-                    if progress_every > 0 and (ch + 1) % progress_every == 0:
-                        print(f"  fused pass: channel {ch + 1}/{n_ch}")
-            else:
-                with ThreadPoolExecutor(max_workers=workers) as pool:
-                    for ch, amp_row, hi_row in pool.map(_fused, range(n_ch)):
-                        amp_mm[ch] = amp_row
-                        high_mm[ch] = hi_row
-                if progress_every > 0:
-                    print(f"  fused pass: {n_ch} channels ({workers} workers)")
-            amp_mm.flush()
-            high_mm.flush()
-        finally:
-            del amp_mm, high_mm
-        return amp_path, high_path
-
-    if amplifier_memmap is not None:
-        print(f"Computing Intan software filter ({workers} worker(s), channel batches)...")
-        write_filtered_stack_channelwise(
-            amplifier_memmap,
-            high_path,
-            intan_dsp,
-            channel_workers=workers,
-            cancel_check=check_analysis_cancelled,
-            progress_every=progress_every,
-        )
-        return amp_path, high_path
-
-    raise ValueError("persist_amp_and_filtered_stacks requires amplifier_2d or amplifier_memmap.")
+    Heavy ThreadPoolExecutor work otherwise saturates every CPU and starves the
+    GUI thread via the GIL, even when computation runs in a QThread.
+    """
+    n_cpu = int(os.cpu_count() or 2)
+    budget = max(1, min(4, n_cpu - 1))
+    resolved = resolve_channel_workers(channel_workers, max(1, int(n_channels)))
+    return max(1, min(resolved, budget))
 
 
 def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> IntanDspSettings:
@@ -607,113 +486,17 @@ def build_intan_dsp_settings(data: dict[str, Any], config: AnalysisConfig) -> In
             config.spike_threshold_uv,
             config.spike_threshold_polarity,
         ),
-        spike_filter_kind=config.intan_spike_filter_kind,  # type: ignore[arg-type]
-        filter_order=int(config.intan_filter_order),
-        filter_type=config.intan_filter_type,  # type: ignore[arg-type]
-        filter_cutoff_hz=float(config.intan_filter_cutoff_hz),
+        hp_filter_order=int(config.intan_hp_filter_order),
+        hp_filter_type=config.intan_hp_filter_type,  # type: ignore[arg-type]
+        hp_filter_cutoff_hz=float(config.intan_hp_filter_cutoff_hz),
+        lp_filter_order=int(config.intan_lp_filter_order),
+        lp_filter_type=config.intan_lp_filter_type,  # type: ignore[arg-type]
+        lp_filter_cutoff_hz=float(config.intan_lp_filter_cutoff_hz),
         artifact_threshold_uv=float(config.intan_artifact_threshold_uv),
         artifact_suppression_enabled=bool(config.intan_artifact_suppression_enabled),
+        rms_window_s=float(config.rms_window_s),
+        software_notch_hz=float(getattr(config, "software_notch_hz", 0) or 0),
     )
-
-
-def persist_intan_high_stack(
-    amplifier_2d: np.ndarray | None,
-    data: dict[str, Any] | None,
-    config: AnalysisConfig | None,
-    work_dir: Path,
-    *,
-    amplifier_memmap: np.memmap | None = None,
-    intan_dsp: IntanDspSettings | None = None,
-    channel_workers: int | None = None,
-) -> tuple[Path, Path, IntanDspSettings]:
-    """Write wideband + filtered Intan stacks under work_dir (channel batches)."""
-    if intan_dsp is None:
-        if data is None or config is None:
-            raise ValueError("data and config are required when intan_dsp is not provided.")
-        intan_dsp = build_intan_dsp_settings(data, config)
-    amp_path = work_dir / "amplifier_raw.npy"
-    high_path = work_dir / "high_intan.npy"
-    intan_dsp.save_json(work_dir / "intan_dsp.json")
-    check_analysis_cancelled()
-
-    n_ch, n_samp = 0, 0
-    if amplifier_memmap is not None:
-        n_ch, n_samp = int(amplifier_memmap.shape[0]), int(amplifier_memmap.shape[1])
-    elif amplifier_2d is not None:
-        n_ch, n_samp = int(np.asarray(amplifier_2d).shape[0]), int(np.asarray(amplifier_2d).shape[1])
-
-    workers = channel_workers
-    if workers is None and config is not None:
-        workers = config.channel_workers
-
-    if amplifier_2d is not None:
-        persist_amp_and_filtered_stacks(
-            work_dir,
-            intan_dsp,
-            (n_ch, n_samp),
-            amplifier_2d=amplifier_2d,
-            channel_workers=workers,
-        )
-    elif amplifier_memmap is not None:
-        persist_amp_and_filtered_stacks(
-            work_dir,
-            intan_dsp,
-            (n_ch, n_samp),
-            amplifier_memmap=amplifier_memmap,
-            channel_workers=workers,
-        )
-    else:
-        raise ValueError("amplifier_2d or amplifier_memmap is required.")
-    return amp_path, high_path, intan_dsp
-
-
-def extract_triggered_windows(
-    amplifier_data: np.ndarray,
-    trigger_indices: np.ndarray,
-    fs: float,
-    pre_s: float,
-    post_s: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Legacy 3D window extraction.
-
-    Implemented without a giant 2D sample index matrix to avoid huge int64 allocations.
-    """
-    amplifier_data = np.asarray(amplifier_data)
-    if amplifier_data.ndim != 2:
-        raise RuntimeError("Unexpected amplifier_data shape (expected [n_channels, n_samples]).")
-
-    _, n_samples = amplifier_data.shape
-    pre_n = int(round(pre_s * fs))
-    post_n = int(round(post_s * fs))
-    win_len = pre_n + post_n
-    if win_len <= 1:
-        raise RuntimeError("Invalid time window.")
-
-    trigger_indices = np.asarray(trigger_indices, dtype=np.int64)
-    start_idx = trigger_indices - pre_n
-    end_idx = trigger_indices + post_n
-    valid_mask = (start_idx >= 0) & (end_idx <= n_samples)
-    valid_triggers = trigger_indices[valid_mask]
-
-    if valid_triggers.size == 0:
-        raise RuntimeError("No valid window around triggers.")
-
-    n_trials = int(valid_triggers.size)
-    n_channels = int(amplifier_data.shape[0])
-    # Memory guard for excessive 3D allocation.
-    est_values = n_trials * n_channels * win_len
-    if est_values > 200_000_000:
-        raise RuntimeError(
-            "3D windows too large for RAM extraction. Use the per-channel streaming pipeline."
-        )
-
-    windows = np.empty((n_trials, n_channels, win_len), dtype=np.asarray(amplifier_data).dtype)
-    for i, trig in enumerate(valid_triggers):
-        start = int(trig - pre_n)
-        end = int(trig + post_n)
-        windows[i] = amplifier_data[:, start:end]
-    t_rel = np.arange(-pre_n, post_n, dtype=np.float64) / fs
-    return windows, t_rel
 
 
 def mean_triggered_windows_channelwise(
@@ -722,8 +505,12 @@ def mean_triggered_windows_channelwise(
     pre_n: int,
     post_n: int,
     channel_workers: int | None = None,
+    channels: Sequence[int] | None = None,
 ) -> np.ndarray:
-    """Raw mean per channel (parallel, mmap-friendly row reads)."""
+    """Raw mean per channel (parallel, mmap-friendly row reads).
+
+    ``channels`` restricts the pass to those indices. Other rows stay zero.
+    """
     amplifier_data = np.asarray(amplifier_data)
     if amplifier_data.ndim != 2:
         raise RuntimeError("Unexpected amplifier_data shape (expected [n_channels, n_samples]).")
@@ -734,9 +521,22 @@ def mean_triggered_windows_channelwise(
         raise RuntimeError("Invalid time window.")
     valid_triggers = np.asarray(valid_triggers, dtype=np.int64)
     if valid_triggers.size == 0:
-        raise RuntimeError("No valid window around triggers.")
+        raise RuntimeError("No valid window around stimulations.")
+
+    if channels is None:
+        wanted = list(range(n_ch))
+    else:
+        wanted = []
+        seen: set[int] = set()
+        for raw in channels:
+            ch = int(raw)
+            if 0 <= ch < n_ch and ch not in seen:
+                seen.add(ch)
+                wanted.append(ch)
 
     out = np.zeros((n_ch, win_len), dtype=np.float32)
+    if not wanted:
+        return out
     n_trig = float(valid_triggers.size)
 
     def _compute_one_channel(c: int) -> tuple[int, np.ndarray]:
@@ -749,9 +549,9 @@ def mean_triggered_windows_channelwise(
             acc += row[start:end]
         return c, acc / n_trig
 
-    worker_count = resolve_channel_workers(channel_workers, n_ch)
+    worker_count = resolve_channel_workers(channel_workers, len(wanted))
     with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        for c, mean_row in pool.map(_compute_one_channel, range(n_ch)):
+        for c, mean_row in pool.map(_compute_one_channel, wanted):
             out[c] = mean_row
     return out
 
