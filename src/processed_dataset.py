@@ -524,6 +524,9 @@ class ProcessedRecording:
         self._overlay_request: dict[int, tuple[float, float]] = {}
         # Cache des enveloppes continues (stream, ch, max_points) → (t, y).
         self._continuous_cache: dict[tuple[str, int, int], tuple[np.ndarray, np.ndarray]] = {}
+        # Détections relancées sur une plage plus étroite que l’essai (après affichage).
+        self._range_spike_cache: dict[tuple[Any, ...], list[np.ndarray]] = {}
+        self._range_overlay_cache: dict[tuple[Any, ...], tuple[Any, ...]] = {}
 
     # ---------------------------------------------------------------- identity
 
@@ -584,6 +587,7 @@ class ProcessedRecording:
         self._channel_data[index] = data
         self._overlay_override.pop(index, None)
         self._overlay_request.pop(index, None)
+        self._drop_range_detection_cache(index)
         self._data_generation = int(getattr(self, "_data_generation", 0)) + 1
         while len(self.threshold_captions) <= int(ch):
             self.threshold_captions.append("")
@@ -882,6 +886,127 @@ class ProcessedRecording:
         sign = "−" if info.polarity == "negative" else "+"
         return f"threshold {sign}{abs(info.threshold_uv):g} µV"
 
+    def _drop_range_detection_cache(self, ch: int | None = None) -> None:
+        if ch is None:
+            self._range_spike_cache.clear()
+            self._range_overlay_cache.clear()
+            return
+        marker = int(ch)
+        for cache in (self._range_spike_cache, self._range_overlay_cache):
+            for key in [key for key in cache if key and key[0] == marker]:
+                cache.pop(key, None)
+
+    def _range_bounds(self, t_range_s: tuple[float, float]) -> tuple[float, float] | None:
+        lo, hi = float(t_range_s[0]), float(t_range_s[1])
+        if hi < lo:
+            lo, hi = hi, lo
+        if not (np.isfinite(lo) and np.isfinite(hi)) or hi <= lo:
+            return None
+        return lo, hi
+
+    def _range_is_full_trial(self, lo: float, hi: float) -> bool:
+        """True si la plage couvre tout l’essai (détection déjà en cache)."""
+        t_rel = np.asarray(self.t_rel, dtype=np.float64)
+        if t_rel.size == 0:
+            return True
+        rel0, rel1 = float(t_rel[0]), float(t_rel[-1])
+        span = max(rel1 - rel0, 1e-9)
+        tol = max(1e-4, 0.002 * span)
+        return lo <= rel0 + tol and hi >= rel1 - tol
+
+    def _detection_source(self) -> Any | None:
+        source = self.source
+        if source is None or not hasattr(source, "spike_times_per_trial_for_channel"):
+            return None
+        return source
+
+    def _remember_range_cache(self, cache: dict[tuple[Any, ...], Any], key: tuple[Any, ...], value: Any) -> Any:
+        if len(cache) > 48:
+            cache.clear()
+        cache[key] = value
+        return value
+
+    def _spikes_redetected(
+        self,
+        ch: int,
+        t_range_s: tuple[float, float],
+        *,
+        trigger_index: int | None,
+    ) -> list[np.ndarray] | None:
+        """Relance la détection sur une plage partielle. None = filtrer le cache."""
+        bounds = self._range_bounds(t_range_s)
+        if bounds is None:
+            return None
+        lo, hi = bounds
+        if self._range_is_full_trial(lo, hi):
+            return None
+        source = self._detection_source()
+        if source is None:
+            return None
+        key = (int(ch), round(lo, 6), round(hi, 6), None if trigger_index is None else int(trigger_index))
+        cached = self._range_spike_cache.get(key)
+        if cached is not None:
+            return [np.asarray(trial, dtype=np.float64) for trial in cached]
+        try:
+            trains = source.spike_times_per_trial_for_channel(
+                int(ch),
+                np.asarray(self.t_rel, dtype=np.float64),
+                float(self.threshold_uv(int(ch))),
+                t_range_s=(lo, hi),
+                trigger_index=trigger_index,
+            )
+        except Exception:
+            return None
+        stored = [np.asarray(trial, dtype=np.float64) for trial in trains]
+        self._remember_range_cache(self._range_spike_cache, key, stored)
+        return [np.asarray(trial, dtype=np.float64) for trial in stored]
+
+    def _overlay_redetected(
+        self,
+        ch: int,
+        t_range_s: tuple[float, float],
+        *,
+        pre_ms: float | None,
+        post_ms: float | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray | None] | None:
+        """Formes d’onde des spikes détectés sur la plage. None = cache essai entier."""
+        bounds = self._range_bounds(t_range_s)
+        if bounds is None:
+            return None
+        lo, hi = bounds
+        if self._range_is_full_trial(lo, hi):
+            return None
+        source = self._detection_source()
+        if source is None or not hasattr(source, "high_trace_for_channel"):
+            return None
+        if not hasattr(source, "valid_triggers"):
+            return None
+        pre = 2.0 if pre_ms is None else max(0.0, float(pre_ms))
+        post = 4.0 if post_ms is None else max(1e-6, float(post_ms))
+        key = (int(ch), round(lo, 6), round(hi, 6), round(pre, 4), round(post, 4))
+        cached = self._range_overlay_cache.get(key)
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        trains = self._spikes_redetected(int(ch), (lo, hi), trigger_index=None)
+        if trains is None:
+            return None
+        from draw_primitives import _extract_spike_waveforms
+
+        try:
+            t_ms, waves, times, total, mean = _extract_spike_waveforms(
+                source, int(ch), trains, pre_ms=pre, post_ms=post
+            )
+        except Exception:
+            return None
+        result = (
+            np.asarray(t_ms, dtype=np.float64),
+            np.asarray(waves, dtype=np.float32),
+            np.asarray(times, dtype=np.float64),
+            int(total),
+            None if mean is None else np.asarray(mean, dtype=np.float64),
+        )
+        return self._remember_range_cache(self._range_overlay_cache, key, result)  # type: ignore[return-value]
+
     def spike_times(
         self,
         ch: int,
@@ -891,10 +1016,16 @@ class ProcessedRecording:
     ) -> list[np.ndarray]:
         """Spike times per trial, optionally restricted to one trial / window.
 
-        Detection runs once over the full trial window when the channel is
-        ensured; narrowing to a zoom window filters those detections instead of
-        re-detecting, which keeps zooming instantaneous and consistent.
+        Une plage plus étroite que l’essai relance la détection sur cette
+        plage (le détecteur Intan dépend du début de recherche). L’essai
+        entier reste le cache du premier affichage.
         """
+        if t_range_s is not None:
+            fresh = self._spikes_redetected(
+                int(ch), t_range_s, trigger_index=trigger_index
+            )
+            if fresh is not None:
+                return fresh
         data = self._channel_data.get(int(ch))
         trains = (
             [np.asarray(trial, dtype=np.float64) for trial in data.spike_trains]
@@ -910,6 +1041,8 @@ class ProcessedRecording:
         if t_range_s is None:
             return trains
         lo, hi = float(t_range_s[0]), float(t_range_s[1])
+        if hi < lo:
+            lo, hi = hi, lo
         return [arr[(arr >= lo) & (arr <= hi)] for arr in trains]
 
     def _read_overlay_channel(
@@ -982,11 +1115,21 @@ class ProcessedRecording:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, np.ndarray | None]:
         """``(t_ms, waveforms, spike_times, total, exact_mean_or_None)``.
 
-        ``t_range_s`` ne garde que les spikes dont le temps (s, relatif à la
-        stimulation) tombe dans la fenêtre. ``pre_ms`` / ``post_ms`` recadrent
+        ``t_range_s`` plus étroit que l’essai relance la détection sur cette
+        plage (même après un premier affichage). Sinon les spikes déjà
+        détectés sont filtrés. ``pre_ms`` / ``post_ms`` recadrent
         chaque forme d’onde sur la fenêtre sélectionnée autour de la détection,
         et ré-extraient la trace si le cache est plus court.
         """
+        if t_range_s is not None:
+            detected = self._overlay_redetected(
+                int(ch),
+                t_range_s,
+                pre_ms=pre_ms,
+                post_ms=post_ms,
+            )
+            if detected is not None:
+                return detected
         if pre_ms is not None and post_ms is not None:
             self._ensure_overlay_coverage(int(ch), float(pre_ms), float(post_ms))
         t_ms, waves, times, total, mean = self._read_overlay_channel(ch)
@@ -1014,6 +1157,8 @@ class ProcessedRecording:
         self._channel_data.clear()
         self._overlay_override.clear()
         self._overlay_request.clear()
+        self._range_spike_cache.clear()
+        self._range_overlay_cache.clear()
         source = self.source
         self.source = None
         if source is not None and hasattr(source, "close"):

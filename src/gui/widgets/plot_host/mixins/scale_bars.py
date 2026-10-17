@@ -18,6 +18,7 @@ from scale_bar_model import (
     resolve_axis_bar,
     time_value_in_axis_units,
     units_for_kind,
+    uses_shared_manual_scale,
 )
 
 from ..constants import (
@@ -33,14 +34,10 @@ from ..helpers import (
 )
 from ..text_style import _scale_label_item, _tick_qfont
 
-# Au-delà de cette largeur ViewBox cible, on garde le bâton à L px sans élargir l’UI.
-_MAX_SCALE_FIT_VIEW_WIDTH_PX = 4800
-
-
 def _manual_y_params(
-    bars: ScaleBarSpec, y_unit: str
+    bars: ScaleBarSpec, y_unit: str, *, shared: bool = True
 ) -> tuple[float | None, float | None]:
-    if not amp_manual_applies(y_unit):
+    if not shared or not amp_manual_applies(y_unit):
         return None, None
     val = float(bars.amplitude) if bool(bars.amp_manual) else None
     length = (
@@ -50,8 +47,10 @@ def _manual_y_params(
 
 
 def _manual_x_params(
-    bars: ScaleBarSpec, x_unit: str
+    bars: ScaleBarSpec, x_unit: str, *, shared: bool = True
 ) -> tuple[float | None, float | None]:
+    if not shared:
+        return None, None
     val = None
     if bool(bars.time_manual):
         val = time_value_in_axis_units(float(bars.time_s), x_unit)
@@ -64,22 +63,32 @@ def _manual_x_params(
 
 
 def _resolve_y_bar(
-    bars: ScaleBarSpec, *, span: float, axis_px: float, y_unit: str
+    bars: ScaleBarSpec,
+    *,
+    span: float,
+    axis_px: float,
+    y_unit: str,
+    shared: bool = True,
 ):
     if not (span > 0) or not (axis_px > 0) or not y_unit:
         return None
-    val, length = _manual_y_params(bars, y_unit)
+    val, length = _manual_y_params(bars, y_unit, shared=shared)
     if val is None and length is None:
         return resolve_axis_bar(span=span, axis_px=axis_px)
     return resolve_axis_bar(span=span, axis_px=axis_px, value=val, length_px=length)
 
 
 def _resolve_x_bar(
-    bars: ScaleBarSpec, *, span: float, axis_px: float, x_unit: str
+    bars: ScaleBarSpec,
+    *,
+    span: float,
+    axis_px: float,
+    x_unit: str,
+    shared: bool = True,
 ):
     if not (span > 0) or not (axis_px > 0) or not x_unit:
         return None
-    val, length = _manual_x_params(bars, x_unit)
+    val, length = _manual_x_params(bars, x_unit, shared=shared)
     if val is None and length is None:
         return resolve_axis_bar(span=span, axis_px=axis_px)
     return resolve_axis_bar(span=span, axis_px=axis_px, value=val, length_px=length)
@@ -96,19 +105,18 @@ class ScaleBarsMixin:
         return amp_fit or time_fit
 
     def scale_bar_needed_view_height_px(self) -> int | None:
-        """Hauteur ViewBox totale pour que amplitude (µV) = taille amp. (px)."""
+        """Hauteur ViewBox totale pour que amplitude (µV) = taille amp. (px).
+
+        Utilise la plage Y *visible* (ylim manuel compris) :
+        ``hauteur = span × taille_px / amplitude``. Pas de plancher : un
+        minimum en pixels change le gain µV/px.
+        """
         if not self.scale_bar_widget_fit_enabled():
             return None
         bars = self._active_scale_bars()
         if bars is None or not (
             bool(bars.amp_manual) and bool(bars.amp_length_manual)
         ):
-            return None
-        spec = self._spec
-        if getattr(spec, "ylim", None) is not None:
-            return None
-        row_ylims = list(getattr(spec, "row_ylims", None) or [])
-        if any(y is not None for y in row_ylims):
             return None
         try:
             amp = float(bars.amplitude)
@@ -124,12 +132,18 @@ class ScaleBarsMixin:
         any_span = False
         for row, plot in enumerate(plots):
             _x_unit, y_unit = self._scale_bar_units_for_row(bars, row)
+            if not self._row_shares_manual_scale(row):
+                # Spike scope : hauteur de ligne fixe, pas le gain µV des traces.
+                any_span = True
+                total += float(self._independent_row_height_px())
+                continue
             if not amp_manual_applies(y_unit):
                 continue
-            span = self._axis_span(plot, axis="y")
-            if span is None:
+            try:
+                (_x0, _x1), (y0, y1) = plot.viewRange()
+            except Exception:
                 continue
-            dy = float(span[1]) - float(span[0])
+            dy = abs(float(y1) - float(y0))
             if not (dy > 0.0) or dy != dy:
                 continue
             bar = resolve_axis_bar(
@@ -141,7 +155,7 @@ class ScaleBarsMixin:
             total += float(bar.needed_axis_px)
         if not any_span or not (total > 0.0) or total != total:
             return None
-        return max(40, int(round(total)))
+        return max(1, int(round(total)))
 
     def scale_bar_needed_view_width_px(self) -> int | None:
         """Largeur ViewBox pour temps (s) = taille temps (px), plage X visible."""
@@ -161,7 +175,9 @@ class ScaleBarsMixin:
         plots = list(getattr(self, "_plots", None) or [])
         if not plots:
             return None
-        row = len(plots) - 1
+        row = self._shared_scale_width_row()
+        if row is None:
+            return None
         plot = plots[row]
         x_unit, _y_unit = self._scale_bar_units_for_row(bars, row)
         if x_unit is None:
@@ -182,9 +198,11 @@ class ScaleBarsMixin:
         if bar.needed_axis_px is None or not (bar.needed_axis_px > 0):
             return None
         needed = float(bar.needed_axis_px)
-        if needed > float(_MAX_SCALE_FIT_VIEW_WIDTH_PX):
+        if not (needed > 0.0) or needed != needed:
             return None
-        return max(80, int(round(needed)))
+        # Pas de plancher : 80 px minimum étirait les zooms courts
+        # (le bâton ne valait plus la durée affichée).
+        return max(1, int(round(needed)))
 
     def _active_scale_bars(self) -> ScaleBarSpec | None:
         spec = getattr(self, "_spec", None)
@@ -246,6 +264,67 @@ class ScaleBarsMixin:
                     pass
         self._scale_bar_items.clear()
 
+    def _row_kind(self, row: int) -> str:
+        spec = getattr(self, "_spec", None)
+        kinds = list(getattr(spec, "row_kinds", None) or []) if spec else []
+        if 0 <= row < len(kinds):
+            return str(kinds[row])
+        return ""
+
+    def _row_shares_manual_scale(self, row: int) -> bool:
+        """False pour une ligne spike scope : échelle propre à ses formes d’onde."""
+        return uses_shared_manual_scale(kind=self._row_kind(row))
+
+    def _independent_row_height_px(self) -> int:
+        spec = getattr(self, "_spec", None)
+        raw = int(getattr(spec, "row_min_height_px", 0) or 0) if spec else 0
+        return max(36, raw or 52)
+
+    def _shared_scale_width_row(self) -> int | None:
+        """Dernière ligne dont l’axe X suit le gain temps partagé (pas le spike scope)."""
+        plots = list(getattr(self, "_plots", None) or [])
+        bars = self._active_scale_bars()
+        if bars is None:
+            return None
+        for row in range(len(plots) - 1, -1, -1):
+            if not self._row_shares_manual_scale(row):
+                continue
+            x_unit, _y_unit = self._scale_bar_units_for_row(bars, row)
+            if x_unit is not None:
+                return row
+        return None
+
+    def _pin_independent_scale_rows(self) -> None:
+        """Le spike scope garde une hauteur de ligne fixe quand le gain µV est manuel.
+
+        Les autres lignes continuent de se partager le reste, au gain demandé.
+        """
+        spec = getattr(self, "_spec", None)
+        if spec is None or str(getattr(spec, "layout_kind", "") or "") != "montage":
+            return
+        layout = getattr(getattr(self._glw, "ci", None), "layout", None)
+        if layout is None or not hasattr(layout, "setRowFixedHeight"):
+            return
+        bars = self._active_scale_bars()
+        amp_fit = bool(
+            bars is not None
+            and bool(bars.amp_manual)
+            and bool(bars.amp_length_manual)
+        )
+        row0 = int(getattr(self, "_data_row0", 0) or 0)
+        height = self._independent_row_height_px()
+        for row in range(len(self._plots)):
+            grid_row = row0 + row
+            try:
+                if amp_fit and not self._row_shares_manual_scale(row):
+                    layout.setRowFixedHeight(grid_row, height)
+                    layout.setRowStretchFactor(grid_row, 0)
+                else:
+                    layout.setRowMaximumHeight(grid_row, 16777215)
+                    layout.setRowStretchFactor(grid_row, 1)
+            except Exception:
+                continue
+
     def _scale_bar_units_for_row(
         self, bars: ScaleBarSpec, row: int
     ) -> tuple[str | None, str | None]:
@@ -270,17 +349,30 @@ class ScaleBarsMixin:
             x_span = abs(float(x1) - float(x0))
             y_span = abs(float(y1) - float(y0))
             x_unit, y_unit = self._scale_bar_units_for_row(bars, row)
+            shared = self._row_shares_manual_scale(row)
             x_size: float | None = None
             y_size: float | None = None
             y_bar = (
-                _resolve_y_bar(bars, span=y_span, axis_px=100.0, y_unit=str(y_unit))
+                _resolve_y_bar(
+                    bars,
+                    span=y_span,
+                    axis_px=100.0,
+                    y_unit=str(y_unit),
+                    shared=shared,
+                )
                 if y_unit is not None and y_span > 0
                 else None
             )
             y_size = float(y_bar.label) if y_bar is not None else None
             show_x = x_unit is not None and (row == n - 1 or not multi)
             x_bar = (
-                _resolve_x_bar(bars, span=x_span, axis_px=100.0, x_unit=str(x_unit))
+                _resolve_x_bar(
+                    bars,
+                    span=x_span,
+                    axis_px=100.0,
+                    x_unit=str(x_unit),
+                    shared=shared,
+                )
                 if show_x and x_span > 0
                 else None
             )
@@ -307,6 +399,9 @@ class ScaleBarsMixin:
             if y_size is not None and y_unit is not None:
                 lab = format_scale_label(float(y_size), str(y_unit))
                 label_w = max(label_w, int(metrics.horizontalAdvance(lab)) + 14)
+        # Le décalage élargit la gouttière. Avec valeur + taille px fixes, le
+        # fit du widget (empreinte de placement) rend ces pixels au graphique :
+        # la zone de tracé ne change pas, le widget si.
         right_needed = int(round(pad + max(0.0, amp_dx) + pad + max(0, label_w - 14) + 8))
         right_w = max(_SCALE_BAR_RIGHT_GUTTER_PX, label_w, right_needed)
         bottom_needed = int(
@@ -393,6 +488,7 @@ class ScaleBarsMixin:
             return
         if not self._plots:
             return
+        self._pin_independent_scale_rows()
         floating = bool(getattr(bars, "floating", True))
         if not floating:
             key = scale_bar_spec_settings_key(bars)
@@ -447,6 +543,7 @@ class ScaleBarsMixin:
         self._clear_scale_bar_items()
         self._scale_bar_lengths = []
         self._scale_bar_settings_key = None
+        self._pin_independent_scale_rows()
         if not self._plots:
             return
         c = self._colors
@@ -563,11 +660,12 @@ class ScaleBarsMixin:
         bars: ScaleBarSpec,
         axis: str,
         unit: str,
+        shared: bool = True,
     ) -> list[tuple[float, str]] | None:
         if axis == "y":
-            val, length = _manual_y_params(bars, unit)
+            val, length = _manual_y_params(bars, unit, shared=shared)
         else:
-            val, length = _manual_x_params(bars, unit)
+            val, length = _manual_x_params(bars, unit, shared=shared)
         val_manual = val is not None
         length_manual = length is not None
         ticks = major_ticks_for_axis(
@@ -592,6 +690,7 @@ class ScaleBarsMixin:
             except Exception:
                 continue
             x_unit, y_unit = self._scale_bar_units_for_row(bars, row)
+            shared = self._row_shares_manual_scale(row)
             left = plot.getAxis("left")
             try:
                 h = float(left.height())
@@ -607,6 +706,7 @@ class ScaleBarsMixin:
                     bars=bars,
                     axis="y",
                     unit=str(y_unit),
+                    shared=shared,
                 )
                 if y_ticks:
                     left.setTicks([y_ticks])
@@ -627,6 +727,7 @@ class ScaleBarsMixin:
                         bars=bars,
                         axis="x",
                         unit=str(x_unit),
+                        shared=shared,
                     )
                     if x_ticks:
                         bottom.setTicks([x_ticks])
@@ -657,6 +758,7 @@ class ScaleBarsMixin:
             x_span = abs(float(x1) - float(x0))
             y_span = abs(float(y1) - float(y0))
             x_unit, y_unit = self._scale_bar_units_for_row(bars, row)
+            shared = self._row_shares_manual_scale(row)
 
             if y_unit is not None and y_span > 0:
                 self._draw_y_scale_in_gutter(
@@ -664,6 +766,7 @@ class ScaleBarsMixin:
                     bars=bars,
                     y_span=y_span,
                     y_unit=str(y_unit),
+                    shared=shared,
                     pen=pen,
                     brush=QBrush(qcolor),
                     font=font,
@@ -680,6 +783,7 @@ class ScaleBarsMixin:
                     bars=bars,
                     x_span=x_span,
                     x_unit=str(x_unit),
+                    shared=shared,
                     pen=pen,
                     brush=QBrush(qcolor),
                     font=font,
@@ -696,6 +800,7 @@ class ScaleBarsMixin:
         bars: ScaleBarSpec,
         y_span: float,
         y_unit: str,
+        shared: bool = True,
         pen: QPen,
         brush: QBrush,
         font: QFont,
@@ -712,10 +817,12 @@ class ScaleBarsMixin:
             return
         if h < 4.0 or w < 4.0:
             return
-        bar = _resolve_y_bar(bars, span=y_span, axis_px=h, y_unit=y_unit)
+        bar = _resolve_y_bar(
+            bars, span=y_span, axis_px=h, y_unit=y_unit, shared=shared
+        )
         if bar is None:
             return
-        val, length = _manual_y_params(bars, y_unit)
+        val, length = _manual_y_params(bars, y_unit, shared=shared)
         both_manual = val is not None and length is not None
         length_only = length is not None and val is None
         bar_h = float(bar.bar_px)
@@ -765,6 +872,7 @@ class ScaleBarsMixin:
         bars: ScaleBarSpec,
         x_span: float,
         x_unit: str,
+        shared: bool = True,
         pen: QPen,
         brush: QBrush,
         font: QFont,
@@ -781,10 +889,12 @@ class ScaleBarsMixin:
             return
         if h < 4.0 or w < 8.0:
             return
-        bar = _resolve_x_bar(bars, span=x_span, axis_px=w, x_unit=x_unit)
+        bar = _resolve_x_bar(
+            bars, span=x_span, axis_px=w, x_unit=x_unit, shared=shared
+        )
         if bar is None:
             return
-        val, length = _manual_x_params(bars, x_unit)
+        val, length = _manual_x_params(bars, x_unit, shared=shared)
         both_manual = val is not None and length is not None
         length_only = length is not None and val is None
         bar_w = float(bar.bar_px)

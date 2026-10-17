@@ -451,6 +451,12 @@ class RenderRequest:
     highlight_zooms: tuple[tuple[float, float, str, str], ...] = ()
     # True = garder zoom/pan utilisateur après le redessin (ex. bascule Stim).
     preserve_view: bool = False
+    # Fenêtre de temps réellement affichée sur les traces (spike scope).
+    # None : section, ou zoom du placement pour une fenêtre détachée.
+    # Coordonnées absolues fichier si ``visible_time_absolute``, sinon t_rel.
+    # Les zones de zoom (plages) ne sont pas cette fenêtre.
+    visible_time_s: tuple[float, float] | None = None
+    visible_time_absolute: bool = False
 
     @property
     def panel(self) -> str:
@@ -649,46 +655,114 @@ def _zoom_absolute_to_relative(
     )
 
 
+def _placement_zoom_time_range(
+    request: RenderRequest, recording: ProcessedRecording
+) -> tuple[float, float] | None:
+    """Fenêtre t_rel du zoom de placement, ou None s’il n’y en a pas."""
+    if not request.placement.has_custom_zoom:
+        return None
+    t0 = float(request.placement.zoom_t0_s)
+    t1 = float(request.placement.zoom_t1_s)
+    if t1 < t0:
+        t0, t1 = t1, t0
+    if request.placement.zoom_absolute:
+        converted = _zoom_absolute_to_relative(recording, t0, t1)
+        # Hors essai : aucune détection, pas le repli « essai entier ».
+        return converted if converted is not None else (1.0, 0.0)
+    clipped = _clip_to_t_rel(recording, t0, t1)
+    return clipped if clipped is not None else (1.0, 0.0)
+
+
+def _section_spike_window(
+    request: RenderRequest, _recording: ProcessedRecording, index: int
+) -> tuple[float, float] | None:
+    """Fenêtre de section (essai / manuel), sans plage active."""
+    windows = request.per_recording_windows()
+    if index < len(windows) and windows[index] is not None:
+        return windows[index]
+    return request.section_window()
+
+
+def _visible_time_as_relative(
+    request: RenderRequest, recording: ProcessedRecording
+) -> tuple[float, float] | None:
+    """Fenêtre affichée → t_rel. None si le request n’en porte pas."""
+    visible = getattr(request, "visible_time_s", None)
+    if visible is None:
+        return None
+    t0, t1 = float(visible[0]), float(visible[1])
+    if t1 < t0:
+        t0, t1 = t1, t0
+    if bool(getattr(request, "visible_time_absolute", False)):
+        converted = _zoom_absolute_to_relative(recording, t0, t1)
+        return converted if converted is not None else (1.0, 0.0)
+    clipped = _clip_to_t_rel(recording, t0, t1)
+    return clipped if clipped is not None else (1.0, 0.0)
+
+
 def spike_scope_time_range(
     request: RenderRequest, recording: ProcessedRecording, index: int
 ) -> tuple[float, float] | None:
-    """Fenêtre (s, relatif stim) dont le spike scope doit montrer les détections.
+    """Fenêtre (s, relatif stim) des détections du spike scope.
 
-    Zoom du panneau s’il existe, sinon la plage active, sinon la section.
+    La fenêtre de temps affichée sur les traces, si elle est fournie.
+    Sinon le zoom du panneau (fenêtre zoom détachée).
+    Sinon la section.
+    Les zones de zoom (plage active) ne filtrent pas le spike scope.
     """
-    if request.placement.has_custom_zoom:
-        t0 = float(request.placement.zoom_t0_s)
-        t1 = float(request.placement.zoom_t1_s)
-        if t1 < t0:
-            t0, t1 = t1, t0
-        if request.placement.zoom_absolute:
-            converted = _zoom_absolute_to_relative(recording, t0, t1)
-            # Hors essai : aucune détection, pas le repli « essai entier ».
-            return converted if converted is not None else (1.0, 0.0)
-        clipped = _clip_to_t_rel(recording, t0, t1)
-        return clipped if clipped is not None else (1.0, 0.0)
-    windows = request.per_recording_windows()
+    visible = _visible_time_as_relative(request, recording)
+    if visible is not None:
+        return visible
+    zoom = _placement_zoom_time_range(request, recording)
+    if zoom is not None:
+        return zoom
+    return _section_spike_window(request, recording, index)
+
+
+def spike_panel_time_range(
+    request: RenderRequest, recording: ProcessedRecording, index: int
+) -> tuple[float, float] | None:
+    """Fenêtre t_rel des autres graphs spikes (PSTH, raster, ISI).
+
+    Zoom du panneau, puis plage active, puis section.
+    Le spike scope n’utilise pas cette fonction.
+    """
+    zoom = _placement_zoom_time_range(request, recording)
+    if zoom is not None:
+        return zoom
     bar = request.settings.active_range_bar()
     if bar is not None:
         t0, t1 = bar.ordered()
         if bool(bar.relative_to_stim):
             clipped = _clip_to_t_rel(recording, t0, t1)
             return clipped if clipped is not None else (1.0, 0.0)
-        # Plage absolue active → offset relatif à sa stim locale (pas l’index aperçu).
         converted = _zoom_absolute_to_relative(recording, t0, t1)
         return converted if converted is not None else (1.0, 0.0)
-    if index < len(windows) and windows[index] is not None:
-        return windows[index]
-    return request.section_window()
+    return _section_spike_window(request, recording, index)
 
 
 def _range_bar_fingerprint(request: RenderRequest) -> tuple[Any, ...]:
-    """Identité de la plage active — le spike scope doit se reconstruire avec elle."""
+    """Identité de la plage active (PSTH / raster / surlignage)."""
     bar = request.settings.active_range_bar()
     if bar is None:
         return (None,)
     t0, t1 = bar.ordered()
     return (round(float(t0), 6), round(float(t1), 6), bool(bar.relative_to_stim))
+
+
+def _spike_scope_visible_fingerprint(request: RenderRequest) -> tuple[Any, ...]:
+    """Fenêtre affichée — uniquement le spike scope (pas les autres panneaux)."""
+    panel = str(request.panel)
+    if panel not in {"analysis_overlay", "spike_overlay"}:
+        return ()
+    window = getattr(request, "visible_time_s", None)
+    if window is None:
+        return (None,)
+    return (
+        round(float(window[0]), 6),
+        round(float(window[1]), 6),
+        bool(getattr(request, "visible_time_absolute", False)),
+    )
 
 
 def _decimate(x: np.ndarray, y: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
@@ -830,8 +904,13 @@ def _scale_bar_lengths(
     x_unit: str | None,
     y_unit: str | None,
     ax: Any,
+    shared: bool = True,
 ) -> tuple[float | None, float | None]:
-    """Longueurs X/Y (unités de données) selon réglages manuels ou auto."""
+    """Longueurs X/Y (unités de données) selon réglages manuels ou auto.
+
+    ``shared=False`` (spike scope) : barre auto sur la fenêtre visible,
+    sans le gain µV / temps des traces.
+    """
     from scale_bar_model import (
         amp_manual_applies,
         resolve_axis_bar,
@@ -849,7 +928,7 @@ def _scale_bar_lengths(
     x_size: float | None = None
     if x_unit is not None and x_span > 0:
         time_s = float(getattr(style, "scale_bar_time_s", 0.1) or 0.1)
-        manual = bool(getattr(style, "scale_bar_time_manual", False))
+        manual = shared and bool(getattr(style, "scale_bar_time_manual", False))
         val = time_value_in_axis_units(time_s, x_unit) if manual else None
         x_size = resolve_axis_bar(
             span=x_span, axis_px=100.0, value=val if val and val > 0 else None
@@ -857,8 +936,10 @@ def _scale_bar_lengths(
 
     y_size: float | None = None
     if y_unit is not None and y_span > 0:
-        manual = bool(getattr(style, "scale_bar_amplitude_manual", False)) and (
-            amp_manual_applies(y_unit)
+        manual = (
+            shared
+            and bool(getattr(style, "scale_bar_amplitude_manual", False))
+            and amp_manual_applies(y_unit)
         )
         val = (
             float(getattr(style, "scale_bar_amplitude", 100.0) or 100.0)
@@ -963,6 +1044,12 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
             )
         return (panel_x, panel_y)
 
+    def _row_shared(row: int) -> bool:
+        from scale_bar_model import uses_shared_manual_scale
+
+        kind = str(row_kinds[row]) if row < len(row_kinds) else ""
+        return uses_shared_manual_scale(kind=kind, panel=str(request.panel))
+
     if not show_bars:
         for row, ax in enumerate(axes):
             clear_floating_scale_bars(ax)
@@ -970,11 +1057,18 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
             if x_unit is None and y_unit is None:
                 ax.tick_params(axis="y", which="both", labelleft=False)
                 continue
+            shared = _row_shared(row)
             x_size, y_size = _scale_bar_lengths(
-                style, x_unit=x_unit, y_unit=y_unit, ax=ax
+                style, x_unit=x_unit, y_unit=y_unit, ax=ax, shared=shared
             )
             apply_mpl_scale_ticks(
-                ax, style, x_unit=x_unit, y_unit=y_unit, x_size=x_size, y_size=y_size
+                ax,
+                style,
+                x_unit=x_unit,
+                y_unit=y_unit,
+                x_size=x_size,
+                y_size=y_size,
+                shared=shared,
             )
             if row < last:
                 ax.tick_params(axis="x", which="both", labelbottom=False)
@@ -1002,11 +1096,16 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
         for spine in ax.spines.values():
             spine.set_visible(False)
         x_unit, y_unit = _units_for_row(row)
+        shared = _row_shared(row)
         if x_unit is None and y_unit is None:
             clear_floating_scale_bars(ax)
             continue
-        x_size, y_size = _scale_bar_lengths(style, x_unit=x_unit, y_unit=y_unit, ax=ax)
+        x_size, y_size = _scale_bar_lengths(
+            style, x_unit=x_unit, y_unit=y_unit, ax=ax, shared=shared
+        )
         # Y dans la gouttière à droite de chaque ligne.
+        # Spike scope : barre auto (pas la valeur µV des traces).
+        row_y_length = y_length_px if shared else None
         if y_unit is not None:
             draw_floating_scale_bars(
                 ax,
@@ -1020,9 +1119,10 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
                 face=style.tick_face,
                 dx_px=dx_px,
                 dy_px=dy_px,
-                y_length_px=y_length_px,
+                y_length_px=row_y_length,
                 y_value_manual=bool(
-                    getattr(style, "scale_bar_amplitude_manual", False)
+                    shared
+                    and getattr(style, "scale_bar_amplitude_manual", False)
                     and y_unit == "µV"
                 ),
             )
@@ -1043,8 +1143,10 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
                 face=style.tick_face,
                 dx_px=time_dx_px,
                 dy_px=time_dy_px,
-                x_length_px=x_length_px,
-                x_value_manual=bool(getattr(style, "scale_bar_time_manual", False)),
+                x_length_px=x_length_px if shared else None,
+                x_value_manual=bool(
+                    shared and getattr(style, "scale_bar_time_manual", False)
+                ),
             )
 
 
@@ -1499,8 +1601,8 @@ def _panel_expects_relative_x(panel: str) -> bool:
 def _relative_stim_window(request: RenderRequest) -> tuple[float, float] | None:
     """Fenêtre d’affichage en t_rel (spikes / RMS / analyse), jamais le temps fichier.
 
-    Alignée sur la fenêtre visible : zoom panneau → plage active → échelle X
-    manuelle → section — comme ``spike_scope_time_range``.
+    Zoom panneau → plage active → échelle X manuelle → section.
+    Le spike scope ne suit pas la plage active : voir ``spike_scope_time_range``.
     """
     reference = request.reference
     if reference is None:
@@ -1995,10 +2097,10 @@ def _render_rms(ax: Any, request: RenderRequest) -> str:
 
 
 def _spike_trains_for(request: RenderRequest, trigger_index: int | None) -> list[list[np.ndarray]]:
-    """Spikes filtrés sur la fenêtre affichée (zoom / plage active / section)."""
+    """Spikes filtrés pour PSTH / raster / ISI (zoom / plage active / section)."""
     trains: list[list[np.ndarray]] = []
     for index, recording in enumerate(request.recordings):
-        window = spike_scope_time_range(request, recording, index)
+        window = spike_panel_time_range(request, recording, index)
         trains.append(
             recording.spike_times(
                 request.channel_index,
@@ -3179,7 +3281,7 @@ def _montage_draw_extra_row(
                 drawn += 1
             continue
 
-        spike_win = spike_scope_time_range(request, recording, index)
+        spike_win = spike_panel_time_range(request, recording, index)
         if spike_win is None:
             spike_win = section_x
         trains = recording.spike_times(
@@ -3699,9 +3801,10 @@ def _structure_fingerprint(request: RenderRequest) -> tuple[Any, ...]:
             str(request.settings.texts.xlabel or "").strip(),
             str(request.settings.texts.ylabel or "").strip(),
             tuple(str(label) for label in request.settings.texts.legend_labels),
-            bool(request.settings.texts.show_series_suffix),
-            _range_bar_fingerprint(request),
-        )
+        bool(request.settings.texts.show_series_suffix),
+        _range_bar_fingerprint(request),
+        _spike_scope_visible_fingerprint(request),
+    )
 
     rec_fp = tuple(
         (
@@ -3746,6 +3849,7 @@ def _structure_fingerprint(request: RenderRequest) -> tuple[Any, ...]:
         tuple(str(label) for label in request.settings.texts.legend_labels),
         bool(request.settings.texts.show_series_suffix),
         _range_bar_fingerprint(request),
+        _spike_scope_visible_fingerprint(request),
     )
 
 

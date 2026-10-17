@@ -544,6 +544,8 @@ def main() -> int:
         f"time_dx={getattr(bars, 'time_dx_px', None)} time_dy={getattr(bars, 'time_dy_px', None)}",
     )
 
+    # L’amplitude manuelle fixe la hauteur : la décocher pour tester la hauteur libre.
+    params._scale_bar_amp_manual.setChecked(False)
     params._preview_title_gap.setValue(36)
     params._graph_height.setValue(520)
     _settle(app, window)

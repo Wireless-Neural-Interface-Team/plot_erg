@@ -199,6 +199,44 @@ def _apply_plot_tick_font(
         axis.setStyle(tickFont=font)
 
 
+def _relax_label_width(label: Any) -> None:
+    """Ne pas laisser un texte imposer la largeur du graphique.
+
+    ``LabelItem.updateMin`` fige la largeur minimale sur le texte. Le layout
+    pyqtgraph refuse alors de rétrécir : le widget (échelle temps) devient
+    plus petit que le graphique, et la courbe est coupée.
+    """
+    if label is None or not hasattr(label, "updateMin"):
+        return
+    if not getattr(label, "_erg_width_relaxed", False):
+
+        def update_min(*_args: Any, **_kwargs: Any) -> None:
+            try:
+                height = float(label.itemRect().height())
+            except Exception:
+                height = float(label.minimumHeight() or 0.0)
+            label.setMinimumWidth(0)
+            label.setPreferredWidth(0)
+            label.setMinimumHeight(height)
+            label._sizeHint = {
+                Qt.SizeHint.MinimumSize: (0.0, height),
+                Qt.SizeHint.PreferredSize: (0.0, height),
+                Qt.SizeHint.MaximumSize: (-1.0, -1.0),
+                Qt.SizeHint.MinimumDescent: (0.0, 0.0),
+            }
+            try:
+                label.updateGeometry()
+            except Exception:
+                pass
+
+        label.updateMin = update_min  # type: ignore[method-assign]
+        label._erg_width_relaxed = True
+    try:
+        label.updateMin()
+    except Exception:
+        pass
+
+
 class PlotHost(QWidget):
     """QWidget wrapping ``GraphicsLayoutWidget`` with coalesce + view API.
 
@@ -274,6 +312,11 @@ class PlotHost(QWidget):
         self._glw.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
+        # Un titre plus large que la zone de tracé ne doit pas figer le layout.
+        try:
+            self._glw.ci.setMinimumWidth(0)
+        except Exception:
+            pass
         # Paint ciblé : évite de redessiner toute la scène à chaque cran de scroll.
         try:
             from PySide6.QtWidgets import QGraphicsView
@@ -1362,6 +1405,7 @@ class PlotHost(QWidget):
             )
             self._apply_montage_title_row_height(spec)
             self._apply_title_pixel_offset(title_item, spec)
+            _relax_label_width(title_item)
         elif self._plots:
             self._plots[0].setTitle(
                 spec.title or "", color=c["title"], size=title_size
@@ -1380,6 +1424,7 @@ class PlotHost(QWidget):
             self._apply_preview_title_gap(self._plots[0], spec)
             if title_item is not None:
                 self._apply_title_pixel_offset(title_item, spec)
+                _relax_label_width(title_item)
         for row, plot in enumerate(self._plots):
             if not is_montage:
                 ylabel = ""
@@ -1449,6 +1494,21 @@ class PlotHost(QWidget):
             except Exception:
                 pass
         self._reposition_stim_labels()
+        self._release_plot_width_floor()
+
+    def _release_plot_width_floor(self) -> None:
+        """Oublier une largeur minimale héritée d’un titre ou d’une légende."""
+        try:
+            self._glw.ci.setMinimumWidth(0)
+            self._glw.ci.updateGeometry()
+        except Exception:
+            pass
+        for plot in self._plots:
+            try:
+                plot.setMinimumWidth(0)
+                plot.updateGeometry()
+            except Exception:
+                pass
 
     def _apply_title_pixel_offset(self, title_item: Any, spec: PanelSpec) -> None:
         """Décaler le titre en pixels (+dx droite, +dy haut).
@@ -1630,6 +1690,14 @@ class PlotHost(QWidget):
                 italic=bool(spec.legend_italic),
                 underline=bool(getattr(spec, "legend_underline", False)),
             )
+            _relax_label_width(label_item)
+        try:
+            legend.setMinimumWidth(0)
+            legend.setPreferredWidth(0)
+            legend.updateGeometry()
+        except Exception:
+            pass
+        self._release_plot_width_floor()
         # Entrées de légende éditables unitairement.
         for index, (_sample, label_item) in enumerate(
             list(getattr(legend, "items", []) or [])

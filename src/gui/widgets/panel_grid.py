@@ -89,6 +89,13 @@ class PanelGrid(QScrollArea):
         self._fill_timer.setSingleShot(True)
         self._fill_timer.setInterval(50)
         self._fill_timer.timeout.connect(self._reflow_fill_heights)
+        # Fige la largeur après le premier layout : fenêtre et séparateur
+        # Paramètres ne doivent plus étirer le graph.
+        self._width_freeze_timer = QTimer(self)
+        self._width_freeze_timer.setSingleShot(True)
+        self._width_freeze_timer.setInterval(50)
+        self._width_freeze_timer.timeout.connect(self._freeze_panel_widths_once)
+        self._width_freeze_attempts = 0
 
     def sizeHint(self) -> QSize:  # noqa: D102
         if self.isVisible() and self.width() > 0:
@@ -169,6 +176,8 @@ class PanelGrid(QScrollArea):
         self._order = list(placements)
         self._relayout()
         self._restore_scroll(scroll_v, scroll_h)
+        if self.isVisible() and self._panels_missing_width_lock():
+            self._width_freeze_timer.start()
 
     def _restore_scroll(self, scroll_v: int, scroll_h: int) -> None:
         """Rétablir la position de scroll après un relayout (immédiat + tick suivant)."""
@@ -225,16 +234,15 @@ class PanelGrid(QScrollArea):
             current_h = max(1, int(widget.height()))
         except Exception:
             current_h = 160
-        fitted = max(140, int(height))
-        if not scale_fit:
+        if scale_fit:
+            # Hauteur exacte : un plancher changerait le gain µV/px.
+            fitted = max(1, int(height))
+        else:
+            fitted = max(140, int(height))
             fitted = max(fitted, current_h)
         previous = getattr(widget, "fitted_height_px", None)
         widget.fitted_height_px = fitted  # type: ignore[attr-defined]
-        if (
-            not scale_fit
-            and previous is not None
-            and abs(int(previous) - fitted) <= 2
-        ):
+        if previous is not None and abs(int(previous) - fitted) <= 2:
             return
         self._apply_panel_height(widget, placement)
 
@@ -249,29 +257,39 @@ class PanelGrid(QScrollArea):
             current_w = max(1, int(widget.width()))
         except Exception:
             current_w = 200
-        fitted = max(200, int(width))
-        if not scale_fit:
+        if scale_fit:
+            # Largeur exacte : un plancher changerait le gain temporel.
+            fitted = max(1, int(width))
+        else:
+            fitted = max(200, int(width))
             fitted = max(fitted, current_w)
         previous = getattr(widget, "fitted_width_px", None)
         widget.fitted_width_px = fitted  # type: ignore[attr-defined]
-        if (
-            not scale_fit
-            and previous is not None
-            and abs(int(previous) - fitted) <= 2
-        ):
+        if previous is not None and abs(int(previous) - fitted) <= 2:
             return
         self._apply_panel_width(widget, placement)
 
     def _apply_panel_width(self, widget: object, placement: PanelPlacement) -> None:
+        """Largeur figée : la fenêtre et le séparateur Paramètres ne l’étirent pas."""
+        del placement
+        v_policy = widget.sizePolicy().verticalPolicy()  # type: ignore[attr-defined]
         fitted = getattr(widget, "fitted_width_px", None)
-        if fitted is None:
+        if fitted is not None:
+            widget.frozen_width_px = max(1, int(fitted))  # type: ignore[attr-defined]
+        locked = getattr(widget, "frozen_width_px", None)
+        if locked is None:
             widget.setMinimumWidth(0)  # type: ignore[attr-defined]
             widget.setMaximumWidth(16777215)  # type: ignore[attr-defined]
+            widget.setSizePolicy(QSizePolicy.Policy.Expanding, v_policy)  # type: ignore[attr-defined]
+            self._layout.setAlignment(widget, Qt.AlignmentFlag(0))  # type: ignore[arg-type]
             return
-        width = max(200, int(fitted))
-        widget.setMinimumWidth(width)  # type: ignore[attr-defined]
-        # Largeur max libre : le graph peut dépasser → scroll, pas de bande étroite figée.
-        widget.setMaximumWidth(16777215)  # type: ignore[attr-defined]
+        width = max(1, int(locked))
+        widget.setFixedWidth(width)  # type: ignore[attr-defined]
+        widget.setSizePolicy(QSizePolicy.Policy.Fixed, v_policy)  # type: ignore[attr-defined]
+        self._layout.setAlignment(
+            widget,  # type: ignore[arg-type]
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+        )
 
     def set_graph_height(self, graph_height: int) -> None:
         """Hauteur des panneaux hors montage (RMS, spikes, résumés…)."""
@@ -311,7 +329,7 @@ class PanelGrid(QScrollArea):
                 height = max(height, int(fitted))
             else:
                 # Échelle flottante : hauteur exacte pour le gain µV/px.
-                height = max(140, int(fitted))
+                height = max(1, int(fitted))
         widget.setMinimumHeight(height)  # type: ignore[attr-defined]
         # Hauteur fixe pour tous les graphs (scroll si la fenêtre est plus petite).
         # fill (legacy) : Expanding pour occuper le viewport.
@@ -329,7 +347,14 @@ class PanelGrid(QScrollArea):
         else:
             widget.setMaximumHeight(16777215)  # type: ignore[attr-defined]
             v_policy = QSizePolicy.Policy.Expanding
-        widget.setSizePolicy(QSizePolicy.Policy.Expanding, v_policy)  # type: ignore[attr-defined]
+        # Largeur déjà figée : ne pas la rendre Expanding ici.
+        h_policy = (
+            QSizePolicy.Policy.Fixed
+            if getattr(widget, "frozen_width_px", None) is not None
+            or getattr(widget, "fitted_width_px", None) is not None
+            else QSizePolicy.Policy.Expanding
+        )
+        widget.setSizePolicy(h_policy, v_policy)  # type: ignore[attr-defined]
 
     def _on_panel_style_changed(self, placement: PanelPlacement) -> None:
         """Recaler la hauteur après un override d’affichage / style local."""
@@ -377,10 +402,58 @@ class PanelGrid(QScrollArea):
             if callable(apply):
                 apply(shared)
 
+    def showEvent(self, event: Any) -> None:  # noqa: N802
+        super().showEvent(event)
+        if self._panels_missing_width_lock():
+            self._width_freeze_attempts = 0
+            self._width_freeze_timer.start()
+
     def resizeEvent(self, event: Any) -> None:  # noqa: N802
         super().resizeEvent(event)
         if self._fill and self._order:
             self._fill_timer.start()
+        if self.isVisible() and self._panels_missing_width_lock():
+            self._width_freeze_attempts = 0
+            self._width_freeze_timer.start()
+
+    def _panels_missing_width_lock(self) -> bool:
+        for placement in self._order:
+            widget = self._panels.get(placement.key)
+            if widget is None:
+                continue
+            if getattr(widget, "fitted_width_px", None) is not None:
+                continue
+            if getattr(widget, "frozen_width_px", None) is not None:
+                continue
+            return True
+        return False
+
+    def _freeze_panel_widths_once(self) -> None:
+        """Mémoriser la largeur affichée et ne plus suivre le viewport."""
+        if not self.isVisible():
+            return
+        pending = False
+        for placement in self._order:
+            widget = self._panels.get(placement.key)
+            if widget is None:
+                continue
+            if getattr(widget, "fitted_width_px", None) is not None:
+                continue
+            if getattr(widget, "frozen_width_px", None) is not None:
+                continue
+            try:
+                width = int(widget.width())
+            except Exception:
+                pending = True
+                continue
+            if width < 320:
+                pending = True
+                continue
+            widget.frozen_width_px = width  # type: ignore[attr-defined]
+            self._apply_panel_width(widget, placement)
+        if pending and self._width_freeze_attempts < 40:
+            self._width_freeze_attempts += 1
+            self._width_freeze_timer.start()
 
     def _reflow_fill_heights(self) -> None:
         """Recalculer la hauteur min pour coller au viewport (mode fill)."""
@@ -438,13 +511,13 @@ class PanelGrid(QScrollArea):
             widget = self._panels[placement.key]
             info = panel_info(placement.panel)
             self._apply_panel_height(widget, placement)
-            widget.setMinimumWidth(0)  # type: ignore[attr-defined]
             widget.setParent(self._container)  # type: ignore[attr-defined]
             row, column = divmod(index, self._columns)
             n_rows = max(n_rows, row + 1)
             span = self._columns if info.is_global and info.key.startswith("montage_") else 1
             span = min(span, self._columns)
             self._layout.addWidget(widget, row, column, 1, span)  # type: ignore[arg-type]
+            self._apply_panel_width(widget, placement)
             widget.show()  # type: ignore[attr-defined]
         for column in range(self._columns):
             self._layout.setColumnStretch(column, 1)

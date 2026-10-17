@@ -212,6 +212,7 @@ class ViewLimitsMixin:
             self._refresh_scale_bars()
             self.draw_idle()
             self.xAutoscaleRequested.emit(xlim)
+            self.viewChanged.emit()
             return
         xlim = self._union_x_from_all_plots()
         if xlim is not None:
@@ -223,6 +224,7 @@ class ViewLimitsMixin:
         self._refresh_scale_bars()
         self.draw_idle()
         self.xAutoscaleRequested.emit(xlim)
+        self.viewChanged.emit()
 
     def data_xlim(self) -> tuple[float, float] | None:
         """Étendue X des courbes affichées (hors barres d’échelle)."""

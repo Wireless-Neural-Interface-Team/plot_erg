@@ -391,8 +391,8 @@ class LocalViewParams(QWidget):
             160, 1200, int(settings.graph_height_px), step=20, suffix=" px"
         )
         self._graph_height.setToolTip(
-            "Hauteur du panneau si « Taille amp. » n’est pas en manuel. "
-            "Sinon la hauteur suit Taille amp. + Amplitude."
+            "Hauteur du panneau si l’amplitude n’est pas en manuel. "
+            "Sinon la hauteur suit la valeur et la taille d’amplitude."
         )
         self._show_scale_bars = QCheckBox(
             "Barres flottantes (sinon graduations sur les axes)"
@@ -406,6 +406,12 @@ class LocalViewParams(QWidget):
         self._scale_bar_amp_manual = QCheckBox("Manuel")
         self._scale_bar_amp_manual.setChecked(
             bool(getattr(style, "scale_bar_amplitude_manual", False))
+            or bool(getattr(style, "scale_bar_amplitude_length_manual", False))
+        )
+        self._scale_bar_amp_manual.setToolTip(
+            "Échelle d’amplitude manuelle : valeur (µV) et taille (px) ensemble. "
+            "Coche : la hauteur du graphique suit ces deux valeurs "
+            "(ex. 50 µV = 40 px)."
         )
         self._scale_bar_amp = _spin(
             0.01,
@@ -417,13 +423,7 @@ class LocalViewParams(QWidget):
         )
         self._scale_bar_amp.setToolTip(
             "Amplitude du bâton vertical (ex. 50 µV). "
-            "Seule : le bâton suit le zoom. "
-            "Avec « Taille amp. » : fixe la hauteur du graph "
-            "(pas de recalcul du libellé)."
-        )
-        self._scale_bar_amp_len_manual = QCheckBox("Manuel")
-        self._scale_bar_amp_len_manual.setChecked(
-            bool(getattr(style, "scale_bar_amplitude_length_manual", False))
+            "Avec la taille en pixels, fixe la hauteur du graphique."
         )
         _amp_len0 = int(
             round(float(getattr(style, "scale_bar_amplitude_length_px", 40.0) or 40.0))
@@ -433,13 +433,18 @@ class LocalViewParams(QWidget):
         )
         self._scale_bar_amp_len_px.setToolTip(
             "Hauteur du bâton en pixels. "
-            "Seule : le libellé est calculé depuis le zoom. "
-            "Avec Amplitude : fixe la hauteur du graph "
-            "(ex. 50 µV = 40 px)."
+            "Activée avec la case Amplitude. "
+            "Avec la valeur, fixe la hauteur du graphique (ex. 50 µV = 40 px)."
         )
         self._scale_bar_time_manual = QCheckBox("Manuel")
         self._scale_bar_time_manual.setChecked(
             bool(getattr(style, "scale_bar_time_manual", False))
+            or bool(getattr(style, "scale_bar_time_length_manual", False))
+        )
+        self._scale_bar_time_manual.setToolTip(
+            "Échelle de temps manuelle : durée (ms) et taille (px) ensemble. "
+            "Coche : la largeur du graphique suit ces deux valeurs "
+            "(ex. 200 ms = 40 px)."
         )
         # UI en millisecondes (stockage interne en secondes).
         time_s = float(getattr(style, "scale_bar_time_s", 0.1) or 0.1)
@@ -453,13 +458,7 @@ class LocalViewParams(QWidget):
         )
         self._scale_bar_time_ms.setToolTip(
             "Durée du bâton horizontal (ex. 200 ms). "
-            "Seule : le bâton suit le zoom X, libellé = cette durée. "
-            "Avec « Taille temps » : fixe la largeur du graph "
-            "(pas de recalcul du libellé)."
-        )
-        self._scale_bar_time_len_manual = QCheckBox("Manuel")
-        self._scale_bar_time_len_manual.setChecked(
-            bool(getattr(style, "scale_bar_time_length_manual", False))
+            "Avec la taille en pixels, fixe la largeur du graphique."
         )
         self._scale_bar_time_len_px = _int_spin(
             4,
@@ -469,9 +468,8 @@ class LocalViewParams(QWidget):
         )
         self._scale_bar_time_len_px.setToolTip(
             "Longueur du bâton de temps en pixels. "
-            "Seule : le libellé est calculé depuis le zoom X. "
-            "Avec Durée : fixe la largeur du graph "
-            "(ex. 200 ms = 40 px)."
+            "Activée avec la case Temps. "
+            "Avec la durée, fixe la largeur du graphique (ex. 200 ms = 40 px)."
         )
         amp_row = QWidget(page)
         amp_lay = QHBoxLayout(amp_row)
@@ -479,24 +477,12 @@ class LocalViewParams(QWidget):
         amp_lay.setSpacing(6)
         amp_lay.addWidget(self._scale_bar_amp_manual)
         amp_lay.addWidget(self._scale_bar_amp, 1)
-        amp_len_row = QWidget(page)
-        amp_len_lay = QHBoxLayout(amp_len_row)
-        amp_len_lay.setContentsMargins(0, 0, 0, 0)
-        amp_len_lay.setSpacing(6)
-        amp_len_lay.addWidget(self._scale_bar_amp_len_manual)
-        amp_len_lay.addWidget(self._scale_bar_amp_len_px, 1)
         time_row = QWidget(page)
         time_lay = QHBoxLayout(time_row)
         time_lay.setContentsMargins(0, 0, 0, 0)
         time_lay.setSpacing(6)
         time_lay.addWidget(self._scale_bar_time_manual)
         time_lay.addWidget(self._scale_bar_time_ms, 1)
-        time_len_row = QWidget(page)
-        time_len_lay = QHBoxLayout(time_len_row)
-        time_len_lay.setContentsMargins(0, 0, 0, 0)
-        time_len_lay.setSpacing(6)
-        time_len_lay.addWidget(self._scale_bar_time_len_manual)
-        time_len_lay.addWidget(self._scale_bar_time_len_px, 1)
         bar_lw = float(getattr(style, "scale_bar_linewidth", 1.4) or 1.4)
         self._scale_bar_linewidth = _spin(
             0.2, 20.0, bar_lw, decimals=2, step=0.1, suffix=" pt"
@@ -546,8 +532,6 @@ class LocalViewParams(QWidget):
         )
         self._scale_bar_amp_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._scale_bar_time_manual.toggled.connect(self._sync_scale_bar_inputs)
-        self._scale_bar_amp_len_manual.toggled.connect(self._sync_scale_bar_inputs)
-        self._scale_bar_time_len_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._show_scale_bars.toggled.connect(self._sync_scale_bar_inputs)
         self._sync_scale_bar_inputs()
         _max_pts_lo, _max_pts_hi = 500, 200_000
@@ -584,9 +568,9 @@ class LocalViewParams(QWidget):
             self._graph_height.hide()
         layout_form.addRow(self._show_scale_bars)
         layout_form.addRow("Amplitude barre :", amp_row)
-        layout_form.addRow("Taille amp. :", amp_len_row)
+        layout_form.addRow("Taille amp. :", self._scale_bar_amp_len_px)
         layout_form.addRow("Temps barre :", time_row)
-        layout_form.addRow("Taille temps :", time_len_row)
+        layout_form.addRow("Taille temps :", self._scale_bar_time_len_px)
         layout_form.addRow("Épaisseur du trait :", self._scale_bar_linewidth)
         layout_form.addRow("Temps — horizontal :", self._scale_bar_time_dx)
         layout_form.addRow("Temps — vertical :", self._scale_bar_time_dy)
@@ -958,24 +942,20 @@ class LocalViewParams(QWidget):
     def _sync_scale_bar_inputs(self, *_args: Any) -> None:
         floating = bool(self._show_scale_bars.isChecked())
         # Valeur / taille px : barres flottantes ou graduations sur les axes.
+        amp_on = bool(self._scale_bar_amp_manual.isChecked())
+        time_on = bool(self._scale_bar_time_manual.isChecked())
         self._scale_bar_amp_manual.setEnabled(True)
         self._scale_bar_time_manual.setEnabled(True)
-        self._scale_bar_amp.setEnabled(bool(self._scale_bar_amp_manual.isChecked()))
-        self._scale_bar_time_ms.setEnabled(bool(self._scale_bar_time_manual.isChecked()))
-        self._scale_bar_amp_len_manual.setEnabled(True)
-        self._scale_bar_time_len_manual.setEnabled(True)
-        self._scale_bar_amp_len_px.setEnabled(
-            bool(self._scale_bar_amp_len_manual.isChecked())
-        )
-        self._scale_bar_time_len_px.setEnabled(
-            bool(self._scale_bar_time_len_manual.isChecked())
-        )
+        self._scale_bar_amp.setEnabled(amp_on)
+        self._scale_bar_amp_len_px.setEnabled(amp_on)
+        self._scale_bar_time_ms.setEnabled(time_on)
+        self._scale_bar_time_len_px.setEnabled(time_on)
         self._scale_bar_linewidth.setEnabled(floating)
         self._scale_bar_dx.setEnabled(floating)
         self._scale_bar_dy.setEnabled(floating)
         self._scale_bar_time_dx.setEnabled(floating)
         self._scale_bar_time_dy.setEnabled(floating)
-        amp_len_on = bool(self._scale_bar_amp_len_manual.isChecked())
+        amp_len_on = amp_on
         if hasattr(self, "_graph_height") and bool(
             getattr(self, "_show_graph_height", True)
         ):
@@ -1054,11 +1034,9 @@ class LocalViewParams(QWidget):
             self._show_scale_bars,
             self._scale_bar_amp_manual,
             self._scale_bar_amp,
+            self._scale_bar_amp_len_px,
             self._scale_bar_time_manual,
             self._scale_bar_time_ms,
-            self._scale_bar_amp_len_manual,
-            self._scale_bar_amp_len_px,
-            self._scale_bar_time_len_manual,
             self._scale_bar_time_len_px,
             self._scale_bar_linewidth,
             self._scale_bar_dx,
@@ -1251,11 +1229,11 @@ class LocalViewParams(QWidget):
             scale_bar_amplitude_manual=bool(self._scale_bar_amp_manual.isChecked()),
             scale_bar_amplitude=float(self._scale_bar_amp.value()),
             scale_bar_amplitude_length_manual=bool(
-                self._scale_bar_amp_len_manual.isChecked()
+                self._scale_bar_amp_manual.isChecked()
             ),
             scale_bar_amplitude_length_px=float(self._scale_bar_amp_len_px.value()),
             scale_bar_time_length_manual=bool(
-                self._scale_bar_time_len_manual.isChecked()
+                self._scale_bar_time_manual.isChecked()
             ),
             scale_bar_time_length_px=float(self._scale_bar_time_len_px.value()),
             scale_bar_linewidth=float(self._scale_bar_linewidth.value()),

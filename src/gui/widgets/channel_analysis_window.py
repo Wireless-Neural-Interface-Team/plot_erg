@@ -35,7 +35,9 @@ from gui.widgets.custom_zoom_dialog import ask_custom_zoom
 from gui.widgets.panel_canvas import (
     DetachedPanelWindow,
     DetachedZoomWindow,
+    initial_zoom_panel_height,
     zoom_grid_panel_height,
+    zoom_scale_bar_amp_fit_active,
     _Y_SCALE_NONNEG_FAMILIES,
     _axis_ylim_setting,
     y_scale_family,
@@ -77,6 +79,76 @@ _ANALYSIS_TEMPORAL_PANELS = frozenset(
         "mean_rms",
     }
 )
+# Spike scope : formes d’onde, axe en ms. La sélection des spikes suit
+# la fenêtre de temps des traces, pas ces panneaux.
+_SPIKE_SCOPE_PANELS = frozenset({"analysis_overlay", "spike_overlay"})
+_SPIKE_SCOPE_TIME_PANELS = _ANALYSIS_TEMPORAL_PANELS | {"full_recording"}
+
+
+def _as_time_span(value: object) -> tuple[float, float] | None:
+    if not isinstance(value, tuple) or len(value) != 2:
+        return None
+    try:
+        start, end = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if end < start:
+        start, end = end, start
+    if not (end > start):
+        return None
+    return start, end
+
+
+def _view_covers_data(
+    view: tuple[float, float], data: tuple[float, float] | None
+) -> bool:
+    """True si le zoom utilisateur n’a pas rétréci l’étendue des données."""
+    if data is None:
+        return True
+    span = max(float(data[1]) - float(data[0]), 1e-9)
+    tol = max(1e-3, 0.002 * span)
+    return float(view[0]) <= float(data[0]) + tol and float(view[1]) >= float(data[1]) - tol
+
+
+def _host_view_xlim(host: Any) -> tuple[float, float] | None:
+    try:
+        axes = list(getattr(getattr(host, "figure", None), "axes", []) or [])
+        if not axes:
+            return None
+        xlim = axes[0].get_xlim()
+        return _as_time_span((float(xlim[0]), float(xlim[1])))
+    except Exception:
+        return None
+
+
+def _qt_alive(obj: Any) -> bool:
+    """True si le wrapper Python pointe encore vers un objet Qt C++."""
+    if obj is None:
+        return False
+    try:
+        from shiboken6 import isValid
+
+        return bool(isValid(obj))
+    except Exception:
+        try:
+            obj.objectName()  # type: ignore[attr-defined]
+            return True
+        except RuntimeError:
+            return False
+
+
+def _grid_of(widget: Any) -> PanelGrid | None:
+    parent = widget
+    while parent is not None:
+        if not _qt_alive(parent):
+            return None
+        if isinstance(parent, PanelGrid):
+            return parent
+        try:
+            parent = parent.parentWidget()
+        except RuntimeError:
+            return None
+    return None
 
 
 class ChannelAnalysisWindow(QWidget):
@@ -342,10 +414,17 @@ class ChannelAnalysisWindow(QWidget):
             root.addWidget(splitter)
 
         self._request_factory: RequestFactory | None = None
+        self._spike_scope_view_host: Any = None
+        self._spike_scope_refreshing = False
+        self._spike_scope_window_key: dict[int, tuple[Any, ...]] = {}
         self._bars_debouncer = Debouncer(80, self)
         self._bars_debouncer.triggered.connect(self._after_bars_moved)
         self._analysis_bars_debouncer = Debouncer(80, self)
         self._analysis_bars_debouncer.triggered.connect(self._after_analysis_bars_moved)
+        self._spike_view_debouncer = Debouncer(120, self)
+        self._spike_view_debouncer.triggered.connect(
+            self._refresh_spike_scope_for_displayed_window
+        )
         self._wire_range_toolbar_once()
         self._apply_preview_mode_ui()
         self._rebuild_placements()
@@ -1168,8 +1247,7 @@ class ChannelAnalysisWindow(QWidget):
                 self.channel_name,
                 group,
                 zoom_seed,
-                panel_height=zoom_grid_panel_height(zoom_seed)
-                or self._panel_height(),
+                panel_height=initial_zoom_panel_height(zoom_seed),
                 zoom_key=key,
                 zoom_label=label,
                 parent=parent_win,
@@ -1189,12 +1267,44 @@ class ChannelAnalysisWindow(QWidget):
         # Même échelle Y entre fenêtres zoom (même flux) — X reste propre à chaque plage.
         self._sync_zoom_shared_ylims()
 
+    def _widget_skips_zoom_y_sync(self, widget: Any) -> bool:
+        """Ne pas fusionner l’axe Y si échelle locale (ylim ou barre amplitude fit)."""
+        request = getattr(widget, "_last_request", None)
+        host = getattr(widget, "plot_host", None) or getattr(widget, "_plot", None)
+        if request is not None and host is not None:
+            figure = getattr(host, "figure", None)
+            if figure is not None and _axis_ylim_setting(figure, request, 0) is not None:
+                return True
+            if zoom_scale_bar_amp_fit_active(request.settings):
+                return True
+            plot = getattr(host, "_plot", host)
+            fit = getattr(plot, "scale_bar_widget_fit_enabled", None)
+            if callable(fit) and bool(fit()):
+                return True
+        return False
+
+    def _refit_zoom_scale_bars(self) -> None:
+        """Re-appliquer le fit échelle sur chaque panneau de chaque fenêtre zoom."""
+        for win in self._zoom_windows.values():
+            if not isinstance(win, DetachedZoomWindow):
+                continue
+            panels = getattr(getattr(win, "grid", None), "_panels", None) or {}
+            for widget in panels.values():
+                run_fit = getattr(widget, "_run_scale_bar_widget_fit", None)
+                if not callable(run_fit):
+                    continue
+                try:
+                    run_fit()
+                except Exception:
+                    pass
+
     def _sync_zoom_shared_ylims(self) -> None:
         """Une échelle Y commune aux zooms affichés d’une même famille de courbes.
 
         WIDE avec WIDE, HIGH avec HIGH, etc. L’axe X n’est pas synchronisé
         (chaque fenêtre garde sa fenêtre temporelle). Une échelle Y manuelle
-        (onglet Canal de la fenêtre) reste prioritaire pour ce panneau.
+        (onglet Canal) ou une barre d’amplitude valeur+px (fit widget) reste
+        propre à chaque fenêtre.
         """
         windows = [
             win
@@ -1217,13 +1327,8 @@ class ChannelAnalysisWindow(QWidget):
                 )
                 if not family:
                     continue
-                # Y manuel local → ne pas écraser ni forcer les autres sur cette valeur.
-                request = getattr(widget, "_last_request", None)
-                host = getattr(widget, "plot_host", None) or getattr(widget, "_plot", None)
-                if request is not None and host is not None:
-                    figure = getattr(host, "figure", None)
-                    if figure is not None and _axis_ylim_setting(figure, request, 0) is not None:
-                        continue
+                if self._widget_skips_zoom_y_sync(widget):
+                    continue
                 peers.setdefault(family, []).append(widget)
 
         for family, widgets in peers.items():
@@ -1248,9 +1353,12 @@ class ChannelAnalysisWindow(QWidget):
                 token in family for token in ("psth", "trial_rate", "isi", ":rms")
             )
             for widget in widgets:
+                if self._widget_skips_zoom_y_sync(widget):
+                    continue
                 apply = getattr(widget, "apply_shared_y_scale", None)
                 if callable(apply):
                     apply(shared, non_negative=nonneg)
+        self._refit_zoom_scale_bars()
 
     def _on_zoom_window_closed(self) -> None:
         sender = self.sender()
@@ -1342,6 +1450,7 @@ class ChannelAnalysisWindow(QWidget):
                 )
 
             window.schedule_render(factory, force=True)
+            self._bind_spike_scope_views(window.grid)
             return
 
         request = self._request_factory(self, window.placement)
@@ -1804,10 +1913,174 @@ class ChannelAnalysisWindow(QWidget):
         self._update_range_counts()
         self._analysis_bars_debouncer.request()
 
-    def _refresh_spike_scope_for_active_range(self) -> None:
-        """La plage active filtre le spike scope — redessiner sans bouger les traces."""
-        if not self._analysis_from_toggles().show_overlay:
+    def _window_from_temporal_host(
+        self, host: Any
+    ) -> tuple[tuple[float, float] | None, bool]:
+        """Fenêtre affichée d’un graph temporel, ou (None, …) si elle couvre tout.
+
+        Le second booléen est True quand les bornes sont en temps fichier.
+        """
+        if not _qt_alive(host):
+            return None, False
+        try:
+            canvas = host.parentWidget()
+        except RuntimeError:
+            return None, False
+        placement = getattr(canvas, "placement", None)
+        view = _host_view_xlim(host)
+        data = None
+        reader = getattr(host, "data_xlim", None)
+        if callable(reader):
+            try:
+                data = _as_time_span(reader())
+            except Exception:
+                data = None
+        if view is None or _view_covers_data(view, data):
+            return None, False
+        absolute = placement is not None and str(placement.panel) == "full_recording"
+        if absolute:
+            offset = continuous_sync_offset_s(
+                self._stim_times_s, self.settings.time_sync
+            )
+            return (float(view[0]) + offset, float(view[1]) + offset), True
+        return view, False
+
+    def _displayed_spike_window_for_grid(
+        self, grid: Any
+    ) -> tuple[tuple[float, float] | None, bool]:
+        host = self._spike_scope_view_host
+        if not _qt_alive(host):
+            self._spike_scope_view_host = None
+            host = None
+        if host is not None and _grid_of(host) is grid:
+            return self._window_from_temporal_host(host)
+        panels = getattr(grid, "_panels", {}) or {}
+        for widget in panels.values():
+            placement = getattr(widget, "placement", None)
+            if placement is None or str(placement.panel) not in _SPIKE_SCOPE_TIME_PANELS:
+                continue
+            candidate = getattr(widget, "plot_host", None) or getattr(widget, "_plot", None)
+            if not _qt_alive(candidate):
+                continue
+            return self._window_from_temporal_host(candidate)
+        return None, False
+
+    def _bind_spike_scope_views(self, grid: Any) -> None:
+        panels = getattr(grid, "_panels", {}) or {}
+        for widget in panels.values():
+            placement = getattr(widget, "placement", None)
+            if placement is None or str(placement.panel) not in _SPIKE_SCOPE_TIME_PANELS:
+                continue
+            host = getattr(widget, "plot_host", None) or getattr(widget, "_plot", None)
+            if not _qt_alive(host):
+                continue
+            signal = getattr(host, "viewChanged", None)
+            # PySide avertit (RuntimeWarning) si on déconnecte un slot jamais branché.
+            if signal is not None and not getattr(host, "_spike_view_bound", False):
+                signal.connect(self._on_temporal_view_changed)
+                host._spike_view_bound = True
+            self._bind_temporal_x_range(host)
+
+    def _bind_temporal_x_range(self, host: Any) -> None:
+        """Tout changement d’axe X (après le premier affichage) relance la détection."""
+        if not _qt_alive(host) or getattr(host, "_spike_x_bound", False):
             return
+        plots = list(getattr(host, "plot_items", lambda: [])() or [])
+        if not plots:
+            return
+        bound = False
+        for plot in plots:
+            try:
+                vb = plot.getViewBox()
+            except Exception:
+                continue
+            signal = getattr(vb, "sigXRangeChanged", None)
+            if signal is None:
+                continue
+            signal.connect(lambda *_a, h=host: self._note_temporal_host(h))
+            bound = True
+        host._spike_x_bound = bound
+
+    def _note_temporal_host(self, host: Any) -> None:
+        if not _qt_alive(host) or self._spike_scope_refreshing:
+            return
+        self._spike_scope_view_host = host
+        self._spike_view_debouncer.request()
+
+    def _on_temporal_view_changed(self) -> None:
+        self._note_temporal_host(self.sender())
+
+    def _zoom_window_owning_grid(self, grid: Any) -> DetachedZoomWindow | None:
+        for win in list(self._zoom_windows.values()):
+            if getattr(win, "grid", None) is grid:
+                return win
+        return None
+
+    def _refresh_spike_scope_for_displayed_window(self) -> None:
+        """Recalculer le spike scope de la grille dont la fenêtre de temps a bougé."""
+        if self._request_factory is None or self._spike_scope_refreshing:
+            return
+        host = self._spike_scope_view_host
+        if not _qt_alive(host):
+            self._spike_scope_view_host = None
+            return
+        grid = _grid_of(host)
+        if grid is None:
+            return
+        window, absolute = self._window_from_temporal_host(host)
+        key = (
+            None
+            if window is None
+            else (round(float(window[0]), 6), round(float(window[1]), 6)),
+            bool(absolute),
+        )
+        if self._spike_scope_window_key.get(id(grid)) == key:
+            return
+        self._spike_scope_window_key[id(grid)] = key
+        self._rerender_spike_scopes(grid, window, absolute)
+
+    def _rerender_spike_scopes(
+        self,
+        grid: Any,
+        window: tuple[float, float] | None,
+        absolute: bool,
+    ) -> None:
+        panels = getattr(grid, "_panels", {}) or {}
+        targets = [
+            widget
+            for widget in panels.values()
+            if str(getattr(getattr(widget, "placement", None), "panel", ""))
+            in _SPIKE_SCOPE_PANELS
+        ]
+        if not targets or self._request_factory is None:
+            return
+        zoom = self._zoom_window_owning_grid(grid)
+        self._spike_scope_refreshing = True
+        try:
+            for widget in targets:
+                placement = widget.placement
+                request = self._request_factory(self, placement)  # type: ignore[misc]
+                if request is None:
+                    continue
+                if zoom is not None:
+                    request = replace(
+                        request,
+                        settings=settings_for_zoom_window(zoom.local_settings()),
+                        highlight_zooms=(),
+                    )
+                widget.render(
+                    replace(
+                        request,
+                        preserve_view=True,
+                        visible_time_s=window,
+                        visible_time_absolute=absolute,
+                    )
+                )
+        finally:
+            self._spike_scope_refreshing = False
+
+    def _refresh_after_range_moved(self) -> None:
+        """PSTH / raster suivent la plage. Le spike scope suit la fenêtre affichée."""
         self._preserve_view = True
         self._sync_settings_from_bars()
         self.refreshRequested.emit(self)
@@ -1815,7 +2088,7 @@ class ChannelAnalysisWindow(QWidget):
     def _after_bars_moved(self) -> None:
         """Déplacement des barres continuous → zooms (si appliqués)."""
         if not self._zooms_applied:
-            self._refresh_spike_scope_for_active_range()
+            self._refresh_after_range_moved()
             return
         if self.is_analysis_view():
             self._after_analysis_bars_moved()
@@ -1833,7 +2106,7 @@ class ChannelAnalysisWindow(QWidget):
             self._render_zoom_window(zoom)
         self._sync_zoom_shared_ylims()
         self._status.setText("Barres déplacées — zooms actualisés.")
-        self._refresh_spike_scope_for_active_range()
+        self._refresh_after_range_moved()
 
     def _continuous_zoom_panel_lists(
         self,
@@ -1884,7 +2157,7 @@ class ChannelAnalysisWindow(QWidget):
     def _after_analysis_bars_moved(self) -> None:
         """Déplacement des barres → zooms analyse (fenêtre détachée)."""
         if not self._zooms_applied:
-            self._refresh_spike_scope_for_active_range()
+            self._refresh_after_range_moved()
             return
         analysis = self._ensure_analysis_curves()
         analysis_panels: list[PanelPlacement] = []
@@ -1911,7 +2184,7 @@ class ChannelAnalysisWindow(QWidget):
             self._render_zoom_window(zoom)
         self._sync_zoom_shared_ylims()
         self._status.setText("Barres déplacées — zooms actualisés.")
-        self._refresh_spike_scope_for_active_range()
+        self._refresh_after_range_moved()
 
     def _sync_analysis_range_ctrl_from_list(self) -> None:
         """Pousser les plages partagées vers le controller analyse (coords t_rel)."""
@@ -2146,6 +2419,16 @@ class ChannelAnalysisWindow(QWidget):
             preserve = keep and not placement.has_custom_zoom
             request = self._request_factory(self, placement)  # type: ignore[misc]
             if request is not None:
+                if (
+                    preserve
+                    and str(placement.panel) in _SPIKE_SCOPE_PANELS
+                ):
+                    window, absolute = self._displayed_spike_window_for_grid(self.grid)
+                    request = replace(
+                        request,
+                        visible_time_s=window,
+                        visible_time_absolute=absolute,
+                    )
                 if preserve:
                     return replace(request, preserve_view=True)
                 return replace(request, preserve_view=False) if keep else request
@@ -2173,6 +2456,7 @@ class ChannelAnalysisWindow(QWidget):
 
     def _on_render_finished(self, drawn: int, elapsed_s: float) -> None:
         self._preserve_view = False
+        self._bind_spike_scope_views(self.grid)
         n_zoom = len(self._zoom_placements) if self._zoom_windows else 0
         n_an = len(self._analysis_placements)
         parts: list[str] = []

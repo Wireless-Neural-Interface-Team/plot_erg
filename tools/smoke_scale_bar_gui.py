@@ -81,11 +81,9 @@ def _enable_both_manual(
     params._show_scale_bars.setChecked(True)
     params._scale_bar_amp_manual.setChecked(True)
     params._scale_bar_amp.setValue(amp)
-    params._scale_bar_amp_len_manual.setChecked(True)
     params._scale_bar_amp_len_px.setValue(amp_px)
     params._scale_bar_time_manual.setChecked(True)
     params._scale_bar_time_ms.setValue(time_ms)
-    params._scale_bar_time_len_manual.setChecked(True)
     params._scale_bar_time_len_px.setValue(time_px)
 
 

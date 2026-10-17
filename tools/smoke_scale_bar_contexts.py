@@ -276,7 +276,7 @@ def test_zoom_window() -> None:
     expect_w = (t1 - t0) * (time_px / time_s)
     if needed_w is None or not _close(needed_w, expect_w, tol=0.05):
         _fail(f"zoom largeur {needed_w} ≠ {expect_w}")
-    # ylim Canal manuel → pas de fit hauteur.
+    # ylim Canal manuel : la plage Y visible fixe le span, la hauteur suit le gain.
     spec2 = PanelSpec(
         title="Zoom ylim fixe",
         xlabel="Temps (s)",
@@ -290,9 +290,11 @@ def test_zoom_window() -> None:
         scale_bars=_bars(amp=amp, amp_px=amp_px, time_s=time_s, time_px=time_px),
     )
     _show(host, spec2)
-    if host.scale_bar_needed_view_height_px() is not None:
-        _fail("zoom: fit hauteur doit être None si ylim manuel")
-    print("  OK  fit actif (ylim auto) / inactif (ylim Canal)")
+    needed_h_fixed = host.scale_bar_needed_view_height_px()
+    expect_h_fixed = 400.0 * (amp_px / amp)
+    if needed_h_fixed is None or not _close(needed_h_fixed, expect_h_fixed, tol=0.05):
+        _fail(f"zoom ylim manuel hauteur {needed_h_fixed} ≠ {expect_h_fixed}")
+    print("  OK  fit actif (ylim auto et ylim Canal)")
     _check_labels_after_zoom(host, amp=amp, time_s=time_s, label="zoom")
     host.close()
 

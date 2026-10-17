@@ -9,6 +9,7 @@ from scale_bar_model import (
     major_ticks_for_axis,
     time_value_in_axis_units,
     units_for_kind,
+    uses_shared_manual_scale,
 )
 
 
@@ -24,10 +25,13 @@ def style_scale_lengths(
     x_unit: str | None,
     y_unit: str | None,
     ax: Any,
+    shared: bool = True,
 ) -> tuple[float | None, float | None]:
     from panel_registry import _scale_bar_lengths
 
-    return _scale_bar_lengths(style, x_unit=x_unit, y_unit=y_unit, ax=ax)
+    return _scale_bar_lengths(
+        style, x_unit=x_unit, y_unit=y_unit, ax=ax, shared=shared
+    )
 
 
 def apply_mpl_scale_ticks(
@@ -38,6 +42,7 @@ def apply_mpl_scale_ticks(
     y_unit: str | None,
     x_size: float | None,
     y_size: float | None,
+    shared: bool = True,
 ) -> None:
     """Graduations matplotlib calées sur le modèle d’échelle (pas les barres flottantes)."""
     try:
@@ -56,6 +61,10 @@ def apply_mpl_scale_ticks(
     except Exception:
         w_px, h_px = 400.0, 300.0
 
+    amp_manual = shared and bool(getattr(style, "scale_bar_amplitude_manual", False))
+    amp_length_manual = shared and bool(
+        getattr(style, "scale_bar_amplitude_length_manual", False)
+    )
     if y_unit is not None and y_span > 0 and amp_manual_applies(y_unit):
         y_ticks = major_ticks_for_axis(
             lo=y0,
@@ -64,20 +73,23 @@ def apply_mpl_scale_ticks(
             axis_px=h_px,
             unit=str(y_unit),
             manual_value=float(getattr(style, "scale_bar_amplitude", 0.0) or 0.0)
-            if bool(getattr(style, "scale_bar_amplitude_manual", False))
+            if amp_manual
             else None,
-            value_manual=bool(getattr(style, "scale_bar_amplitude_manual", False)),
+            value_manual=amp_manual,
             length_px=float(getattr(style, "scale_bar_amplitude_length_px", 0.0) or 0.0)
-            if bool(getattr(style, "scale_bar_amplitude_length_manual", False))
+            if amp_length_manual
             else None,
-            length_manual=bool(getattr(style, "scale_bar_amplitude_length_manual", False)),
+            length_manual=amp_length_manual,
         )
         if y_ticks:
             ax.set_yticks([p for p, _ in y_ticks])
             ax.set_yticklabels([lab for _, lab in y_ticks])
 
     if x_unit is not None and x_span > 0:
-        time_manual = bool(getattr(style, "scale_bar_time_manual", False))
+        time_manual = shared and bool(getattr(style, "scale_bar_time_manual", False))
+        time_length_manual = shared and bool(
+            getattr(style, "scale_bar_time_length_manual", False)
+        )
         x_ticks = major_ticks_for_axis(
             lo=x0,
             hi=x1,
@@ -91,9 +103,9 @@ def apply_mpl_scale_ticks(
             else None,
             value_manual=time_manual,
             length_px=float(getattr(style, "scale_bar_time_length_px", 0.0) or 0.0)
-            if bool(getattr(style, "scale_bar_time_length_manual", False))
+            if time_length_manual
             else None,
-            length_manual=bool(getattr(style, "scale_bar_time_length_manual", False)),
+            length_manual=time_length_manual,
         )
         if x_ticks:
             ax.set_xticks([p for p, _ in x_ticks])
@@ -135,8 +147,9 @@ def apply_panel_scale_display(
         return
 
     floating = bool(getattr(style, "show_scale_bars", False))
+    shared = uses_shared_manual_scale(panel=panel)
     x_size, y_size = style_scale_lengths(
-        style, x_unit=x_unit, y_unit=y_unit, ax=ax
+        style, x_unit=x_unit, y_unit=y_unit, ax=ax, shared=shared
     )
 
     if floating:
@@ -149,12 +162,12 @@ def apply_panel_scale_display(
         dx_px, dy_px = resolved_scale_bar_offset_px(style)
         time_dx_px, time_dy_px = resolved_scale_bar_time_offset_px(style)
         y_length_px = None
-        if bool(getattr(style, "scale_bar_amplitude_length_manual", False)):
+        if shared and bool(getattr(style, "scale_bar_amplitude_length_manual", False)):
             y_px = float(getattr(style, "scale_bar_amplitude_length_px", 0.0) or 0.0)
             if y_px > 0:
                 y_length_px = y_px
         x_length_px = None
-        if bool(getattr(style, "scale_bar_time_length_manual", False)):
+        if shared and bool(getattr(style, "scale_bar_time_length_manual", False)):
             x_px = float(getattr(style, "scale_bar_time_length_px", 0.0) or 0.0)
             if x_px > 0:
                 x_length_px = x_px
@@ -175,9 +188,13 @@ def apply_panel_scale_display(
             y_length_px=y_length_px,
             x_length_px=x_length_px,
             y_value_manual=bool(
-                getattr(style, "scale_bar_amplitude_manual", False) and y_unit == "µV"
+                shared
+                and getattr(style, "scale_bar_amplitude_manual", False)
+                and y_unit == "µV"
             ),
-            x_value_manual=bool(getattr(style, "scale_bar_time_manual", False)),
+            x_value_manual=bool(
+                shared and getattr(style, "scale_bar_time_manual", False)
+            ),
         )
         return
 
@@ -189,6 +206,7 @@ def apply_panel_scale_display(
         y_unit=y_unit,
         x_size=x_size,
         y_size=y_size,
+        shared=shared,
     )
 
 

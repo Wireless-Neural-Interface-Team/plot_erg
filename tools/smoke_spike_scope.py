@@ -1,4 +1,4 @@
-"""Le spike scope suit la fenêtre avant/après le spike et la plage active."""
+"""Le spike scope suit la fenêtre avant/après le spike et la fenêtre affichée."""
 
 from __future__ import annotations
 
@@ -194,16 +194,47 @@ def main() -> int:
 
     bar = TimeRangeBar(t0_s=lo, t1_s=hi, label="active", relative_to_stim=True)
     scoped = prepare_panel(_request(rec, bars=(bar,), active=0))
-    if scoped.status != "ok" or len(scoped.series) != expected + 1:
+    if scoped.status != "ok" or len(scoped.series) != len(full.series):
         raise AssertionError(
-            f"plage active n={len(scoped.series)} attendu {expected + 1} ({scoped.status})"
+            f"la zone de zoom ne doit pas filtrer le spike scope "
+            f"n={len(scoped.series)} attendu {len(full.series)} ({scoped.status})"
+        )
+    visible_req = replace(
+        _request(rec),
+        visible_time_s=(lo, hi),
+        visible_time_absolute=False,
+    )
+    visible = prepare_panel(visible_req)
+    if visible.status != "ok" or len(visible.series) != expected + 1:
+        raise AssertionError(
+            f"fenêtre affichée n={len(visible.series)} attendu {expected + 1} ({visible.status})"
+        )
+    # Un zoom plus large sur le panneau, resserré par la fenêtre vraiment affichée.
+    tight_over_zoom = replace(
+        _request(
+            rec,
+            placement=PanelPlacement("analysis_overlay").with_custom_zoom(
+                float(times.min()) - 1.0,
+                float(times.max()) + 1.0,
+                label="large",
+            ),
+        ),
+        visible_time_s=(lo, hi),
+        visible_time_absolute=False,
+    )
+    tight = prepare_panel(tight_over_zoom)
+    if tight.status != "ok" or len(tight.series) != expected + 1:
+        raise AssertionError(
+            f"fenêtre affichée prioritaire sur le zoom "
+            f"n={len(tight.series)} attendu {expected + 1}"
         )
     key_full = screen_prepare_key(_request(rec))
     key_bar = screen_prepare_key(_request(rec, bars=(bar,), active=0))
     key_pre = screen_prepare_key(_request(rec, pre=0.5, post=1.0))
-    if key_full == key_bar or key_full == key_pre:
+    key_visible = screen_prepare_key(visible_req)
+    if key_full == key_bar or key_full == key_pre or key_full == key_visible:
         raise AssertionError("le cache écran ignore la fenêtre sélectionnée")
-    print("ok  plage active filtre les spikes et invalide le cache")
+    print("ok  fenêtre affichée filtre les spikes ; les zones de zoom non")
 
     restyled = restyle_panel_spec(full, _request(rec))
     lws = sorted(float(getattr(s, "linewidth", 1.0)) for s in restyled.series)
@@ -228,6 +259,44 @@ def main() -> int:
     if tpeak >= 400.0:
         raise AssertionError("la fenêtre −2…+4 ms inclut l’impulsion à −15 ms")
     print("ok  fenêtre plus large ré-extrait la trace")
+
+    # Après le premier affichage, une plage plus étroite relance la détection.
+    detect_calls: list[tuple[float, float] | None] = []
+    stored = [np.asarray(trial, dtype=np.float64) for trial in live.spikes.per_trial(0)]
+
+    def _detect(ch, t_rel, threshold, refractory_s=0.001, t_range_s=None, trigger_index=None):
+        del ch, t_rel, threshold, refractory_s, trigger_index
+        if t_range_s is None:
+            detect_calls.append(None)
+            return stored
+        lo, hi = float(t_range_s[0]), float(t_range_s[1])
+        detect_calls.append((lo, hi))
+        return [arr[(arr >= lo) & (arr <= hi)] for arr in stored]
+
+    live.source.spike_times_per_trial_for_channel = _detect  # type: ignore[attr-defined]
+    detect_calls.clear()
+    prepare_panel(_request(live))
+    if detect_calls:
+        raise AssertionError(f"l’essai entier ne doit pas relancer la détection {detect_calls}")
+    first = replace(
+        _request(live),
+        visible_time_s=(0.0, 0.02),
+        visible_time_absolute=False,
+    )
+    first_spec = prepare_panel(first)
+    if not detect_calls or detect_calls[-1] != (0.0, 0.02):
+        raise AssertionError(f"détection non relancée sur la plage {detect_calls}")
+    if first_spec.status != "ok":
+        raise AssertionError(f"plage étroite {first_spec.status} {first_spec.status_message}")
+    detect_calls.clear()
+    prepare_panel(first)
+    if detect_calls:
+        raise AssertionError(f"la même plage a redétecté {detect_calls}")
+    second = replace(first, visible_time_s=(0.0, 0.05), visible_time_absolute=False)
+    prepare_panel(second)
+    if not detect_calls or detect_calls[-1] != (0.0, 0.05):
+        raise AssertionError(f"second changement de plage ignoré {detect_calls}")
+    print("ok  détection relancée après affichage quand la plage change")
 
     # Matplotlib : même xlim.
     fig = Figure()

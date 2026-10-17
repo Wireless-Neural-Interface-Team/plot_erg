@@ -870,22 +870,26 @@ def _scale_bar_spec(request: Any, *, panel: str) -> ScaleBarSpec:
     if time_len <= 0:
         time_len = 40.0
     floating = bool(getattr(style, "show_scale_bars", False))
+    from scale_bar_model import uses_shared_manual_scale
+
+    # Spike scope : barre auto sur sa propre fenêtre (ms / µV), pas le gain
+    # des traces. Le panneau garde la hauteur / largeur des graphs.
+    shared = uses_shared_manual_scale(panel=panel)
     return ScaleBarSpec(
         enabled=True,
         floating=floating,
         x_unit=x_unit,
         y_unit=y_unit,
-        time_manual=bool(getattr(style, "scale_bar_time_manual", False)),
+        time_manual=shared and bool(getattr(style, "scale_bar_time_manual", False)),
         time_s=float(getattr(style, "scale_bar_time_s", 0.1) or 0.1),
-        amp_manual=bool(getattr(style, "scale_bar_amplitude_manual", False)),
+        amp_manual=shared
+        and bool(getattr(style, "scale_bar_amplitude_manual", False)),
         amplitude=float(getattr(style, "scale_bar_amplitude", 100.0) or 100.0),
-        amp_length_manual=bool(
-            getattr(style, "scale_bar_amplitude_length_manual", False)
-        ),
+        amp_length_manual=shared
+        and bool(getattr(style, "scale_bar_amplitude_length_manual", False)),
         amp_length_px=float(amp_len),
-        time_length_manual=bool(
-            getattr(style, "scale_bar_time_length_manual", False)
-        ),
+        time_length_manual=shared
+        and bool(getattr(style, "scale_bar_time_length_manual", False)),
         time_length_px=float(time_len),
         linewidth=resolved_scale_bar_linewidth(style),
         fontsize=float(getattr(style, "tick_font_size", 8.0) or 8.0),
@@ -1113,9 +1117,11 @@ def _apply_montage_shared_ylims(
 ) -> list[tuple[float, float] | None]:
     """Une échelle Y commune aux courbes auto d’un même type.
 
-    WIDE, HIGH et LOW partagent la même étendue en µV. Les autres graphs
-    (RMS, PSTH, spike scope…) partagent une échelle entre canaux du même type.
-    Une échelle déjà fixée (manuelle) n’est pas remplacée.
+    WIDE, HIGH et LOW partagent la même étendue en µV. RMS, PSTH et les
+    autres graphs du même type partagent une échelle entre canaux.
+    Le spike scope (``overlay``) reste indépendant : chaque ligne suit
+    ses propres formes d’onde. Une échelle déjà fixée (manuelle) n’est
+    pas remplacée.
     """
     out = list(row_ylims)
     if not bool(getattr(settings, "montage_shared_ylim", False)):
@@ -1123,7 +1129,7 @@ def _apply_montage_shared_ylims(
     groups: dict[str, list[int]] = {}
     for row, kind in enumerate(row_kinds):
         kind_s = str(kind)
-        if kind_s == "raster":
+        if kind_s in {"raster", "overlay"}:
             continue
         if row < len(out) and out[row] is not None:
             continue
@@ -1697,9 +1703,9 @@ def _spike_trigger_index(request: Any) -> int | None:
 
 
 def _spike_window(request: Any) -> tuple[float, float] | None:
-    """Fenêtre t_rel affichée pour les graphs spikes (zoom / plage / section)."""
+    """Fenêtre t_rel des graphs spikes hors spike scope (zoom / plage / section)."""
     try:
-        from panel_registry import _relative_stim_window, spike_scope_time_range
+        from panel_registry import _relative_stim_window, spike_panel_time_range
 
         reference = getattr(request, "reference", None)
         recordings = list(getattr(request, "recordings", []) or [])
@@ -1710,7 +1716,7 @@ def _spike_window(request: Any) -> tuple[float, float] | None:
                 )
             except StopIteration:
                 index = 0
-            window = spike_scope_time_range(request, reference, index)
+            window = spike_panel_time_range(request, reference, index)
             if window is not None:
                 return window
         window = _relative_stim_window(request)
@@ -1743,12 +1749,12 @@ def _prepare_spike_like(request: Any) -> PanelSpec:
 
 
 def _spike_trains(request: Any, trigger_index: int | None) -> list[list[np.ndarray]]:
-    """Spikes filtrés sur la fenêtre affichée (même logique que le spike scope)."""
-    from panel_registry import spike_scope_time_range
+    """Spikes filtrés pour PSTH / raster / ISI (zoom / plage / section)."""
+    from panel_registry import spike_panel_time_range
 
     trains: list[list[np.ndarray]] = []
     for index, recording in enumerate(request.recordings):
-        window = spike_scope_time_range(request, recording, index)
+        window = spike_panel_time_range(request, recording, index)
         trains.append(
             recording.spike_times(
                 request.channel_index,
@@ -2460,13 +2466,13 @@ def _prepare_montage_continuous(request: Any) -> PanelSpec:
                     _psth_mean_hz,
                     _trial_mean_firing_rate_hz,
                 )
-                from panel_registry import spike_scope_time_range
+                from panel_registry import spike_panel_time_range
 
                 color_default = _MONTAGE_EXTRA_COLORS.get(kind, "#334155")
                 for index, recording in enumerate(recordings):
                     if ch >= int(recording.n_channels):
                         continue
-                    spike_win = spike_scope_time_range(request, recording, index)
+                    spike_win = spike_panel_time_range(request, recording, index)
                     if spike_win is None:
                         spike_win = extra_section_x
                     trains = recording.spike_times(

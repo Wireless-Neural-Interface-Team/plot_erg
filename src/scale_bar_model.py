@@ -294,3 +294,20 @@ def units_for_kind(
 def amp_manual_applies(y_unit: str | None) -> bool:
     """Le spin amplitude (µV) ne s’applique qu’aux axes tension."""
     return y_unit == "µV"
+
+
+# Spike scope : fenêtre de quelques ms et amplitude des formes d’onde.
+# Le gain partagé (Amplitude / Temps des traces) ne le dimensionne pas.
+_INDEPENDENT_SCALE_KINDS = frozenset({"overlay"})
+_INDEPENDENT_SCALE_PANELS = frozenset({"analysis_overlay", "spike_overlay"})
+
+
+def uses_shared_manual_scale(
+    *, kind: str | None = None, panel: str | None = None
+) -> bool:
+    """False pour le spike scope : échelle propre, pas le gain des traces."""
+    if str(kind or "") in _INDEPENDENT_SCALE_KINDS:
+        return False
+    if str(panel or "") in _INDEPENDENT_SCALE_PANELS:
+        return False
+    return True
