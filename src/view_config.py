@@ -468,6 +468,14 @@ class PanelStyle:
     # que l’amplitude (compatibilité avec les réglages qui n’avaient qu’une paire).
     scale_bar_time_dx_px: float | None = None
     scale_bar_time_dy_px: float | None = None
+    # Échelle propre du spike scope (ms / µV). Indépendante du gain des traces.
+    # La case « Manuel » lie la valeur et la taille en pixels, comme les traces.
+    spike_scale_amplitude_manual: bool = False
+    spike_scale_amplitude: float = 50.0
+    spike_scale_amplitude_length_px: float = 40.0
+    spike_scale_time_manual: bool = False
+    spike_scale_time_ms: float = 1.0
+    spike_scale_time_length_px: float = 40.0
     # Max points drawn per curve (min/max envelope decimation above this).
     # UI range is 500…200000 ; défaut = milieu de la plage.
     max_points_per_curve: int = 100_250
@@ -687,6 +695,20 @@ def copy_scale_bar_style(target: PanelStyle, source: PanelStyle) -> PanelStyle:
         scale_bar_dy_px=amp_dy,
         scale_bar_time_dx_px=time_dx,
         scale_bar_time_dy_px=time_dy,
+        spike_scale_amplitude_manual=bool(
+            getattr(source, "spike_scale_amplitude_manual", False)
+        ),
+        spike_scale_amplitude=float(
+            getattr(source, "spike_scale_amplitude", 50.0) or 50.0
+        ),
+        spike_scale_amplitude_length_px=float(
+            getattr(source, "spike_scale_amplitude_length_px", 40.0) or 40.0
+        ),
+        spike_scale_time_manual=bool(getattr(source, "spike_scale_time_manual", False)),
+        spike_scale_time_ms=float(getattr(source, "spike_scale_time_ms", 1.0) or 1.0),
+        spike_scale_time_length_px=float(
+            getattr(source, "spike_scale_time_length_px", 40.0) or 40.0
+        ),
     )
 
 

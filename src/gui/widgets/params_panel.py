@@ -733,6 +733,16 @@ class ParamsPanel(QWidget):
         if hasattr(self, "_graph_height") and hasattr(self, "_layout_form"):
             _set_form_row_visible(self._layout_form, self._graph_height, not amp_len_on)
 
+    def _sync_spike_scale_inputs(self, *_args: Any) -> None:
+        if not hasattr(self, "_spike_scale_amp_manual"):
+            return
+        amp_on = bool(self._spike_scale_amp_manual.isChecked())
+        time_on = bool(self._spike_scale_time_manual.isChecked())
+        self._spike_scale_amp.setEnabled(amp_on)
+        self._spike_scale_amp_len.setEnabled(amp_on)
+        self._spike_scale_time_ms.setEnabled(time_on)
+        self._spike_scale_time_len.setEnabled(time_on)
+
     def _sync_stim_label_inputs(self, *_args: Any) -> None:
         enabled = bool(self._show_stim_labels.isChecked())
         for widget in (
@@ -1271,6 +1281,55 @@ class ParamsPanel(QWidget):
             "Ligne horizontale du seuil de détection (µV) sur les courbes WIDE, HIGH, "
             "LOW et le spike scope. Redessin immédiat — pas de Traiter (F5)."
         )
+        self._spike_scale_amp_manual = QCheckBox("Manuel")
+        self._spike_scale_amp_manual.setChecked(False)
+        self._spike_scale_amp_manual.setToolTip(
+            "Échelle d’amplitude du spike scope uniquement (pas les traces). "
+            "Valeur (µV) et taille (px) ensemble : le graphique s’ajuste "
+            "pour que, par exemple, 50 µV fassent 40 px."
+        )
+        self._spike_scale_amp = _spin(
+            0.01, 1_000_000.0, 50.0, decimals=2, step=5.0, suffix=" µV"
+        )
+        self._spike_scale_amp.setToolTip(
+            "Amplitude du bâton vertical du spike scope (ex. 50 µV)."
+        )
+        self._spike_scale_amp_len = _int_spin(4, 800, 40, step=5, suffix=" px")
+        self._spike_scale_amp_len.setToolTip(
+            "Hauteur du bâton d’amplitude du spike scope, en pixels."
+        )
+        self._spike_scale_time_manual = QCheckBox("Manuel")
+        self._spike_scale_time_manual.setChecked(False)
+        self._spike_scale_time_manual.setToolTip(
+            "Échelle de temps du spike scope uniquement, en millisecondes. "
+            "Durée et taille (px) ensemble : le graphique s’ajuste "
+            "pour que, par exemple, 1 ms fasse 40 px."
+        )
+        self._spike_scale_time_ms = _spin(
+            0.01, 500.0, 1.0, decimals=2, step=0.5, suffix=" ms"
+        )
+        self._spike_scale_time_ms.setToolTip(
+            "Durée du bâton horizontal du spike scope (ex. 1 ms)."
+        )
+        self._spike_scale_time_len = _int_spin(4, 800, 40, step=5, suffix=" px")
+        self._spike_scale_time_len.setToolTip(
+            "Longueur du bâton de temps du spike scope, en pixels."
+        )
+        scope_amp_row = QWidget()
+        scope_amp_lay = QHBoxLayout(scope_amp_row)
+        scope_amp_lay.setContentsMargins(0, 0, 0, 0)
+        scope_amp_lay.setSpacing(6)
+        scope_amp_lay.addWidget(self._spike_scale_amp_manual)
+        scope_amp_lay.addWidget(self._spike_scale_amp, 1)
+        scope_time_row = QWidget()
+        scope_time_lay = QHBoxLayout(scope_time_row)
+        scope_time_lay.setContentsMargins(0, 0, 0, 0)
+        scope_time_lay.setSpacing(6)
+        scope_time_lay.addWidget(self._spike_scale_time_manual)
+        scope_time_lay.addWidget(self._spike_scale_time_ms, 1)
+        self._spike_scale_amp_manual.toggled.connect(self._sync_spike_scale_inputs)
+        self._spike_scale_time_manual.toggled.connect(self._sync_spike_scale_inputs)
+        self._sync_spike_scale_inputs()
         spike_form.addRow("Mode de seuil :", self._threshold_mode)
         spike_form.addRow("Seuil fixe :", self._spike_threshold)
         spike_form.addRow("Polarité :", self._polarity)
@@ -1297,6 +1356,17 @@ class ParamsPanel(QWidget):
         spike_form.addRow("Avant le spike :", self._overlay_pre)
         spike_form.addRow("Après le spike :", self._overlay_post)
         spike_form.addRow("Opacité des traces :", self._overlay_alpha)
+        scope_scale_hint = QLabel(
+            "Échelle du spike scope (µV / ms), indépendante des traces. "
+            "Barres flottantes ou graduations : choix Affichage."
+        )
+        scope_scale_hint.setObjectName("hintLabel")
+        scope_scale_hint.setWordWrap(True)
+        spike_form.addRow(scope_scale_hint)
+        spike_form.addRow("Amplitude scope :", scope_amp_row)
+        spike_form.addRow("Taille amp. scope :", self._spike_scale_amp_len)
+        spike_form.addRow("Temps scope :", scope_time_row)
+        spike_form.addRow("Taille temps scope :", self._spike_scale_time_len)
         spike_form.addRow("Bin PSTH :", self._psth_bin)
         spike_form.addRow("Échantillonnage :", self._sampling)
         self._threshold_mode.currentIndexChanged.connect(lambda _i: self._sync_threshold_rows())
@@ -1425,6 +1495,12 @@ class ParamsPanel(QWidget):
         self._overlay_post.valueChanged.connect(lambda _v: self._emit_view())
         self._overlay_alpha.valueChanged.connect(lambda _v: self._emit_view())
         self._show_spike_threshold.toggled.connect(lambda _c: self._emit_view())
+        self._spike_scale_amp_manual.toggled.connect(lambda _c: self._emit_view())
+        self._spike_scale_time_manual.toggled.connect(lambda _c: self._emit_view())
+        self._spike_scale_amp.valueChanged.connect(lambda _v: self._emit_view())
+        self._spike_scale_amp_len.valueChanged.connect(lambda _v: self._emit_view())
+        self._spike_scale_time_ms.valueChanged.connect(lambda _v: self._emit_view())
+        self._spike_scale_time_len.valueChanged.connect(lambda _v: self._emit_view())
         # Bin PSTH / sampling : display (redraw) + config (PDF / F5).
         self._psth_bin.valueChanged.connect(lambda _v: self._emit_display_and_config())
         self._threshold.valueChanged.connect(lambda _v: self._on_processing_threshold_changed())
@@ -1879,6 +1955,25 @@ class ParamsPanel(QWidget):
             self._overlay_post.setValue(float(settings.spike_overlay_post_ms))
             self._overlay_alpha.setValue(float(settings.spike_overlay_alpha))
             self._show_spike_threshold.setChecked(bool(settings.show_spike_threshold))
+            self._spike_scale_amp_manual.setChecked(
+                bool(getattr(style, "spike_scale_amplitude_manual", False))
+            )
+            self._spike_scale_amp.setValue(
+                float(getattr(style, "spike_scale_amplitude", 50.0) or 50.0)
+            )
+            self._spike_scale_amp_len.setValue(
+                int(round(float(getattr(style, "spike_scale_amplitude_length_px", 40.0) or 40.0)))
+            )
+            self._spike_scale_time_manual.setChecked(
+                bool(getattr(style, "spike_scale_time_manual", False))
+            )
+            self._spike_scale_time_ms.setValue(
+                float(getattr(style, "spike_scale_time_ms", 1.0) or 1.0)
+            )
+            self._spike_scale_time_len.setValue(
+                int(round(float(getattr(style, "spike_scale_time_length_px", 40.0) or 40.0)))
+            )
+            self._sync_spike_scale_inputs()
             self._psth_bin.setValue(float(settings.psth_bin_window_s))
             self._sampling.setValue(int(settings.sampling_percent))
             self.sync_analysis_checks_from(settings.analysis)
@@ -2058,6 +2153,12 @@ class ParamsPanel(QWidget):
             scale_bar_dy_px=float(self._scale_bar_dy.value()),
             scale_bar_time_dx_px=float(self._scale_bar_time_dx.value()),
             scale_bar_time_dy_px=float(self._scale_bar_time_dy.value()),
+            spike_scale_amplitude_manual=bool(self._spike_scale_amp_manual.isChecked()),
+            spike_scale_amplitude=float(self._spike_scale_amp.value()),
+            spike_scale_amplitude_length_px=float(self._spike_scale_amp_len.value()),
+            spike_scale_time_manual=bool(self._spike_scale_time_manual.isChecked()),
+            spike_scale_time_ms=float(self._spike_scale_time_ms.value()),
+            spike_scale_time_length_px=float(self._spike_scale_time_len.value()),
             max_points_per_curve=int(self._max_points.value()),
         )
         legend_lines = tuple(

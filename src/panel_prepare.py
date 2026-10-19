@@ -338,6 +338,15 @@ class ScaleBarSpec:
     # Décalage échelle temps / axe horizontal (+dx droite, +dy haut).
     time_dx_px: float = 0.0
     time_dy_px: float = 0.0
+    # Échelle propre du spike scope (lignes overlay). Ignorée par les traces.
+    scope_amp_manual: bool = False
+    scope_amplitude: float = 50.0
+    scope_amp_length_manual: bool = False
+    scope_amp_length_px: float = 40.0
+    scope_time_manual: bool = False
+    scope_time_s: float = 0.001
+    scope_time_length_manual: bool = False
+    scope_time_length_px: float = 40.0
 
 
 def scale_bar_spec_settings_key(bars: ScaleBarSpec) -> tuple[Any, ...]:
@@ -353,6 +362,14 @@ def scale_bar_spec_settings_key(bars: ScaleBarSpec) -> tuple[Any, ...]:
         round(float(bars.time_s), 12),
         bool(bars.time_length_manual),
         round(float(bars.time_length_px), 3),
+        bool(getattr(bars, "scope_amp_manual", False)),
+        round(float(getattr(bars, "scope_amplitude", 0.0) or 0.0), 12),
+        bool(getattr(bars, "scope_amp_length_manual", False)),
+        round(float(getattr(bars, "scope_amp_length_px", 0.0) or 0.0), 3),
+        bool(getattr(bars, "scope_time_manual", False)),
+        round(float(getattr(bars, "scope_time_s", 0.0) or 0.0), 12),
+        bool(getattr(bars, "scope_time_length_manual", False)),
+        round(float(getattr(bars, "scope_time_length_px", 0.0) or 0.0), 3),
     )
 
 
@@ -870,11 +887,20 @@ def _scale_bar_spec(request: Any, *, panel: str) -> ScaleBarSpec:
     if time_len <= 0:
         time_len = 40.0
     floating = bool(getattr(style, "show_scale_bars", False))
-    from scale_bar_model import uses_shared_manual_scale
+    from scale_bar_model import scope_scale_params, uses_shared_manual_scale
 
-    # Spike scope : barre auto sur sa propre fenêtre (ms / µV), pas le gain
-    # des traces. Le panneau garde la hauteur / largeur des graphs.
+    # Spike scope : sa propre échelle (ms / µV), pas le gain des traces.
+    # Un panneau entièrement overlay se cale sur cette échelle ; une ligne
+    # overlay dans un montage affiche la barre sans changer le gain des traces.
     shared = uses_shared_manual_scale(panel=panel)
+    (
+        scope_amp_manual,
+        scope_amplitude,
+        scope_amp_px,
+        scope_time_manual,
+        scope_time_s,
+        scope_time_px,
+    ) = scope_scale_params(style)
     return ScaleBarSpec(
         enabled=True,
         floating=floating,
@@ -897,6 +923,14 @@ def _scale_bar_spec(request: Any, *, panel: str) -> ScaleBarSpec:
         dy_px=dy_px,
         time_dx_px=time_dx_px,
         time_dy_px=time_dy_px,
+        scope_amp_manual=scope_amp_manual,
+        scope_amplitude=scope_amplitude,
+        scope_amp_length_manual=scope_amp_manual,
+        scope_amp_length_px=scope_amp_px,
+        scope_time_manual=scope_time_manual,
+        scope_time_s=scope_time_s,
+        scope_time_length_manual=scope_time_manual,
+        scope_time_length_px=scope_time_px,
     )
 
 

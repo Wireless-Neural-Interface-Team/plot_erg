@@ -311,3 +311,41 @@ def uses_shared_manual_scale(
     if str(panel or "") in _INDEPENDENT_SCALE_PANELS:
         return False
     return True
+
+
+def scope_scale_params(style: object) -> tuple[bool, float, float, bool, float, float]:
+    """Échelle manuelle du spike scope.
+
+    Retourne ``(amp_manual, amplitude_µV, amp_px, time_manual, time_s, time_px)``.
+    ``time_s`` est en secondes (l’axe en ms convertit via
+    :func:`time_value_in_axis_units`). La case Manuel lie valeur et taille.
+    """
+    amp_manual = bool(getattr(style, "spike_scale_amplitude_manual", False))
+    time_manual = bool(getattr(style, "spike_scale_time_manual", False))
+    try:
+        amplitude = float(getattr(style, "spike_scale_amplitude", 50.0) or 50.0)
+    except (TypeError, ValueError):
+        amplitude = 50.0
+    try:
+        amp_px = float(getattr(style, "spike_scale_amplitude_length_px", 40.0) or 40.0)
+    except (TypeError, ValueError):
+        amp_px = 40.0
+    try:
+        time_ms = float(getattr(style, "spike_scale_time_ms", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        time_ms = 1.0
+    try:
+        time_px = float(getattr(style, "spike_scale_time_length_px", 40.0) or 40.0)
+    except (TypeError, ValueError):
+        time_px = 40.0
+    if not (amplitude > 0.0) or amplitude != amplitude:
+        amp_manual = False
+        amplitude = 50.0
+    if not (amp_px > 0.0) or amp_px != amp_px:
+        amp_px = 40.0
+    if not (time_ms > 0.0) or time_ms != time_ms:
+        time_manual = False
+        time_ms = 1.0
+    if not (time_px > 0.0) or time_px != time_px:
+        time_px = 40.0
+    return amp_manual, amplitude, amp_px, time_manual, time_ms / 1000.0, time_px

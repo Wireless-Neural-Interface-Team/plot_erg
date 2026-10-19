@@ -908,12 +908,13 @@ def _scale_bar_lengths(
 ) -> tuple[float | None, float | None]:
     """Longueurs X/Y (unités de données) selon réglages manuels ou auto.
 
-    ``shared=False`` (spike scope) : barre auto sur la fenêtre visible,
-    sans le gain µV / temps des traces.
+    ``shared=False`` (spike scope) : échelle propre (``spike_scale_*``),
+    pas le gain µV / temps des traces.
     """
     from scale_bar_model import (
         amp_manual_applies,
         resolve_axis_bar,
+        scope_scale_params,
         time_value_in_axis_units,
     )
 
@@ -925,27 +926,27 @@ def _scale_bar_lengths(
     x_span = abs(float(xlim[1]) - float(xlim[0]))
     y_span = abs(float(ylim[1]) - float(ylim[0]))
 
+    if shared:
+        time_manual = bool(getattr(style, "scale_bar_time_manual", False))
+        time_s = float(getattr(style, "scale_bar_time_s", 0.1) or 0.1)
+        amp_manual = bool(getattr(style, "scale_bar_amplitude_manual", False))
+        amplitude = float(getattr(style, "scale_bar_amplitude", 100.0) or 100.0)
+    else:
+        amp_manual, amplitude, _amp_px, time_manual, time_s, _time_px = (
+            scope_scale_params(style)
+        )
+
     x_size: float | None = None
     if x_unit is not None and x_span > 0:
-        time_s = float(getattr(style, "scale_bar_time_s", 0.1) or 0.1)
-        manual = shared and bool(getattr(style, "scale_bar_time_manual", False))
-        val = time_value_in_axis_units(time_s, x_unit) if manual else None
+        val = time_value_in_axis_units(time_s, x_unit) if time_manual else None
         x_size = resolve_axis_bar(
             span=x_span, axis_px=100.0, value=val if val and val > 0 else None
         ).value
 
     y_size: float | None = None
     if y_unit is not None and y_span > 0:
-        manual = (
-            shared
-            and bool(getattr(style, "scale_bar_amplitude_manual", False))
-            and amp_manual_applies(y_unit)
-        )
-        val = (
-            float(getattr(style, "scale_bar_amplitude", 100.0) or 100.0)
-            if manual
-            else None
-        )
+        manual = amp_manual and amp_manual_applies(y_unit)
+        val = amplitude if manual else None
         y_size = resolve_axis_bar(
             span=y_span, axis_px=100.0, value=val
         ).value
@@ -1075,6 +1076,11 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
             ax.tick_params(axis="y", which="both", labelleft=(y_unit is not None))
         return
 
+    from scale_bar_model import scope_scale_params
+
+    scope_amp_on, _scope_amp, scope_amp_px, scope_time_on, _scope_time_s, scope_time_px = (
+        scope_scale_params(style)
+    )
     fontsize = float(style.tick_font_size)
     linewidth = resolved_scale_bar_linewidth(style)
     dx_px, dy_px = resolved_scale_bar_offset_px(style)
@@ -1104,8 +1110,16 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
             style, x_unit=x_unit, y_unit=y_unit, ax=ax, shared=shared
         )
         # Y dans la gouttière à droite de chaque ligne.
-        # Spike scope : barre auto (pas la valeur µV des traces).
-        row_y_length = y_length_px if shared else None
+        # Spike scope : sa propre amplitude, pas celle des traces.
+        if shared:
+            row_y_length = y_length_px
+            row_y_manual = bool(
+                getattr(style, "scale_bar_amplitude_manual", False)
+                and y_unit == "µV"
+            )
+        else:
+            row_y_length = scope_amp_px if scope_amp_on and y_unit == "µV" else None
+            row_y_manual = bool(scope_amp_on and y_unit == "µV")
         if y_unit is not None:
             draw_floating_scale_bars(
                 ax,
@@ -1120,11 +1134,7 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
                 dx_px=dx_px,
                 dy_px=dy_px,
                 y_length_px=row_y_length,
-                y_value_manual=bool(
-                    shared
-                    and getattr(style, "scale_bar_amplitude_manual", False)
-                    and y_unit == "µV"
-                ),
+                y_value_manual=row_y_manual,
             )
         else:
             clear_floating_scale_bars(ax)
@@ -1143,9 +1153,11 @@ def _apply_montage_scale_bars(figure: Any, request: RenderRequest) -> None:
                 face=style.tick_face,
                 dx_px=time_dx_px,
                 dy_px=time_dy_px,
-                x_length_px=x_length_px if shared else None,
+                x_length_px=x_length_px if shared else (scope_time_px if scope_time_on else None),
                 x_value_manual=bool(
-                    shared and getattr(style, "scale_bar_time_manual", False)
+                    getattr(style, "scale_bar_time_manual", False)
+                    if shared
+                    else scope_time_on
                 ),
             )
 

@@ -219,6 +219,78 @@ def test_zoom_panel_height_helpers() -> None:
     assert initial_zoom_panel_height(fit) == 420
 
 
+def test_spike_scope_uses_its_own_manual_scale() -> None:
+    """L’échelle saisie dans Spikes aboutit au spike scope, pas aux traces."""
+    from gui.widgets.plot_host.mixins.scale_bars import (
+        _manual_x_params,
+        _manual_y_params,
+    )
+    from panel_registry import _scale_bar_lengths
+
+    settings = replace(
+        ViewerSettings(),
+        style=replace(
+            ViewerSettings().style,
+            show_scale_bars=True,
+            scale_bar_amplitude_manual=True,
+            scale_bar_amplitude=100.0,
+            scale_bar_amplitude_length_manual=True,
+            scale_bar_amplitude_length_px=40.0,
+            scale_bar_time_manual=True,
+            scale_bar_time_s=0.2,
+            scale_bar_time_length_manual=True,
+            scale_bar_time_length_px=40.0,
+            spike_scale_amplitude_manual=True,
+            spike_scale_amplitude=25.0,
+            spike_scale_amplitude_length_px=80.0,
+            spike_scale_time_manual=True,
+            spike_scale_time_ms=2.0,
+            spike_scale_time_length_px=60.0,
+        ),
+    )
+    scope = _scale_bar_spec(
+        _request(settings, panel="analysis_overlay"), panel="analysis_overlay"
+    )
+    traces = _scale_bar_spec(_request(settings), panel="full_recording")
+    assert scope.x_unit == "ms"
+    assert scope.amp_manual is False and scope.time_manual is False
+    assert scope.scope_amp_manual is True
+    assert scope.scope_amplitude == 25.0
+    assert scope.scope_amp_length_px == 80.0
+    assert scope.scope_time_manual is True
+    assert abs(scope.scope_time_s - 0.002) < 1e-9
+    assert scope.scope_time_length_px == 60.0
+    y_val, y_len = _manual_y_params(scope, "µV", shared=False)
+    x_val, x_len = _manual_x_params(scope, "ms", shared=False)
+    assert y_val == 25.0 and y_len == 80.0
+    assert x_val is not None and abs(x_val - 2.0) < 1e-6 and x_len == 60.0
+    trace_y, _trace_y_len = _manual_y_params(traces, "µV", shared=True)
+    assert trace_y == 100.0
+
+    class _Ax:
+        def get_xlim(self) -> tuple[float, float]:
+            return (-2.0, 4.0)
+
+        def get_ylim(self) -> tuple[float, float]:
+            return (-80.0, 80.0)
+
+    x_size, y_size = _scale_bar_lengths(
+        settings.style, x_unit="ms", y_unit="µV", ax=_Ax(), shared=False
+    )
+    assert y_size == 25.0
+    assert x_size == 2.0
+    # Les traces gardent leur propre gain.
+    x_trace, y_trace = _scale_bar_lengths(
+        settings.style, x_unit="s", y_unit="µV", ax=_Ax(), shared=True
+    )
+    assert y_trace == 100.0
+    assert x_trace == 0.2
+    from gui.widgets.panel_canvas import _scale_fit_signature
+
+    base = ViewerSettings()
+    assert _scale_fit_signature(settings) != _scale_fit_signature(base)
+
+
 def test_spike_scope_scale_ignores_shared_manual_gain() -> None:
     """Le spike scope ne reprend pas le gain µV/px ni ms/px des traces."""
     from gui.widgets.panel_canvas import y_scale_family
@@ -331,3 +403,67 @@ def test_spike_scope_ylim_stays_per_channel() -> None:
     assert out[0] == (-100.0, 100.0)
     assert out[1] is None
     assert out[3] is None
+
+
+def test_spike_scope_manual_scale_is_drawn() -> None:
+    """Le bâton du spike scope affiche la valeur saisie, pas celle des traces."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import numpy as np
+    from PySide6.QtWidgets import QApplication, QGraphicsSimpleTextItem
+
+    from gui.widgets.plot_host.host import PlotHost
+    from panel_prepare import CurveSeries, PanelSpec
+
+    app = QApplication.instance() or QApplication([])
+    settings = replace(
+        ViewerSettings(),
+        style=replace(
+            ViewerSettings().style,
+            show_scale_bars=True,
+            scale_bar_amplitude_manual=True,
+            scale_bar_amplitude=100.0,
+            scale_bar_amplitude_length_manual=True,
+            scale_bar_amplitude_length_px=40.0,
+            spike_scale_amplitude_manual=True,
+            spike_scale_amplitude=25.0,
+            spike_scale_amplitude_length_px=80.0,
+            spike_scale_time_manual=True,
+            spike_scale_time_ms=2.0,
+            spike_scale_time_length_px=60.0,
+        ),
+    )
+    bars = _scale_bar_spec(
+        _request(settings, panel="analysis_overlay"), panel="analysis_overlay"
+    )
+    x = np.linspace(-2.0, 4.0, 64)
+    spec = PanelSpec(
+        title="Spike scope",
+        xlabel="Temps (ms)",
+        ylabel="µV",
+        series=[
+            CurveSeries(x=x, y=np.sin(x) * 30.0, color="#1f77b4", label="spike", row=0)
+        ],
+        xlim=(-2.0, 4.0),
+        ylim=(-80.0, 80.0),
+        layout_kind="single",
+        n_rows=1,
+        row_kinds=["overlay"],
+        show_legend=False,
+        scale_bars=bars,
+    )
+    host = PlotHost()
+    host.resize(720, 480)
+    host.show()
+    host.render_spec(spec)
+    app.processEvents()
+    host._refresh_scale_bars()
+    app.processEvents()
+    labels = []
+    for _plot, item in host._scale_bar_items:
+        if isinstance(item, QGraphicsSimpleTextItem):
+            labels.append(item.text())
+    assert "25µV" in labels, labels
+    assert "2ms" in labels, labels
+    host.close()

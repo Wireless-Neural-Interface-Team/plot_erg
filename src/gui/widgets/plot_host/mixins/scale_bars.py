@@ -37,8 +37,17 @@ from ..text_style import _scale_label_item, _tick_qfont
 def _manual_y_params(
     bars: ScaleBarSpec, y_unit: str, *, shared: bool = True
 ) -> tuple[float | None, float | None]:
-    if not shared or not amp_manual_applies(y_unit):
+    if not amp_manual_applies(y_unit):
         return None, None
+    if not shared:
+        if not bool(getattr(bars, "scope_amp_manual", False)):
+            return None, None
+        length = (
+            float(bars.scope_amp_length_px)
+            if bool(getattr(bars, "scope_amp_length_manual", False))
+            else None
+        )
+        return float(bars.scope_amplitude), length
     val = float(bars.amplitude) if bool(bars.amp_manual) else None
     length = (
         float(bars.amp_length_px) if bool(bars.amp_length_manual) else None
@@ -50,7 +59,17 @@ def _manual_x_params(
     bars: ScaleBarSpec, x_unit: str, *, shared: bool = True
 ) -> tuple[float | None, float | None]:
     if not shared:
-        return None, None
+        if not bool(getattr(bars, "scope_time_manual", False)):
+            return None, None
+        val = time_value_in_axis_units(float(bars.scope_time_s), x_unit)
+        if not (val and val > 0):
+            val = None
+        length = (
+            float(bars.scope_time_length_px)
+            if bool(getattr(bars, "scope_time_length_manual", False))
+            else None
+        )
+        return val, length
     val = None
     if bool(bars.time_manual):
         val = time_value_in_axis_units(float(bars.time_s), x_unit)
@@ -100,9 +119,38 @@ class ScaleBarsMixin:
         bars = self._active_scale_bars()
         if bars is None:
             return False
-        amp_fit = bool(bars.amp_manual) and bool(bars.amp_length_manual)
-        time_fit = bool(bars.time_manual) and bool(bars.time_length_manual)
+        amp_fit, time_fit = self.scale_fit_targets()
         return amp_fit or time_fit
+
+    def _host_is_scope_only(self) -> bool:
+        """True si toutes les lignes sont un spike scope (pas de gain de traces)."""
+        plots = list(getattr(self, "_plots", None) or [])
+        if not plots:
+            return False
+        return all(
+            not self._row_shares_manual_scale(row) for row in range(len(plots))
+        )
+
+    def scale_fit_targets(self) -> tuple[bool, bool]:
+        """(amplitude, temps) : ce panneau doit se caler sur une échelle manuelle.
+
+        Le spike scope ne reprend pas le gain des traces. Son propre Manuel
+        ne redimensionne que un panneau entièrement overlay.
+        """
+        bars = self._active_scale_bars()
+        if bars is None:
+            return False, False
+        trace_amp = bool(bars.amp_manual) and bool(bars.amp_length_manual)
+        trace_time = bool(bars.time_manual) and bool(bars.time_length_manual)
+        scope_amp = bool(getattr(bars, "scope_amp_manual", False)) and bool(
+            getattr(bars, "scope_amp_length_manual", False)
+        )
+        scope_time = bool(getattr(bars, "scope_time_manual", False)) and bool(
+            getattr(bars, "scope_time_length_manual", False)
+        )
+        if self._host_is_scope_only():
+            return scope_amp, scope_time
+        return trace_amp, trace_time
 
     def scale_bar_needed_view_height_px(self) -> int | None:
         """Hauteur ViewBox totale pour que amplitude (µV) = taille amp. (px).
@@ -111,16 +159,19 @@ class ScaleBarsMixin:
         ``hauteur = span × taille_px / amplitude``. Pas de plancher : un
         minimum en pixels change le gain µV/px.
         """
-        if not self.scale_bar_widget_fit_enabled():
+        if not self.scale_fit_targets()[0]:
             return None
         bars = self._active_scale_bars()
-        if bars is None or not (
-            bool(bars.amp_manual) and bool(bars.amp_length_manual)
-        ):
+        if bars is None:
             return None
+        scope_only = self._host_is_scope_only()
         try:
-            amp = float(bars.amplitude)
-            length = float(bars.amp_length_px)
+            if scope_only:
+                amp = float(bars.scope_amplitude)
+                length = float(bars.scope_amp_length_px)
+            else:
+                amp = float(bars.amplitude)
+                length = float(bars.amp_length_px)
         except (TypeError, ValueError):
             return None
         if not (amp > 0.0 and length > 0.0):
@@ -133,10 +184,13 @@ class ScaleBarsMixin:
         for row, plot in enumerate(plots):
             _x_unit, y_unit = self._scale_bar_units_for_row(bars, row)
             if not self._row_shares_manual_scale(row):
-                # Spike scope : hauteur de ligne fixe, pas le gain µV des traces.
-                any_span = True
-                total += float(self._independent_row_height_px())
-                continue
+                if scope_only:
+                    pass
+                else:
+                    # Ligne overlay dans un montage : hauteur fixe, pas le gain des traces.
+                    any_span = True
+                    total += float(self._independent_row_height_px())
+                    continue
             if not amp_manual_applies(y_unit):
                 continue
             try:
@@ -159,15 +213,16 @@ class ScaleBarsMixin:
 
     def scale_bar_needed_view_width_px(self) -> int | None:
         """Largeur ViewBox pour temps (s) = taille temps (px), plage X visible."""
-        if not self.scale_bar_widget_fit_enabled():
+        if not self.scale_fit_targets()[1]:
             return None
         bars = self._active_scale_bars()
-        if bars is None or not (
-            bool(bars.time_manual) and bool(bars.time_length_manual)
-        ):
+        if bars is None:
             return None
+        scope_only = self._host_is_scope_only()
         try:
-            length = float(bars.time_length_px)
+            length = float(
+                bars.scope_time_length_px if scope_only else bars.time_length_px
+            )
         except (TypeError, ValueError):
             return None
         if not (length > 0.0):
@@ -175,14 +230,24 @@ class ScaleBarsMixin:
         plots = list(getattr(self, "_plots", None) or [])
         if not plots:
             return None
-        row = self._shared_scale_width_row()
+        if scope_only:
+            row = None
+            for index in range(len(plots) - 1, -1, -1):
+                x_unit, _y_unit = self._scale_bar_units_for_row(bars, index)
+                if x_unit is not None:
+                    row = index
+                    break
+            time_s = float(bars.scope_time_s)
+        else:
+            row = self._shared_scale_width_row()
+            time_s = float(bars.time_s)
         if row is None:
             return None
         plot = plots[row]
         x_unit, _y_unit = self._scale_bar_units_for_row(bars, row)
         if x_unit is None:
             return None
-        time_val = time_value_in_axis_units(float(bars.time_s), x_unit)
+        time_val = time_value_in_axis_units(time_s, x_unit)
         if not (time_val > 0.0):
             return None
         try:

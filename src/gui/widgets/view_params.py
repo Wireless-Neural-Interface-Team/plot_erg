@@ -127,6 +127,12 @@ class LocalViewParams(QWidget):
         self._cb_isi: QCheckBox | None = None
         self._cb_overlay: QCheckBox | None = None
         self._cb_mark_stims: QCheckBox | None = None
+        self._spike_scale_amp_manual: QCheckBox | None = None
+        self._spike_scale_amp: Any = None
+        self._spike_scale_amp_len: Any = None
+        self._spike_scale_time_manual: QCheckBox | None = None
+        self._spike_scale_time_ms: Any = None
+        self._spike_scale_time_len: Any = None
 
         canal_page = (
             self._build_canal_page(settings) if self._show_canal_tab else None
@@ -294,6 +300,84 @@ class LocalViewParams(QWidget):
             self._cb_overlay,
         ):
             spikes_layout.addWidget(box)
+
+        style = settings.style
+        scale_host = QWidget(spikes_inner)
+        scale_form = configure_narrow_form(QFormLayout(scale_host))
+        scale_form.setContentsMargins(0, 0, 0, 0)
+        self._spike_scale_amp_manual = QCheckBox("Manuel")
+        self._spike_scale_amp_manual.setChecked(
+            bool(getattr(style, "spike_scale_amplitude_manual", False))
+        )
+        self._spike_scale_amp_manual.setToolTip(
+            "Amplitude du spike scope seulement (µV + px). "
+            "Le graphique s’ajuste sur ces deux valeurs."
+        )
+        self._spike_scale_amp = _spin(
+            0.01,
+            1_000_000.0,
+            float(getattr(style, "spike_scale_amplitude", 50.0) or 50.0),
+            decimals=2,
+            step=5.0,
+            suffix=" µV",
+        )
+        self._spike_scale_amp_len = _int_spin(
+            4,
+            800,
+            int(round(float(getattr(style, "spike_scale_amplitude_length_px", 40.0) or 40.0))),
+            step=5,
+            suffix=" px",
+        )
+        self._spike_scale_time_manual = QCheckBox("Manuel")
+        self._spike_scale_time_manual.setChecked(
+            bool(getattr(style, "spike_scale_time_manual", False))
+        )
+        self._spike_scale_time_manual.setToolTip(
+            "Temps du spike scope seulement (ms + px). "
+            "Le graphique s’ajuste sur ces deux valeurs."
+        )
+        self._spike_scale_time_ms = _spin(
+            0.01,
+            500.0,
+            float(getattr(style, "spike_scale_time_ms", 1.0) or 1.0),
+            decimals=2,
+            step=0.5,
+            suffix=" ms",
+        )
+        self._spike_scale_time_len = _int_spin(
+            4,
+            800,
+            int(round(float(getattr(style, "spike_scale_time_length_px", 40.0) or 40.0))),
+            step=5,
+            suffix=" px",
+        )
+        amp_row = QWidget()
+        amp_lay = QHBoxLayout(amp_row)
+        amp_lay.setContentsMargins(0, 0, 0, 0)
+        amp_lay.setSpacing(6)
+        amp_lay.addWidget(self._spike_scale_amp_manual)
+        amp_lay.addWidget(self._spike_scale_amp, 1)
+        time_row = QWidget()
+        time_lay = QHBoxLayout(time_row)
+        time_lay.setContentsMargins(0, 0, 0, 0)
+        time_lay.setSpacing(6)
+        time_lay.addWidget(self._spike_scale_time_manual)
+        time_lay.addWidget(self._spike_scale_time_ms, 1)
+        hint = QLabel(
+            "Échelle du spike scope (µV / ms), indépendante des traces. "
+            "Barres flottantes ou graduations : choix Affichage."
+        )
+        hint.setObjectName("hintLabel")
+        hint.setWordWrap(True)
+        scale_form.addRow(hint)
+        scale_form.addRow("Amplitude scope :", amp_row)
+        scale_form.addRow("Taille amp. scope :", self._spike_scale_amp_len)
+        scale_form.addRow("Temps scope :", time_row)
+        scale_form.addRow("Taille temps scope :", self._spike_scale_time_len)
+        self._spike_scale_amp_manual.toggled.connect(self._sync_spike_scale_inputs)
+        self._spike_scale_time_manual.toggled.connect(self._sync_spike_scale_inputs)
+        self._sync_spike_scale_inputs()
+        spikes_layout.addWidget(scale_host)
 
         if self._show_display_extras:
             spike_form_host = QWidget(spikes_inner)
@@ -966,6 +1050,16 @@ class LocalViewParams(QWidget):
                 if label is not None:
                     label.setVisible(show_h)
 
+    def _sync_spike_scale_inputs(self, *_args: Any) -> None:
+        if self._spike_scale_amp_manual is None:
+            return
+        amp_on = bool(self._spike_scale_amp_manual.isChecked())
+        time_on = bool(self._spike_scale_time_manual.isChecked())
+        self._spike_scale_amp.setEnabled(amp_on)
+        self._spike_scale_amp_len.setEnabled(amp_on)
+        self._spike_scale_time_ms.setEnabled(time_on)
+        self._spike_scale_time_len.setEnabled(time_on)
+
     def _sync_stim_label_inputs(self, *_args: Any) -> None:
         enabled = bool(self._show_stim_labels.isChecked())
         for widget in (
@@ -1055,6 +1149,12 @@ class LocalViewParams(QWidget):
             self._trigger_polarity,
             self._trigger_threshold,
             self._cb_mark_stims,
+            self._spike_scale_amp_manual,
+            self._spike_scale_amp,
+            self._spike_scale_amp_len,
+            self._spike_scale_time_manual,
+            self._spike_scale_time_ms,
+            self._spike_scale_time_len,
             self._curve_wide_box,
             self._curve_high_box,
             self._curve_low_box,
@@ -1193,6 +1293,29 @@ class LocalViewParams(QWidget):
             show_sample_counts=bool(self._legend_counts.isChecked()),
             show_reference_markers=bool(self._stim_markers.isChecked()),
         )
+        base_style = self._settings.style
+        if self._spike_scale_amp_manual is not None:
+            spike_amp_manual = bool(self._spike_scale_amp_manual.isChecked())
+            spike_amp = float(self._spike_scale_amp.value())
+            spike_amp_px = float(self._spike_scale_amp_len.value())
+            spike_time_manual = bool(self._spike_scale_time_manual.isChecked())
+            spike_time_ms = float(self._spike_scale_time_ms.value())
+            spike_time_px = float(self._spike_scale_time_len.value())
+        else:
+            spike_amp_manual = bool(
+                getattr(base_style, "spike_scale_amplitude_manual", False)
+            )
+            spike_amp = float(getattr(base_style, "spike_scale_amplitude", 50.0) or 50.0)
+            spike_amp_px = float(
+                getattr(base_style, "spike_scale_amplitude_length_px", 40.0) or 40.0
+            )
+            spike_time_manual = bool(
+                getattr(base_style, "spike_scale_time_manual", False)
+            )
+            spike_time_ms = float(getattr(base_style, "spike_scale_time_ms", 1.0) or 1.0)
+            spike_time_px = float(
+                getattr(base_style, "spike_scale_time_length_px", 40.0) or 40.0
+            )
         style = PanelStyle(
             title_font_size=self._title_font.size_value(),
             label_font_size=self._label_font.size_value(),
@@ -1241,6 +1364,12 @@ class LocalViewParams(QWidget):
             scale_bar_dy_px=float(self._scale_bar_dy.value()),
             scale_bar_time_dx_px=float(self._scale_bar_time_dx.value()),
             scale_bar_time_dy_px=float(self._scale_bar_time_dy.value()),
+            spike_scale_amplitude_manual=spike_amp_manual,
+            spike_scale_amplitude=spike_amp,
+            spike_scale_amplitude_length_px=spike_amp_px,
+            spike_scale_time_manual=spike_time_manual,
+            spike_scale_time_ms=spike_time_ms,
+            spike_scale_time_length_px=spike_time_px,
             ticks_inside=bool(self._ticks_inside.isChecked()),
             max_points_per_curve=int(self._max_points.value()),
             tight_layout=bool(self._settings.style.tight_layout),

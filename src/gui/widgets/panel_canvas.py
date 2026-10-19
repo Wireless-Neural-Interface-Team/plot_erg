@@ -53,6 +53,13 @@ _FIT_MATCH_PX = 2
 
 def _scale_fit_axis_flags(host: Any) -> tuple[bool, bool]:
     """(amplitude, temps) : vrai si valeur + taille px sont demandées."""
+    targets = getattr(host, "scale_fit_targets", None)
+    if callable(targets):
+        try:
+            amp, time = targets()
+            return bool(amp), bool(time)
+        except Exception:
+            pass
     try:
         bars = host._active_scale_bars()
     except Exception:
@@ -315,6 +322,12 @@ def _scale_fit_signature(settings: ViewerSettings) -> tuple[Any, ...]:
         int(round(amp_dy)),
         int(round(time_dx)),
         int(round(time_dy)),
+        bool(getattr(style, "spike_scale_amplitude_manual", False)),
+        round(float(getattr(style, "spike_scale_amplitude", 0.0) or 0.0), 12),
+        int(round(float(getattr(style, "spike_scale_amplitude_length_px", 0.0) or 0.0))),
+        bool(getattr(style, "spike_scale_time_manual", False)),
+        round(float(getattr(style, "spike_scale_time_ms", 0.0) or 0.0), 12),
+        int(round(float(getattr(style, "spike_scale_time_length_px", 0.0) or 0.0))),
         _font_pt(style.title_font_size, 10.0),
         _font_face_key(style.title_face),
         _font_pt(style.label_font_size, 9.0),
