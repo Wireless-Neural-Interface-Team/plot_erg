@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPlainTextEdit,
     QPushButton,
     QSizePolicy,
     QTabWidget,
@@ -126,7 +125,6 @@ class LocalViewParams(QWidget):
         self._cb_raster_trials: QCheckBox | None = None
         self._cb_isi: QCheckBox | None = None
         self._cb_overlay: QCheckBox | None = None
-        self._cb_mark_stims: QCheckBox | None = None
         self._spike_scale_amp_manual: QCheckBox | None = None
         self._spike_scale_amp: Any = None
         self._spike_scale_amp_len: Any = None
@@ -475,8 +473,19 @@ class LocalViewParams(QWidget):
             160, 1200, int(settings.graph_height_px), step=20, suffix=" px"
         )
         self._graph_height.setToolTip(
-            "Hauteur du panneau si l’amplitude n’est pas en manuel. "
-            "Sinon la hauteur suit la valeur et la taille d’amplitude."
+            "Hauteur de la zone de tracé (ViewBox). XOR avec l’amplitude "
+            "manuelle — jamais les deux. Le chrome s’ajoute autour."
+        )
+        self._graph_width = _int_spin(
+            0,
+            4000,
+            int(getattr(settings, "graph_width_px", 0) or 0),
+            step=20,
+            suffix=" px",
+        )
+        self._graph_width.setToolTip(
+            "Largeur de la zone de tracé (ViewBox). 0 = remplit le conteneur. "
+            "XOR avec le temps manuel — jamais les deux."
         )
         self._show_scale_bars = QCheckBox(
             "Barres flottantes (sinon graduations sur les axes)"
@@ -648,8 +657,10 @@ class LocalViewParams(QWidget):
         max_pts_lay.addWidget(max_pts_max_btn)
         if self._show_graph_height:
             layout_form.addRow("Hauteur des graphs :", self._graph_height)
+            layout_form.addRow("Largeur des graphs :", self._graph_width)
         else:
             self._graph_height.hide()
+            self._graph_width.hide()
         layout_form.addRow(self._show_scale_bars)
         layout_form.addRow("Amplitude barre :", amp_row)
         layout_form.addRow("Taille amp. :", self._scale_bar_amp_len_px)
@@ -691,15 +702,7 @@ class LocalViewParams(QWidget):
                 "ou premier trigger détecté (redessin immédiat)."
             )
             if self._show_canal_tab:
-                self._cb_mark_stims = QCheckBox(
-                    "Marqueurs de stimulation sur les traces"
-                )
-                self._cb_mark_stims.setChecked(bool(settings.continuous_mark_stims))
-                self._cb_mark_stims.setToolTip(
-                    "Marquer les stimulations sur les zooms de cette fenêtre."
-                )
                 sync_form.addRow("Origine du temps :", self._time_sync)
-                sync_form.addRow(self._cb_mark_stims)
                 self._trigger_polarity = None
                 self._trigger_threshold = None
             else:
@@ -761,10 +764,6 @@ class LocalViewParams(QWidget):
             4.0, 50.0, legend.font_size, legend.face, decimals=1, step=0.5
         )
         self._legend_columns = _int_spin(1, 6, legend.columns)
-        self._legend_gap = _spin(0.0, 1.0, legend.gap, decimals=2, step=0.02)
-        self._legend_gap.setToolTip(
-            "Écart entre la légende et le graphique (fraction de la hauteur des axes)."
-        )
         self._legend_frame = QCheckBox("Cadre autour des légendes")
         self._legend_frame.setChecked(bool(legend.frame))
         self._legend_filters = QCheckBox("Détails du filtre")
@@ -775,7 +774,6 @@ class LocalViewParams(QWidget):
         legend_form.addRow("Position :", self._legend_location)
         legend_form.addRow("Police de la légende :", self._legend_font)
         legend_form.addRow("Colonnes :", self._legend_columns)
-        legend_form.addRow("Distance au graphique :", self._legend_gap)
         legend_form.addRow(self._legend_frame)
         legend_form.addRow(self._legend_filters)
         legend_form.addRow(self._legend_counts)
@@ -798,18 +796,6 @@ class LocalViewParams(QWidget):
         self._text_series_suffix.setToolTip(
             "Décochez pour n’afficher que le nom d’enregistrement dans la légende."
         )
-        self._text_legend_labels = QPlainTextEdit()
-        if texts.legend_labels:
-            self._text_legend_labels.setPlainText("\n".join(texts.legend_labels))
-        self._text_legend_labels.setPlaceholderText(
-            "Automatique — une entrée de légende par ligne,\n"
-            "dans l’ordre des courbes. Ligne vide = garder l’auto."
-        )
-        self._text_legend_labels.setMaximumHeight(90)
-        self._text_legend_labels.setToolTip(
-            "Remplace les libellés de légende. Les noms de base restent "
-            "aussi éditables dans le dock Enregistrements → Légende."
-        )
         self._title_font = FontSizeFaceRow(
             5.0, 50.0, style.title_font_size, style.title_face, decimals=1, step=0.5
         )
@@ -821,15 +807,6 @@ class LocalViewParams(QWidget):
         )
         self._title_dx.setToolTip(
             "Décalage horizontal du titre de graphique. Positif = droite."
-        )
-        self._title_dy = _int_spin(
-            -400,
-            400,
-            int(round(float(getattr(style, "title_dy_px", 0.0) or 0.0))),
-            suffix=" px",
-        )
-        self._title_dy.setToolTip(
-            "Décalage vertical du titre de graphique. Positif = haut."
         )
         self._label_font = FontSizeFaceRow(
             5.0, 50.0, style.label_font_size, style.label_face, decimals=1, step=0.5
@@ -933,11 +910,6 @@ class LocalViewParams(QWidget):
         self._show_borders.setToolTip(
             "Cadre avec graduations autour de la zone de tracé de chaque panneau."
         )
-        self._ticks_inside = QCheckBox("Graduations vers l’intérieur")
-        self._ticks_inside.setChecked(bool(style.ticks_inside))
-        self._ticks_inside.setToolTip(
-            "Oriente les graduations (ticks) vers l’intérieur du cadre de tracé."
-        )
         self._stim_markers = QCheckBox("Pointillés de début / fin de stimulation")
         self._stim_markers.setChecked(bool(legend.show_reference_markers))
         self._stim_markers.setToolTip(
@@ -955,17 +927,14 @@ class LocalViewParams(QWidget):
         style_form.addRow("Axe X :", self._text_xlabel)
         style_form.addRow("Axe Y :", self._text_ylabel)
         style_form.addRow(self._text_series_suffix)
-        style_form.addRow("Légendes :", self._text_legend_labels)
         style_form.addRow("Police du titre :", self._title_font)
         style_form.addRow("Titre — horizontal :", self._title_dx)
-        style_form.addRow("Titre — vertical :", self._title_dy)
         style_form.addRow("Police des axes :", self._label_font)
         style_form.addRow("Police des ticks :", self._tick_font)
         style_form.addRow("Épaisseur de trait :", self._line_width)
         style_form.addRow(self._grid)
         style_form.addRow("Opacité de la grille :", self._grid_alpha)
         style_form.addRow(self._show_borders)
-        style_form.addRow(self._ticks_inside)
         style_form.addRow(self._stim_markers)
         style_form.addRow("Épaisseur du trait de stimulation :", self._stim_linewidth)
         style_form.addRow("Couleur début de stimulation :", self._stim_onset_color)
@@ -1040,6 +1009,7 @@ class LocalViewParams(QWidget):
         self._scale_bar_time_dx.setEnabled(floating)
         self._scale_bar_time_dy.setEnabled(floating)
         amp_len_on = amp_on
+        time_len_on = time_on
         if hasattr(self, "_graph_height") and bool(
             getattr(self, "_show_graph_height", True)
         ):
@@ -1049,6 +1019,15 @@ class LocalViewParams(QWidget):
                 label = self._layout_form.labelForField(self._graph_height)
                 if label is not None:
                     label.setVisible(show_h)
+        if hasattr(self, "_graph_width") and bool(
+            getattr(self, "_show_graph_height", True)
+        ):
+            show_w = not time_len_on
+            self._graph_width.setVisible(show_w)
+            if hasattr(self, "_layout_form"):
+                label = self._layout_form.labelForField(self._graph_width)
+                if label is not None:
+                    label.setVisible(show_w)
 
     def _sync_spike_scale_inputs(self, *_args: Any) -> None:
         if self._spike_scale_amp_manual is None:
@@ -1090,7 +1069,6 @@ class LocalViewParams(QWidget):
             self._legend_location,
             self._legend_font,
             self._legend_columns,
-            self._legend_gap,
             self._legend_frame,
             self._legend_filters,
             self._legend_counts,
@@ -1098,12 +1076,10 @@ class LocalViewParams(QWidget):
             self._text_xlabel,
             self._text_ylabel,
             self._text_series_suffix,
-            self._text_legend_labels,
             self._text_stim_on,
             self._text_stim_off,
             self._title_font,
             self._title_dx,
-            self._title_dy,
             self._label_font,
             self._tick_font,
             self._stim_on_font,
@@ -1124,7 +1100,6 @@ class LocalViewParams(QWidget):
             self._grid,
             self._grid_alpha,
             self._show_borders,
-            self._ticks_inside,
             self._show_scale_bars,
             self._scale_bar_amp_manual,
             self._scale_bar_amp,
@@ -1142,13 +1117,14 @@ class LocalViewParams(QWidget):
         ]
         if self._show_graph_height:
             widgets.append(self._graph_height)
+            if hasattr(self, "_graph_width"):
+                widgets.append(self._graph_width)
         for optional in (
             self._psth_bin,
             self._sampling,
             self._time_sync,
             self._trigger_polarity,
             self._trigger_threshold,
-            self._cb_mark_stims,
             self._spike_scale_amp_manual,
             self._spike_scale_amp,
             self._spike_scale_amp_len,
@@ -1270,10 +1246,6 @@ class LocalViewParams(QWidget):
             self._text_xlabel.setText(str(texts.xlabel or ""))
             self._text_ylabel.setText(str(texts.ylabel or ""))
             self._text_series_suffix.setChecked(bool(texts.show_series_suffix))
-            if texts.legend_labels:
-                self._text_legend_labels.setPlainText("\n".join(texts.legend_labels))
-            else:
-                self._text_legend_labels.setPlainText("")
             self._text_stim_on.setText(str(getattr(texts, "stim_on", "on") or ""))
             self._text_stim_off.setText(str(getattr(texts, "stim_off", "off") or ""))
         finally:
@@ -1287,7 +1259,7 @@ class LocalViewParams(QWidget):
             font_size=self._legend_font.size_value(),
             face=self._legend_font.face_value(),
             columns=int(self._legend_columns.value()),
-            gap=float(self._legend_gap.value()),
+            gap=0.22,
             frame=bool(self._legend_frame.isChecked()),
             show_filter_details=bool(self._legend_filters.isChecked()),
             show_sample_counts=bool(self._legend_counts.isChecked()),
@@ -1324,7 +1296,7 @@ class LocalViewParams(QWidget):
             label_face=self._label_font.face_value(),
             tick_face=self._tick_font.face_value(),
             title_dx_px=float(self._title_dx.value()),
-            title_dy_px=float(self._title_dy.value()),
+            title_dy_px=0.0,
             line_width=float(self._line_width.value()),
             stim_linewidth=float(self._stim_linewidth.value()),
             stim_onset_color=self._stim_onset_color.color_value(),
@@ -1370,21 +1342,15 @@ class LocalViewParams(QWidget):
             spike_scale_time_manual=spike_time_manual,
             spike_scale_time_ms=spike_time_ms,
             spike_scale_time_length_px=spike_time_px,
-            ticks_inside=bool(self._ticks_inside.isChecked()),
+            ticks_inside=False,
             max_points_per_curve=int(self._max_points.value()),
             tight_layout=bool(self._settings.style.tight_layout),
         )
-        legend_lines = tuple(
-            line.rstrip("\r")
-            for line in self._text_legend_labels.toPlainText().split("\n")
-        )
-        if legend_lines == ("",):
-            legend_lines = ()
         texts = TextOverrides(
             title=self._text_title.text().strip(),
             xlabel=self._text_xlabel.text().strip(),
             ylabel=self._text_ylabel.text().strip(),
-            legend_labels=legend_lines,
+            legend_labels=(),
             show_series_suffix=bool(self._text_series_suffix.isChecked()),
             stim_on=self._text_stim_on.text(),
             stim_off=self._text_stim_off.text(),
@@ -1401,6 +1367,7 @@ class LocalViewParams(QWidget):
             "lp_ylim": self._lp_ylim.value(),
             "rms_ylim": self._rms_ylim.value(),
             "graph_height_px": int(self._graph_height.value()),
+            "graph_width_px": int(self._graph_width.value()),
         }
         if self._show_canal_tab:
             streams: list[str] = []
@@ -1414,10 +1381,7 @@ class LocalViewParams(QWidget):
                 streams = ["raw"]
             kwargs["continuous_streams"] = tuple(streams)
             kwargs["continuous_stream"] = streams[0]
-            if self._cb_mark_stims is not None:
-                kwargs["continuous_mark_stims"] = bool(
-                    self._cb_mark_stims.isChecked()
-                )
+            kwargs["continuous_mark_stims"] = bool(self._stim_markers.isChecked())
         if self._psth_bin is not None and self._sampling is not None:
             kwargs["psth_bin_window_s"] = float(self._psth_bin.value())
             kwargs["sampling_percent"] = int(self._sampling.value())
@@ -1454,6 +1418,7 @@ class LocalViewParams(QWidget):
             "lp_ylim": current.lp_ylim,
             "rms_ylim": current.rms_ylim,
             "graph_height_px": current.graph_height_px,
+            "graph_width_px": int(getattr(current, "graph_width_px", 0) or 0),
         }
         if self._show_canal_tab:
             keep["analysis"] = current.analysis

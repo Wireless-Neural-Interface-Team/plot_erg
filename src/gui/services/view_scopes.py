@@ -6,6 +6,11 @@ Trois scopes indépendants (mêmes champs d’affichage, valeurs séparées) :
 - **montage** — dock Paramètres en mode revue montage
 - **zoom** — chaque fenêtre ``DetachedZoomWindow`` (LocalViewParams)
 
+Les fenêtres zoom sont créées **uniquement** depuis l’aperçu canal. Elles
+sont amorcées avec une copie du profil preview, puis restent indépendantes
+(``LocalViewParams``) : modifier le zoom ne change pas l’aperçu, et
+inversement.
+
 Les **plages** (``TimeRangeBar``) n’appartiennent à aucun profil dock : elles
 vivent uniquement sur ``ChannelAnalysisWindow`` et ne sont jamais fusionnées
 depuis le dock (voir ``merge_central_viewer_settings``).
@@ -24,10 +29,14 @@ ViewScope = Literal["preview", "montage", "zoom"]
 
 
 def settings_for_zoom_window(base: ViewerSettings) -> ViewerSettings:
-    """Seed d’une fenêtre zoom : styles / courbes, sans échelle X de l’aperçu.
+    """Seed d’une fenêtre zoom depuis le profil **aperçu canal**.
 
-    La fenêtre X vient exclusivement du ``PanelPlacement`` (custom zoom).
-    Réinjecter ``x_limits`` de l’aperçu faisait réafficher toute la courbe.
+    Hérite styles / courbes / échelles de ``base`` (typiquement
+    ``params_panel.settings_for("preview")`` + inspecteur), sans échelle X
+    ni plages : la fenêtre X vient du ``PanelPlacement`` custom.
+
+    Après création, la fenêtre a son propre ``LocalViewParams`` — plus de
+    lien automatique avec le dock.
     """
     return replace(
         base,

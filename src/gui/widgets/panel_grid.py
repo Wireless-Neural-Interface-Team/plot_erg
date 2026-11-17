@@ -242,7 +242,7 @@ class PanelGrid(QScrollArea):
             fitted = max(fitted, current_h)
         previous = getattr(widget, "fitted_height_px", None)
         widget.fitted_height_px = fitted  # type: ignore[attr-defined]
-        if previous is not None and abs(int(previous) - fitted) <= 2:
+        if previous is not None and abs(int(previous) - fitted) < 4:
             return
         self._apply_panel_height(widget, placement)
 
@@ -265,7 +265,7 @@ class PanelGrid(QScrollArea):
             fitted = max(fitted, current_w)
         previous = getattr(widget, "fitted_width_px", None)
         widget.fitted_width_px = fitted  # type: ignore[attr-defined]
-        if previous is not None and abs(int(previous) - fitted) <= 2:
+        if previous is not None and abs(int(previous) - fitted) < 4:
             return
         self._apply_panel_width(widget, placement)
 

@@ -6,13 +6,13 @@ Fond clair volontaire : pas de thème scope noir.
 from __future__ import annotations
 
 # ---- Chrome ---------------------------------------------------------------
-CHROME_BG = "#e8eaed"
-CHROME_BG_ALT = "#d8dce2"
-CHROME_BG_LIGHT = "#f5f6f8"
-CHROME_BORDER = "#9aa3ad"
-CHROME_BORDER_DARK = "#6b7280"
-TEXT = "#1a1a1a"
-TEXT_MUTED = "#4b5563"
+CHROME_BG = "#eceff3"
+CHROME_BG_ALT = "#dde2e8"
+CHROME_BG_LIGHT = "#f7f8fa"
+CHROME_BORDER = "#c5cbd3"
+CHROME_BORDER_DARK = "#8b949e"
+TEXT = "#1c2430"
+TEXT_MUTED = "#5b6572"
 TEXT_INVERSE = "#ffffff"
 
 # ---- Graphiques (fond clair) ---------------------------------------------

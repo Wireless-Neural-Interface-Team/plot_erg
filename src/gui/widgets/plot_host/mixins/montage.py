@@ -324,10 +324,13 @@ class MontageMixin:
         metrics = QFontMetrics(font)
         extra = _montage_label_column_extra(spec)
         max_w = 48 + extra
+        fallback = str(getattr(spec, "ylabel", "") or "").strip()
         for row, label in enumerate(self._row_labels):
             text = ""
             if row < len(spec.row_labels) and spec.row_labels[row]:
                 text = str(spec.row_labels[row])
+            elif fallback:
+                text = fallback
             max_w = max(max_w, int(metrics.horizontalAdvance(text)) + 10 + extra)
             try:
                 label.setText(text or " ")
@@ -408,9 +411,12 @@ class MontageMixin:
             )
         except Exception:
             text_h = 14.0
+        # Écart titre / courbe : agrandit la ligne de titre vers le haut
+        # (jamais vers la ViewBox).
+        gap = int(getattr(spec, "title_gap_px", 0) or 0)
         row_h, _spacing = preview_title_row_layout(
             text_h,
-            0,
+            gap,
             title_dx_px=float(getattr(spec, "title_dx_px", 0.0) or 0.0),
             title_dy_px=float(getattr(spec, "title_dy_px", 0.0) or 0.0),
         )
@@ -495,10 +501,13 @@ class MontageMixin:
         max_w = 48 + extra
         size = f"{label_pt}pt"
         row0 = int(self._data_row0)
+        fallback = str(getattr(spec, "ylabel", "") or "").strip()
         for row in range(n_rows):
             text = ""
             if row < len(spec.row_labels) and spec.row_labels[row]:
                 text = str(spec.row_labels[row])
+            elif fallback:
+                text = fallback
             max_w = max(max_w, int(metrics.horizontalAdvance(text)) + 10 + extra)
             label = _MontageRowLabel(
                 text or " ",

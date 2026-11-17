@@ -33,7 +33,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPlainTextEdit,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -51,6 +50,7 @@ from gui.form_widgets import (
     ColorSwatchButton,
     FitWidthScrollArea,
     FontSizeFaceRow,
+    collapsible_section,
     configure_narrow_form,
     make_double_spin as _spin,
     make_int_spin as _int_spin,
@@ -113,7 +113,7 @@ def _scrollable(inner: QWidget) -> FitWidthScrollArea:
 
 
 def _collapsible_group(title: str, *, expanded: bool = False) -> tuple[QGroupBox, QWidget]:
-    """Groupe à cocher : décoché = contenu masqué (disclosure progressive)."""
+    """Groupe à cocher (Pipeline) : décoché = courbe masquée + contenu plié."""
     box = QGroupBox(title)
     box.setCheckable(True)
     box.setChecked(expanded)
@@ -130,6 +130,11 @@ def _collapsible_group(title: str, *, expanded: bool = False) -> tuple[QGroupBox
     box.toggled.connect(_on_toggled)
     content.setVisible(expanded)
     return box, content
+
+
+def _accordion(title: str, *, expanded: bool = False) -> tuple[QWidget, QWidget]:
+    """Section Affichage (chevron) — collapse sans case à cocher."""
+    return collapsible_section(title, expanded=expanded)
 
 
 def _set_form_row_visible(form: QFormLayout, field: QWidget, visible: bool) -> None:
@@ -173,13 +178,13 @@ class ParamsPanel(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Expanding)
 
         self._mode_hint = QLabel(
-            "Canal + Pipeline → Traiter (F5) · Affichage → redessin immédiat"
+            "Canal → Traiter (F5)  ·  Affichage → redessin immédiat"
         )
-        self._mode_hint.setObjectName("hintLabel")
+        self._mode_hint.setObjectName("paramsDockHint")
         self._mode_hint.setWordWrap(True)
         self._mode_hint.setToolTip(
-            "Onglet Canal : contenu du canal et paramètres de calcul (filtres, spikes, RMS). "
-            "Onglet Affichage : axe X, sync, légendes et apparence — appliqués sans F5."
+            "Onglet Canal : contenu et calcul (filtres, spikes, RMS). "
+            "Onglet Affichage : disposition et apparence — sans F5."
         )
 
         self.tabs = QTabWidget(self)
@@ -294,11 +299,18 @@ class ParamsPanel(QWidget):
         defaults = self._defaults
         page = QWidget()
         page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(8, 8, 8, 8)
-        page_layout.setSpacing(8)
+        page_layout.setContentsMargins(6, 6, 6, 6)
+        page_layout.setSpacing(2)
 
-        sync_group = QGroupBox("Temps & marqueurs")
-        sync_form = configure_narrow_form(QFormLayout(sync_group))
+        self._display_profile_banner = QLabel("Profil : aperçu canal")
+        self._display_profile_banner.setObjectName("viewProfileBanner")
+        self._display_profile_banner.setWordWrap(True)
+        page_layout.addWidget(self._display_profile_banner)
+
+        sync_group, sync_inner = _accordion("Temps", expanded=False)
+        self._block_time = sync_group
+        sync_form = configure_narrow_form(QFormLayout(sync_inner))
+        sync_form.setContentsMargins(0, 0, 0, 0)
         self._time_sync = _choice(
             _TIME_SYNC_CHOICES,
             str(defaults.get("default_time_sync", "recording_start")),
@@ -308,17 +320,12 @@ class ParamsPanel(QWidget):
             "ou premier trigger détecté (t=0). La détection du trigger se règle "
             "dans Canal → Traitement."
         )
-        self._cb_mark_stims = QCheckBox("Marqueurs de stimulation sur les traces")
-        self._cb_mark_stims.setChecked(True)
-        self._cb_mark_stims.setToolTip(
-            "Marquer les stimulations sur l’aperçu continuous et la revue montage."
-        )
         sync_form.addRow("Origine du temps :", self._time_sync)
-        sync_form.addRow(self._cb_mark_stims)
-        self._cb_mark_stims.toggled.connect(self._emit_view)
 
-        axis_group = QGroupBox("Plages d’affichage")
-        self._axis_form = configure_narrow_form(QFormLayout(axis_group))
+        axis_group, axis_inner = _accordion("Axe X", expanded=False)
+        self._block_axis_x = axis_group
+        self._axis_form = configure_narrow_form(QFormLayout(axis_inner))
+        self._axis_form.setContentsMargins(0, 0, 0, 0)
         self._x_limits = AxisLimitRow(
             AxisLimits(enabled=False, minimum=-0.1, maximum=0.4),
             unit=" s",
@@ -327,87 +334,34 @@ class ParamsPanel(QWidget):
         )
         self._x_limits.setToolTip(
             "Plage de temps visible (fenêtre X, en secondes). Ne fixe pas le gain "
-            "temporel (s/px) : utilisez Temps barre + Taille temps plus bas."
+            "temporel (s/px) : utilisez Temps barre + Taille temps."
         )
+        self._text_xlabel = QLineEdit()
+        self._text_xlabel.setPlaceholderText("Automatique")
+        self._axis_form.addRow("Libellé :", self._text_xlabel)
         self._axis_form.addRow("Plage X (temps) :", self._x_limits)
         axis_hint = QLabel(
-            "Plages Y (WIDE / HIGH / LOW / RMS) → Canal, section de chaque courbe. "
-            "Recadrent l’affichage ; le gain µV/px vient d’Amplitude + Taille amp."
+            "Plages Y (WIDE / HIGH / LOW / RMS) → Canal, section de chaque courbe."
         )
         axis_hint.setObjectName("hintLabel")
         axis_hint.setWordWrap(True)
         self._axis_form.addRow(axis_hint)
 
-        zoom_group, zoom_inner = _collapsible_group(
-            "Fenêtres de zoom (PDF / sections)", expanded=False
+        # Zooms PDF : plus d’UI (plages = outil zoom aperçu). Défauts internes.
+        self._zoom_onset_t0_s = float(
+            defaults.get("default_zoom_onset_t0_s", DEFAULT_ZOOM_T0_S)
         )
-        zoom_form = configure_narrow_form(QFormLayout(zoom_inner))
-        zoom_form.setContentsMargins(0, 0, 0, 0)
-        self._zoom_onset_t0 = _spin(
-            -60.0,
-            60.0,
-            float(defaults.get("default_zoom_onset_t0_s", DEFAULT_ZOOM_T0_S)),
-            decimals=3,
-            step=0.01,
-            suffix=" s",
+        self._zoom_onset_t1_s = float(
+            defaults.get("default_zoom_onset_t1_s", DEFAULT_ZOOM_T1_S)
         )
-        self._zoom_onset_t1 = _spin(
-            -60.0,
-            60.0,
-            float(defaults.get("default_zoom_onset_t1_s", DEFAULT_ZOOM_T1_S)),
-            decimals=3,
-            step=0.01,
-            suffix=" s",
+        self._zoom_end_t0_s = float(
+            defaults.get("default_zoom_end_t0_s", DEFAULT_ZOOM_T0_S)
         )
-        self._zoom_end_t0 = _spin(
-            -60.0,
-            60.0,
-            float(defaults.get("default_zoom_end_t0_s", DEFAULT_ZOOM_T0_S)),
-            decimals=3,
-            step=0.01,
-            suffix=" s",
+        self._zoom_end_t1_s = float(
+            defaults.get("default_zoom_end_t1_s", DEFAULT_ZOOM_T1_S)
         )
-        self._zoom_end_t1 = _spin(
-            -60.0,
-            60.0,
-            float(defaults.get("default_zoom_end_t1_s", DEFAULT_ZOOM_T1_S)),
-            decimals=3,
-            step=0.01,
-            suffix=" s",
-        )
-        for widget, tip in (
-            (
-                self._zoom_onset_t0,
-                "Début de la fenêtre relative au début de stimulation (PDF / panneaux zoom début).",
-            ),
-            (
-                self._zoom_onset_t1,
-                "Fin de la fenêtre relative au début de stimulation.",
-            ),
-            (
-                self._zoom_end_t0,
-                "Début de la fenêtre relative à la fin de stimulation (PDF / panneaux zoom fin).",
-            ),
-            (
-                self._zoom_end_t1,
-                "Fin de la fenêtre relative à la fin de stimulation.",
-            ),
-        ):
-            widget.setToolTip(tip)
-        zoom_hint = QLabel(
-            "Temps relatifs à la stim (t=0). Utilisés pour les sections PDF "
-            "« zoom début / fin » et comme valeurs par défaut des plages Rel. stim."
-        )
-        zoom_hint.setObjectName("hintLabel")
-        zoom_hint.setWordWrap(True)
-        zoom_form.addRow("Zoom début — de :", self._zoom_onset_t0)
-        zoom_form.addRow("Zoom début — à :", self._zoom_onset_t1)
-        zoom_form.addRow("Zoom fin — de :", self._zoom_end_t0)
-        zoom_form.addRow("Zoom fin — à :", self._zoom_end_t1)
-        zoom_form.addRow(zoom_hint)
 
-        layout_group = QGroupBox("Disposition")
-        self._layout_form = configure_narrow_form(QFormLayout(layout_group))
+        # --- Widgets taille / échelle (assemblés dans les blocs plus bas) ---
         self._graph_height = _int_spin(
             160,
             1200,
@@ -416,64 +370,46 @@ class ParamsPanel(QWidget):
             suffix=" px",
         )
         self._graph_height_tooltip = (
-            "Hauteur fixe de chaque graphique (aperçu, analyse, onglets). "
-            "Masquée si l’amplitude est en manuel "
-            "(la valeur et la taille fixent alors le gain Y)."
+            "Hauteur de la zone de tracé (ViewBox) en aperçu canal. "
+            "XOR avec l’amplitude manuelle : jamais les deux."
         )
         self._graph_height.setToolTip(self._graph_height_tooltip)
-        self._preview_title_gap = _int_spin(-40, 240, 0, suffix=" px")
-        self._preview_title_gap_tooltip = (
-            "Espace vertical entre le titre du graphique et la courbe, "
-            "en aperçu canal. 0 = écart actuel. "
-            "Positif agrandit l’espace, négatif le réduit jusqu’à coller le titre à la courbe."
+        self._graph_width = _int_spin(
+            0,
+            4000,
+            int(defaults.get("default_graph_width_px", 0) or 0),
+            step=20,
+            suffix=" px",
         )
-        self._preview_title_gap.setToolTip(self._preview_title_gap_tooltip)
+        self._graph_width_tooltip = (
+            "Largeur de la zone de tracé (ViewBox). 0 = remplit le conteneur. "
+            "XOR avec le temps manuel : jamais les deux."
+        )
+        self._graph_width.setToolTip(self._graph_width_tooltip)
         self._show_scale_bars = QCheckBox("Barres flottantes (sinon graduations sur les axes)")
         self._show_scale_bars.setChecked(False)
         self._show_scale_bars.setToolTip(
-            "Les réglages Temps / Amplitude ci-dessous définissent toujours l’échelle. "
-            "Coché : barres flottantes. Décoché : mêmes valeurs en graduations sur les axes."
+            "Coché : barres flottantes. Décoché : graduations sur les axes. "
+            "Les valeurs Temps / Amplitude s’appliquent dans les deux cas."
         )
         self._scale_bar_amp_manual = QCheckBox("Manuel")
         self._scale_bar_amp_manual.setChecked(False)
         self._scale_bar_amp_manual.setToolTip(
-            "Échelle d’amplitude manuelle : valeur (µV) et taille (px) ensemble. "
-            "Coche : la hauteur du graphique suit ces deux valeurs "
-            "(ex. 50 µV = 40 px)."
+            "Amplitude manuelle (µV) + taille (px) : XOR avec la hauteur du graph."
         )
         self._scale_bar_amp = _spin(
             0.01, 1_000_000.0, 100.0, decimals=2, step=10.0, suffix=" µV"
         )
-        self._scale_bar_amp.setToolTip(
-            "Amplitude du bâton vertical (ex. 50 µV). "
-            "Avec la taille en pixels, fixe la hauteur du graphique."
-        )
         self._scale_bar_amp_len_px = _int_spin(4, 800, 40, step=5, suffix=" px")
-        self._scale_bar_amp_len_px.setToolTip(
-            "Hauteur du bâton en pixels. "
-            "Activée avec la case Amplitude. "
-            "Avec la valeur, fixe la hauteur du graphique (ex. 50 µV = 40 px)."
-        )
         self._scale_bar_time_manual = QCheckBox("Manuel")
         self._scale_bar_time_manual.setChecked(False)
         self._scale_bar_time_manual.setToolTip(
-            "Échelle de temps manuelle : durée (ms) et taille (px) ensemble. "
-            "Coche : la largeur du graphique suit ces deux valeurs "
-            "(ex. 200 ms = 40 px)."
+            "Temps manuel (ms) + taille (px) : XOR avec la largeur du graph."
         )
         self._scale_bar_time_ms = _spin(
             0.01, 1_000_000.0, 100.0, decimals=2, step=10.0, suffix=" ms"
         )
-        self._scale_bar_time_ms.setToolTip(
-            "Durée du bâton horizontal (ex. 200 ms). "
-            "Avec la taille en pixels, fixe la largeur du graphique."
-        )
         self._scale_bar_time_len_px = _int_spin(4, 800, 40, suffix=" px")
-        self._scale_bar_time_len_px.setToolTip(
-            "Longueur du bâton de temps en pixels. "
-            "Activée avec la case Temps. "
-            "Avec la durée, fixe la largeur du graphique (ex. 200 ms = 40 px)."
-        )
         amp_row = QWidget()
         amp_lay = QHBoxLayout(amp_row)
         amp_lay.setContentsMargins(0, 0, 0, 0)
@@ -489,46 +425,26 @@ class ParamsPanel(QWidget):
         self._scale_bar_linewidth = _spin(
             0.2, 20.0, 1.4, decimals=2, step=0.1, suffix=" pt"
         )
-        self._scale_bar_linewidth.setToolTip(
-            "Épaisseur du trait noir des barres d’échelle flottantes "
-            "(temps et amplitude)."
-        )
         self._scale_bar_dx = _int_spin(-400, 400, 0, suffix=" px")
         self._scale_bar_dx.setToolTip(
-            "Décalage horizontal de l’échelle amplitude (axe vertical). "
-            "0 = position par défaut. "
-            "Positif décale vers la droite, négatif vers la gauche."
+            "Marge entre le bord gauche du bloc échelle µV et l’échelle."
         )
         self._scale_bar_dy = _int_spin(-400, 400, 0, suffix=" px")
-        self._scale_bar_dy.setToolTip(
-            "Décalage vertical de l’échelle amplitude (axe vertical). "
-            "0 = position par défaut. "
-            "Positif monte la barre, négatif la descend."
-        )
         self._scale_bar_time_dx = _int_spin(-400, 400, 0, suffix=" px")
-        self._scale_bar_time_dx.setToolTip(
-            "Décalage horizontal de l’échelle temps (axe horizontal). "
-            "0 = position par défaut. "
-            "Positif décale vers la droite, négatif vers la gauche."
-        )
         self._scale_bar_time_dy = _int_spin(-400, 400, 0, suffix=" px")
         self._scale_bar_time_dy.setToolTip(
-            "Décalage vertical de l’échelle temps (axe horizontal). "
-            "0 = position par défaut. "
-            "Positif monte la barre, négatif la descend."
+            "Marge entre le haut du bloc échelle temps et l’échelle."
         )
         self._scale_bar_amp_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._scale_bar_time_manual.toggled.connect(self._sync_scale_bar_inputs)
         self._show_scale_bars.toggled.connect(self._sync_scale_bar_inputs)
-        self._sync_scale_bar_inputs()
         _max_pts_lo, _max_pts_hi = 500, 200_000
         _max_pts_mid = (_max_pts_lo + _max_pts_hi) // 2
         self._max_points = _int_spin(
             _max_pts_lo, _max_pts_hi, _max_pts_mid, step=500
         )
         self._max_points.setToolTip(
-            "Points dessinés par courbe (aperçu, montage et fenêtres zoom). "
-            "Au-delà, une enveloppe min/max conserve tous les pics tout en restant rapide."
+            "Points dessinés par courbe. Au-delà : enveloppe min/max."
         )
         max_pts_row = QWidget()
         max_pts_lay = QHBoxLayout(max_pts_row)
@@ -536,34 +452,51 @@ class ParamsPanel(QWidget):
         max_pts_lay.setSpacing(6)
         max_pts_min_btn = QPushButton("Min")
         max_pts_max_btn = QPushButton("Max")
-        max_pts_min_btn.setToolTip(f"Mettre le minimum ({_max_pts_lo})")
-        max_pts_max_btn.setToolTip(f"Mettre le maximum ({_max_pts_hi})")
-        max_pts_min_btn.clicked.connect(
-            lambda: self._max_points.setValue(_max_pts_lo)
-        )
-        max_pts_max_btn.clicked.connect(
-            lambda: self._max_points.setValue(_max_pts_hi)
-        )
+        max_pts_min_btn.clicked.connect(lambda: self._max_points.setValue(_max_pts_lo))
+        max_pts_max_btn.clicked.connect(lambda: self._max_points.setValue(_max_pts_hi))
         max_pts_lay.addWidget(self._max_points, 1)
         max_pts_lay.addWidget(max_pts_min_btn)
         max_pts_lay.addWidget(max_pts_max_btn)
-        self._layout_form.addRow("Hauteur des graphs :", self._graph_height)
-        self._layout_form.addRow("Écart titre / courbe :", self._preview_title_gap)
-        self._layout_form.addRow(self._show_scale_bars)
-        self._layout_form.addRow("Amplitude barre :", amp_row)
-        self._layout_form.addRow("Taille amp. :", self._scale_bar_amp_len_px)
-        self._layout_form.addRow("Temps barre :", time_row)
-        self._layout_form.addRow("Taille temps :", self._scale_bar_time_len_px)
-        self._layout_form.addRow("Épaisseur du trait :", self._scale_bar_linewidth)
-        self._layout_form.addRow("Temps — horizontal :", self._scale_bar_time_dx)
-        self._layout_form.addRow("Temps — vertical :", self._scale_bar_time_dy)
-        self._layout_form.addRow("Amplitude — horizontal :", self._scale_bar_dx)
-        self._layout_form.addRow("Amplitude — vertical :", self._scale_bar_dy)
+
+        # D. Graph — taille (+ apparence ajoutée dans _add_style_groups)
+        graph_size_group, graph_size_inner = _accordion(
+            "Graph", expanded=True
+        )
+        self._block_graph_size = graph_size_group
+        self._block_graph_appear = graph_size_group  # fusionné
+        self._layout_form = configure_narrow_form(QFormLayout(graph_size_inner))
+        self._layout_form.setContentsMargins(0, 0, 0, 0)
+        self._graph_appear_form = self._layout_form
+        self._layout_form.addRow("Hauteur :", self._graph_height)
+        self._layout_form.addRow("Largeur :", self._graph_width)
         self._layout_form.addRow("Points max / courbe :", max_pts_row)
 
+        # E+F. Échelles flottantes (µV + temps)
+        scale_group, scale_inner = _accordion("Échelles", expanded=True)
+        self._block_scale_v = scale_group
+        self._block_scale_h = scale_group
+        self._block_scales = scale_group
+        scale_form = configure_narrow_form(QFormLayout(scale_inner))
+        scale_form.setContentsMargins(0, 0, 0, 0)
+        scale_form.addRow(self._show_scale_bars)
+        scale_form.addRow("Amplitude (µV) :", amp_row)
+        scale_form.addRow("Taille amp. :", self._scale_bar_amp_len_px)
+        scale_form.addRow("Temps (ms) :", time_row)
+        scale_form.addRow("Taille temps :", self._scale_bar_time_len_px)
+        scale_form.addRow("Épaisseur du trait :", self._scale_bar_linewidth)
+        scale_form.addRow("µV — marge gauche :", self._scale_bar_dx)
+        scale_form.addRow("µV — décalage vertical :", self._scale_bar_dy)
+        scale_form.addRow("Temps — horizontal :", self._scale_bar_time_dx)
+        scale_form.addRow("Temps — marge haut :", self._scale_bar_time_dy)
+
+        self._sync_scale_bar_inputs()
+
         # Revue montage continue uniquement.
-        self._montage_review_group = QGroupBox("Revue montage")
-        review_form = configure_narrow_form(QFormLayout(self._montage_review_group))
+        self._montage_review_group, review_inner = _accordion(
+            "Revue montage", expanded=True
+        )
+        review_form = configure_narrow_form(QFormLayout(review_inner))
+        review_form.setContentsMargins(0, 0, 0, 0)
         self._montage_review_channels = _int_spin(1, 128, 10)
         self._montage_review_channels_tooltip = (
             "Nombre de canaux empilés par page dans la revue montage. "
@@ -579,8 +512,9 @@ class ParamsPanel(QWidget):
             suffix=" px",
         )
         self._montage_row_tooltip = (
-            "Hauteur minimale d’une ligne canal×flux dans la revue montage. "
-            "Plus bas = ouverture plus rapide, moins de détail vertical."
+            "Hauteur de zone de tracé d’une ligne canal×flux (revue montage). "
+            "XOR avec l’amplitude manuelle : jamais les deux. "
+            "Titre, stim et échelles s’ajoutent autour sans réduire cette hauteur."
         )
         self._montage_row_height.setToolTip(self._montage_row_tooltip)
         review_form.addRow("Hauteur de ligne :", self._montage_row_height)
@@ -637,62 +571,23 @@ class ParamsPanel(QWidget):
         )
         self._montage_review_group.setToolTip(self._montage_review_tooltip)
 
-        montage_group, montage_inner = _collapsible_group(
-            "Montages PDF (moyenne / 2e stim)", expanded=False
-        )
-        self._montage_pdf_group = montage_group
-        self._montage_pdf_tooltip = (
-            "Pagination des montages PDF moyenne / 2e stim (export). "
-            "Sans effet sur la revue montage continue."
-        )
-        self._montage_pdf_group.setToolTip(self._montage_pdf_tooltip)
-        montage_form = configure_narrow_form(QFormLayout(montage_inner))
-        montage_form.setContentsMargins(0, 0, 0, 0)
-        self._montage_channels = _int_spin(2, 1024, 12)
-        self._montage_channels_tooltip = (
-            "Canaux empilés par page pour les montages PDF moyenne / 2e stim. "
-            "La revue continue utilise « Canaux visibles » ci-dessus."
-        )
-        self._montage_channels.setToolTip(self._montage_channels_tooltip)
-        self._montage_page = _int_spin(0, 64, 0)
-        self._montage_page_tooltip = (
-            "Bloc de canaux pour les montages PDF (0 = première page). "
-            "Sans effet sur la revue montage continue."
-        )
-        self._montage_page.setToolTip(self._montage_page_tooltip)
-        montage_form.addRow("Canaux par montage :", self._montage_channels)
-        montage_form.addRow("Page de montage :", self._montage_page)
+        # Montages PDF : plus d’UI (pagination = revue continue).
+        self._montage_channels_value = 12
+        self._montage_page_value = 0
 
-        for group in (
-            sync_group,
-            axis_group,
-            zoom_group,
-            layout_group,
-            self._montage_review_group,
-            montage_group,
-        ):
-            page_layout.addWidget(group)
+        self._block_montage_review = self._montage_review_group
 
         for int_widget in (
-            self._montage_channels,
-            self._montage_page,
             self._montage_review_channels,
             self._montage_row_height,
             self._montage_label_dx,
             self._montage_label_dy,
-            self._preview_title_gap,
             self._max_points,
         ):
             int_widget.valueChanged.connect(lambda _v: self._emit_view())
         self._graph_height.valueChanged.connect(lambda _v: self._emit_view())
+        self._graph_width.valueChanged.connect(lambda _v: self._emit_view())
         self._scale_bar_amp_len_px.valueChanged.connect(lambda _v: self._emit_view())
-        for zoom_spin in (
-            self._zoom_onset_t0,
-            self._zoom_onset_t1,
-            self._zoom_end_t0,
-            self._zoom_end_t1,
-        ):
-            zoom_spin.valueChanged.connect(lambda _v: self._emit_view())
         self._x_limits.changed.connect(self._emit_view)
         self._time_sync.currentIndexChanged.connect(lambda _i: self._emit_view())
         self._show_scale_bars.toggled.connect(lambda _c: self._emit_view())
@@ -728,10 +623,22 @@ class ParamsPanel(QWidget):
         self._scale_bar_dy.setEnabled(floating)
         self._scale_bar_time_dx.setEnabled(floating)
         self._scale_bar_time_dy.setEnabled(floating)
-        # Amplitude manuelle → hauteur pilotée par l’échelle, pas graph_height_px.
+        # XOR hauteur : amplitude manuelle ↔ graph_height / hauteur de ligne.
+        # XOR largeur : temps manuel ↔ graph_width.
         amp_len_on = amp_on
+        time_len_on = time_on
+        montage = getattr(self, "_view_mode", "preview") == "montage"
         if hasattr(self, "_graph_height") and hasattr(self, "_layout_form"):
-            _set_form_row_visible(self._layout_form, self._graph_height, not amp_len_on)
+            _set_form_row_visible(
+                self._layout_form, self._graph_height, (not montage) and (not amp_len_on)
+            )
+        if hasattr(self, "_graph_width") and hasattr(self, "_layout_form"):
+            _set_form_row_visible(
+                self._layout_form, self._graph_width, not time_len_on
+            )
+        if hasattr(self, "_montage_row_height") and hasattr(self, "_montage_review_group"):
+            self._montage_row_height.setEnabled(not amp_len_on)
+            self._montage_row_height.setVisible(True)
 
     def _sync_spike_scale_inputs(self, *_args: Any) -> None:
         if not hasattr(self, "_spike_scale_amp_manual"):
@@ -765,9 +672,112 @@ class ParamsPanel(QWidget):
     # ---------------------------------------------------- style (dans Affichage)
 
     def _add_style_groups(self, page_layout: QVBoxLayout) -> None:
-        """Légendes, textes et apparence — redessin immédiat (jamais F5)."""
-        legend_group = QGroupBox("Légendes")
-        legend_form = configure_narrow_form(QFormLayout(legend_group))
+        """Paramètres d'apparence groupés par élément modifié (blocs A–I)."""
+        # --- A. Titre ---
+        title_group, title_inner = _accordion("Titre", expanded=False)
+        self._block_title = title_group
+        title_form = configure_narrow_form(QFormLayout(title_inner))
+        title_form.setContentsMargins(0, 0, 0, 0)
+        self._title_form = title_form
+        self._text_title = QLineEdit()
+        self._text_title.setPlaceholderText("Automatique")
+        self._text_title.setToolTip("Laissez vide pour le titre généré automatiquement.")
+        self._title_font = FontSizeFaceRow(5.0, 50.0, 10.0, decimals=1, step=0.5)
+        self._title_dx = _int_spin(-400, 400, 0, suffix=" px")
+        self._title_dx.setToolTip(
+            "Marge horizontale du titre (bord gauche du bloc). Positif = droite."
+        )
+        title_form.addRow("Texte :", self._text_title)
+        title_form.addRow("Police :", self._title_font)
+        title_form.addRow("Marge gauche :", self._title_dx)
+
+        # --- B. Stimulation ---
+        stim_group, stim_inner = _accordion("Stimulation", expanded=True)
+        self._block_stim = stim_group
+        stim_form = configure_narrow_form(QFormLayout(stim_inner))
+        stim_form.setContentsMargins(0, 0, 0, 0)
+        self._stim_form = stim_form
+        self._stim_markers = QCheckBox("Pointillés de début / fin de stimulation")
+        self._stim_markers.setChecked(True)
+        self._stim_markers.setToolTip(
+            "Lignes en pointillés au début et à la fin de stimulation "
+            "(aperçu, analyse et revue montage). "
+            "Pilote aussi les marqueurs sur les traces continues."
+        )
+        self._stim_linewidth = _spin(0.2, 20.0, 1.0, decimals=2, step=0.1)
+        self._stim_linewidth.setToolTip(
+            "Épaisseur (points) des pointillés de début et de fin de stimulation."
+        )
+        self._stim_onset_color = ColorSwatchButton(
+            STIM_ONSET_COLOR, dialog_title="Couleur du début de stimulation"
+        )
+        self._stim_offset_color = ColorSwatchButton(
+            STIM_OFFSET_COLOR, dialog_title="Couleur de la fin de stimulation"
+        )
+        self._show_stim_labels = QCheckBox("Libellés on / off sur les traits")
+        self._show_stim_labels.setChecked(True)
+        self._text_stim_on = QLineEdit("on")
+        self._text_stim_on.setPlaceholderText("on")
+        self._text_stim_off = QLineEdit("off")
+        self._text_stim_off.setPlaceholderText("off")
+        self._stim_on_font = FontSizeFaceRow(4.0, 50.0, 8.0, decimals=1, step=0.5)
+        self._stim_off_font = FontSizeFaceRow(4.0, 50.0, 8.0, decimals=1, step=0.5)
+        self._stim_on_dx = _int_spin(-400, 400, 0, suffix=" px")
+        self._stim_on_dy = _int_spin(-400, 400, 0, suffix=" px")
+        self._stim_off_dx = _int_spin(-400, 400, 0, suffix=" px")
+        self._stim_off_dy = _int_spin(-400, 400, 0, suffix=" px")
+        stim_form.addRow(self._stim_markers)
+        stim_form.addRow("Épaisseur :", self._stim_linewidth)
+        stim_form.addRow("Couleur début :", self._stim_onset_color)
+        stim_form.addRow("Couleur fin :", self._stim_offset_color)
+        stim_form.addRow(self._show_stim_labels)
+        stim_form.addRow("Texte début (on) :", self._text_stim_on)
+        stim_form.addRow("Police début :", self._stim_on_font)
+        stim_form.addRow("Début — horizontal :", self._stim_on_dx)
+        stim_form.addRow("Début — vertical :", self._stim_on_dy)
+        stim_form.addRow("Texte fin (off) :", self._text_stim_off)
+        stim_form.addRow("Police fin :", self._stim_off_font)
+        stim_form.addRow("Fin — horizontal :", self._stim_off_dx)
+        stim_form.addRow("Fin — vertical :", self._stim_off_dy)
+        self._show_stim_labels.toggled.connect(self._sync_stim_label_inputs)
+        self._sync_stim_label_inputs()
+
+        # --- C. Labels verticaux / axe Y ---
+        labels_group, labels_inner = _accordion(
+            "Labels verticaux", expanded=False
+        )
+        self._block_labels_y = labels_group
+        labels_form = configure_narrow_form(QFormLayout(labels_inner))
+        labels_form.setContentsMargins(0, 0, 0, 0)
+        self._labels_y_form = labels_form
+        self._text_ylabel = QLineEdit()
+        self._text_ylabel.setPlaceholderText("Automatique")
+        self._label_font = FontSizeFaceRow(5.0, 50.0, 9.0, decimals=1, step=0.5)
+        labels_form.addRow("Libellé axe Y :", self._text_ylabel)
+        labels_form.addRow("Police des axes :", self._label_font)
+
+        # --- D. Graph — apparence (dans le même bloc que la taille) ---
+        self._line_width = _spin(0.2, 20.0, 1.2, decimals=2, step=0.1)
+        self._tick_font = FontSizeFaceRow(4.0, 50.0, 8.0, decimals=1, step=0.5)
+        self._grid = QCheckBox("Afficher la grille")
+        self._grid.setChecked(True)
+        self._grid_alpha = _spin(0.0, 1.0, 0.3, decimals=2, step=0.05)
+        self._show_borders = QCheckBox("Afficher les bordures du graphique")
+        self._show_borders.setChecked(True)
+        self._layout_form.addRow("Épaisseur de trait :", self._line_width)
+        self._layout_form.addRow("Police des ticks :", self._tick_font)
+        self._layout_form.addRow(self._grid)
+        self._layout_form.addRow("Opacité de la grille :", self._grid_alpha)
+        self._layout_form.addRow(self._show_borders)
+
+        # --- H. Légende des courbes ---
+        legend_group, legend_inner = _accordion(
+            "Légende des courbes", expanded=False
+        )
+        self._block_legend = legend_group
+        legend_form = configure_narrow_form(QFormLayout(legend_inner))
+        legend_form.setContentsMargins(0, 0, 0, 0)
+        self._legend_form = legend_form
         self._legend_visible = QCheckBox("Afficher les légendes")
         self._legend_visible.setChecked(True)
         self._legend_location = QComboBox()
@@ -780,192 +790,62 @@ class ParamsPanel(QWidget):
         )
         for location in LEGEND_LOCATIONS:
             self._legend_location.addItem(
-                "Sous le panneau" if location == "below" else location.capitalize(), location
+                "Sous le panneau" if location == "below" else location.capitalize(),
+                location,
             )
         self._legend_font = FontSizeFaceRow(4.0, 50.0, 9.0, decimals=1, step=0.5)
         self._legend_columns = _int_spin(1, 6, 1)
-        self._legend_gap = _spin(0.0, 1.0, 0.22, decimals=2, step=0.02)
-        self._legend_gap.setToolTip(
-            "Écart entre la légende et le graphique (fraction de la hauteur des axes)."
-        )
         self._legend_frame = QCheckBox("Cadre autour des légendes")
         self._legend_frame.setChecked(True)
         self._legend_filters = QCheckBox("Détails du filtre (type, ordre, coupure)")
         self._legend_filters.setChecked(True)
         self._legend_counts = QCheckBox("Compteurs d’échantillons / spikes")
         self._legend_counts.setChecked(True)
-        legend_form.addRow(self._legend_visible)
-        legend_form.addRow("Position :", self._legend_location)
-        legend_form.addRow("Police de la légende :", self._legend_font)
-        legend_form.addRow("Colonnes :", self._legend_columns)
-        legend_form.addRow("Distance au graphique :", self._legend_gap)
-        legend_form.addRow(self._legend_frame)
-        legend_form.addRow(self._legend_filters)
-        legend_form.addRow(self._legend_counts)
-
-        style_group = QGroupBox("Textes et apparence")
-        style_form = configure_narrow_form(QFormLayout(style_group))
-        self._text_title = QLineEdit()
-        self._text_title.setPlaceholderText("Automatique")
-        self._text_title.setToolTip("Laissez vide pour le titre généré automatiquement.")
-        self._text_xlabel = QLineEdit()
-        self._text_xlabel.setPlaceholderText("Automatique")
-        self._text_ylabel = QLineEdit()
-        self._text_ylabel.setPlaceholderText("Automatique")
         self._text_series_suffix = QCheckBox(
             "Suffixe de type de courbe (moyenne, RMS…)"
         )
         self._text_series_suffix.setChecked(True)
-        self._text_series_suffix.setToolTip(
-            "Décochez pour n’afficher que le nom d’enregistrement dans la légende."
-        )
-        self._text_legend_labels = QPlainTextEdit()
-        self._text_legend_labels.setPlaceholderText(
-            "Automatique — une entrée de légende par ligne,\n"
-            "dans l’ordre des courbes. Ligne vide = garder l’auto."
-        )
-        self._text_legend_labels.setMaximumHeight(90)
-        self._text_legend_labels.setToolTip(
-            "Remplace les libellés de légende. Les noms de base restent "
-            "aussi éditables dans le dock Enregistrements → Légende."
-        )
-        self._title_font = FontSizeFaceRow(5.0, 50.0, 10.0, decimals=1, step=0.5)
-        self._title_dx = _int_spin(-400, 400, 0, suffix=" px")
-        self._title_dx.setToolTip(
-            "Décalage horizontal du titre de graphique. Positif = droite."
-        )
-        self._title_dy = _int_spin(-400, 400, 0, suffix=" px")
-        self._title_dy.setToolTip(
-            "Décalage vertical du titre de graphique. Positif = haut."
-        )
-        self._label_font = FontSizeFaceRow(5.0, 50.0, 9.0, decimals=1, step=0.5)
-        self._tick_font = FontSizeFaceRow(4.0, 50.0, 8.0, decimals=1, step=0.5)
-        self._line_width = _spin(0.2, 20.0, 1.2, decimals=2, step=0.1)
-        self._stim_linewidth = _spin(0.2, 20.0, 1.0, decimals=2, step=0.1)
-        self._stim_linewidth.setToolTip(
-            "Épaisseur (points) des pointillés de début et de fin de stimulation."
-        )
-        self._stim_onset_color = ColorSwatchButton(
-            STIM_ONSET_COLOR, dialog_title="Couleur du début de stimulation"
-        )
-        self._stim_onset_color.setToolTip(
-            "Couleur des pointillés au début de chaque stimulation."
-        )
-        self._stim_offset_color = ColorSwatchButton(
-            STIM_OFFSET_COLOR, dialog_title="Couleur de la fin de stimulation"
-        )
-        self._stim_offset_color.setToolTip(
-            "Couleur des pointillés à la fin de chaque stimulation."
-        )
-        self._text_stim_on = QLineEdit("on")
-        self._text_stim_on.setPlaceholderText("on")
-        self._text_stim_on.setToolTip(
-            "Texte au-dessus du trait de début de stimulation. Vide = masquer."
-        )
-        self._text_stim_off = QLineEdit("off")
-        self._text_stim_off.setPlaceholderText("off")
-        self._text_stim_off.setToolTip(
-            "Texte au-dessus du trait de fin de stimulation. Vide = masquer."
-        )
-        self._stim_on_font = FontSizeFaceRow(4.0, 50.0, 8.0, decimals=1, step=0.5)
-        self._stim_off_font = FontSizeFaceRow(4.0, 50.0, 8.0, decimals=1, step=0.5)
-        self._stim_on_dx = _int_spin(-400, 400, 0, suffix=" px")
-        self._stim_on_dx.setToolTip(
-            "Décalage horizontal du libellé « on ». Positif = droite."
-        )
-        self._stim_on_dy = _int_spin(-400, 400, 0, suffix=" px")
-        self._stim_on_dy.setToolTip(
-            "Décalage vertical du libellé « on ». Positif = haut."
-        )
-        self._stim_off_dx = _int_spin(-400, 400, 0, suffix=" px")
-        self._stim_off_dx.setToolTip(
-            "Décalage horizontal du libellé « off ». Positif = droite."
-        )
-        self._stim_off_dy = _int_spin(-400, 400, 0, suffix=" px")
-        self._stim_off_dy.setToolTip(
-            "Décalage vertical du libellé « off ». Positif = haut."
-        )
-        self._grid = QCheckBox("Afficher la grille")
-        self._grid.setChecked(True)
-        self._grid_alpha = _spin(0.0, 1.0, 0.3, decimals=2, step=0.05)
-        self._show_borders = QCheckBox("Afficher les bordures du graphique")
-        self._show_borders.setChecked(True)
-        self._show_borders.setToolTip(
-            "Cadre avec graduations autour de la zone de tracé de chaque panneau."
-        )
-        self._ticks_inside = QCheckBox("Graduations vers l’intérieur")
-        self._ticks_inside.setChecked(False)
-        self._ticks_inside.setToolTip(
-            "Oriente les graduations (ticks) vers l’intérieur du cadre de tracé."
-        )
-        self._stim_markers = QCheckBox("Pointillés de début / fin de stimulation")
-        self._stim_markers.setChecked(True)
-        self._stim_markers.setToolTip(
-            "Lignes en pointillés au début et à la fin de stimulation "
-            "(aperçu, revue montage et graphiques d’analyse). "
-            "Sur les traces continues, décochez aussi "
-            "« Marqueurs de stimulation sur les traces » pour les masquer."
-        )
-        self._show_stim_labels = QCheckBox("Libellés on / off sur les traits")
-        self._show_stim_labels.setChecked(True)
-        self._show_stim_labels.setToolTip(
-            "Afficher les textes « on » et « off » juste sous le haut des traits "
-            "de début et de fin de stimulation."
-        )
-        style_form.addRow("Titre :", self._text_title)
-        style_form.addRow("Axe X :", self._text_xlabel)
-        style_form.addRow("Axe Y :", self._text_ylabel)
-        style_form.addRow(self._text_series_suffix)
-        style_form.addRow("Légendes :", self._text_legend_labels)
-        style_form.addRow("Police du titre :", self._title_font)
-        style_form.addRow("Titre — horizontal :", self._title_dx)
-        style_form.addRow("Titre — vertical :", self._title_dy)
-        style_form.addRow("Police des axes :", self._label_font)
-        style_form.addRow("Police des ticks :", self._tick_font)
-        style_form.addRow("Épaisseur de trait :", self._line_width)
-        style_form.addRow(self._grid)
-        style_form.addRow("Opacité de la grille :", self._grid_alpha)
-        style_form.addRow(self._show_borders)
-        style_form.addRow(self._ticks_inside)
-        style_form.addRow(self._stim_markers)
-        style_form.addRow("Épaisseur du trait de stimulation :", self._stim_linewidth)
-        style_form.addRow("Couleur début de stimulation :", self._stim_onset_color)
-        style_form.addRow("Couleur fin de stimulation :", self._stim_offset_color)
-        style_form.addRow(self._show_stim_labels)
-        style_form.addRow("Texte début (on) :", self._text_stim_on)
-        style_form.addRow("Police début (on) :", self._stim_on_font)
-        style_form.addRow("Début — horizontal :", self._stim_on_dx)
-        style_form.addRow("Début — vertical :", self._stim_on_dy)
-        style_form.addRow("Texte fin (off) :", self._text_stim_off)
-        style_form.addRow("Police fin (off) :", self._stim_off_font)
-        style_form.addRow("Fin — horizontal :", self._stim_off_dx)
-        style_form.addRow("Fin — vertical :", self._stim_off_dy)
+        legend_form.addRow(self._legend_visible)
+        legend_form.addRow("Position :", self._legend_location)
+        legend_form.addRow("Police :", self._legend_font)
+        legend_form.addRow("Colonnes :", self._legend_columns)
+        legend_form.addRow(self._legend_frame)
+        legend_form.addRow(self._legend_filters)
+        legend_form.addRow(self._legend_counts)
+        legend_form.addRow(self._text_series_suffix)
+
+        # --- I. Zones de zoom ---
+        zone_group, zone_inner = _accordion("Zones de zoom", expanded=False)
+        self._block_zones = zone_group
+        zone_form = configure_narrow_form(QFormLayout(zone_inner))
+        zone_form.setContentsMargins(0, 0, 0, 0)
+        self._zone_form = zone_form
         self._show_zone_labels = QCheckBox("Libellés sous les zones de zoom")
         self._show_zone_labels.setChecked(True)
-        self._show_zone_labels.setToolTip(
-            "Afficher « Zone N » (ou le nom édité dans Plages / zooms) "
-            "sous chaque bande de zoom, en bas du graphique."
-        )
         self._zone_font = FontSizeFaceRow(4.0, 50.0, 8.0, decimals=1, step=0.5)
         self._zone_dx = _int_spin(-400, 400, 0, suffix=" px")
-        self._zone_dx.setToolTip(
-            "Décalage horizontal du libellé de zone. Positif = droite."
-        )
         self._zone_dy = _int_spin(-400, 400, 0, suffix=" px")
-        self._zone_dy.setToolTip(
-            "Décalage vertical du libellé de zone. Positif = haut."
-        )
-        style_form.addRow(self._show_zone_labels)
-        style_form.addRow("Police des zones :", self._zone_font)
-        style_form.addRow("Zone — horizontal :", self._zone_dx)
-        style_form.addRow("Zone — vertical :", self._zone_dy)
-        self._show_stim_labels.toggled.connect(self._sync_stim_label_inputs)
-        self._sync_stim_label_inputs()
+        zone_form.addRow(self._show_zone_labels)
+        zone_form.addRow("Police :", self._zone_font)
+        zone_form.addRow("Horizontal :", self._zone_dx)
+        zone_form.addRow("Vertical :", self._zone_dy)
         self._show_zone_labels.toggled.connect(self._sync_zone_label_inputs)
         self._sync_zone_label_inputs()
 
-        page_layout.addWidget(legend_group)
-        page_layout.addWidget(style_group)
+        # Ordre UI = éléments du canvas (sections secondaires repliées par défaut)
+        for group in (
+            self._block_stim,
+            self._block_graph_size,
+            self._block_scales,
+            self._block_title,
+            self._block_labels_y,
+            self._block_axis_x,
+            self._block_legend,
+            self._block_zones,
+            self._block_time,
+            self._block_montage_review,
+        ):
+            page_layout.addWidget(group)
 
         for box in (
             self._legend_visible,
@@ -975,7 +855,6 @@ class ParamsPanel(QWidget):
             self._text_series_suffix,
             self._grid,
             self._show_borders,
-            self._ticks_inside,
             self._stim_markers,
             self._show_stim_labels,
             self._show_zone_labels,
@@ -983,12 +862,10 @@ class ParamsPanel(QWidget):
             box.toggled.connect(lambda _c: self._emit_view())
         self._legend_location.currentIndexChanged.connect(lambda _i: self._emit_view())
         for spin in (
-            self._legend_gap,
             self._line_width,
             self._stim_linewidth,
             self._grid_alpha,
             self._title_dx,
-            self._title_dy,
             self._stim_on_dx,
             self._stim_on_dy,
             self._stim_off_dx,
@@ -1018,7 +895,6 @@ class ParamsPanel(QWidget):
             self._text_stim_off,
         ):
             line.textChanged.connect(lambda _t: self._emit_view())
-        self._text_legend_labels.textChanged.connect(self._emit_view)
 
     # -------------------------------------------------------- processing tab
 
@@ -1760,7 +1636,8 @@ class ParamsPanel(QWidget):
             self._loading = previous
 
     def mark_stimulations(self) -> bool:
-        return bool(self._cb_mark_stims.isChecked())
+        """Pointillés stim sur les traces — case « Pointillés début/fin »."""
+        return bool(self._stim_markers.isChecked())
 
     def set_dirty_message(self, message: str) -> None:
         self._dirty_label.setText(message)
@@ -1815,16 +1692,17 @@ class ParamsPanel(QWidget):
             self._hp_ylim.set_value(settings.hp_ylim)
             self._lp_ylim.set_value(settings.lp_ylim)
             self._rms_ylim_row.set_value(settings.rms_ylim)
-            self._zoom_onset_t0.setValue(float(settings.zoom_onset_t0_s))
-            self._zoom_onset_t1.setValue(float(settings.zoom_onset_t1_s))
-            self._zoom_end_t0.setValue(float(settings.zoom_end_t0_s))
-            self._zoom_end_t1.setValue(float(settings.zoom_end_t1_s))
+            self._zoom_onset_t0_s = float(settings.zoom_onset_t0_s)
+            self._zoom_onset_t1_s = float(settings.zoom_onset_t1_s)
+            self._zoom_end_t0_s = float(settings.zoom_end_t0_s)
+            self._zoom_end_t1_s = float(settings.zoom_end_t1_s)
             self._set_combo_data(self._time_sync, settings.time_sync)
-            self._cb_mark_stims.setChecked(bool(settings.continuous_mark_stims))
             self._graph_height.setValue(
                 max(160, min(1200, int(settings.graph_height_px)))
             )
-            self._preview_title_gap.setValue(int(settings.preview_title_gap_px))
+            self._graph_width.setValue(
+                max(0, min(4000, int(getattr(settings, "graph_width_px", 0) or 0)))
+            )
             style = settings.style
             self._show_scale_bars.setChecked(bool(style.show_scale_bars))
             self._scale_bar_amp_manual.setChecked(
@@ -1864,15 +1742,14 @@ class ParamsPanel(QWidget):
             self._montage_shared_ylim.setChecked(bool(settings.montage_shared_ylim))
             self._montage_label_dx.setValue(int(round(float(settings.montage_label_dx_px))))
             self._montage_label_dy.setValue(int(round(float(settings.montage_label_dy_px))))
-            self._montage_channels.setValue(int(settings.montage_channels))
-            self._montage_page.setValue(int(settings.montage_page))
+            self._montage_channels_value = int(settings.montage_channels)
+            self._montage_page_value = int(settings.montage_page)
             legend = settings.legend
             self._legend_visible.setChecked(bool(legend.visible))
             self._set_combo_data(self._legend_location, legend.location)
             self._legend_font.set_size_value(float(legend.font_size))
             self._legend_font.set_face_value(legend.face)
             self._legend_columns.setValue(int(legend.columns))
-            self._legend_gap.setValue(float(legend.gap))
             self._legend_frame.setChecked(bool(legend.frame))
             self._legend_filters.setChecked(bool(legend.show_filter_details))
             self._legend_counts.setChecked(bool(legend.show_sample_counts))
@@ -1881,18 +1758,12 @@ class ParamsPanel(QWidget):
             self._text_xlabel.setText(str(texts.xlabel or ""))
             self._text_ylabel.setText(str(texts.ylabel or ""))
             self._text_series_suffix.setChecked(bool(texts.show_series_suffix))
-            self._text_legend_labels.setPlainText(
-                "\n".join(texts.legend_labels) if texts.legend_labels else ""
-            )
             self._text_stim_on.setText(str(getattr(texts, "stim_on", "on") or ""))
             self._text_stim_off.setText(str(getattr(texts, "stim_off", "off") or ""))
             self._title_font.set_size_value(float(style.title_font_size))
             self._title_font.set_face_value(style.title_face)
             self._title_dx.setValue(
                 int(round(float(getattr(style, "title_dx_px", 0.0) or 0.0)))
-            )
-            self._title_dy.setValue(
-                int(round(float(getattr(style, "title_dy_px", 0.0) or 0.0)))
             )
             self._label_font.set_size_value(float(style.label_font_size))
             self._label_font.set_face_value(style.label_face)
@@ -1949,7 +1820,6 @@ class ParamsPanel(QWidget):
             self._grid.setChecked(bool(style.grid))
             self._grid_alpha.setValue(float(style.grid_alpha))
             self._show_borders.setChecked(bool(style.show_borders))
-            self._ticks_inside.setChecked(bool(style.ticks_inside))
             self._stim_markers.setChecked(bool(legend.show_reference_markers))
             self._overlay_pre.setValue(float(settings.spike_overlay_pre_ms))
             self._overlay_post.setValue(float(settings.spike_overlay_post_ms))
@@ -1987,9 +1857,11 @@ class ParamsPanel(QWidget):
 
     def _apply_view_mode_visibility(self) -> None:
         """Montrer les paramètres de la vue active ; masquer ceux de l’autre."""
-        montage = self._view_mode == "montage"
+        from gui.services.view_param_visibility import visible_in
 
-        # Courbes, échelles et apparence : mêmes noms, valeurs du profil actif.
+        montage = self._view_mode == "montage"
+        mode = "montage" if montage else "preview"
+
         if hasattr(self, "_channel_host"):
             self._channel_host.setVisible(True)
             if hasattr(self, "_pipeline_sep"):
@@ -1998,6 +1870,15 @@ class ParamsPanel(QWidget):
                 self._pipeline_header.setVisible(True)
 
         view_name = "revue montage" if montage else "aperçu canal"
+        if hasattr(self, "_display_profile_banner"):
+            self._display_profile_banner.setText(
+                f"Profil : {view_name} — valeurs indépendantes de l’autre vue"
+            )
+            self._display_profile_banner.setProperty(
+                "mode", "montage" if montage else "preview"
+            )
+            self._display_profile_banner.style().unpolish(self._display_profile_banner)
+            self._display_profile_banner.style().polish(self._display_profile_banner)
         if self._channel_tab_index is not None:
             self.tabs.setTabVisible(self._channel_tab_index, True)
             self.tabs.setTabToolTip(
@@ -2006,19 +1887,28 @@ class ParamsPanel(QWidget):
                 "Le traitement (filtres, détection) reste commun → Traiter (F5).",
             )
 
+        # Groupes / lignes selon la carte de sélection (profils indépendants).
         if hasattr(self, "_montage_review_group"):
+            # Contient hauteur de ligne + canaux page + kind labels…
             self._montage_review_group.setVisible(montage)
             self._montage_review_group.setEnabled(True)
-        if hasattr(self, "_montage_pdf_group"):
-            self._montage_pdf_group.setVisible(montage)
-            self._montage_pdf_group.setEnabled(True)
-        if hasattr(self, "_layout_form") and hasattr(self, "_graph_height"):
-            _set_form_row_visible(self._layout_form, self._graph_height, not montage)
-            # Respecter le masquage « amplitude manuelle » (ne pas forcer True).
-            self._sync_scale_bar_inputs()
-        if hasattr(self, "_layout_form") and hasattr(self, "_preview_title_gap"):
-            _set_form_row_visible(self._layout_form, self._preview_title_gap, not montage)
-            _set_form_row_enabled(self._layout_form, self._preview_title_gap, True)
+        form = getattr(self, "_layout_form", None)
+        if form is not None and hasattr(self, "_graph_width"):
+            _set_form_row_visible(
+                form, self._graph_width, visible_in("graph_width", mode)
+            )
+
+        # Titres canal (montage only) — déjà dans _montage_review_group.
+        if hasattr(self, "_montage_show_kind_label"):
+            show_kind = visible_in("montage_show_kind", mode)
+            self._montage_show_kind_label.setVisible(show_kind)
+        if hasattr(self, "_montage_shared_ylim"):
+            self._montage_shared_ylim.setVisible(
+                visible_in("montage_shared_ylim", mode)
+            )
+
+        # XOR taille / échelle après les règles de vue.
+        self._sync_scale_bar_inputs()
 
         self.tabs.setTabToolTip(
             1,
@@ -2098,7 +1988,7 @@ class ParamsPanel(QWidget):
             font_size=self._legend_font.size_value(),
             face=self._legend_font.face_value(),
             columns=int(self._legend_columns.value()),
-            gap=float(self._legend_gap.value()),
+            gap=0.22,
             frame=self._legend_frame.isChecked(),
             show_filter_details=self._legend_filters.isChecked(),
             show_sample_counts=self._legend_counts.isChecked(),
@@ -2112,7 +2002,7 @@ class ParamsPanel(QWidget):
             label_face=self._label_font.face_value(),
             tick_face=self._tick_font.face_value(),
             title_dx_px=float(self._title_dx.value()),
-            title_dy_px=float(self._title_dy.value()),
+            title_dy_px=0.0,
             line_width=float(self._line_width.value()),
             stim_linewidth=float(self._stim_linewidth.value()),
             stim_onset_color=self._stim_onset_color.color_value(),
@@ -2134,7 +2024,7 @@ class ParamsPanel(QWidget):
             grid=self._grid.isChecked(),
             grid_alpha=float(self._grid_alpha.value()),
             show_borders=self._show_borders.isChecked(),
-            ticks_inside=self._ticks_inside.isChecked(),
+            ticks_inside=False,
             show_scale_bars=self._show_scale_bars.isChecked(),
             scale_bar_time_manual=bool(self._scale_bar_time_manual.isChecked()),
             scale_bar_time_s=float(self._scale_bar_time_ms.value()) / 1000.0,
@@ -2161,17 +2051,11 @@ class ParamsPanel(QWidget):
             spike_scale_time_length_px=float(self._spike_scale_time_len.value()),
             max_points_per_curve=int(self._max_points.value()),
         )
-        legend_lines = tuple(
-            line.rstrip("\r")
-            for line in self._text_legend_labels.toPlainText().split("\n")
-        )
-        if legend_lines == ("",):
-            legend_lines = ()
         texts = TextOverrides(
             title=self._text_title.text().strip(),
             xlabel=self._text_xlabel.text().strip(),
             ylabel=self._text_ylabel.text().strip(),
-            legend_labels=legend_lines,
+            legend_labels=(),
             show_series_suffix=bool(self._text_series_suffix.isChecked()),
             stim_on=self._text_stim_on.text(),
             stim_off=self._text_stim_off.text(),
@@ -2196,10 +2080,10 @@ class ParamsPanel(QWidget):
             show_overlay=bool(flags["show_overlay"]),
         )
         return ViewerSettings(
-            zoom_onset_t0_s=float(self._zoom_onset_t0.value()),
-            zoom_onset_t1_s=float(self._zoom_onset_t1.value()),
-            zoom_end_t0_s=float(self._zoom_end_t0.value()),
-            zoom_end_t1_s=float(self._zoom_end_t1.value()),
+            zoom_onset_t0_s=float(self._zoom_onset_t0_s),
+            zoom_onset_t1_s=float(self._zoom_onset_t1_s),
+            zoom_end_t0_s=float(self._zoom_end_t0_s),
+            zoom_end_t1_s=float(self._zoom_end_t1_s),
             psth_bin_window_s=float(self._psth_bin.value()),
             sampling_percent=int(self._sampling.value()),
             spike_overlay_pre_ms=float(self._overlay_pre.value()),
@@ -2215,12 +2099,13 @@ class ParamsPanel(QWidget):
             style=style,
             texts=texts,
             analysis=analysis,
-            montage_channels=int(self._montage_channels.value()),
-            montage_page=int(self._montage_page.value()),
+            montage_channels=int(self._montage_channels_value),
+            montage_page=int(self._montage_page_value),
             montage_review_channels=int(self._montage_review_channels.value()),
             montage_review_page=int(self._montage_review_page),
             graph_height_px=max(160, min(1200, int(self._graph_height.value()))),
-            preview_title_gap_px=int(self._preview_title_gap.value()),
+            graph_width_px=max(0, min(4000, int(self._graph_width.value()))),
+            preview_title_gap_px=0,
             montage_row_min_height_px=int(self._montage_row_height.value()),
             montage_show_kind_label=bool(self._montage_show_kind_label.isChecked()),
             montage_shared_ylim=bool(self._montage_shared_ylim.isChecked()),
@@ -2280,10 +2165,10 @@ class ParamsPanel(QWidget):
             psth_bin_window_s=float(self._psth_bin.value()),
             spike_overlay_pre_ms=float(self._overlay_pre.value()),
             spike_overlay_post_ms=float(self._overlay_post.value()),
-            zoom_onset_t0_s=float(self._zoom_onset_t0.value()),
-            zoom_onset_t1_s=float(self._zoom_onset_t1.value()),
-            zoom_end_t0_s=float(self._zoom_end_t0.value()),
-            zoom_end_t1_s=float(self._zoom_end_t1.value()),
+            zoom_onset_t0_s=float(self._zoom_onset_t0_s),
+            zoom_onset_t1_s=float(self._zoom_onset_t1_s),
+            zoom_end_t0_s=float(self._zoom_end_t0_s),
+            zoom_end_t1_s=float(self._zoom_end_t1_s),
             first_trigger_hp_ylim_enabled=self._hp_ylim.value().enabled,
             first_trigger_hp_ylim_min_uv=self._hp_ylim.value().minimum,
             first_trigger_hp_ylim_max_uv=self._hp_ylim.value().maximum,

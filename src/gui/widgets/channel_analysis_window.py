@@ -200,6 +200,7 @@ class ChannelAnalysisWindow(QWidget):
         # « preview » : le combo édite cette fenêtre. « montage » : il édite
         # seulement le mode affiché dans le dock (profil montage).
         self._mode_editor = "preview"
+        self._preview_settings_provider: Callable[[], ViewerSettings] | None = None
         if self._embedded:
             self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
         else:
@@ -265,13 +266,6 @@ class ChannelAnalysisWindow(QWidget):
         self._cb_rms.setChecked(analysis.show_rms)
         self._cb_isi.setChecked(analysis.show_isi)
         self._cb_overlay.setChecked(analysis.show_overlay)
-        self._cb_mark_stims = QCheckBox("Marqueurs de stimulation")
-        self._cb_mark_stims.setChecked(bool(base_settings.continuous_mark_stims))
-        self._cb_mark_stims.setToolTip(
-            "Marquer les stimulations sur les traces continuous / montage."
-        )
-        curves_layout.addWidget(self._cb_mark_stims)
-        self._cb_mark_stims.toggled.connect(self._on_stim_markers_changed)
         for box in (self._cb_raw, self._cb_hp, self._cb_lp):
             curves_layout.addWidget(box)
             box.toggled.connect(self._on_curves_toggled)
@@ -454,6 +448,10 @@ class ChannelAnalysisWindow(QWidget):
             self._btn_redraw,
         ):
             widget.setVisible(preview)
+        # Outil zoom = aperçu canal uniquement.
+        if not preview:
+            self._close_all_zoom_windows()
+            self._zooms_applied = False
 
     def display_content_mode(self, mode: str, stim_index: int) -> None:
         """Afficher un mode dans le combo sans changer le mode réel de l’aperçu."""
@@ -558,20 +556,20 @@ class ChannelAnalysisWindow(QWidget):
                 ):
                     self._cb_raw.setChecked(True)
                     streams = ("raw",)
-                self._cb_mark_stims.setChecked(mark)
             finally:
                 self._pipeline_applying = False
             analysis = self._analysis_from_toggles()
             rms_ylim = settings.rms_ylim
         else:
             streams = self._selected_streams()
-            mark = self._cb_mark_stims.isChecked()
-            # Échelle RMS : panneau Affichage local (pas le dock principal).
-            rms_ylim = (
-                self.params.settings().rms_ylim
+            local = (
+                self.params.settings()
                 if self.params is not None
-                else settings.rms_ylim
+                else settings
             )
+            mark = bool(local.continuous_mark_stims)
+            # Échelle RMS : panneau Affichage local (pas le dock principal).
+            rms_ylim = local.rms_ylim
         self.settings = replace(
             settings,
             analysis=analysis,
@@ -697,20 +695,31 @@ class ChannelAnalysisWindow(QWidget):
             preview_content=self._preview_mode,
             continuous_stream=streams[0],
             continuous_streams=streams,
-            continuous_mark_stims=self._cb_mark_stims.isChecked(),
+            continuous_mark_stims=bool(base.continuous_mark_stims),
             range_bars=bars,
             active_range_index=active,
         )
 
+    def set_preview_settings_provider(
+        self, provider: Callable[[], ViewerSettings] | None
+    ) -> None:
+        """Fournit le profil aperçu pour amorcer les fenêtres zoom."""
+        self._preview_settings_provider = provider
+
+    def _zoom_seed_settings(self) -> ViewerSettings:
+        """Réglages d’amorçage zoom : profil aperçu (+ inspecteur), pas montage."""
+        provider = getattr(self, "_preview_settings_provider", None)
+        if callable(provider):
+            try:
+                seeded = provider()
+                if seeded is not None:
+                    return seeded
+            except Exception:
+                pass
+        return self.local_settings()
+
     def _on_local_params_changed(self) -> None:
         self.settings = self.local_settings()
-        self.refreshRequested.emit(self)
-
-    def _on_stim_markers_changed(self, *_args: Any) -> None:
-        """Bascule des marqueurs stim : redessiner sans reset zoom/position."""
-        self._preserve_view = True
-        self.settings = self.local_settings()
-        self._sync_params_base()
         self.refreshRequested.emit(self)
 
     def needs_channel_compute(self) -> bool:
@@ -892,10 +901,6 @@ class ChannelAnalysisWindow(QWidget):
                 box.blockSignals(True)
                 box.setChecked(bool(raw.get(key, False)))
                 box.blockSignals(False)
-            if mark_stims is not None:
-                self._cb_mark_stims.blockSignals(True)
-                self._cb_mark_stims.setChecked(bool(mark_stims))
-                self._cb_mark_stims.blockSignals(False)
             analysis = self._analysis_from_toggles()
             # Continuous : au moins un flux. Analyse : au moins un graph.
             need_fallback = (
@@ -912,12 +917,17 @@ class ChannelAnalysisWindow(QWidget):
                 analysis = self._analysis_from_toggles()
             streams = self._selected_streams()
             self._preserve_view = False
+            mark = (
+                bool(mark_stims)
+                if mark_stims is not None
+                else bool(self.settings.continuous_mark_stims)
+            )
             self.settings = replace(
                 self.settings,
                 analysis=analysis,
                 continuous_streams=streams,
                 continuous_stream=streams[0],
-                continuous_mark_stims=self._cb_mark_stims.isChecked(),
+                continuous_mark_stims=mark,
             )
             self._sync_params_base()
             self._rebuild_placements()
@@ -1204,6 +1214,9 @@ class ChannelAnalysisWindow(QWidget):
 
     def _sync_zoom_windows(self, *, reopen: bool = False) -> None:
         """Ouvrir / mettre à jour / fermer une fenêtre de zooms par plage."""
+        if self._mode_editor == "montage":
+            self._close_all_zoom_windows()
+            return
         if reopen:
             self._user_closed_zoom_keys.clear()
         placements = self._zoom_placements
@@ -1239,10 +1252,10 @@ class ChannelAnalysisWindow(QWidget):
             if key in self._user_closed_zoom_keys and not reopen:
                 continue
 
-            # Scope zoom : pas d’échelle X aperçu (sinon toute la courbe revient).
+            # Scope zoom : seed = profil aperçu canal, puis indépendant.
             # Parent = fenêtre top-level (aperçu embarqué) ; coords écran via mapToGlobal.
             parent_win = self.window() if self.window() is not None else self
-            zoom_seed = settings_for_zoom_window(self.local_settings())
+            zoom_seed = settings_for_zoom_window(self._zoom_seed_settings())
             win = DetachedZoomWindow(
                 self.channel_name,
                 group,
@@ -1505,6 +1518,11 @@ class ChannelAnalysisWindow(QWidget):
     ) -> None:
         """« Appliquer les zooms » — une fenêtre par plage, uniquement le zoom."""
         del scope  # Plus de scope séparé : une seule liste de plages.
+        if self._mode_editor == "montage":
+            self._status.setText(
+                "Les fenêtres zoom sont disponibles en aperçu canal uniquement."
+            )
+            return
         bars = self._all_range_bars()
         if not bars:
             self._zooms_applied = False

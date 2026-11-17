@@ -155,9 +155,9 @@ class ScaleBarsMixin:
     def scale_bar_needed_view_height_px(self) -> int | None:
         """Hauteur ViewBox totale pour que amplitude (µV) = taille amp. (px).
 
-        Utilise la plage Y *visible* (ylim manuel compris) :
-        ``hauteur = span × taille_px / amplitude``. Pas de plancher : un
-        minimum en pixels change le gain µV/px.
+        ``hauteur = span × taille_px / amplitude``. Attend un ylim données
+        fiable (ignore les plages placeholder 0–1) et refuse d’écraser le
+        graph sous un plancher lié à la taille du bâton.
         """
         if not self.scale_fit_targets()[0]:
             return None
@@ -200,6 +200,10 @@ class ScaleBarsMixin:
             dy = abs(float(y1) - float(y0))
             if not (dy > 0.0) or dy != dy:
                 continue
+            # Placeholder pyqtgraph (0–1) ou span dérisoire vs amplitude :
+            # attendre le vrai ylim données, sinon le widget s’écrase à ~40 px.
+            if dy < max(float(amp) * 0.05, 1e-3):
+                return None
             bar = resolve_axis_bar(
                 span=dy, axis_px=100.0, value=amp, length_px=length
             )
@@ -209,7 +213,9 @@ class ScaleBarsMixin:
             total += float(bar.needed_axis_px)
         if not any_span or not (total > 0.0) or total != total:
             return None
-        return max(1, int(round(total)))
+        # Plancher : bâton + marge — le graph doit rester lisible.
+        floor_px = max(160.0, float(length) * 3.0)
+        return max(1, int(round(max(total, floor_px))))
 
     def scale_bar_needed_view_width_px(self) -> int | None:
         """Largeur ViewBox pour temps (s) = taille temps (px), plage X visible."""
@@ -256,6 +262,9 @@ class ScaleBarsMixin:
                 return None
             dx = abs(float(x1) - float(x0))
         except Exception:
+            return None
+        # Placeholder pyqtgraph (0–1) : attendre un vrai xlim données.
+        if dx < max(float(time_val) * 0.05, 1e-6):
             return None
         bar = resolve_axis_bar(
             span=dx, axis_px=100.0, value=time_val, length_px=length
@@ -454,8 +463,6 @@ class ScaleBarsMixin:
             underline=bool(getattr(spec, "tick_underline", False)),
         )
         metrics = QFontMetrics(font)
-        amp_dx, _amp_dy = _scale_bar_offset_px(bars)
-        _time_dx, time_dy = _scale_bar_time_offset_px(bars)
         pad = float(_SCALE_BAR_PAD_PX)
         label_w = 28
         label_h = int(metrics.height())
@@ -464,15 +471,12 @@ class ScaleBarsMixin:
             if y_size is not None and y_unit is not None:
                 lab = format_scale_label(float(y_size), str(y_unit))
                 label_w = max(label_w, int(metrics.horizontalAdvance(lab)) + 14)
-        # Le décalage élargit la gouttière. Avec valeur + taille px fixes, le
-        # fit du widget (empreinte de placement) rend ces pixels au graphique :
-        # la zone de tracé ne change pas, le widget si.
-        right_needed = int(round(pad + max(0.0, amp_dx) + pad + max(0, label_w - 14) + 8))
-        right_w = max(_SCALE_BAR_RIGHT_GUTTER_PX, label_w, right_needed)
-        bottom_needed = int(
-            round(pad + max(0.0, -time_dy) + pad + float(label_h) + 4.0)
+        # Gouttières stables (indépendantes des décalages dx/dy) : les offsets
+        # déplacent le bâton *dans* la gouttière sans redimensionner le widget.
+        right_w = max(_SCALE_BAR_RIGHT_GUTTER_PX, label_w, int(round(pad * 2 + 8)))
+        bottom_h = max(
+            _SCALE_BAR_BOTTOM_GUTTER_PX, int(round(pad * 2 + float(label_h) + 4.0))
         )
-        bottom_h = max(_SCALE_BAR_BOTTOM_GUTTER_PX, bottom_needed)
         n = len(self._plots)
         is_montage = bool(
             spec is not None and str(getattr(spec, "layout_kind", "")) == "montage"

@@ -476,6 +476,7 @@ class PlotHost(QWidget):
                     unit = kinds
             return (
                 layout,
+                "chrome_out_v1",
                 unit,
                 bool(spec.show_legend),
                 str(spec.legend_location or "below"),
@@ -483,6 +484,7 @@ class PlotHost(QWidget):
             )
         return (
             layout,
+            "chrome_out_v1",
             max(1, int(spec.n_rows or 1)),
             tuple(spec.row_keys) if spec.row_keys else (),
             tuple(spec.row_kinds) if spec.row_kinds else (),
@@ -539,27 +541,31 @@ class PlotHost(QWidget):
 
         self._clear_plots()
         self._geometry_key = geo
-        label_col = 0 if is_montage else -1
-        plot_col = 1 if is_montage else 0
+        # Chrome externe (titre ↑, légende ←) : la ViewBox garde sa taille ;
+        # les blocs périphériques poussent le widget vers l’extérieur.
+        label_col = 0
+        plot_col = 1
         self._plot_col = plot_col
         self._plots = []
         self._row_labels = []
         self.figure.axes = []
-        # Titre montage hors du 1er PlotItem : sinon la ligne 0 est plus haute
-        # que les libellés et tout le bloc paraît décalé.
-        self._data_row0 = 1 if is_montage else 0
-        if is_montage:
-            self._add_montage_title_row(spec, label_col=label_col, plot_col=plot_col)
-            self._add_montage_row_labels(spec, n_rows=n_rows, label_col=label_col)
+        self._data_row0 = 1
+        self._add_montage_title_row(spec, label_col=label_col, plot_col=plot_col)
+        self._add_montage_row_labels(spec, n_rows=n_rows, label_col=label_col)
 
         for row in range(n_rows):
             grid_row = row + self._data_row0
             plot = self._glw.addPlot(row=grid_row, col=plot_col)
             self._style_plot(plot, montage=is_montage, spec=spec)
             self._configure_mouse(plot)
-            if is_montage:
-                # Placeholder ; largeur réelle calculée après les ylim (uniforme).
-                plot.getAxis("left").setWidth(_MONTAGE_AXIS_WIDTH_MIN)
+            # Axe gauche mince : le libellé vit dans la colonne externe.
+            plot.getAxis("left").setWidth(
+                _MONTAGE_AXIS_WIDTH_MIN if is_montage else 8
+            )
+            try:
+                plot.setTitle(None)
+            except Exception:
+                pass
             self._plots.append(plot)
             self.figure.axes.append(_AxisShim(plot))
             if row > 0 and (not is_montage or _montage_shares_x(spec)):
@@ -569,8 +575,7 @@ class PlotHost(QWidget):
             except Exception:
                 pass
 
-        if is_montage:
-            self._bind_montage_row_label_anchors()
+        self._bind_montage_row_label_anchors()
         return self._finish_draw(spec, is_montage=is_montage, n_rows=n_rows)
 
 
@@ -601,8 +606,8 @@ class PlotHost(QWidget):
         self._clear_stim_labels()
         self._clear_zone_labels()
         self._editable.clear()
-        # Keep montage row labels / axis shims; re-register edit targets.
-        if is_montage:
+        # Libellés colonne gauche (montage + canal) ; re-register edit targets.
+        if self._row_labels:
             self._update_montage_row_labels(spec)
             for row, label in enumerate(self._row_labels):
                 self._editable.append(
@@ -671,11 +676,11 @@ class PlotHost(QWidget):
                 plot_col=self._plot_col,
             )
         self._reapply_text_pins()
-        if is_montage:
-            self._apply_montage_row_minimums(spec)
-            self._bind_montage_row_label_anchors()
-            # Après layout (gouttières échelle / légende) : recentrer les libellés.
-            QTimer.singleShot(0, self._bind_montage_row_label_anchors)
+        # Hauteurs de ligne = taille ViewBox cible ; chrome (titre/stim/échelles)
+        # dans d’autres lignes/colonnes → expansion vers l’extérieur.
+        self._apply_montage_row_minimums(spec)
+        self._bind_montage_row_label_anchors()
+        QTimer.singleShot(0, self._bind_montage_row_label_anchors)
 
         # Montage metadata for view restore / range bars.
         if spec.row_keys:
@@ -1379,9 +1384,8 @@ class PlotHost(QWidget):
         title_pt = max(5, int(round(float(spec.title_font_size or 10.0))))
         label_pt = max(5, int(round(float(spec.label_font_size or 9.0))))
         title_size = f"{title_pt}pt"
-        if is_montage and self._montage_title_label is not None:
-            # Titre sur ligne dédiée — pas dans le 1er PlotItem.
-            # ``setTitle('')`` laisse 30 px vides ; ``None`` masque vraiment.
+        if self._montage_title_label is not None:
+            # Titre sur ligne dédiée (haut) — jamais dans le PlotItem / ViewBox.
             if self._plots:
                 try:
                     self._plots[0].setTitle(None)
@@ -1406,53 +1410,12 @@ class PlotHost(QWidget):
             self._apply_montage_title_row_height(spec)
             self._apply_title_pixel_offset(title_item, spec)
             _relax_label_width(title_item)
-        elif self._plots:
-            self._plots[0].setTitle(
-                spec.title or "", color=c["title"], size=title_size
-            )
-            title_item = getattr(self._plots[0], "titleLabel", None)
-            if title_item is not None:
-                _apply_label_face(
-                    title_item,
-                    bold=bool(spec.title_bold),
-                    italic=bool(spec.title_italic),
-                    underline=bool(getattr(spec, "title_underline", False)),
-                )
-                self._editable.append(
-                    _EditableText(title_item, "title", axes_index=0, item_index=0)
-                )
-            self._apply_preview_title_gap(self._plots[0], spec)
-            if title_item is not None:
-                self._apply_title_pixel_offset(title_item, spec)
-                _relax_label_width(title_item)
         for row, plot in enumerate(self._plots):
-            if not is_montage:
-                ylabel = ""
-                if row < len(spec.row_labels) and spec.row_labels[row]:
-                    ylabel = spec.row_labels[row]
-                elif row == 0:
-                    ylabel = spec.ylabel or ""
-                if ylabel:
-                    plot.setLabel(
-                        "left",
-                        ylabel,
-                        color=c["fg"],
-                        **{"font-size": f"{label_pt}pt"},
-                    )
-                    axis = plot.getAxis("left")
-                    _apply_label_face(
-                        getattr(axis, "label", None),
-                        bold=bool(spec.label_bold),
-                        italic=bool(spec.label_italic),
-                        underline=bool(getattr(spec, "label_underline", False)),
-                    )
-                    label_item = getattr(axis, "label", None)
-                    if label_item is not None:
-                        self._editable.append(
-                            _EditableText(
-                                label_item, "ylabel", axes_index=row, item_index=0
-                            )
-                        )
+            # Ylabel dans la colonne gauche externe (pas l’axe PlotItem).
+            try:
+                plot.getAxis("left").setLabel("")
+            except Exception:
+                pass
             is_last = row == len(self._plots) - 1
             bottom = plot.getAxis("bottom")
             if is_montage:

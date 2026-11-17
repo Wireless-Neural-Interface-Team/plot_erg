@@ -576,15 +576,20 @@ class ViewerSettings:
     # Polarité / seuil ANALOG-IN-0 (affichage + alimente le traitement F5).
     trigger_polarity: TriggerPolarity = "low"
     trigger_threshold: float = 1.0
-    # Hauteur fixe de chaque graphique (px) — aperçu, analyse, onglets.
-    # Pas d’ajustement automatique au viewport.
+    # Hauteur de la zone de tracé (ViewBox, px) — aperçu / analyse / onglets.
+    # XOR avec l’échelle amplitude manuelle (valeur + taille px) : jamais les deux.
+    # Le chrome (titre, stim, échelles…) s’ajoute autour, sans réduire cette hauteur.
     graph_height_px: int = 400
+    # Largeur de la zone de tracé (ViewBox, px). 0 = remplit le conteneur.
+    # XOR avec l’échelle temps manuelle (valeur + taille px) : jamais les deux.
+    # Le chrome (légende, échelle µV…) s’étend vers l’extérieur.
+    graph_width_px: int = 0
     # Écart vertical titre ↔ courbe en aperçu canal (px).
     # 0 = bandeau pyqtgraph (30 px, texte centré). Positif agrandit l’espace
     # sous le titre, négatif le réduit.
     preview_title_gap_px: int = 0
-    # Hauteur minimale d’une ligne canal×flux dans le montage continu (px).
-    # Plus bas = moins de pixels Agg (ouverture plus rapide).
+    # Hauteur de zone de tracé d’une ligne canal×flux en revue montage (px).
+    # XOR avec l’échelle amplitude manuelle — même règle que graph_height_px.
     montage_row_min_height_px: int = 52
     # Titres d’axes du montage : « A-002 LOW » si True, « A-002 » si False.
     montage_show_kind_label: bool = True
@@ -724,14 +729,18 @@ def scale_bar_ref_height_px(settings: object, *, montage: bool = False) -> float
 
 
 def scale_bar_drives_widget_height(settings: object) -> bool:
-    """True si amplitude + taille px manuelles : le widget doit suivre le gain."""
+    """True si amplitude + taille px manuelles : hauteur ViewBox pilotée par l’échelle.
+
+    Dans ce mode, ``graph_height_px`` / ``montage_row_min_height_px`` sont ignorés
+    (XOR). Le chrome périphérique reste additif autour de la ViewBox.
+    """
     if settings is None:
         return False
     style = getattr(settings, "style", None)
     if style is None:
         style = settings
-    if not bool(getattr(style, "show_scale_bars", False)):
-        return False
+    # Les valeurs manuelles pilotent le gain même sans barre flottante visible
+    # (graduations classiques sur les axes).
     if not bool(getattr(style, "scale_bar_amplitude_manual", False)):
         return False
     if not bool(getattr(style, "scale_bar_amplitude_length_manual", False)):
@@ -742,6 +751,28 @@ def scale_bar_drives_widget_height(settings: object) -> bool:
     except (TypeError, ValueError):
         return False
     return bool(amp > 0.0 and length > 0.0 and amp == amp and length == length)
+
+
+def scale_bar_drives_widget_width(settings: object) -> bool:
+    """True si temps + taille px manuels : largeur ViewBox pilotée par l’échelle.
+
+    XOR avec ``graph_width_px`` : jamais les deux en même temps.
+    """
+    if settings is None:
+        return False
+    style = getattr(settings, "style", None)
+    if style is None:
+        style = settings
+    if not bool(getattr(style, "scale_bar_time_manual", False)):
+        return False
+    if not bool(getattr(style, "scale_bar_time_length_manual", False)):
+        return False
+    try:
+        time_s = float(getattr(style, "scale_bar_time_s", 0.0) or 0.0)
+        length = float(getattr(style, "scale_bar_time_length_px", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return False
+    return bool(time_s > 0.0 and length > 0.0 and time_s == time_s and length == length)
 
 
 def scale_bar_view_height_for_span(
@@ -980,10 +1011,12 @@ def apply_local_display_settings(
     style = local.style
     legend = local.legend
     graph_height_px = int(local.graph_height_px)
+    graph_width_px = int(getattr(local, "graph_width_px", 0) or 0)
     if inherit_scale_bars:
         style = copy_global_display_style(style, base.style)
         legend = base.legend
         graph_height_px = int(base.graph_height_px)
+        graph_width_px = int(getattr(base, "graph_width_px", 0) or 0)
     kwargs: dict[str, object] = {
         "legend": legend,
         "style": style,
@@ -999,6 +1032,7 @@ def apply_local_display_settings(
         "trigger_polarity": local.trigger_polarity,
         "trigger_threshold": local.trigger_threshold,
         "graph_height_px": graph_height_px,
+        "graph_width_px": graph_width_px,
     }
     if include_analysis:
         kwargs["analysis"] = local.analysis

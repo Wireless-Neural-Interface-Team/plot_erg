@@ -151,14 +151,15 @@ def _stim_line_colors(request: Any) -> tuple[str, str]:
 def _show_continuous_stim_marks(request: Any) -> bool:
     """Pointillés sur les traces continues (aperçu et revue montage).
 
-    Les deux coches comptent : « Marqueurs de stimulation sur les traces »
-    et « Pointillés de début / fin de stimulation ».
+    Une seule source : « Pointillés de début / fin de stimulation »
+    (``legend.show_reference_markers``). ``continuous_mark_stims`` reste
+    synchronisé pour compatibilité.
     """
-    settings = getattr(request, "settings", None)
-    if not bool(getattr(settings, "continuous_mark_stims", True)):
-        return False
     legend = getattr(request, "legend", None)
-    return bool(getattr(legend, "show_reference_markers", True))
+    if legend is not None:
+        return bool(getattr(legend, "show_reference_markers", True))
+    settings = getattr(request, "settings", None)
+    return bool(getattr(settings, "continuous_mark_stims", True))
 
 
 def _show_stim_labels(request: Any) -> bool:
@@ -815,6 +816,18 @@ def _apply_display_settings(spec: PanelSpec, request: Any) -> None:
     spec.row_label_dx_px = float(getattr(settings, "montage_label_dx_px", 0.0) or 0.0)
     spec.row_label_dy_px = float(getattr(settings, "montage_label_dy_px", 0.0) or 0.0)
     spec.title_gap_px = int(getattr(settings, "preview_title_gap_px", 0) or 0)
+    # Canal / stacked : hauteur de ligne = zone de tracé (XOR hors échelle amp.).
+    if (
+        str(getattr(spec, "layout_kind", "") or "") != "montage"
+        and int(getattr(spec, "row_min_height_px", 0) or 0) <= 0
+        and settings is not None
+    ):
+        from view_config import scale_bar_drives_widget_height
+
+        if not scale_bar_drives_widget_height(settings):
+            spec.row_min_height_px = max(
+                40, int(getattr(settings, "graph_height_px", 400) or 400)
+            )
 
 
 def _apply_text_overrides(spec: PanelSpec, request: Any) -> None:

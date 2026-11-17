@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -30,8 +31,59 @@ def configure_narrow_form(form: QFormLayout) -> QFormLayout:
     form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
     form.setFormAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
     form.setHorizontalSpacing(6)
-    form.setVerticalSpacing(4)
+    form.setVerticalSpacing(6)
+    form.setContentsMargins(2, 2, 2, 4)
     return form
+
+
+def collapsible_section(
+    title: str, *, expanded: bool = False
+) -> tuple[QFrame, QWidget]:
+    """Section accordéon (chevron + titre) pour docks étroits.
+
+    Retourne ``(section, content)`` : placer les contrôles dans ``content``.
+    """
+    section = QFrame()
+    section.setObjectName("paramsSection")
+    section.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+
+    outer = QVBoxLayout(section)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(0)
+
+    header = QToolButton(section)
+    header.setObjectName("paramsSectionHeader")
+    header.setCheckable(True)
+    header.setChecked(expanded)
+    header.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+    header.setArrowType(
+        Qt.ArrowType.DownArrow if expanded else Qt.ArrowType.RightArrow
+    )
+    header.setText(title)
+    header.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    header.setAutoRaise(True)
+
+    body = QWidget(section)
+    body.setObjectName("paramsSectionBody")
+    body_layout = QVBoxLayout(body)
+    body_layout.setContentsMargins(8, 2, 6, 8)
+    body_layout.setSpacing(4)
+
+    content = QWidget(body)
+    body_layout.addWidget(content)
+
+    outer.addWidget(header)
+    outer.addWidget(body)
+
+    def _on_toggled(checked: bool) -> None:
+        body.setVisible(checked)
+        header.setArrowType(
+            Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow
+        )
+
+    header.toggled.connect(_on_toggled)
+    body.setVisible(expanded)
+    return section, content
 
 
 class FitWidthScrollArea(QScrollArea):

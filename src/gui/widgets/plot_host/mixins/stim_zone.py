@@ -121,21 +121,11 @@ class StimZoneMixin:
             pad = max(pad, need)
         return pad
 
-    def _title_offset_margin_px(self) -> tuple[int, int, int]:
-        """``(left, top, right)`` réservés pour le décalage du titre."""
-        spec = self._spec
-        if spec is None:
-            return (0, 0, 0)
-        dx = int(round(float(getattr(spec, "title_dx_px", 0.0) or 0.0)))
-        dy = int(round(float(getattr(spec, "title_dy_px", 0.0) or 0.0)))
-        return (max(0, -dx), max(0, dy), max(0, dx))
-
     def _apply_stim_label_band_margin(self, height_px: float | None = None) -> None:
-        """Marges du layout GLW : libellés stim (haut) + zones (bas) + titre.
+        """Marges GLW stables : bande stim (haut) + zones (bas).
 
-        ``height_px`` force la bande stim (``0`` = pas de libellés). ``None`` =
-        recalculer depuis les libellés présents. Le pad titre est toujours
-        fusionné pour ne pas écraser un décalage d’aperçu.
+        Les décalages titre dx/dy se dessinent dans l’espace existant — ils
+        n’élargissent plus les margins (évite les resize de widget en cascade).
         """
         if height_px is None:
             stim_top = (
@@ -146,14 +136,12 @@ class StimZoneMixin:
         zone_bottom = (
             int(round(self._zone_label_pad_px())) if self._zone_labels else 0
         )
-        title_left, title_top, title_right = self._title_offset_margin_px()
-        top = max(stim_top, title_top)
         try:
             layout = self._glw.ci.layout
-            layout.setContentsMargins(title_left, top, title_right, zone_bottom)
+            layout.setContentsMargins(0, stim_top, 0, zone_bottom)
         except Exception:
             try:
-                self._glw.setContentsMargins(title_left, top, title_right, zone_bottom)
+                self._glw.setContentsMargins(0, stim_top, 0, zone_bottom)
             except Exception:
                 pass
 

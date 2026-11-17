@@ -33,6 +33,13 @@ from gui.widgets.plot_host import (
 from gui.widgets.view_params import LocalViewParams
 from panel_prepare import prepare_panel, restyle_panel_spec, screen_prepare_key
 from panel_registry import RenderRequest, panel_info
+from plot_layout import (
+    fixed_graph_width_px,
+    height_mode_for,
+    resolve_graph_area_size,
+    widget_size_for_plot_area,
+    width_mode_for,
+)
 from view_config import (
     AnalysisSettings,
     PanelPlacement,
@@ -42,13 +49,19 @@ from view_config import (
     apply_local_display_settings,
     continuous_sync_offset_s,
     copy_global_display_style,
-    resolved_scale_bar_offset_px,
-    resolved_scale_bar_time_offset_px,
 )
 
 
-_FIT_RETRY_MAX = 12
-_FIT_MATCH_PX = 2
+# Peu de retries : éviter les oscillations chrome ↔ widget.
+_FIT_RETRY_MAX = 4
+_FIT_MATCH_PX = 4
+# Ne pas appliquer un micro-ajustement (évite les sauts « inopinés »).
+_FIT_APPLY_MIN_DELTA = 3
+
+
+def _size_needs_update(current: int, target: int) -> bool:
+    """True seulement si l’écart justifie un vrai changement de géométrie."""
+    return abs(int(current) - int(target)) >= _FIT_APPLY_MIN_DELTA
 
 
 def _scale_fit_axis_flags(host: Any) -> tuple[bool, bool]:
@@ -103,71 +116,133 @@ def _fitted_width_px(
     return max(1, int(round(chrome + float(needed_vb))))
 
 
-def _measure_scale_fit_height(
-    host: Any, widget_h: int
-) -> tuple[str, int | None]:
-    """``off`` / ``wait`` / ``ready`` pour la hauteur liée à l’amplitude."""
-    amp, _time = _scale_fit_axis_flags(host)
-    if not amp:
-        return "off", None
-    try:
-        needed = host.scale_bar_needed_view_height_px()
-    except Exception:
-        needed = None
-    if needed is None:
-        return "wait", None
+def _host_is_montage(host: Any) -> bool:
+    spec = getattr(host, "_spec", None)
+    if spec is None:
+        return False
+    return str(getattr(spec, "layout_kind", "") or "") == "montage"
+
+
+def _measure_viewbox_height(host: Any) -> float:
     total = 0.0
     for plot in getattr(host, "_plots", None) or []:
         try:
             total += float(plot.getViewBox().height())
         except Exception:
             continue
-    if total > float(widget_h) + 2.0 or float(widget_h) < 4.0:
-        return "wait", None
-    # Zone de tracé écrasée (0 px) : le widget est tout en chrome
-    # (axes, libellés). On l’agrandit quand même, sinon le gain reste faux.
-    if total < 4.0:
-        total = 0.0
-    required = int(round(float(widget_h) - total + float(needed)))
-    return "ready", max(1, required)
+    return total
 
 
-def _scale_fit_matches(host: Any) -> bool:
-    """True si la zone de tracé a déjà le gain demandé (µV/px et s/px)."""
-    amp, time = _scale_fit_axis_flags(host)
-    tol = float(_FIT_MATCH_PX)
+def _measure_viewbox_width(host: Any) -> float | None:
+    plots = list(getattr(host, "_plots", None) or [])
+    if not plots:
+        return None
+    try:
+        return float(plots[-1].getViewBox().width())
+    except Exception:
+        return None
+
+
+def _target_view_height_px(
+    host: Any, settings: Any | None
+) -> tuple[str, int | None]:
+    """Cible ViewBox hauteur : échelle XOR hauteur fixe (chrome additif)."""
+    amp, _time = _scale_fit_axis_flags(host)
+    montage = _host_is_montage(host)
     if amp:
         try:
             needed = host.scale_bar_needed_view_height_px()
         except Exception:
             needed = None
         if needed is None:
-            return False
-        total = 0.0
-        n = 0
-        for plot in getattr(host, "_plots", None) or []:
-            try:
-                total += float(plot.getViewBox().height())
-                n += 1
-            except Exception:
-                continue
-        if n == 0 or abs(total - float(needed)) > tol:
-            return False
+            return "wait", None
+        return "ready", int(needed)
+    if settings is None:
+        return "off", None
+    # Montage hors échelle : ``_fit_montage_height`` + ``row_min_height_px``.
+    if montage:
+        return "off", None
+    if height_mode_for(settings, montage=False) != "fixed":
+        return "off", None
+    area = resolve_graph_area_size(settings, montage=False, n_rows=1)
+    if area.height_px is None:
+        return "off", None
+    return "ready", int(area.height_px)
+
+
+def _target_view_width_px(
+    host: Any, settings: Any | None
+) -> tuple[str, int | None]:
+    """Cible ViewBox largeur : échelle XOR largeur fixe (0 = fill → off)."""
+    _amp, time = _scale_fit_axis_flags(host)
     if time:
         try:
-            needed_w = host.scale_bar_needed_view_width_px()
+            needed = host.scale_bar_needed_view_width_px()
         except Exception:
-            needed_w = None
-        if needed_w is None:
+            needed = None
+        if needed is None:
+            return "wait", None
+        return "ready", int(needed)
+    if settings is None:
+        return "off", None
+    mode = width_mode_for(settings)
+    if mode == "fill":
+        return "off", None
+    if mode == "fixed":
+        width = fixed_graph_width_px(settings)
+        if width is None:
+            return "off", None
+        return "ready", int(width)
+    return "off", None
+
+
+def _measure_scale_fit_height(
+    host: Any, widget_h: int, *, settings: Any | None = None
+) -> tuple[str, int | None]:
+    """``off`` / ``wait`` / ``ready`` : hauteur widget pour ViewBox cible.
+
+    Couvre le XOR échelle amplitude **et** hauteur fixe : le chrome
+    (titre, stim, échelles…) s’ajoute autour, jamais dans le graph.
+    """
+    state, needed = _target_view_height_px(host, settings)
+    if state != "ready" or needed is None:
+        return state, None
+    total = _measure_viewbox_height(host)
+    if total > float(widget_h) + 2.0 or float(widget_h) < 4.0:
+        return "wait", None
+    # Zone de tracé écrasée (0 px) : le widget est tout en chrome
+    # (axes, libellés). On l’agrandit quand même, sinon le gain reste faux.
+    if total < 4.0:
+        total = 0.0
+    required_h, _required_w = widget_size_for_plot_area(
+        plot_area_h=total,
+        plot_area_w=0.0,
+        widget_h=float(widget_h),
+        widget_w=1.0,
+        target_h=float(needed),
+        target_w=None,
+    )
+    if required_h is None:
+        return "wait", None
+    return "ready", max(1, int(required_h))
+
+
+def _scale_fit_matches(host: Any, settings: Any | None = None) -> bool:
+    """True si la ViewBox a déjà la taille cible (échelle XOR taille fixe)."""
+    tol = float(_FIT_MATCH_PX)
+    h_state, needed_h = _target_view_height_px(host, settings)
+    if h_state == "wait":
+        return False
+    if h_state == "ready" and needed_h is not None:
+        total = _measure_viewbox_height(host)
+        if total < 4.0 or abs(total - float(needed_h)) > tol:
             return False
-        plots = list(getattr(host, "_plots", None) or [])
-        if not plots:
-            return False
-        try:
-            current = float(plots[-1].getViewBox().width())
-        except Exception:
-            return False
-        if abs(current - float(needed_w)) > tol:
+    w_state, needed_w = _target_view_width_px(host, settings)
+    if w_state == "wait":
+        return False
+    if w_state == "ready" and needed_w is not None:
+        current = _measure_viewbox_width(host)
+        if current is None or abs(float(current) - float(needed_w)) > tol:
             return False
     return True
 
@@ -180,7 +255,12 @@ def _settle_scale_fit(widget: Any, *, force: bool, tries: int) -> None:
     n’est plus celui demandé. On recommence jusqu’à convergence.
     """
     host = widget._plot
-    if force or _scale_fit_matches(host):
+    settings = (
+        widget._last_request.settings
+        if getattr(widget, "_last_request", None) is not None
+        else None
+    )
+    if force or _scale_fit_matches(host, settings):
         widget._scale_fit_pending = False
         widget._scale_fit_tries = 0
     else:
@@ -195,30 +275,27 @@ def _settle_scale_fit(widget: Any, *, force: bool, tries: int) -> None:
 
 
 def _measure_scale_fit_width(
-    host: Any, widget_w: int, *, strict: bool
+    host: Any,
+    widget_w: int,
+    *,
+    strict: bool,
+    settings: Any | None = None,
 ) -> tuple[str, int | None]:
-    """``off`` / ``wait`` / ``ready`` pour la largeur liée au temps."""
-    _amp, time = _scale_fit_axis_flags(host)
-    if not time:
-        return "off", None
-    try:
-        needed = host.scale_bar_needed_view_width_px()
-    except Exception:
-        needed = None
-    if needed is None:
-        return "wait", None
-    plots = list(getattr(host, "_plots", None) or [])
-    if not plots:
-        return "wait", None
-    try:
-        current = float(plots[-1].getViewBox().width())
-    except Exception:
+    """``off`` / ``wait`` / ``ready`` : largeur widget pour ViewBox cible.
+
+    Couvre le XOR échelle temps **et** ``graph_width_px`` fixe.
+    """
+    state, needed = _target_view_width_px(host, settings)
+    if state != "ready" or needed is None:
+        return state, None
+    current = _measure_viewbox_width(host)
+    if current is None:
         return "wait", None
     if current < 8.0:
         return "wait", None
     required = _fitted_width_px(
         int(widget_w),
-        current,
+        float(current),
         float(needed),
         explicit_chrome=_explicit_graph_chrome_px(host, float(widget_w)),
         strict=strict,
@@ -281,35 +358,17 @@ def _explicit_graph_chrome_px(host: Any, panel_w: float) -> float:
     return frame + label + left + right
 
 
-def _font_face_key(face: Any) -> tuple[bool, bool, bool]:
-    """Gras / italique / souligné : ils changent la largeur et la hauteur du texte."""
-    return (
-        bool(getattr(face, "bold", False)),
-        bool(getattr(face, "italic", False)),
-        bool(getattr(face, "underline", False)),
-    )
-
-
-def _font_pt(value: Any, default: float) -> float:
-    try:
-        return round(float(value), 2)
-    except (TypeError, ValueError):
-        return round(float(default), 2)
-
-
 def _scale_fit_signature(settings: ViewerSettings) -> tuple[Any, ...]:
-    """Empreinte échelle (valeur + px), placement et polices.
+    """Empreinte XOR taille/échelle uniquement (pas les offsets ni polices).
 
-    Taille, gras, italique, souligné et le placement des barres d’échelle
-    élargissent le chrome (gouttières, titre, axes, ticks, légende, libellés
-    stim / zone). Avec une échelle fixe (valeur + taille px), c’est le widget
-    qui absorbe ce chrome : la zone de tracé reste en pixels.
+    Les décalages dx/dy et les polices redessinent sans redimensionner le
+    widget — sinon chaque micro-réglage provoque un saut de layout.
     """
     style = settings.style
-    legend = settings.legend
-    amp_dx, amp_dy = resolved_scale_bar_offset_px(style)
-    time_dx, time_dy = resolved_scale_bar_time_offset_px(style)
     return (
+        int(getattr(settings, "graph_height_px", 400) or 400),
+        int(getattr(settings, "graph_width_px", 0) or 0),
+        int(getattr(settings, "montage_row_min_height_px", 52) or 52),
         bool(style.scale_bar_amplitude_manual),
         round(float(style.scale_bar_amplitude or 0.0), 12),
         bool(style.scale_bar_amplitude_length_manual),
@@ -318,30 +377,14 @@ def _scale_fit_signature(settings: ViewerSettings) -> tuple[Any, ...]:
         round(float(style.scale_bar_time_s or 0.0), 12),
         bool(style.scale_bar_time_length_manual),
         int(round(float(style.scale_bar_time_length_px or 0.0))),
-        int(round(amp_dx)),
-        int(round(amp_dy)),
-        int(round(time_dx)),
-        int(round(time_dy)),
         bool(getattr(style, "spike_scale_amplitude_manual", False)),
         round(float(getattr(style, "spike_scale_amplitude", 0.0) or 0.0), 12),
         int(round(float(getattr(style, "spike_scale_amplitude_length_px", 0.0) or 0.0))),
         bool(getattr(style, "spike_scale_time_manual", False)),
         round(float(getattr(style, "spike_scale_time_ms", 0.0) or 0.0), 12),
         int(round(float(getattr(style, "spike_scale_time_length_px", 0.0) or 0.0))),
-        _font_pt(style.title_font_size, 10.0),
-        _font_face_key(style.title_face),
-        _font_pt(style.label_font_size, 9.0),
-        _font_face_key(style.label_face),
-        _font_pt(style.tick_font_size, 8.0),
-        _font_face_key(style.tick_face),
-        _font_pt(getattr(style, "stim_on_font_size", 8.0), 8.0),
-        _font_face_key(getattr(style, "stim_on_face", None)),
-        _font_pt(getattr(style, "stim_off_font_size", 8.0), 8.0),
-        _font_face_key(getattr(style, "stim_off_face", None)),
-        _font_pt(getattr(style, "zone_font_size", 8.0), 8.0),
-        _font_face_key(getattr(style, "zone_face", None)),
-        _font_pt(getattr(legend, "font_size", 9.0), 9.0),
-        _font_face_key(getattr(legend, "face", None)),
+        bool(getattr(style, "show_scale_bars", False)),
+        bool(getattr(style, "show_stim_labels", True)),
     )
 
 
@@ -920,6 +963,9 @@ class PanelCanvas(QFrame):
                     style=merged,
                     legend=self._style_overrides.legend,
                     graph_height_px=int(self._style_overrides.graph_height_px),
+                    graph_width_px=int(
+                        getattr(self._style_overrides, "graph_width_px", 0) or 0
+                    ),
                 ),
             )
         self._refresh_style_button()
@@ -936,6 +982,7 @@ class PanelCanvas(QFrame):
             return
         legend = getattr(style_or_settings, "legend", None)
         graph_height = getattr(style_or_settings, "graph_height_px", None)
+        graph_width = getattr(style_or_settings, "graph_width_px", None)
         style = getattr(style_or_settings, "style", style_or_settings)
         updates: dict[str, Any] = {
             "style": copy_global_display_style(self._style_overrides.style, style),
@@ -944,6 +991,8 @@ class PanelCanvas(QFrame):
             updates["legend"] = legend
         if graph_height is not None:
             updates["graph_height_px"] = int(graph_height)
+        if graph_width is not None:
+            updates["graph_width_px"] = int(graph_width)
         self._style_overrides = replace(self._style_overrides, **updates)
 
     def _on_host_x_autoscale(self, xlim: object) -> None:
@@ -1114,11 +1163,17 @@ class PanelCanvas(QFrame):
             return
         tries = int(self._scale_fit_tries)
         force = tries >= _FIT_RETRY_MAX
+        settings = (
+            self._last_request.settings if self._last_request is not None else None
+        )
         h_state, h_px = _measure_scale_fit_height(
-            self._plot, max(1, int(self.height()))
+            self._plot, max(1, int(self.height())), settings=settings
         )
         w_state, w_px = _measure_scale_fit_width(
-            self._plot, max(1, int(self.width())), strict=not force
+            self._plot,
+            max(1, int(self.width())),
+            strict=not force,
+            settings=settings,
         )
         h_state, self._scale_fit_height_sample = _accept_fit_sample(
             self._scale_fit_height_sample, h_state, h_px, force=force
@@ -1145,13 +1200,25 @@ class PanelCanvas(QFrame):
             return
         if state != "ready" or required is None:
             return
+        # Plancher widget : le graph doit rester visible (ViewBox ~160+ chrome).
+        target = max(160, int(required))
+        previous = self.fitted_height_px
+        current = max(1, int(self.height()))
+        if previous is None and target < current:
+            # Premier calage : grandir OK, ne pas s’effondrer sur un span provisoire.
+            target = current
+        if previous is not None and not _size_needs_update(int(previous), target):
+            return
+        if previous is None and not _size_needs_update(current, target):
+            self.fitted_height_px = target
+            return
         grid = self._grid_host()
         if grid is not None:
-            grid.apply_fitted_height(self.placement, int(required), scale_fit=True)
+            grid.apply_fitted_height(self.placement, target, scale_fit=True)
         else:
-            self.fitted_height_px = int(required)
-            self.setMinimumHeight(int(required))
-            self.setMaximumHeight(int(required))
+            self.fitted_height_px = target
+            self.setMinimumHeight(target)
+            self.setMaximumHeight(target)
 
     def _apply_scale_fit_width(self, state: str, required: int | None) -> None:
         if state == "off":
@@ -1159,12 +1226,22 @@ class PanelCanvas(QFrame):
             return
         if state != "ready" or required is None:
             return
+        target = max(200, int(required))
+        previous = self.fitted_width_px
+        current = max(1, int(self.width()))
+        if previous is None and target < current:
+            target = current
+        if previous is not None and not _size_needs_update(int(previous), target):
+            return
+        if previous is None and not _size_needs_update(current, target):
+            self.fitted_width_px = target
+            return
         grid = self._grid_host()
         if grid is not None:
-            grid.apply_fitted_width(self.placement, int(required), scale_fit=True)
+            grid.apply_fitted_width(self.placement, target, scale_fit=True)
         else:
-            self.fitted_width_px = int(required)
-            self.setFixedWidth(int(required))
+            self.fitted_width_px = target
+            self.setFixedWidth(target)
             self.setSizePolicy(
                 QSizePolicy.Policy.Fixed, self.sizePolicy().verticalPolicy()
             )
@@ -1422,9 +1499,14 @@ class DetachedPanelWindow(QDialog):
         force = tries >= _FIT_RETRY_MAX
         plot_h = max(1, int(self._plot.height()))
         plot_w = max(1, int(self._plot.width()))
-        h_state, h_px = _measure_scale_fit_height(self._plot, plot_h)
+        settings = (
+            self._last_request.settings if self._last_request is not None else None
+        )
+        h_state, h_px = _measure_scale_fit_height(
+            self._plot, plot_h, settings=settings
+        )
         w_state, w_px = _measure_scale_fit_width(
-            self._plot, plot_w, strict=not force
+            self._plot, plot_w, strict=not force, settings=settings
         )
         h_state, self._scale_fit_height_sample = _accept_fit_sample(
             self._scale_fit_height_sample, h_state, h_px, force=force
@@ -1441,55 +1523,48 @@ class DetachedPanelWindow(QDialog):
         _settle_scale_fit(self, force=force, tries=tries)
 
     def _apply_detached_height(self, state: str, required: int | None) -> None:
-        """Une seule hauteur figée. Ne pas relâcher le graph vers la fenêtre."""
+        """Figer la hauteur du graph seul — ne jamais redimensionner la fenêtre."""
         if state != "ready" or required is None:
             return
         required = int(required)
         plot_h = max(1, int(self._plot.height()))
-        if (
-            self._plot_locked_h == required
-            and abs(required - plot_h) <= _FIT_MATCH_PX
+        if self._plot_locked_h is not None and not _size_needs_update(
+            int(self._plot_locked_h), required
         ):
+            return
+        if not _size_needs_update(plot_h, required) and self._plot_locked_h == required:
             return
         self._plot_locked_h = required
         self._plot.setFixedHeight(required)
-        if abs(required - plot_h) <= _FIT_MATCH_PX:
-            return
-        delta = required - plot_h
-        self.resize(self.width(), max(480, int(self.height()) + int(delta)))
 
     def _apply_detached_width(self, state: str, required: int | None) -> None:
-        """Une seule largeur figée. Ne pas relâcher le graph vers la fenêtre."""
+        """Figer la largeur du graph seul — ne jamais redimensionner la fenêtre."""
         if state != "ready" or required is None:
             return
         required = max(1, int(required))
         plot_w = max(1, int(self._plot.width()))
-        if (
-            self._plot_locked_w == required
-            and abs(required - plot_w) <= _FIT_MATCH_PX
+        if self._plot_locked_w is not None and not _size_needs_update(
+            int(self._plot_locked_w), required
         ):
+            return
+        if not _size_needs_update(plot_w, required) and self._plot_locked_w == required:
             return
         self._plot_locked_w = required
         self._plot.setFixedWidth(required)
-        if abs(required - plot_w) <= _FIT_MATCH_PX:
-            return
-        delta = required - plot_w
-        self.resize(max(640, int(self.width()) + int(delta)), self.height())
 
     def showEvent(self, event: Any) -> None:  # noqa: N802
         super().showEvent(event)
+        # Un seul verrouillage initial — pas de re-fit à chaque show.
         if self._plot_locked_w is None or self._plot_locked_h is None:
             self._plot_lock_timer.start()
 
     def resizeEvent(self, event: Any) -> None:  # noqa: N802
+        # Ne pas relancer un fit / freeze : le drag utilisateur ne doit pas
+        # provoquer de rebondissement du graph.
         super().resizeEvent(event)
-        if self.isVisible() and (
-            self._plot_locked_w is None or self._plot_locked_h is None
-        ):
-            self._plot_lock_timer.start()
 
     def _freeze_plot_chrome_once(self) -> None:
-        """Garder la taille du graph : fenêtre et séparateur Paramètres ne l’étirent plus."""
+        """Verrouiller une fois la taille courante du graph (pas la fenêtre)."""
         if not self.isVisible():
             return
         plot = self._plot

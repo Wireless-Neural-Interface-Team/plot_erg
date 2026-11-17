@@ -327,8 +327,8 @@ def test_spike_scope_scale_ignores_shared_manual_gain() -> None:
     assert y_scale_family("analysis_hp") == "stream:hp"
 
 
-def test_scale_fit_signature_tracks_font_size_and_face() -> None:
-    """Police (taille, gras, italique, souligné) : le widget se recale, pas le tracé."""
+def test_scale_fit_signature_ignores_offsets_and_fonts() -> None:
+    """Offsets / polices : redessin seul. XOR taille/échelle : recale le widget."""
     from gui.widgets.panel_canvas import _scale_fit_signature
     from view_config import TextFace
 
@@ -338,41 +338,58 @@ def test_scale_fit_signature_tracks_font_size_and_face() -> None:
     def style(**kwargs: object) -> ViewerSettings:
         return replace(base, style=replace(base.style, **kwargs))
 
-    assert _scale_fit_signature(style(title_font_size=16.0)) != sig
-    assert _scale_fit_signature(style(label_font_size=13.0)) != sig
-    assert _scale_fit_signature(style(tick_font_size=18.0)) != sig
-    assert _scale_fit_signature(style(title_face=TextFace(bold=True))) != sig
-    assert _scale_fit_signature(style(label_face=TextFace(italic=True))) != sig
-    assert _scale_fit_signature(style(tick_face=TextFace(underline=True))) != sig
-    assert (
-        _scale_fit_signature(
-            style(stim_on_font_size=14.0, stim_on_face=TextFace(bold=True))
-        )
-        != sig
-    )
-    assert (
-        _scale_fit_signature(
-            style(stim_off_font_size=11.0, stim_off_face=TextFace(italic=True))
-        )
-        != sig
-    )
-    assert (
-        _scale_fit_signature(
-            style(zone_font_size=12.0, zone_face=TextFace(underline=True))
-        )
-        != sig
-    )
-    legend = replace(
-        base.legend, font_size=15.0, face=TextFace(bold=True, underline=True)
-    )
-    assert _scale_fit_signature(replace(base, legend=legend)) != sig
-    # Placement : la gouttière change, le widget se recale, pas la zone de tracé.
-    assert _scale_fit_signature(style(scale_bar_dx_px=40.0)) != sig
-    assert _scale_fit_signature(style(scale_bar_dy_px=-24.0)) != sig
-    assert _scale_fit_signature(style(scale_bar_time_dx_px=-16.0)) != sig
-    assert _scale_fit_signature(style(scale_bar_time_dy_px=30.0)) != sig
-    # Un réglage sans effet sur le chrome ne relance pas le calage.
+    # Cosmétique — ne doit pas relancer un resize.
+    assert _scale_fit_signature(style(title_font_size=16.0)) == sig
+    assert _scale_fit_signature(style(title_face=TextFace(bold=True))) == sig
+    assert _scale_fit_signature(style(scale_bar_dx_px=40.0)) == sig
+    assert _scale_fit_signature(style(scale_bar_time_dy_px=30.0)) == sig
     assert _scale_fit_signature(style(line_width=3.0)) == sig
+    # XOR taille / échelle — doit recaler.
+    assert _scale_fit_signature(replace(base, graph_height_px=280)) != sig
+    assert _scale_fit_signature(style(scale_bar_amplitude_manual=True)) != sig
+    assert _scale_fit_signature(style(scale_bar_time_manual=True)) != sig
+
+
+def test_needed_view_height_rejects_placeholder_and_floors() -> None:
+    """Échelle manuelle : pas d’écrasement sur ylim 0–1 ; plancher ViewBox."""
+    from types import SimpleNamespace
+
+    from gui.widgets.plot_host.mixins.scale_bars import ScaleBarsMixin
+    from panel_prepare import ScaleBarSpec
+
+    class _Plot:
+        def __init__(self, y0: float, y1: float) -> None:
+            self._yr = (y0, y1)
+
+        def viewRange(self):  # noqa: N802 — API pyqtgraph
+            return (0.0, 1.0), self._yr
+
+    class _Host(ScaleBarsMixin):
+        def __init__(self, plot: _Plot, bars: ScaleBarSpec) -> None:
+            self._plots = [plot]
+            self._spec = SimpleNamespace(scale_bars=bars)
+
+        def _scale_bar_units_for_row(self, bars, row):  # noqa: ANN001
+            return "s", "µV"
+
+        def _row_shares_manual_scale(self, row: int) -> bool:
+            return True
+
+    bars = ScaleBarSpec(
+        enabled=True,
+        amp_manual=True,
+        amp_length_manual=True,
+        amplitude=100.0,
+        amp_length_px=40.0,
+    )
+    # Placeholder pyqtgraph → attendre.
+    assert _Host(_Plot(0.0, 1.0), bars).scale_bar_needed_view_height_px() is None
+    # span 100 → brut 40 px, plancher 160.
+    assert _Host(_Plot(-50.0, 50.0), bars).scale_bar_needed_view_height_px() == 160
+    # span 400 → brut 160, inchangé.
+    assert _Host(_Plot(-200.0, 200.0), bars).scale_bar_needed_view_height_px() == 160
+    # span large → suit la formule.
+    assert _Host(_Plot(-500.0, 500.0), bars).scale_bar_needed_view_height_px() == 400
 
 
 def test_spike_scope_ylim_stays_per_channel() -> None:

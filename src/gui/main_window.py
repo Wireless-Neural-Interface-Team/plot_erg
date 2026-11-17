@@ -1044,6 +1044,14 @@ class ViewerWindow(QMainWindow):
         """Valeurs par défaut injectées à l’ouverture d’une fenêtre de vue."""
         return self._default_viewer_settings()
 
+    def _preview_settings_for_zoom(self) -> ViewerSettings:
+        """Profil aperçu canal pour amorcer une fenêtre zoom (indépendante ensuite)."""
+        return merge_central_viewer_settings(
+            self.params_panel.settings_for("preview"),
+            hidden_channels=self.channel_panel.hidden_channels,
+            channel_inspect=self._channel_inspect,
+        )
+
     def _build_config(self, rhs_file: Path) -> AnalysisConfig:
         from core import gui_channel_workers
 
@@ -1496,6 +1504,7 @@ class ViewerWindow(QMainWindow):
                 embedded=True,
             )
             window.set_request_factory(self._make_channel_analysis_request)
+            window.set_preview_settings_provider(self._preview_settings_for_zoom)
             window.refreshRequested.connect(self._on_channel_window_refresh)
             window.previewModeChanged.connect(self._on_preview_mode_changed)
             window.analysisCurvesChanged.connect(

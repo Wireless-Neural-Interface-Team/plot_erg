@@ -146,19 +146,21 @@ QDockWidget QTabBar::tab {{
     background-color: {CHROME_BG_ALT};
     border: 1px solid {CHROME_BORDER};
     border-bottom: none;
-    padding: 4px 8px;
-    margin-right: 1px;
+    padding: 6px 10px;
+    margin-right: 2px;
     min-width: 0px;
+    border-top-left-radius: 4px;
+    border-top-right-radius: 4px;
 }}
 QDockWidget QTabBar::tab:selected {{
-    background-color: {CHROME_BG_LIGHT};
+    background-color: {SCOPE_BG};
     border-bottom: 2px solid {SCOPE_ACCENT};
     font-weight: 700;
 }}
-/* Dock Paramètres : 2 onglets compacts (Canal / Affichage). */
+/* Dock Paramètres : 2 onglets (Canal / Affichage). */
 QTabWidget#paramsTabs QTabBar::tab {{
-    padding: 4px 6px;
-    font-size: 11px;
+    padding: 6px 8px;
+    font-size: 12px;
 }}
 QLabel#sectionLabel {{
     font-weight: 700;
@@ -166,8 +168,62 @@ QLabel#sectionLabel {{
     color: {TEXT};
     margin-top: 4px;
 }}
+QLabel#paramsDockHint {{
+    color: {TEXT_MUTED};
+    font-size: 11px;
+    font-weight: 500;
+    padding: 6px 10px;
+    background-color: {CHROME_BG_LIGHT};
+    border-bottom: 1px solid {CHROME_BORDER};
+}}
+QLabel#viewProfileBanner {{
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 0.2px;
+    color: {TEXT};
+    background-color: {SCOPE_BG};
+    border: 1px solid {CHROME_BORDER};
+    border-radius: 4px;
+    padding: 7px 10px;
+    margin: 2px 0 6px 0;
+}}
+QLabel#viewProfileBanner[mode="montage"] {{
+    background-color: #dbeafe;
+    color: #1e3a8a;
+    border-color: #93c5fd;
+}}
 QFrame#sectionSeparator {{
     color: {CHROME_BORDER_DARK};
+}}
+/* Accordion Paramètres */
+QFrame#paramsSection {{
+    background-color: {SCOPE_BG};
+    border: 1px solid {CHROME_BORDER};
+    border-radius: 5px;
+    margin: 0 0 4px 0;
+}}
+QToolButton#paramsSectionHeader {{
+    background-color: transparent;
+    border: none;
+    border-radius: 4px;
+    padding: 7px 8px;
+    font-weight: 700;
+    font-size: 12px;
+    color: {TEXT};
+    text-align: left;
+}}
+QToolButton#paramsSectionHeader:hover {{
+    background-color: {CHROME_BG_LIGHT};
+    color: {PRIMARY};
+}}
+QToolButton#paramsSectionHeader:checked {{
+    background-color: {CHROME_BG_LIGHT};
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+    border-bottom: 1px solid {CHROME_BORDER};
+}}
+QWidget#paramsSectionBody {{
+    background-color: {SCOPE_BG};
 }}
 
 /* ---- Zone centrale (viewport scope) ---- */
@@ -185,9 +241,10 @@ QLabel#controlChannel {{
     font-weight: 700;
     font-size: 13px;
     color: {TEXT};
-    background-color: {CHROME_BG_LIGHT};
+    background-color: {SCOPE_BG};
     border: 1px solid {CHROME_BORDER};
-    padding: 4px 10px;
+    border-radius: 4px;
+    padding: 5px 12px;
     min-width: 120px;
 }}
 QLabel#viewModeBadge {{
@@ -195,10 +252,10 @@ QLabel#viewModeBadge {{
     font-size: 11px;
     letter-spacing: 0.4px;
     color: {TEXT};
-    background-color: {CHROME_BG_LIGHT};
+    background-color: {SCOPE_BG};
     border: 1px solid {CHROME_BORDER};
-    border-radius: 2px;
-    padding: 4px 10px;
+    border-radius: 4px;
+    padding: 5px 12px;
     min-width: 72px;
 }}
 QLabel#viewModeBadge[mode="montage"] {{
@@ -269,17 +326,29 @@ QGroupBox {{
     font-weight: 700;
     color: {TEXT};
     border: 1px solid {CHROME_BORDER};
-    border-radius: 2px;
-    margin-top: 12px;
+    border-radius: 5px;
+    margin-top: 10px;
     padding: 12px 8px 8px 8px;
-    background-color: {CHROME_BG_LIGHT};
+    background-color: {SCOPE_BG};
 }}
 QGroupBox::title {{
     subcontrol-origin: margin;
     left: 8px;
     padding: 0 5px;
-    color: {TEXT_MUTED};
-    background-color: {CHROME_BG_LIGHT};
+    color: {TEXT};
+    background-color: {SCOPE_BG};
+}}
+QGroupBox#collapsibleGroup {{
+    font-weight: 700;
+    border: 1px solid {CHROME_BORDER};
+    border-radius: 5px;
+    margin-top: 4px;
+    padding: 8px 6px 6px 6px;
+    background-color: {SCOPE_BG};
+}}
+QGroupBox#collapsibleGroup::title {{
+    color: {TEXT};
+    background-color: {SCOPE_BG};
 }}
 QGroupBox#meaMapBox {{
     background-color: {SCOPE_BG};
@@ -364,16 +433,16 @@ QToolButton#panelToolButton:checked {{
 /* ---- Inputs ---- */
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
     border: 1px solid {CHROME_BORDER};
-    border-radius: 2px;
-    padding: 3px 6px;
+    border-radius: 4px;
+    padding: 4px 7px;
     background-color: #ffffff;
     color: {TEXT};
-    min-height: 18px;
+    min-height: 20px;
     selection-background-color: {SELECT_BG};
     selection-color: {TEXT_INVERSE};
 }}
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
-    border: 1px solid {SELECT_BG};
+    border: 1px solid {PRIMARY};
 }}
 QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {{
     background-color: {CHROME_BG_ALT};
@@ -392,16 +461,16 @@ QComboBox QAbstractItemView {{
 
 /* ---- Buttons ---- */
 QPushButton {{
-    background-color: {CHROME_BG_LIGHT};
+    background-color: {SCOPE_BG};
     color: {TEXT};
     border: 1px solid {CHROME_BORDER};
-    border-radius: 2px;
-    padding: 5px 11px;
+    border-radius: 4px;
+    padding: 5px 12px;
     font-weight: 600;
-    min-height: 18px;
+    min-height: 20px;
 }}
 QPushButton:hover {{
-    background-color: #f0f0f0;
+    background-color: {CHROME_BG_LIGHT};
     border-color: {CHROME_BORDER_DARK};
 }}
 QPushButton:pressed {{
@@ -416,6 +485,7 @@ QPushButton#primaryButton {{
     color: {TEXT_INVERSE};
     border: 1px solid {SELECT_BORDER};
     font-weight: 700;
+    border-radius: 4px;
 }}
 QPushButton#primaryButton:hover {{
     background-color: {PRIMARY_HOVER};
@@ -425,7 +495,7 @@ QPushButton#primaryButton:disabled {{
     border-color: #6e6e6e;
 }}
 QPushButton#dangerButton {{
-    background-color: {CHROME_BG_LIGHT};
+    background-color: {SCOPE_BG};
     color: {DANGER};
     border: 1px solid {DANGER_BORDER};
     font-weight: 700;
@@ -434,7 +504,7 @@ QPushButton#dangerButton:hover {{
     background-color: #f5d0d0;
 }}
 QPushButton#secondaryButton {{
-    background-color: {CHROME_BG_LIGHT};
+    background-color: {SCOPE_BG};
     color: {PRIMARY};
     border: 1px solid {SELECT_BG};
 }}
